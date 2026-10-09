@@ -51,8 +51,26 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                     budget_usd_monthly,
                     rate_limit_rpm,
                     budget_reset,
+                    governance,
                     path,
                 } = auth;
+                // OG-20: the authentication-time half of the key's policy — an
+                // unparseable stored policy, then `source_ips` against the address B-594
+                // derived for this request (`preauth_limiter::client_ip`, ONE derivation).
+                // Here, not in admission, so EVERY route the key can reach is covered:
+                // reads, ingest and companions as well as dispatch. Fail-CLOSED.
+                enforce_source(governance.as_deref())?;
+                // rev5 M6: the WORKSPACE policy's `source_ips` bind every key too — one
+                // warm entitlement-cache read, the same address, the same refusal.
+                if let Some(d) = workspace_source_refusal(
+                    crate::entitlement_cache::global(),
+                    &tenant_id,
+                    crate::db::api_keys::current_client_ip(),
+                )
+                .await
+                {
+                    return Err(super::PolicyRefused(d).into());
+                }
                 let claims = Claims {
                     tenant_id,
                     // `sub` is the api_keys.id UUID — never a value derived from
@@ -77,10 +95,16 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                     rate_limit_rpm,
                     // BILL-01 A3: same SELECT, same zero-extra-round-trip shape.
                     budget_reset,
+                    // OG-20 / OG-23: same SELECT again.
+                    governance,
                 };
                 return Ok((claims, super::AuthPath::ApiKey(path)));
             }
             Ok(None) => bail!("API key not found or revoked"),
+            // B-594: refused BEFORE the store by the source's failed-lookup
+            // budget. Passed through typed — it is neither an outage (503) nor a
+            // wrong key (401), and `auth::failure` answers it 429.
+            Err(err) if err.is::<crate::db::api_keys::AuthThrottled>() => return Err(err),
             Err(err) => {
                 // B-391 (c): a DB outage is NOT an auth failure. Typed, so every
                 // handler answers 503 `auth_unavailable` (via `auth::failure`)
@@ -123,6 +147,7 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
+                governance: None,
             };
             return Ok((claims, super::AuthPath::Static));
         }
@@ -132,9 +157,129 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
     bail!("API key validation requires Postgres pool (set POSTGRES_URL)")
 }
 
+/// rev5 `M6`: the WORKSPACE policy's `source_ips` against `ip`, for an API key of `tenant`
+/// — `Some(policy_ip_denied)` when they refuse it. `None` with no control plane (no cache:
+/// nothing can have been set) or no workspace policy. Fail-CLOSED: no derivable address
+/// under a CIDR rule is a refusal. A WorkOS session is not bound (the dashboard's admin
+/// plane has its own allowlist, `OG-36`).
+pub(crate) async fn workspace_source_refusal(
+    cache: Option<&std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    tenant: &tracelane_shared::TenantId,
+    ip: Option<std::net::IpAddr>,
+) -> Option<tracelane_shared::key_policy::Denial> {
+    let cache = cache?;
+    let e = cache.resolved(*tenant.as_uuid()).await;
+    // rev6 N4: a stored workspace policy that does not parse cannot be shown to carry no
+    // `source_ips` rule — refuse, as every other OG-20 reader of an invalid policy does
+    // (admission refuses inference `policy_invalid` for the same document). Fail-CLOSED.
+    if matches!(
+        e.controls.policy,
+        Some(tracelane_shared::key_policy::LayerPolicy::Invalid)
+    ) {
+        return Some(tracelane_shared::key_policy::Denial::new(
+            403,
+            "policy_invalid",
+            "policy",
+            tracelane_shared::key_policy::Origin::Workspace,
+            None,
+            "this workspace's policy could not be read, so API keys are refused — an owner must \
+             correct or clear it (PUT /v1/controls/policy)"
+                .to_owned(),
+        ));
+    }
+    let p = e.controls.policy()?;
+    p.check_source(tracelane_shared::key_policy::Origin::Workspace, ip)
+        .err()
+}
+
+/// `OG-20`: the authentication-time half of a key's policy — an unparseable stored
+/// policy, then `source_ips` against the address the pre-auth layer derived for THIS
+/// request (`preauth_limiter::client_ip`, carried on the request's cold-gate scope).
+///
+/// # Errors
+/// [`super::PolicyRefused`] (403 `policy_invalid` / `policy_ip_denied`). Fail-CLOSED: no
+/// derivable address under a CIDR rule is a refusal.
+pub(crate) fn enforce_source(
+    governance: Option<&tracelane_shared::key_policy::Governance>,
+) -> std::result::Result<(), super::PolicyRefused> {
+    match governance {
+        Some(g) => g
+            .check_source(crate::db::api_keys::current_client_ip())
+            .map_err(super::PolicyRefused),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OG-20: the CIDR rule is judged on the address B-594's derivation produced — read
+    /// back from the request scope — and a spoofed forwarding header from a PUBLIC peer
+    /// does not move it. Fail-CLOSED with no scope at all.
+    #[tokio::test]
+    async fn og20_source_ips_judge_the_derived_address_not_a_spoofed_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use std::sync::atomic::AtomicU64;
+        let gov = tracelane_shared::key_policy::Governance::from_columns(
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({ "source_ips": ["10.0.0.0/8"] })),
+        )
+        .unwrap();
+        let in_scope = |ip: Option<std::net::IpAddr>| crate::db::api_keys::ColdGateScope {
+            gate: crate::preauth_limiter::PreAuthLimiter::new(1).gate_for_tests(),
+            source: 0,
+            client_ip: ip,
+            throttled_retry_after: AtomicU64::new(0),
+        };
+        // A PUBLIC peer forging both forwarding headers with an allowed address: the
+        // derivation ignores them, the peer is the source, and the key is refused.
+        let mut forged = HeaderMap::new();
+        forged.insert("cf-connecting-ip", HeaderValue::from_static("10.1.1.1"));
+        forged.insert("x-forwarded-for", HeaderValue::from_static("10.1.1.1"));
+        let derived = crate::preauth_limiter::client_ip(
+            &forged,
+            Some("203.0.113.9".parse().unwrap()),
+            crate::providers::translation_policy::auth_throttle_policy(),
+        );
+        assert_eq!(derived, Some("203.0.113.9".parse().unwrap()));
+        let err = crate::db::api_keys::with_cold_gate(in_scope(derived), async {
+            enforce_source(Some(&gov))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.code, "policy_ip_denied");
+        // Behind a PRIVATE hop the believed header decides — inside the CIDR → allowed.
+        let derived = crate::preauth_limiter::client_ip(
+            &forged,
+            Some("172.18.0.5".parse().unwrap()),
+            crate::providers::translation_policy::auth_throttle_policy(),
+        );
+        assert_eq!(derived, Some("10.1.1.1".parse().unwrap()));
+        assert!(
+            crate::db::api_keys::with_cold_gate(in_scope(derived), async {
+                enforce_source(Some(&gov))
+            })
+            .await
+            .is_ok()
+        );
+        // No request scope (no address) → refused, never allowed.
+        assert_eq!(
+            enforce_source(Some(&gov)).unwrap_err().0.code,
+            "policy_ip_denied"
+        );
+        // As an auth failure it is a 403 with its own code, never the 401 a wrong key gets.
+        let e: anyhow::Error = enforce_source(Some(&gov)).unwrap_err().into();
+        assert_eq!(
+            crate::auth::failure_status(&e),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(crate::auth::failure_code(&e), "policy_ip_denied");
+        // No governance: unchanged.
+        assert!(enforce_source(None).is_ok());
+    }
 
     /// A well-formed `tlane_` key for the tests below. The production
     /// generator lives in `db::api_keys` (peppered, minted into Postgres); the

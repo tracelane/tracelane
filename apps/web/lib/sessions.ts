@@ -17,6 +17,8 @@ import { GatewayError, gatewayGet } from "@/lib/gateway";
 
 /** A session summary as returned by `GET /v1/sessions` (gateway shape). */
 export type SessionSummary = {
+	loop_calls?: number;
+	loops_available?: boolean;
 	session_id: string;
 	turns: number;
 	started_at: string;

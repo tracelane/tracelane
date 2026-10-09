@@ -17,20 +17,21 @@
 
 ## What SemVer covers (the versioned surfaces)
 
-Each has its own version and its own SemVer contract:
+Each has its own SemVer contract; published packages share one release version:
 
-| Surface | Where | Version today | SemVer applies to |
+| Surface | Where | Version in source | SemVer applies to |
 |---|---|---|---|
 | Gateway HTTP API | `https://gateway.tracelane.dev/v1/…` | `v1` (path) | request/response shape of documented `/v1` endpoints |
-| Python SDK | `tracelane` (PyPI) | `0.2.3` | public `import tracelane` surface (`init`, `instrument_*`) |
-| TypeScript SDK | `@tracelanedev/sdk` (npm) | `0.2.3` | public exports (`instrument*`, config types) |
-| CLI | `@tracelanedev/cli` (npm) | `0.2.3` | command names, flags, exit codes |
-| Audit wire format / verifier | `packages/verifier-*`, `spec/` | verifier `0.2.3` | the audit record format a third party verifies |
+| Python SDK | `tracelane` (PyPI) | `0.4.0` | public `import tracelane` surface (`init`, `instrument_*`) |
+| TypeScript SDK | `@tracelanedev/sdk` (npm) | `0.4.0` | public exports (`instrument*`, config types) |
+| CLI | `@tracelanedev/cli` (npm) | `0.4.0` | command names, flags, exit codes |
+| Audit wire format / verifier | `packages/verifier-*`, `spec/` | Python/TypeScript `0.4.0`; Rust source `0.2.3` | the audit record format a third party verifies |
 | Rust crates | `crates/*` | `0.1.0` | not published for external use in V1 (internal) |
 | Specs (AFT-1, OpenAgentTrace) | `spec/` | AFT-1 `v0.3` draft, OAT `v0.1` draft | see [Spec versioning](#spec-versioning) |
 
-**These version independently.** An SDK minor bump does not imply a gateway change, and vice
-versa — see [SDK ↔ gateway compatibility](#sdk--gateway-compatibility).
+**These keep independent compatibility contracts.** Published package manifests share
+one version per release; an SDK bump does not change the gateway `/v1` contract — see
+[SDK ↔ gateway compatibility](#sdk--gateway-compatibility).
 
 ## API stability (`/v1`)
 
@@ -96,9 +97,9 @@ the last one.** We do not cut a tag per package, per feature, or per fix.
   idempotent, so an unbumped package is a no-op and the run stays green having published
   nothing for it. Green therefore does not mean "everything on this list is now live" — check
   the version, not the run status.
-- **Between releases, a finished package can sit built and unpublished.** That is the normal
-  state, not a defect: work lands on `main` continuously, and versions become installable only
-  when a tag carries them.
+- **Every successful public promotion checks for the shared package version's tag.**
+  If it is absent, the promotion signs and pushes it, starting the release workflow.
+  A version mismatch blocks tagging and reports every package version.
 
 The rule the last point exists to enforce: **a package is installable only once a tag has
 shipped it, so documentation for an unreleased package says exactly that** rather than

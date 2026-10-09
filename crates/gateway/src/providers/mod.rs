@@ -24,7 +24,8 @@ const VERTEX_PREFIXES: &[&str] = &["vertex/"];
 const GOOGLE_PREFIXES: &[&str] = &["gemini", "google/"];
 const BEDROCK_PREFIXES: &[&str] = &["bedrock/"];
 const AZURE_PREFIXES: &[&str] = &["azure/"];
-const COHERE_PREFIXES: &[&str] = &["command", "cohere/"];
+// D9/OG-06: `rerank-` routes Cohere's rerank models (`rerank-v3.5`, …) to its native adapter.
+const COHERE_PREFIXES: &[&str] = &["command", "cohere/", "rerank-"];
 pub const NATIVE_PREFIXES: &[(&str, &[&str])] = &[
     ("anthropic", ANTHROPIC_PREFIXES),
     ("vertex", VERTEX_PREFIXES),
@@ -42,6 +43,29 @@ use futures::Stream;
 use std::pin::Pin;
 use tracing::instrument;
 
+/// SB (security re-review round 2, 2026-10-05): marks an error DERIVED FROM THE TENANT'S
+/// CREDENTIAL — parsing it, or exchanging it for a token (Vertex's OAuth2 exchange). Such
+/// a failure is evidence about that credential, never about the provider, so the breaker
+/// feeds it to that credential only (`server::transport_outcome`). Attached as anyhow
+/// CONTEXT carrying the error's own message, so `Display`, `downcast_ref` of the inner
+/// error (`ProviderHttpError` for the 401 mapping) and the source chain are unchanged.
+#[derive(Debug)]
+pub struct CredentialDerived(String);
+
+impl std::fmt::Display for CredentialDerived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CredentialDerived {}
+
+/// Mark `err` as credential-derived ([`CredentialDerived`]).
+pub(crate) fn credential_derived(err: anyhow::Error) -> anyhow::Error {
+    let message = err.to_string();
+    err.context(CredentialDerived(message))
+}
+
 /// An upstream provider returned a non-success HTTP status.
 ///
 /// Carries the status code so the gateway can distinguish an **auth rejection**
@@ -53,6 +77,9 @@ use tracing::instrument;
 ///
 /// Adapters return this (via `anyhow`) on a non-2xx upstream response; the chat
 /// handler recovers it with `downcast_ref::<ProviderHttpError>()`.
+///
+/// (See also [`CredentialDerived`]: a `ProviderHttpError` produced while exchanging a
+/// tenant's credential — e.g. Vertex's token endpoint — is wrapped in it.)
 #[derive(Debug, thiserror::Error)]
 #[error("{provider} upstream error: status {status}")]
 pub struct ProviderHttpError {
@@ -71,6 +98,68 @@ pub struct ProviderHttpError {
     /// holds that provider error bodies can echo the credential. Only a validated
     /// enum-shaped token gets in here — see [`safe_reason`].
     pub reason: Option<String>,
+    /// `OG-03` §3.4. The upstream's own `error.message`, SCRUBBED and TRUNCATED, for a
+    /// 4xx that is not an authentication failure — so "Unsupported parameter:
+    /// max_tokens" reaches the caller instead of an unexplained failure. Built ONLY by
+    /// [`ProviderHttpError::from_response`], which is the single place that decides
+    /// whether a body may be relayed; `None` for 401/403/407, for every 5xx, and for
+    /// anything [`ProviderHttpError::is_auth_rejection`] treats as a key problem.
+    pub message: Option<String>,
+    /// `OG-10`. The upstream's own `Retry-After`, parsed (delta-seconds or HTTP-date) and
+    /// clamped by [`retry_after_from`]; `None` when absent or garbage. Read in the
+    /// adapter's non-success branch BEFORE the body, and used in two places: the retry
+    /// loop honours it (or declines to retry when it does not fit the budget), and the
+    /// client response relays it so the caller's own backoff works.
+    pub retry_after: Option<std::time::Duration>,
+}
+
+/// Upstream statuses whose body is NEVER relayed: the credential was rejected (the
+/// body routinely echoes it), or the upstream itself failed (5xx detail is internal).
+const fn body_is_relayable(status: u16) -> bool {
+    status >= 400 && status < 500 && status != 401 && status != 403 && status != 407
+}
+
+/// Pull the human message out of a provider error body and make it safe to relay.
+///
+/// Reads `error.message`, then a top-level `message`, then a string `error` (xAI /
+/// Cohere / Bedrock shapes). Then, in this order: every occurrence of the tenant's own
+/// key is removed (a verbatim echo of the exact credential is the worst leak and the
+/// one pattern-based scrubbing could miss), `tracelane_shared::redact::scrub` removes
+/// key-shaped strings, and the result is cut to `max_chars` characters with `…`.
+///
+/// `max_chars == 0` — the fail-closed reading of an unparseable policy table —
+/// relays nothing.
+#[must_use]
+pub(crate) fn provider_message_from_body(
+    body: &str,
+    api_key: &str,
+    max_chars: usize,
+) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = v
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| v.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| v.get("error").and_then(serde_json::Value::as_str))?;
+    let mut text = raw.to_owned();
+    if !api_key.is_empty() {
+        text = text.replace(api_key, "[REDACTED]");
+    }
+    let scrubbed = tracelane_shared::redact::scrub(text.as_bytes());
+    let text = String::from_utf8_lossy(&scrubbed).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > max_chars {
+        let mut cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        cut.push('…');
+        return Some(cut);
+    }
+    Some(text)
 }
 
 /// Accept an upstream reason token only if it is structurally incapable of
@@ -116,6 +205,43 @@ pub fn reason_from_body(body: &str) -> Option<String> {
 }
 
 impl ProviderHttpError {
+    /// The one constructor adapters use for a non-2xx response.
+    ///
+    /// `message` is attached only when the status is a relayable 4xx AND the error is
+    /// not an auth rejection (Google answers a dead key with a 400 whose body names
+    /// the key) — the order matters, so the decision is made on the finished error.
+    #[must_use]
+    pub fn from_response(
+        provider: &'static str,
+        status: u16,
+        reason: Option<String>,
+        body: &str,
+        api_key: &str,
+    ) -> Self {
+        let mut err = Self {
+            provider,
+            status,
+            reason,
+            message: None,
+            retry_after: None,
+        };
+        if body_is_relayable(status) && !err.is_auth_rejection() {
+            err.message = provider_message_from_body(
+                body,
+                api_key,
+                translation_policy::limits().provider_message_max_chars,
+            );
+        }
+        err
+    }
+
+    /// Attach the upstream's `Retry-After` (`OG-10`); see [`retry_after_from`].
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Option<std::time::Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
     /// True when the upstream rejected the credential itself — the tenant's key is
     /// wrong/expired/retired, not a transient outage. Drives the
     /// `provider_key_rejected` response (/ GW-SPAN-002).
@@ -145,8 +271,14 @@ impl ProviderHttpError {
         self.status == 429
     }
 
-    /// True when the status is an UPSTREAM fault — the class ADR-036 actually names
-    /// as a breaker trip input ("timeouts, 429s, 5xx").
+    /// True when the status is an UPSTREAM fault — a breaker trip input (ADR-036 as
+    /// amended 2026-10-03: timeouts and 5xx).
+    ///
+    /// F4, 2026-10-03: 429 is NOT one. Under BYOK a 429 is the tenant's OWN account
+    /// quota — the same "one tenant's key opens the circuit for everyone" shape as the
+    /// 4xx below, observed live (a free-tier Mistral key's 429s → `503
+    /// upstream_circuit_open` for the whole process). The tenant still gets its 429 and
+    /// `retry-after`; the retry loop honours it.
     ///
     /// SRE audit finding 38, 2026-09-04. A 401/403/404/400 blames the CALLER's key,
     /// model or body, not the provider's health — and `CircuitBreaker` is keyed
@@ -157,7 +289,7 @@ impl ProviderHttpError {
     /// breaker was fed `provider_result.is_ok()`, which is true of any error at all.
     #[must_use]
     pub fn is_upstream_fault(&self) -> bool {
-        self.status >= 500 || self.is_rate_limited()
+        self.status >= 500
     }
 
     /// True when the upstream says the model does not exist (404). Distinct from
@@ -209,6 +341,8 @@ mod provider_http_error_tests {
             provider: "openai",
             status,
             reason: reason.map(str::to_owned),
+            message: None,
+            retry_after: None,
         }
     }
 
@@ -362,7 +496,10 @@ pub mod cohere;
 pub mod failover;
 pub mod google;
 pub mod openai;
+pub(crate) mod responses_bridge;
+pub mod retry_after;
 pub(crate) mod sse_lines;
+pub(crate) mod translation_policy;
 pub mod vertex;
 
 // `all(test, debug_assertions)`, NOT just `test`: smoke_tests calls the
@@ -381,6 +518,12 @@ mod smoke_tests;
 #[cfg(all(test, debug_assertions))]
 mod behavioral_tests;
 
+// `OG-90` (RCA control C1): the adapter no-silent-drop matrix — every native adapter ×
+// every `ChatRequest` field × every `ContentPart` is either on the wire the real adapter
+// sends, or refused with a 400 that names it. Same cfg gate (debug-only loopback bypass).
+#[cfg(all(test, debug_assertions))]
+mod conformance_tests;
+
 pub use anthropic::AnthropicProvider;
 pub use azure::AzureOpenAiProvider;
 pub use bedrock::BedrockProvider;
@@ -394,6 +537,7 @@ pub use openai::{
     EmbeddingsRequest,
     OpenAiProvider,
 };
+pub use retry_after::retry_after_from;
 pub use vertex::VertexProvider;
 
 use tracelane_shared::{ChatRequest, ChatResponse, TenantId};
@@ -716,6 +860,20 @@ impl ProviderRegistry {
         self.compat(provider_id)
     }
 
+    /// `OG-13`: the upstream region a dispatch to `provider_id` lands in — Bedrock's AWS
+    /// region, Vertex's location, Azure's resource host — so the circuit breaker keys on
+    /// it instead of the literal `"default"`. Every other provider has one endpoint per
+    /// process: `"default"`. Still a PROCESS setting (spec §6: no per-request region).
+    #[must_use]
+    pub fn upstream_region(&self, provider_id: &str) -> &str {
+        match provider_id {
+            "bedrock" => self.bedrock.region(),
+            "vertex" => self.vertex.location(),
+            "azure" => self.azure.endpoint(),
+            _ => "default",
+        }
+    }
+
     /// Provider-id → API-key env-var name.
     ///
     /// Returns `""` for a provider that needs no key (Ollama is local) **and**
@@ -793,7 +951,7 @@ mod model_routing_consistency_tests {
     }
 
     /// Regression: the dispatch match in `server.rs` routes
-    /// `llama*` / `qwen* `/ `gemma*` to `registry.groq`, but the BYOK
+    /// `llama*` / `qwen/*` / `gemma*` to `registry.groq`, but the BYOK
     /// key-lookup functions used to default them to `anthropic` /
     /// `ANTHROPIC_API_KEY`. A stored Groq key then never resolved (401), and
     /// a stored Anthropic key would have been sent to `api.groq.com`. The
@@ -851,7 +1009,7 @@ mod model_routing_consistency_tests {
         for m in [
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "qwen-2.5-32b",
+            "qwen/qwen3-32b",
             "gemma2-9b-it",
         ] {
             assert_eq!(
@@ -865,6 +1023,96 @@ mod model_routing_consistency_tests {
                 "api_key_env_var({m}) must be GROQ_API_KEY (was defaulting to ANTHROPIC_API_KEY)"
             );
         }
+    }
+
+    /// `OG-05` §7 row 1: every frontier model id AS THE VENDOR'S DOCS PRINT IT
+    /// routes to that vendor's own provider row and resolves that vendor's key.
+    /// `qwen3.8-max` used to route to GROQ (bare `qwen` claim) — a first-party
+    /// Alibaba id sent with Groq's key.
+    #[test]
+    fn og05_frontier_models_route_to_their_first_party() {
+        let table: &[(&str, &str, &str)] = &[
+            ("gpt-6-astra", "openai", "OPENAI_API_KEY"),
+            ("gpt-6.1-sol", "openai", "OPENAI_API_KEY"),
+            ("gpt-6-sol", "openai", "OPENAI_API_KEY"),
+            ("gpt-6-luna", "openai", "OPENAI_API_KEY"),
+            ("gpt-5.5", "openai", "OPENAI_API_KEY"),
+            ("gpt-5.5-pro", "openai", "OPENAI_API_KEY"),
+            ("gpt-5.3-codex", "openai", "OPENAI_API_KEY"),
+            ("claude-fable-5-1", "anthropic", "ANTHROPIC_API_KEY"),
+            ("claude-opus-5-5", "anthropic", "ANTHROPIC_API_KEY"),
+            ("claude-sonnet-5-5", "anthropic", "ANTHROPIC_API_KEY"),
+            ("claude-haiku-4-5", "anthropic", "ANTHROPIC_API_KEY"),
+            ("gemini-3.1-pro-preview", "google", "GOOGLE_API_KEY"),
+            ("gemini-3.8-flash", "google", "GOOGLE_API_KEY"),
+            ("gemini-3.5-flash", "google", "GOOGLE_API_KEY"),
+            ("gemini-3.1-flash-lite", "google", "GOOGLE_API_KEY"),
+            ("grok-4.7", "xai", "XAI_API_KEY"),
+            ("grok-4.3", "xai", "XAI_API_KEY"),
+            ("grok-build-0.1", "xai", "XAI_API_KEY"),
+            ("deepseek-flash", "deepseek", "DEEPSEEK_API_KEY"),
+            ("deepseek-v4-pro", "deepseek", "DEEPSEEK_API_KEY"),
+            ("kimi-k3", "moonshot-intl", "MOONSHOT_API_KEY"),
+            ("kimi-k2.6", "moonshot-intl", "MOONSHOT_API_KEY"),
+            ("glm-5.3", "zai", "ZHIPU_API_KEY"),
+            ("glm-5.3-flash", "zai", "ZHIPU_API_KEY"),
+            ("qwen3.8-max", "alibaba", "DASHSCOPE_API_KEY"),
+            ("qwen3.7-plus", "alibaba", "DASHSCOPE_API_KEY"),
+            ("qwen3.8-flash", "alibaba", "DASHSCOPE_API_KEY"),
+            ("qwen-max", "alibaba", "DASHSCOPE_API_KEY"),
+            ("mistral-large-3", "mistral", "MISTRAL_API_KEY"),
+            ("magistral-medium-2509", "mistral", "MISTRAL_API_KEY"),
+            ("codestral-2508", "mistral", "MISTRAL_API_KEY"),
+            ("devstral-small-2507", "mistral", "MISTRAL_API_KEY"),
+            ("muse-spark", "meta", "META_API_KEY"),
+            // Groq keeps ITS namespaced ids.
+            ("qwen/qwen3-32b", "groq", "GROQ_API_KEY"),
+        ];
+        for (model, pid, env) in table {
+            assert_eq!(
+                ProviderRegistry::provider_id_for_model(model),
+                Some(*pid),
+                "`{model}` must route to `{pid}`"
+            );
+            assert_eq!(api_key_env_var(model), Some(*env), "`{model}` key env");
+        }
+    }
+
+    /// `OG-05`: the guard BLOCKS. Fail-closed is unchanged — an unknown id is
+    /// still `None` (so `unroutable_model`), and the bare Groq-era qwen ids that
+    /// used to ride the removed `qwen` claim are now unroutable, never
+    /// defaulted to some provider's key.
+    #[test]
+    fn og05_unknown_models_stay_unroutable() {
+        for m in [
+            "totally-unknown-model-9",
+            "kimi",
+            "glm5",
+            "qwen-2.5-32b",
+            "qwen3-32b",
+            "muse",
+        ] {
+            assert_eq!(
+                ProviderRegistry::provider_id_for_model(m),
+                None,
+                "`{m}` must be unroutable (fail-closed), not defaulted"
+            );
+        }
+    }
+
+    /// `OG-05`: the NEW international Moonshot row points at the international
+    /// host; the existing China row keeps its host (a re-pointed `base_url`
+    /// would send a tenant's key to a host they never chose).
+    #[test]
+    fn og05_moonshot_international_is_a_new_row_not_a_repoint() {
+        let intl = super::catalog::by_id("moonshot-intl").expect("row");
+        assert_eq!(intl.base_url_default, "https://api.moonshot.ai");
+        let cn = super::catalog::by_id("moonshot").expect("row");
+        assert_eq!(cn.base_url_default, "https://api.moonshot.cn");
+        assert_eq!(
+            super::catalog::by_id("meta").expect("row").base_url_default,
+            "https://api.meta.ai"
+        );
     }
 
     /// The Groq arm must NOT steal `llama-3.1-sonar*` — those are Perplexity
@@ -930,9 +1178,9 @@ mod model_routing_consistency_tests {
     #[test]
     fn unmatched_models_fail_closed_not_default_anthropic() {
         for model in [
-            "kimi-k2",
+            "kimi", // OG-05: `kimi-` (with the dash) is now moonshot-intl
             "nova-pro",
-            "glm-4-plus",
+            "glm4-plus", // OG-05: `glm-` (with the dash) is now zai
             "phi-4",
             "totally-unknown-model-xyz",
             "",
@@ -1054,7 +1302,7 @@ mod model_routing_consistency_tests {
             "zzz-nonexistent-model",
             "unknown-xyz",
             "",
-            "kimi-k2",
+            "kimi", // OG-05: `kimi-k2` now routes to moonshot-intl
             "nova-pro",
         ] {
             assert_eq!(
@@ -1064,5 +1312,80 @@ mod model_routing_consistency_tests {
             );
             assert_eq!(api_key_env_var(m), None);
         }
+    }
+}
+
+impl FinishReason {
+    /// Gemini's `candidates[].finishReason`.
+    ///
+    /// Unknown reasons stay absent so the gateway uses its derived default.
+    #[must_use]
+    pub fn from_gemini_finish_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "MAX_TOKENS" => Some(Self::Length),
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => {
+                Some(Self::ContentFilter)
+            }
+            "STOP" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod og03_provider_message_tests {
+    use super::{ProviderHttpError, provider_message_from_body};
+
+    const KEY: &str = "unit-test-secret-key-do-not-use-in-prod";
+
+    #[test]
+    fn a_relayable_4xx_carries_the_scrubbed_message() {
+        let body = r#"{"error":{"message":"Unsupported parameter: max_tokens"}}"#;
+        let e = ProviderHttpError::from_response("openai", 400, None, body, KEY);
+        assert_eq!(
+            e.message.as_deref(),
+            Some("Unsupported parameter: max_tokens")
+        );
+    }
+
+    /// The guard must BLOCK: 401 / 403 / 407 and every 5xx never carry a body, and neither
+    /// does a 400 that is a dead key (Google's shape).
+    #[test]
+    fn nothing_is_relayed_for_auth_statuses_server_errors_or_a_key_400() {
+        let body = format!(r#"{{"error":{{"message":"bad key {KEY}"}}}}"#);
+        for s in [401u16, 403, 407, 500, 502, 503, 504] {
+            let e = ProviderHttpError::from_response("openai", s, None, &body, KEY);
+            assert!(e.message.is_none(), "status {s} must not relay a body");
+        }
+        let e = ProviderHttpError::from_response(
+            "google",
+            400,
+            Some("API_KEY_INVALID".into()),
+            &body,
+            KEY,
+        );
+        assert!(e.message.is_none(), "a dead-key 400 must not relay a body");
+    }
+
+    #[test]
+    fn the_tenants_own_key_and_key_shapes_are_removed_and_the_text_is_bounded() {
+        let body = format!(
+            r#"{{"message":"model rejected key {KEY} and sk-proj-abcdefghijklmnopqrstuvwxyz0123"}}"#
+        );
+        let m = provider_message_from_body(&body, KEY, 512).expect("message");
+        assert!(!m.contains(KEY), "{m}");
+        assert!(!m.contains("sk-proj-"), "{m}");
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(2000));
+        let m = provider_message_from_body(&long, KEY, 512).expect("message");
+        assert_eq!(m.chars().count(), 512);
+        assert!(m.ends_with('…'));
+        // Fail-closed: a zero cap (an unparseable policy table) relays nothing.
+        assert!(provider_message_from_body(&long, KEY, 0).is_none());
+        // Every body shape the adapters meet: xAI / Cohere / Bedrock string forms.
+        assert_eq!(
+            provider_message_from_body(r#"{"error":"Bad request shape"}"#, KEY, 512).as_deref(),
+            Some("Bad request shape")
+        );
+        assert!(provider_message_from_body("not json", KEY, 512).is_none());
     }
 }

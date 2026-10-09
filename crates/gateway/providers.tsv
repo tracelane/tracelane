@@ -3,198 +3,216 @@
 # vertex, bedrock, azure, cohere) are NOT here: their wire format differs and
 # they stay as typed Rust adapters.
 #
+# `capabilities` (OG-06) is a comma-separated subset of CAPABILITY_IDS in the
+# generator — the non-chat endpoints the provider's OWN docs show at the
+# OpenAI path; empty = none. DERIVED from CAPABILITIES (doc URL per entry).
+#
 # `prefixes` is comma-separated. A prefix containing `/` (or starting `@`) is
 # NAMESPACED and is matched first; a bare prefix is matched afterwards,
 # LONGEST FIRST — which is what keeps `llama-3.1-sonar` on perplexity while
 # `llama-3.3-70b` goes to groq, exactly as the hand-written match arms did.
 #
 # New rows derive from https://models.dev/api.json (MIT, (c) 2025 models.dev).
-# source sha256: 7cdd618b8f1917689567c70fb7433b9d7160dcad27f8085a17f5775406e6f9de
+# source sha256: 6b116d0887f4c0d59a63c968aa32e4223c71f3db372b7f0f437fcc5155f406c2
 # Existing rows derive from crates/gateway/src/providers/mod.rs itself, so a
 # regeneration can never re-point live production traffic.
-id	label	base_url	base_url_env	api_key_env	prefixes
-302ai	302.AI	https://api.302.ai	302AI_BASE_URL	302AI_API_KEY	302ai/
-abacus	Abacus	https://routellm.abacus.ai	ABACUS_BASE_URL	ABACUS_API_KEY	abacus/
-abliteration-ai	abliteration.ai	https://api.abliteration.ai	ABLITERATION_AI_BASE_URL	ABLIT_KEY	abliteration-ai/
-ai-router	AI-ROUTER	https://api.ai-router.dev	AI_ROUTER_BASE_URL	AI_ROUTER_API_KEY	ai-router/
-ai21	Ai21	https://api.ai21.com	AI21_BASE_URL	AI21_API_KEY	ai21/,j2-,jamba
-aiand	ai&	https://api.aiand.com	AIAND_BASE_URL	AIAND_API_KEY	aiand/
-aki-io	AKI.IO	https://aki.io	AKI_IO_BASE_URL	AKI_IO_API_KEY	aki-io/
-aleph-alpha	Aleph Alpha	https://api.aleph-alpha.com	ALEPH_ALPHA_BASE_URL	ALEPH_ALPHA_API_KEY	luminous,aleph-alpha/
-alibaba	Alibaba	https://dashscope-intl.aliyuncs.com/compatible-mode	ALIBABA_BASE_URL	DASHSCOPE_API_KEY	alibaba/
-alibaba-cn	Alibaba (China)	https://dashscope.aliyuncs.com/compatible-mode	ALIBABA_CN_BASE_URL	DASHSCOPE_API_KEY	alibaba-cn/
-alibaba-coding-plan	Alibaba Coding Plan	https://coding-intl.dashscope.aliyuncs.com	ALIBABA_CODING_PLAN_BASE_URL	ALIBABA_CODING_PLAN_API_KEY	alibaba-coding-plan/
-alibaba-coding-plan-cn	Alibaba Coding Plan (China)	https://coding.dashscope.aliyuncs.com	ALIBABA_CODING_PLAN_CN_BASE_URL	ALIBABA_CODING_PLAN_API_KEY	alibaba-coding-plan-cn/
-alibaba-token-plan	Alibaba Token Plan	https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode	ALIBABA_TOKEN_PLAN_BASE_URL	ALIBABA_TOKEN_PLAN_API_KEY	alibaba-token-plan/
-alibaba-token-plan-cn	Alibaba Token Plan (China)	https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode	ALIBABA_TOKEN_PLAN_CN_BASE_URL	ALIBABA_TOKEN_PLAN_API_KEY	alibaba-token-plan-cn/
-ambient	Ambient	https://api.ambient.xyz	AMBIENT_BASE_URL	AMBIENT_API_KEY	ambient/
-amd	AMD	https://developer.amd.com.cn/radeon/api	AMD_BASE_URL	AMD_API_KEY	amd/
-anyapi	AnyAPI	https://api.anyapi.ai	ANYAPI_BASE_URL	ANYAPI_API_KEY	anyapi/
-anyscale	Anyscale	https://api.endpoints.anyscale.com	ANYSCALE_BASE_URL	ANYSCALE_API_KEY	anyscale/
-arcee	Arcee	https://api.arcee.ai/api	ARCEE_BASE_URL	ARCEE_API_KEY	arcee/
-auriko	Auriko	https://api.auriko.ai	AURIKO_BASE_URL	AURIKO_API_KEY	auriko/
-bailing	Bailing	https://api.tbox.cn/api/llm/v1/chat/completions	BAILING_BASE_URL	BAILING_API_TOKEN	bailing/
-baseten	Baseten	https://bridge.baseten.co/v1/direct	BASETEN_BASE_URL	BASETEN_API_KEY	baseten/
-berget	Berget.AI	https://api.berget.ai	BERGET_BASE_URL	BERGET_API_KEY	berget/
-blueclaw	Blue Claw	https://openai.blueclaw.network	BLUECLAW_BASE_URL	BLUECLAW_API_KEY	blueclaw/
-cerebras	Cerebras	https://api.cerebras.ai	CEREBRAS_BASE_URL	CEREBRAS_API_KEY	cerebras/
-chutes	Chutes	https://llm.chutes.ai	CHUTES_BASE_URL	CHUTES_API_KEY	chutes/
-clarifai	Clarifai	https://api.clarifai.com/v2/ext/openai	CLARIFAI_BASE_URL	CLARIFAI_PAT	clarifai/
-claudinio	Claudinio	https://api.claudin.io	CLAUDINIO_BASE_URL	CLAUDINIO_API_KEY	claudinio/
-cline-pass	ClinePass	https://api.cline.bot/api	CLINE_PASS_BASE_URL	CLINE_API_KEY	cline-pass/
-cloudferro-sherlock	CloudFerro Sherlock	https://api-sherlock.cloudferro.com/openai	CLOUDFERRO_SHERLOCK_BASE_URL	CLOUDFERRO_SHERLOCK_API_KEY	cloudferro-sherlock/
-cloudflare	Cloudflare Workers AI	https://gateway.ai.cloudflare.com/v1/tracelane/workers-ai/openai	CLOUDFLARE_AI_GATEWAY_URL	CLOUDFLARE_API_KEY	@cf/,cloudflare/
-coralbricks	CoralBricks	https://inference.coralbricks.ai	CORALBRICKS_BASE_URL	CORAL_API_KEY	coralbricks/
-cortecs	Cortecs	https://api.cortecs.ai	CORTECS_BASE_URL	CORTECS_API_KEY	cortecs/
-crof	CrofAI	https://crof.ai	CROF_BASE_URL	CROF_API_KEY	crof/
-crossmodel	CrossModel	https://api.crossmodel.ai	CROSSMODEL_BASE_URL	CROSSMODEL_API_KEY	crossmodel/
-crusoe	Crusoe	https://api.inference.crusoecloud.com	CRUSOE_BASE_URL	CRUSOE_API_KEY	crusoe/
-daoxe	DaoXE	https://daoxe.com	DAOXE_BASE_URL	DAOXE_API_KEY	daoxe/
-deepinfra	Deep Infra	https://api.deepinfra.com	DEEPINFRA_BASE_URL	DEEPINFRA_API_KEY	deepinfra/
-deepseek	DeepSeek	https://api.deepseek.com	DEEPSEEK_BASE_URL	DEEPSEEK_API_KEY	deepseek
-digitalocean	DigitalOcean	https://inference.do-ai.run	DIGITALOCEAN_BASE_URL	DIGITALOCEAN_ACCESS_TOKEN	digitalocean/
-dinference	DInference	https://api.dinference.com	DINFERENCE_BASE_URL	DINFERENCE_API_KEY	dinference/
-drun	D.Run (China)	https://chat.d.run	DRUN_BASE_URL	DRUN_API_KEY	drun/
-ebcloud	EBCloud	https://maas-api.ebcloud.com	EBCLOUD_BASE_URL	EBCLOUD_API_KEY	ebcloud/
-edenai	Eden AI	https://api.edenai.run/v3	EDENAI_BASE_URL	EDENAI_API_KEY	edenai/
-empiriolabs	EmpirioLabs AI	https://api.empiriolabs.ai	EMPIRIOLABS_BASE_URL	EMPIRIOLABS_API_KEY	empiriolabs/
-evroc	evroc	https://models.think.evroc.com	EVROC_BASE_URL	EVROC_API_KEY	evroc/
-fastrouter	FastRouter	https://go.fastrouter.ai/api	FASTROUTER_BASE_URL	FASTROUTER_API_KEY	fastrouter/
-fireworks	Fireworks AI	https://api.fireworks.ai/inference	FIREWORKS_BASE_URL	FIREWORKS_API_KEY	fireworks/
-friendli	Friendli	https://api.friendli.ai/serverless	FRIENDLI_BASE_URL	FRIENDLI_TOKEN	friendli/
-frogbot	FrogBot	https://app.frogbot.ai/api	FROGBOT_BASE_URL	FROGBOT_API_KEY	frogbot/
-github-copilot	GitHub Copilot	https://api.githubcopilot.com	GITHUB_COPILOT_BASE_URL	GITHUB_TOKEN	github-copilot/
-gmicloud	GMI Cloud	https://api.gmi-serving.com	GMICLOUD_BASE_URL	GMICLOUD_API_KEY	gmicloud/
-greenpt	GreenPT	https://api.greenpt.ai	GREENPT_BASE_URL	GREENPT_API_KEY	greenpt/
-groq	Groq	https://api.groq.com/openai	GROQ_BASE_URL	GROQ_API_KEY	llama,qwen,gemma
-helicone	Helicone	https://ai-gateway.helicone.ai	HELICONE_BASE_URL	HELICONE_API_KEY	helicone/
-hetzner	Hetzner	https://inference.hetzner.com/api	HETZNER_BASE_URL	HETZNER_API_KEY	hetzner/
-hpc-ai	HPC-AI	https://api.hpc-ai.com/inference	HPC_AI_BASE_URL	HPC_AI_API_KEY	hpc-ai/
-huggingface	Hugging Face	https://api-inference.huggingface.co	HUGGINGFACE_BASE_URL	HUGGINGFACE_API_KEY	hf/,huggingface/
-hyper	Charm Hyper	https://hyper.charm.land	HYPER_BASE_URL	HYPER_API_KEY	hyper/
-hyperbolic	Hyperbolic	https://api.hyperbolic.xyz	HYPERBOLIC_BASE_URL	HYPERBOLIC_API_KEY	hyperbolic/
-iflowcn	iFlow	https://apis.iflow.cn	IFLOWCN_BASE_URL	IFLOW_API_KEY	iflowcn/
-impossibl	Impossibl	https://api.impossibl.com	IMPOSSIBL_BASE_URL	IMPOSSIBL_API_KEY	impossibl/
-inception	Inception	https://api.inceptionlabs.ai	INCEPTION_BASE_URL	INCEPTION_API_KEY	inception/
-inceptron	Inceptron	https://api.inceptron.io	INCEPTRON_BASE_URL	INCEPTRON_API_KEY	inceptron/
-inference	Inference	https://inference.net	INFERENCE_BASE_URL	INFERENCE_API_KEY	inference/
-inferx	InferX	https://model.inferx.net/endpoints	INFERX_BASE_URL	INFERX_API_KEY	inferx/
-io-net	IO.NET	https://api.intelligence.io.solutions/api	IO_NET_BASE_URL	IOINTELLIGENCE_API_KEY	io-net/
-jalapeno	Jalapeno Cloud	https://api.jalapeno-cloud.ai	JALAPENO_BASE_URL	JALAPENO_API_KEY	jalapeno/
-jiekou	Jiekou.AI	https://api.jiekou.ai/openai	JIEKOU_BASE_URL	JIEKOU_API_KEY	jiekou/
-kenari	Kenari	https://kenari.id	KENARI_BASE_URL	KENARI_API_KEY	kenari/
-kilo	Kilo Gateway	https://api.kilo.ai/api/gateway	KILO_BASE_URL	KILO_API_KEY	kilo/
-kosmik	Kosmik Compute	https://api.koscompute.com	KOSMIK_BASE_URL	KOSMIK_API_KEY	kosmik/
-kuae-cloud-coding-plan	KUAE Cloud Coding Plan	https://coding-plan-endpoint.kuaecloud.net	KUAE_CLOUD_CODING_PLAN_BASE_URL	KUAE_API_KEY	kuae-cloud-coding-plan/
-lambda	Lambda	https://api.lambdalabs.com	LAMBDA_BASE_URL	LAMBDA_API_KEY	lambda/
-lepton	Lepton	https://llama3-1-405b.lepton.run	LEPTON_BASE_URL	LEPTON_API_KEY	lepton/
-lilac	Lilac	https://api.getlilac.com	LILAC_BASE_URL	LILAC_API_KEY	lilac/
-llama	Llama	https://api.llama.com/compat	LLAMA_BASE_URL	LLAMA_API_KEY	llama/
-llmgateway	LLM Gateway	https://api.llmgateway.io	LLMGATEWAY_BASE_URL	LLMGATEWAY_API_KEY	llmgateway/
-llmtr	LLMTR	https://llmtr.com	LLMTR_BASE_URL	LLMTR_API_KEY	llmtr/
-longcat	LongCat	https://api.longcat.chat/openai	LONGCAT_BASE_URL	LONGCAT_API_KEY	longcat/
-lucidquery	LucidQuery	https://api.lucidquery.com	LUCIDQUERY_BASE_URL	LUCIDQUERY_API_KEY	lucidquery/
-meganova	Meganova	https://api.meganova.ai	MEGANOVA_BASE_URL	MEGANOVA_API_KEY	meganova/
-mistral	Mistral	https://api.mistral.ai	MISTRAL_BASE_URL	MISTRAL_API_KEY	mistral,mixtral
-mixlayer	Mixlayer	https://models.mixlayer.ai	MIXLAYER_BASE_URL	MIXLAYER_API_KEY	mixlayer/
-moark	Moark	https://moark.com	MOARK_BASE_URL	MOARK_API_KEY	moark/
-modal	Modal	https://api.modal.com/v1/openai	MODAL_BASE_URL	MODAL_API_KEY	modal/
-model-oracle-ai	Model Oracle AI	https://api.modeloracle.com/api	MODEL_ORACLE_AI_BASE_URL	MODEL_ORACLE_API_KEY	model-oracle-ai/
-modelis	Modelis	https://modelishub.com	MODELIS_BASE_URL	MODELIS_API_KEY	modelis/
-modelscope	ModelScope	https://api-inference.modelscope.cn	MODELSCOPE_BASE_URL	MODELSCOPE_API_KEY	modelscope/
-moonshot	Moonshot AI	https://api.moonshot.cn	MOONSHOT_BASE_URL	MOONSHOT_API_KEY	moonshot/
-moonshotai-cn	Moonshot AI (China)	https://api.moonshot.cn	MOONSHOTAI_CN_BASE_URL	MOONSHOT_API_KEY	moonshotai-cn/
-morph	Morph	https://api.morphllm.com	MORPH_BASE_URL	MORPH_API_KEY	morph/
-nano-gpt	NanoGPT	https://nano-gpt.com/api	NANO_GPT_BASE_URL	NANO_GPT_API_KEY	nano-gpt/
-nearai	NEAR AI Cloud	https://cloud-api.near.ai	NEARAI_BASE_URL	NEARAI_API_KEY	nearai/
-nebius	Nebius Token Factory	https://api.tokenfactory.nebius.com	NEBIUS_BASE_URL	NEBIUS_API_KEY	nebius/
-neuralwatt	Neuralwatt	https://api.neuralwatt.com	NEURALWATT_BASE_URL	NEURALWATT_API_KEY	neuralwatt/
-nova	Nova	https://api.nova.amazon.com	NOVA_BASE_URL	NOVA_API_KEY	nova/
-novita	NovitaAI	https://api.novita.ai	NOVITA_BASE_URL	NOVITA_API_KEY	novita/
-nvidia	Nvidia	https://integrate.api.nvidia.com	NVIDIA_BASE_URL	NVIDIA_API_KEY	nvidia/
-ofox	Ofox	https://api.ofox.ai	OFOX_BASE_URL	OFOX_API_KEY	ofox/
-ollama	Ollama	http://localhost:11434	OLLAMA_BASE_URL		ollama/
-ollama-cloud	Ollama Cloud	https://ollama.com	OLLAMA_CLOUD_BASE_URL	OLLAMA_API_KEY	ollama-cloud/
-openai	OpenAI	https://api.openai.com	OPENAI_BASE_URL	OPENAI_API_KEY	gpt,openai/,o1,o3,text-embedding-
-opencode	OpenCode Zen	https://opencode.ai/zen	OPENCODE_BASE_URL	OPENCODE_API_KEY	opencode/
-opencode-go	OpenCode Go	https://opencode.ai/zen/go	OPENCODE_GO_BASE_URL	OPENCODE_API_KEY	opencode-go/
-openrouter	OpenRouter	https://openrouter.ai/api	OPENROUTER_BASE_URL	OPENROUTER_API_KEY	openrouter/
-orcarouter	OrcaRouter	https://api.orcarouter.ai	ORCAROUTER_BASE_URL	ORCAROUTER_API_KEY	orcarouter/
-ovhcloud	OVHcloud AI Endpoints	https://oai.endpoints.kepler.ai.cloud.ovh.net	OVHCLOUD_BASE_URL	OVHCLOUD_API_KEY	ovhcloud/
-perplexity	Perplexity	https://api.perplexity.ai	PERPLEXITY_BASE_URL	PERPLEXITY_API_KEY	sonar,perplexity/,llama-3.1-sonar
-pioneer	Pioneer	https://api.pioneer.ai	PIONEER_BASE_URL	PIONEER_API_KEY	pioneer/
-poe	Poe	https://api.poe.com	POE_BASE_URL	POE_API_KEY	poe/
-poolside	Poolside	https://inference.poolside.ai	POOLSIDE_BASE_URL	POOLSIDE_API_KEY	poolside/
-predibase	Predibase	https://serving.app.predibase.com	PREDIBASE_BASE_URL	PREDIBASE_API_KEY	predibase/
-qihang-ai	QiHang	https://api.qhaigc.net	QIHANG_AI_BASE_URL	QIHANG_API_KEY	qihang-ai/
-qiniu-ai	Qiniu	https://api.qnaigc.com	QINIU_AI_BASE_URL	QINIU_API_KEY	qiniu-ai/
-regolo-ai	Regolo AI	https://api.regolo.ai	REGOLO_AI_BASE_URL	REGOLO_API_KEY	regolo-ai/
-requesty	Requesty	https://router.requesty.ai	REQUESTY_BASE_URL	REQUESTY_API_KEY	requesty/
-routing-run	routing.run	https://api.routing.run	ROUTING_RUN_BASE_URL	ROUTING_RUN_API_KEY	routing-run/
-runinfra	RunInfra	https://api.runinfra.ai	RUNINFRA_BASE_URL	RUNINFRA_GATEWAY_KEY	runinfra/
-sakana	Sakana AI	https://api.sakana.ai	SAKANA_BASE_URL	SAKANA_API_KEY	sakana/
-sambanova	Sambanova	https://api.sambanova.ai	SAMBANOVA_BASE_URL	SAMBANOVA_API_KEY	sambanova/
-sarvam	Sarvam AI	https://api.sarvam.ai	SARVAM_BASE_URL	SARVAM_API_KEY	sarvam/
-scaleway	Scaleway	https://api.scaleway.ai	SCALEWAY_BASE_URL	SCALEWAY_API_KEY	scaleway/
-scnet-token-plan	SCNet Token Plan	https://api.scnet.cn/api/llm	SCNET_TOKEN_PLAN_BASE_URL	SCNET_API_KEY	scnet-token-plan/
-scx	SCX.ai	https://api.scx.ai	SCX_BASE_URL	SCX_API_KEY	scx/
-siliconflow	SiliconFlow	https://api.siliconflow.com	SILICONFLOW_BASE_URL	SILICONFLOW_API_KEY	siliconflow/
-siliconflow-cn	SiliconFlow (China)	https://api.siliconflow.cn	SILICONFLOW_CN_BASE_URL	SILICONFLOW_CN_API_KEY	siliconflow-cn/
-stackit	STACKIT	https://api.openai-compat.model-serving.eu01.onstackit.cloud	STACKIT_BASE_URL	STACKIT_API_KEY	stackit/
-stepfun	StepFun (China)	https://api.stepfun.com	STEPFUN_BASE_URL	STEPFUN_API_KEY	stepfun/
-stepfun-ai	StepFun (Global)	https://api.stepfun.ai	STEPFUN_AI_BASE_URL	STEPFUN_API_KEY	stepfun-ai/
-stepfun-ai-step-plan	StepFun Step Plan (Global)	https://api.stepfun.ai/step_plan	STEPFUN_AI_STEP_PLAN_BASE_URL	STEPFUN_API_KEY	stepfun-ai-step-plan/
-stepfun-step-plan	StepFun Step Plan (China)	https://api.stepfun.com/step_plan	STEPFUN_STEP_PLAN_BASE_URL	STEPFUN_API_KEY	stepfun-step-plan/
-submodel	submodel	https://llm.submodel.ai	SUBMODEL_BASE_URL	SUBMODEL_INSTAGEN_ACCESS_KEY	submodel/
-synthetic	Synthetic	https://api.synthetic.new/openai	SYNTHETIC_BASE_URL	SYNTHETIC_API_KEY	synthetic/
-tencent-coding-plan	Tencent Coding Plan (China)	https://api.lkeap.cloud.tencent.com/coding/v3	TENCENT_CODING_PLAN_BASE_URL	TENCENT_CODING_PLAN_API_KEY	tencent-coding-plan/
-tencent-token-plan	Tencent Token Plan	https://api.lkeap.cloud.tencent.com/plan/v3	TENCENT_TOKEN_PLAN_BASE_URL	TENCENT_TOKEN_PLAN_API_KEY	tencent-token-plan/
-tencent-tokenhub	Tencent TokenHub	https://tokenhub.tencentmaas.com	TENCENT_TOKENHUB_BASE_URL	TENCENT_TOKENHUB_API_KEY	tencent-tokenhub/
-tensorx	TensorX	https://api.tensorx.ai	TENSORX_BASE_URL	TENSORX_API_KEY	tensorx/
-the-grid-ai	The Grid AI	https://api.thegrid.ai	THE_GRID_AI_BASE_URL	THEGRID_API_KEY	the-grid-ai/
-tinfoil	Tinfoil	https://inference.tinfoil.sh	TINFOIL_BASE_URL	TINFOIL_API_KEY	tinfoil/
-together	Together AI	https://api.together.xyz	TOGETHER_BASE_URL	TOGETHER_API_KEY	together/
-trustedrouter	TrustedRouter	https://api.trustedrouter.com	TRUSTEDROUTER_BASE_URL	TRUSTEDROUTER_API_KEY	trustedrouter/
-umans-ai	Umans AI	https://api.code.umans.ai	UMANS_AI_BASE_URL	UMANS_AI_API_KEY	umans-ai/
-umans-ai-coding-plan	Umans AI Coding Plan	https://api.code.umans.ai	UMANS_AI_CODING_PLAN_BASE_URL	UMANS_AI_CODING_PLAN_API_KEY	umans-ai-coding-plan/
-unorouter	UnoRouter	https://api.unorouter.com	UNOROUTER_BASE_URL	UNOROUTER_API_KEY	unorouter/
-upstage	Upstage	https://api.upstage.ai	UPSTAGE_BASE_URL	UPSTAGE_API_KEY	solar-,upstage/
-vultr	Vultr	https://api.vultrinference.com	VULTR_BASE_URL	VULTR_API_KEY	vultr/
-wafer.ai	Wafer	https://pass.wafer.ai	WAFER_AI_BASE_URL	WAFER_API_KEY	wafer.ai/
-wandb	Weights & Biases	https://api.inference.wandb.ai	WANDB_BASE_URL	WANDB_API_KEY	wandb/
-xai	xAI	https://api.x.ai	XAI_BASE_URL	XAI_API_KEY	grok,xai/
-xiaomi	Xiaomi	https://api.xiaomimimo.com	XIAOMI_BASE_URL	XIAOMI_API_KEY	xiaomi/
-xiaomi-token-plan-ams	Xiaomi Token Plan (Europe)	https://token-plan-ams.xiaomimimo.com	XIAOMI_TOKEN_PLAN_AMS_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-ams/
-xiaomi-token-plan-cn	Xiaomi Token Plan (China)	https://token-plan-cn.xiaomimimo.com	XIAOMI_TOKEN_PLAN_CN_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-cn/
-xiaomi-token-plan-sgp	Xiaomi Token Plan (Singapore)	https://token-plan-sgp.xiaomimimo.com	XIAOMI_TOKEN_PLAN_SGP_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-sgp/
-xpersona	Xpersona	https://www.xpersona.co	XPERSONA_BASE_URL	XPERSONA_API_KEY	xpersona/
-yi	Yi	https://api.01.ai	YI_BASE_URL	YI_API_KEY	yi-,yi/
-zai	Z.AI	https://api.z.ai/api/paas/v4	ZAI_BASE_URL	ZHIPU_API_KEY	zai/
-zai-coding-plan	Z.AI Coding Plan	https://api.z.ai/api/coding/paas/v4	ZAI_CODING_PLAN_BASE_URL	ZHIPU_API_KEY	zai-coding-plan/
-zeldoc	Zeldoc	https://api.zeldoc.ai	ZELDOC_BASE_URL	ZELDOC_API_KEY	zeldoc/
-zenifra	Zenifra	https://ai.zenifra.com	ZENIFRA_BASE_URL	ZENIFRA_AI_KEY	zenifra/
-zenmux	ZenMux	https://zenmux.ai/api	ZENMUX_BASE_URL	ZENMUX_API_KEY	zenmux/
-zhipuai	Zhipu AI	https://open.bigmodel.cn/api/paas/v4	ZHIPUAI_BASE_URL	ZHIPU_API_KEY	zhipuai/
-zhipuai-coding-plan	Zhipu AI Coding Plan	https://open.bigmodel.cn/api/coding/paas/v4	ZHIPUAI_CODING_PLAN_BASE_URL	ZHIPU_API_KEY	zhipuai-coding-plan/
-above	above.dev	https://api.above.dev	ABOVE_BASE_URL	ABOVE_API_KEY	above/
-agentrouter	AgentRouter	https://agentrouter.org	AGENTROUTER_BASE_URL	AGENTROUTER_API_KEY	agentrouter/
-agnes	Agnes AI	https://apihub.agnes-ai.com	AGNES_BASE_URL	AGNES_API_KEY	agnes/
-aixy	Aixy	https://api.aixy-gateway.com	AIXY_BASE_URL	AIXY_API_KEY	aixy/
-bothub	Bothub	https://openai.bothub.ru	BOTHUB_BASE_URL	BOTHUB_API_KEY	bothub/
-echo	Echo	https://echo.tracerml.ai	ECHO_BASE_URL	ECHO_API_KEY	echo/
-iteracompute	IteraCompute	https://api.iteracompute.com	ITERACOMPUTE_BASE_URL	ITERACOMPUTE_API_KEY	iteracompute/
-klokintegration	klokintegration.se	https://api-gw.klok.ipaas.se/proxy/kloker-key	KLOKINTEGRATION_BASE_URL	KLOKINTEGRATION_API_KEY	klokintegration/
-llmgateway-providers	LLM Gateway	https://api.llmgateway.io	LLMGATEWAY_PROVIDERS_BASE_URL	LLMGATEWAY_API_KEY	llmgateway-providers/
-llmtech	LLM Tech	https://api.llmtech.eu	LLMTECH_BASE_URL	LLMTECH_API_KEY	llmtech/
-nan	NaN	https://api.nan.builders	NAN_BASE_URL	NAN_API_KEY	nan/
-openreason	OpenReason	https://api.openreason.app	OPENREASON_BASE_URL	OPENREASON_API_KEY	openreason/
-opper	Opper	https://api.opper.ai/v3/compat	OPPER_BASE_URL	OPPER_API_KEY	opper/
-pendra	Pendra	https://api.pendra.ai/api	PENDRA_BASE_URL	PENDRA_API_KEY	pendra/
-scx-ai	SCX.ai	https://api.scx.ai	SCX_AI_BASE_URL	SCX_API_KEY	scx-ai/
-sensenova	SenseNova (China)	https://token.sensenova.cn	SENSENOVA_BASE_URL	SENSENOVA_API_KEY	sensenova/
-standardcompute	Standard Compute	https://api.stdcmpt.com	STANDARDCOMPUTE_BASE_URL	STANDARDCOMPUTE_API_KEY	standardcompute/
-tokengo	TokenGo	https://api.tokengo.com	TOKENGO_BASE_URL	TOKENGO_API_KEY	tokengo/
-tokenrouter	TokenRouter	https://api.tokenrouter.com	TOKENROUTER_BASE_URL	TOKENROUTER_API_KEY	tokenrouter/
-vancine	Vancine	https://vancine.com	VANCINE_BASE_URL	VANCINE_API_KEY	vancine/
-volcengine	Volcengine Ark	https://ark.cn-beijing.volces.com/api/v3	VOLCENGINE_BASE_URL	ARK_API_KEY	volcengine/
-volcengine-coding-plan	Volcengine Ark Coding Plan	https://ark.cn-beijing.volces.com/api/coding/v3	VOLCENGINE_CODING_PLAN_BASE_URL	ARK_CODING_PLAN_API_KEY	volcengine-coding-plan/
+id	label	base_url	base_url_env	api_key_env	prefixes	responses_wire	capabilities
+302ai	302.AI	https://api.302.ai	302AI_BASE_URL	302AI_API_KEY	302ai/	false	
+abacus	Abacus	https://routellm.abacus.ai	ABACUS_BASE_URL	ABACUS_API_KEY	abacus/	false	
+abliteration-ai	abliteration.ai	https://api.abliteration.ai	ABLITERATION_AI_BASE_URL	ABLIT_KEY	abliteration-ai/	false	
+above	above.dev	https://api.above.dev	ABOVE_BASE_URL	ABOVE_API_KEY	above/	false	
+agentrouter	AgentRouter	https://agentrouter.org	AGENTROUTER_BASE_URL	AGENTROUTER_API_KEY	agentrouter/	false	
+agnes	Agnes AI	https://apihub.agnes-ai.com	AGNES_BASE_URL	AGNES_API_KEY	agnes/	false	
+ai-router	AI-ROUTER	https://api.ai-router.dev	AI_ROUTER_BASE_URL	AI_ROUTER_API_KEY	ai-router/	false	
+ai21	Ai21	https://api.ai21.com	AI21_BASE_URL	AI21_API_KEY	ai21/,j2-,jamba	false	
+aiand	ai&	https://api.aiand.com	AIAND_BASE_URL	AIAND_API_KEY	aiand/	false	
+ainetcafe	ainetcafe	https://microquickjs.com	AINETCAFE_BASE_URL	AINETCAFE_API_KEY	ainetcafe/	false	
+aixy	Aixy	https://api.aixy-gateway.com	AIXY_BASE_URL	AIXY_API_KEY	aixy/	false	
+aki-io	AKI.IO	https://aki.io	AKI_IO_BASE_URL	AKI_IO_API_KEY	aki-io/	false	
+aleph-alpha	Aleph Alpha	https://api.aleph-alpha.com	ALEPH_ALPHA_BASE_URL	ALEPH_ALPHA_API_KEY	luminous,aleph-alpha/	false	
+alibaba	Alibaba	https://dashscope-intl.aliyuncs.com/compatible-mode	ALIBABA_BASE_URL	DASHSCOPE_API_KEY	alibaba/,qwen3.,qwen-max,qwen-plus,qwen-flash	false	
+alibaba-cn	Alibaba (China)	https://dashscope.aliyuncs.com/compatible-mode	ALIBABA_CN_BASE_URL	DASHSCOPE_API_KEY	alibaba-cn/	false	
+alibaba-coding-plan	Alibaba Coding Plan	https://coding-intl.dashscope.aliyuncs.com	ALIBABA_CODING_PLAN_BASE_URL	ALIBABA_CODING_PLAN_API_KEY	alibaba-coding-plan/	false	
+alibaba-coding-plan-cn	Alibaba Coding Plan (China)	https://coding.dashscope.aliyuncs.com	ALIBABA_CODING_PLAN_CN_BASE_URL	ALIBABA_CODING_PLAN_API_KEY	alibaba-coding-plan-cn/	false	
+alibaba-token-plan	Alibaba Token Plan	https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode	ALIBABA_TOKEN_PLAN_BASE_URL	ALIBABA_TOKEN_PLAN_API_KEY	alibaba-token-plan/	false	
+alibaba-token-plan-cn	Alibaba Token Plan (China)	https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode	ALIBABA_TOKEN_PLAN_CN_BASE_URL	ALIBABA_TOKEN_PLAN_API_KEY	alibaba-token-plan-cn/	false	
+ambient	Ambient	https://api.ambient.xyz	AMBIENT_BASE_URL	AMBIENT_API_KEY	ambient/	false	
+amd	AMD	https://developer.amd.com.cn/radeon/api	AMD_BASE_URL	AMD_API_KEY	amd/	false	
+anyapi	AnyAPI	https://api.anyapi.ai	ANYAPI_BASE_URL	ANYAPI_API_KEY	anyapi/	false	
+anyscale	Anyscale	https://api.endpoints.anyscale.com	ANYSCALE_BASE_URL	ANYSCALE_API_KEY	anyscale/	false	
+arcee	Arcee	https://api.arcee.ai/api	ARCEE_BASE_URL	ARCEE_API_KEY	arcee/	false	
+auriko	Auriko	https://api.auriko.ai	AURIKO_BASE_URL	AURIKO_API_KEY	auriko/	false	
+bailing	Bailing	https://api.tbox.cn/api/llm/v1/chat/completions	BAILING_BASE_URL	BAILING_API_TOKEN	bailing/	false	
+baseten	Baseten	https://bridge.baseten.co/v1/direct	BASETEN_BASE_URL	BASETEN_API_KEY	baseten/	false	
+bee	Bee by HEOSSI	https://api.bee.heossi.com/bee	BEE_BASE_URL	BEE_API_KEY	bee/	false	
+berget	Berget.AI	https://api.berget.ai	BERGET_BASE_URL	BERGET_API_KEY	berget/	false	
+blueclaw	Blue Claw	https://openai.blueclaw.network	BLUECLAW_BASE_URL	BLUECLAW_API_KEY	blueclaw/	false	
+bothub	Bothub	https://openai.bothub.ru	BOTHUB_BASE_URL	BOTHUB_API_KEY	bothub/	false	
+cerebras	Cerebras	https://api.cerebras.ai	CEREBRAS_BASE_URL	CEREBRAS_API_KEY	cerebras/	false	
+chutes	Chutes	https://llm.chutes.ai	CHUTES_BASE_URL	CHUTES_API_KEY	chutes/	false	
+clarifai	Clarifai	https://api.clarifai.com/v2/ext/openai	CLARIFAI_BASE_URL	CLARIFAI_PAT	clarifai/	false	
+claudinio	Claudinio	https://api.claudin.io	CLAUDINIO_BASE_URL	CLAUDINIO_API_KEY	claudinio/	false	
+cline-pass	ClinePass	https://api.cline.bot/api	CLINE_PASS_BASE_URL	CLINE_API_KEY	cline-pass/	false	
+cloudferro-sherlock	CloudFerro Sherlock	https://api-sherlock.cloudferro.com/openai	CLOUDFERRO_SHERLOCK_BASE_URL	CLOUDFERRO_SHERLOCK_API_KEY	cloudferro-sherlock/	false	
+cloudflare	Cloudflare Workers AI	https://gateway.ai.cloudflare.com/v1/tracelane/workers-ai/openai	CLOUDFLARE_AI_GATEWAY_URL	CLOUDFLARE_API_KEY	@cf/,cloudflare/	false	
+coralbricks	CoralBricks	https://inference.coralbricks.ai	CORALBRICKS_BASE_URL	CORAL_API_KEY	coralbricks/	false	
+cortecs	Cortecs	https://api.cortecs.ai	CORTECS_BASE_URL	CORTECS_API_KEY	cortecs/	false	
+crof	CrofAI	https://crof.ai	CROF_BASE_URL	CROF_API_KEY	crof/	false	
+crossmodel	CrossModel	https://api.crossmodel.ai	CROSSMODEL_BASE_URL	CROSSMODEL_API_KEY	crossmodel/	false	
+crusoe	Crusoe	https://api.inference.crusoecloud.com	CRUSOE_BASE_URL	CRUSOE_API_KEY	crusoe/	false	
+daoxe	DaoXE	https://daoxe.com	DAOXE_BASE_URL	DAOXE_API_KEY	daoxe/	false	
+deepinfra	Deep Infra	https://api.deepinfra.com	DEEPINFRA_BASE_URL	DEEPINFRA_API_KEY	deepinfra/	false	
+deepseek	DeepSeek	https://api.deepseek.com	DEEPSEEK_BASE_URL	DEEPSEEK_API_KEY	deepseek	false	
+digitalocean	DigitalOcean	https://inference.do-ai.run	DIGITALOCEAN_BASE_URL	DIGITALOCEAN_ACCESS_TOKEN	digitalocean/	false	
+dinference	DInference	https://api.dinference.com	DINFERENCE_BASE_URL	DINFERENCE_API_KEY	dinference/	false	
+drun	D.Run (China)	https://chat.d.run	DRUN_BASE_URL	DRUN_API_KEY	drun/	false	
+ebcloud	EBCloud	https://maas-api.ebcloud.com	EBCLOUD_BASE_URL	EBCLOUD_API_KEY	ebcloud/	false	
+echo	Echo	https://echo.tracerml.ai	ECHO_BASE_URL	ECHO_API_KEY	echo/	false	
+edenai	Eden AI	https://api.edenai.run/v3	EDENAI_BASE_URL	EDENAI_API_KEY	edenai/	false	
+empiriolabs	EmpirioLabs AI	https://api.empiriolabs.ai	EMPIRIOLABS_BASE_URL	EMPIRIOLABS_API_KEY	empiriolabs/	false	
+engy	engy	https://api.engy.ai	ENGY_BASE_URL	ENGY_API_KEY	engy/	false	
+evroc	evroc	https://models.think.evroc.com	EVROC_BASE_URL	EVROC_API_KEY	evroc/	false	
+fastrouter	FastRouter	https://go.fastrouter.ai/api	FASTROUTER_BASE_URL	FASTROUTER_API_KEY	fastrouter/	false	
+fireworks	Fireworks AI	https://api.fireworks.ai/inference	FIREWORKS_BASE_URL	FIREWORKS_API_KEY	fireworks/	false	
+friendli	Friendli	https://api.friendli.ai/serverless	FRIENDLI_BASE_URL	FRIENDLI_TOKEN	friendli/	false	
+frogbot	FrogBot	https://app.frogbot.ai/api	FROGBOT_BASE_URL	FROGBOT_API_KEY	frogbot/	false	
+github-copilot	GitHub Copilot	https://api.githubcopilot.com	GITHUB_COPILOT_BASE_URL	GITHUB_TOKEN	github-copilot/	false	
+gmicloud	GMI Cloud	https://api.gmi-serving.com	GMICLOUD_BASE_URL	GMICLOUD_API_KEY	gmicloud/	false	
+greenpt	GreenPT	https://api.greenpt.ai	GREENPT_BASE_URL	GREENPT_API_KEY	greenpt/	false	
+groq	Groq	https://api.groq.com/openai	GROQ_BASE_URL	GROQ_API_KEY	llama,gemma,qwen/,whisper-large,canopylabs/	false	audio_speech,audio_transcription,files,batch
+helicone	Helicone	https://ai-gateway.helicone.ai	HELICONE_BASE_URL	HELICONE_API_KEY	helicone/	false	
+hetzner	Hetzner	https://inference.hetzner.com/api	HETZNER_BASE_URL	HETZNER_API_KEY	hetzner/	false	
+hpc-ai	HPC-AI	https://api.hpc-ai.com/inference	HPC_AI_BASE_URL	HPC_AI_API_KEY	hpc-ai/	false	
+huggingface	Hugging Face	https://api-inference.huggingface.co	HUGGINGFACE_BASE_URL	HUGGINGFACE_API_KEY	hf/,huggingface/	false	
+hyper	Charm Hyper	https://hyper.charm.land	HYPER_BASE_URL	HYPER_API_KEY	hyper/	false	
+hyperbolic	Hyperbolic	https://api.hyperbolic.xyz	HYPERBOLIC_BASE_URL	HYPERBOLIC_API_KEY	hyperbolic/	false	
+iflowcn	iFlow	https://apis.iflow.cn	IFLOWCN_BASE_URL	IFLOW_API_KEY	iflowcn/	false	
+impossibl	Impossibl	https://api.impossibl.com	IMPOSSIBL_BASE_URL	IMPOSSIBL_API_KEY	impossibl/	false	
+inception	Inception	https://api.inceptionlabs.ai	INCEPTION_BASE_URL	INCEPTION_API_KEY	inception/	false	
+inceptron	Inceptron	https://api.inceptron.io	INCEPTRON_BASE_URL	INCEPTRON_API_KEY	inceptron/	false	
+inco	Inco	https://api.inco.ai	INCO_BASE_URL	INCO_API_KEY	inco/	false	
+inference	Inference	https://inference.net	INFERENCE_BASE_URL	INFERENCE_API_KEY	inference/	false	
+inferx	InferX	https://model.inferx.net/endpoints	INFERX_BASE_URL	INFERX_API_KEY	inferx/	false	
+io-net	IO.NET	https://api.intelligence.io.solutions/api	IO_NET_BASE_URL	IOINTELLIGENCE_API_KEY	io-net/	false	
+iteracompute	IteraCompute	https://api.iteracompute.com	ITERACOMPUTE_BASE_URL	ITERACOMPUTE_API_KEY	iteracompute/	false	
+jalapeno	Jalapeno Cloud	https://api.jalapeno-cloud.ai	JALAPENO_BASE_URL	JALAPENO_API_KEY	jalapeno/	false	
+jiekou	Jiekou.AI	https://api.jiekou.ai/openai	JIEKOU_BASE_URL	JIEKOU_API_KEY	jiekou/	false	
+kenari	Kenari	https://kenari.id	KENARI_BASE_URL	KENARI_API_KEY	kenari/	false	
+kilo	Kilo Gateway	https://api.kilo.ai/api/gateway	KILO_BASE_URL	KILO_API_KEY	kilo/	false	
+kimi-code-plan-cn	Kimi For Coding (kimi.com)	https://api.kimi.com/coding	KIMI_CODE_PLAN_CN_BASE_URL	KIMI_API_KEY	kimi-code-plan-cn/	false	
+kimi-code-plan-global	Kimi For Coding (kimi.ai)	https://api.kimi.ai/coding	KIMI_CODE_PLAN_GLOBAL_BASE_URL	KIMI_API_KEY	kimi-code-plan-global/	false	
+klokintegration	klokintegration.se	https://api-gw.klok.ipaas.se/proxy/kloker-key	KLOKINTEGRATION_BASE_URL	KLOKINTEGRATION_API_KEY	klokintegration/	false	
+kosmik	Kosmik Compute	https://api.koscompute.com	KOSMIK_BASE_URL	KOSMIK_API_KEY	kosmik/	false	
+kuae-cloud-coding-plan	KUAE Cloud Coding Plan	https://coding-plan-endpoint.kuaecloud.net	KUAE_CLOUD_CODING_PLAN_BASE_URL	KUAE_API_KEY	kuae-cloud-coding-plan/	false	
+lambda	Lambda	https://api.lambdalabs.com	LAMBDA_BASE_URL	LAMBDA_API_KEY	lambda/	false	
+lepton	Lepton	https://llama3-1-405b.lepton.run	LEPTON_BASE_URL	LEPTON_API_KEY	lepton/	false	
+lilac	Lilac	https://api.getlilac.com	LILAC_BASE_URL	LILAC_API_KEY	lilac/	false	
+llama	Llama	https://api.llama.com/compat	LLAMA_BASE_URL	LLAMA_API_KEY	llama/	false	
+llmgateway	LLM Gateway	https://api.llmgateway.io	LLMGATEWAY_BASE_URL	LLMGATEWAY_API_KEY	llmgateway/	false	
+llmgateway-providers	LLM Gateway	https://api.llmgateway.io	LLMGATEWAY_PROVIDERS_BASE_URL	LLMGATEWAY_API_KEY	llmgateway-providers/	false	
+llmtech	LLM Tech	https://api.llmtech.eu	LLMTECH_BASE_URL	LLMTECH_API_KEY	llmtech/	false	
+llmtr	LLMTR	https://llmtr.com	LLMTR_BASE_URL	LLMTR_API_KEY	llmtr/	false	
+longcat	LongCat	https://api.longcat.chat/openai	LONGCAT_BASE_URL	LONGCAT_API_KEY	longcat/	false	
+lucidquery	LucidQuery	https://api.lucidquery.com	LUCIDQUERY_BASE_URL	LUCIDQUERY_API_KEY	lucidquery/	false	
+meganova	Meganova	https://api.meganova.ai	MEGANOVA_BASE_URL	MEGANOVA_API_KEY	meganova/	false	
+melious	Melious	https://api.melious.ai	MELIOUS_BASE_URL	MELIOUS_API_KEY	melious/	false	
+meta	Meta Model API	https://api.meta.ai	META_BASE_URL	META_API_KEY	meta/,muse-	false	
+mistral	Mistral	https://api.mistral.ai	MISTRAL_BASE_URL	MISTRAL_API_KEY	mistral,mixtral,magistral-,codestral-,devstral-	false	moderation
+mixlayer	Mixlayer	https://models.mixlayer.ai	MIXLAYER_BASE_URL	MIXLAYER_API_KEY	mixlayer/	false	
+moark	Moark	https://moark.com	MOARK_BASE_URL	MOARK_API_KEY	moark/	false	
+modal	Modal	https://api.modal.com/v1/openai	MODAL_BASE_URL	MODAL_API_KEY	modal/	false	
+model-oracle-ai	Model Oracle AI	https://api.modeloracle.com/api	MODEL_ORACLE_AI_BASE_URL	MODEL_ORACLE_API_KEY	model-oracle-ai/	false	
+modelis	Modelis	https://modelishub.com	MODELIS_BASE_URL	MODELIS_API_KEY	modelis/	false	
+modelscope	ModelScope	https://api-inference.modelscope.cn	MODELSCOPE_BASE_URL	MODELSCOPE_API_KEY	modelscope/	false	
+moonshot	Moonshot AI	https://api.moonshot.cn	MOONSHOT_BASE_URL	MOONSHOT_API_KEY	moonshot/	false	
+moonshot-intl	Moonshot AI (International)	https://api.moonshot.ai	MOONSHOT_INTL_BASE_URL	MOONSHOT_API_KEY	moonshot-intl/,kimi-	false	
+moonshotai-cn	Moonshot AI (China)	https://api.moonshot.cn	MOONSHOTAI_CN_BASE_URL	MOONSHOT_API_KEY	moonshotai-cn/	false	
+morph	Morph	https://api.morphllm.com	MORPH_BASE_URL	MORPH_API_KEY	morph/	false	
+nan	NaN	https://api.nan.builders	NAN_BASE_URL	NAN_API_KEY	nan/	false	
+nano-gpt	NanoGPT	https://nano-gpt.com/api	NANO_GPT_BASE_URL	NANO_GPT_API_KEY	nano-gpt/	false	
+nearai	NEAR AI Cloud	https://cloud-api.near.ai	NEARAI_BASE_URL	NEARAI_API_KEY	nearai/	false	
+nebius	Nebius Token Factory	https://api.tokenfactory.nebius.com	NEBIUS_BASE_URL	NEBIUS_API_KEY	nebius/	false	
+neuralwatt	Neuralwatt	https://api.neuralwatt.com	NEURALWATT_BASE_URL	NEURALWATT_API_KEY	neuralwatt/	false	
+nova	Nova	https://api.nova.amazon.com	NOVA_BASE_URL	NOVA_API_KEY	nova/	false	
+novita	NovitaAI	https://api.novita.ai	NOVITA_BASE_URL	NOVITA_API_KEY	novita/	false	
+nvidia	Nvidia	https://integrate.api.nvidia.com	NVIDIA_BASE_URL	NVIDIA_API_KEY	nvidia/	false	
+oci	OCI Generative AI	https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai	OCI_BASE_URL	OCI_GENAI_API_KEY	oci/	false	
+ofox	Ofox	https://api.ofox.ai	OFOX_BASE_URL	OFOX_API_KEY	ofox/	false	
+ollama	Ollama	http://localhost:11434	OLLAMA_BASE_URL		ollama/	false	
+ollama-cloud	Ollama Cloud	https://ollama.com	OLLAMA_CLOUD_BASE_URL	OLLAMA_API_KEY	ollama-cloud/	false	
+openai	OpenAI	https://api.openai.com	OPENAI_BASE_URL	OPENAI_API_KEY	gpt,openai/,o1,o3,text-embedding-,tts-1,whisper-1,dall-e,omni-moderation,text-moderation	true	images,images_edits,audio_speech,audio_transcription,moderation,files,batch
+opencode	OpenCode Zen	https://opencode.ai/zen	OPENCODE_BASE_URL	OPENCODE_API_KEY	opencode/	false	
+opencode-go	OpenCode Go	https://opencode.ai/zen/go	OPENCODE_GO_BASE_URL	OPENCODE_API_KEY	opencode-go/	false	
+openreason	OpenReason	https://api.openreason.app	OPENREASON_BASE_URL	OPENREASON_API_KEY	openreason/	false	
+openrouter	OpenRouter	https://openrouter.ai/api	OPENROUTER_BASE_URL	OPENROUTER_API_KEY	openrouter/	true	
+opper	Opper	https://api.opper.ai/v3/compat	OPPER_BASE_URL	OPPER_API_KEY	opper/	false	
+orcarouter	OrcaRouter	https://api.orcarouter.ai	ORCAROUTER_BASE_URL	ORCAROUTER_API_KEY	orcarouter/	false	
+ovhcloud	OVHcloud AI Endpoints	https://oai.endpoints.kepler.ai.cloud.ovh.net	OVHCLOUD_BASE_URL	OVHCLOUD_API_KEY	ovhcloud/	false	
+pareto	Pareto Inference	https://api.paretoinference.com	PARETO_BASE_URL	PARETO_API_KEY	pareto/	false	
+pendra	Pendra	https://api.pendra.ai/api	PENDRA_BASE_URL	PENDRA_API_KEY	pendra/	false	
+perplexity	Perplexity	https://api.perplexity.ai	PERPLEXITY_BASE_URL	PERPLEXITY_API_KEY	sonar,perplexity/,llama-3.1-sonar	false	
+pioneer	Pioneer	https://api.pioneer.ai	PIONEER_BASE_URL	PIONEER_API_KEY	pioneer/	false	
+poe	Poe	https://api.poe.com	POE_BASE_URL	POE_API_KEY	poe/	false	
+poolside	Poolside	https://inference.poolside.ai	POOLSIDE_BASE_URL	POOLSIDE_API_KEY	poolside/	false	
+predibase	Predibase	https://serving.app.predibase.com	PREDIBASE_BASE_URL	PREDIBASE_API_KEY	predibase/	false	
+qihang-ai	QiHang	https://api.qhaigc.net	QIHANG_AI_BASE_URL	QIHANG_API_KEY	qihang-ai/	false	
+qiniu-ai	Qiniu	https://api.qnaigc.com	QINIU_AI_BASE_URL	QINIU_API_KEY	qiniu-ai/	false	
+regolo-ai	Regolo AI	https://api.regolo.ai	REGOLO_AI_BASE_URL	REGOLO_API_KEY	regolo-ai/	false	
+requesty	Requesty	https://router.requesty.ai	REQUESTY_BASE_URL	REQUESTY_API_KEY	requesty/	false	
+routing-run	routing.run	https://api.routing.run	ROUTING_RUN_BASE_URL	ROUTING_RUN_API_KEY	routing-run/	false	
+runinfra	RunInfra	https://api.runinfra.ai	RUNINFRA_BASE_URL	RUNINFRA_GATEWAY_KEY	runinfra/	false	
+sakana	Sakana AI	https://api.sakana.ai	SAKANA_BASE_URL	SAKANA_API_KEY	sakana/	false	
+sambanova	Sambanova	https://api.sambanova.ai	SAMBANOVA_BASE_URL	SAMBANOVA_API_KEY	sambanova/	false	
+sarvam	Sarvam AI	https://api.sarvam.ai	SARVAM_BASE_URL	SARVAM_API_KEY	sarvam/	false	
+scaleway	Scaleway	https://api.scaleway.ai	SCALEWAY_BASE_URL	SCALEWAY_API_KEY	scaleway/	false	
+scnet-token-plan	SCNet Token Plan	https://api.scnet.cn/api/llm	SCNET_TOKEN_PLAN_BASE_URL	SCNET_API_KEY	scnet-token-plan/	false	
+scx	SCX.ai	https://api.scx.ai	SCX_BASE_URL	SCX_API_KEY	scx/	false	
+scx-ai	SCX.ai	https://api.scx.ai	SCX_AI_BASE_URL	SCX_API_KEY	scx-ai/	false	
+sensenova	SenseNova (China)	https://token.sensenova.cn	SENSENOVA_BASE_URL	SENSENOVA_API_KEY	sensenova/	false	
+siliconflow	SiliconFlow	https://api.siliconflow.com	SILICONFLOW_BASE_URL	SILICONFLOW_API_KEY	siliconflow/	false	
+siliconflow-cn	SiliconFlow (China)	https://api.siliconflow.cn	SILICONFLOW_CN_BASE_URL	SILICONFLOW_CN_API_KEY	siliconflow-cn/	false	
+stackit	STACKIT	https://api.openai-compat.model-serving.eu01.onstackit.cloud	STACKIT_BASE_URL	STACKIT_API_KEY	stackit/	false	
+standardcompute	Standard Compute	https://api.stdcmpt.com	STANDARDCOMPUTE_BASE_URL	STANDARDCOMPUTE_API_KEY	standardcompute/	false	
+stepfun	StepFun (China)	https://api.stepfun.com	STEPFUN_BASE_URL	STEPFUN_API_KEY	stepfun/	false	
+stepfun-ai	StepFun (Global)	https://api.stepfun.ai	STEPFUN_AI_BASE_URL	STEPFUN_API_KEY	stepfun-ai/	false	
+stepfun-ai-step-plan	StepFun Step Plan (Global)	https://api.stepfun.ai/step_plan	STEPFUN_AI_STEP_PLAN_BASE_URL	STEPFUN_API_KEY	stepfun-ai-step-plan/	false	
+stepfun-step-plan	StepFun Step Plan (China)	https://api.stepfun.com/step_plan	STEPFUN_STEP_PLAN_BASE_URL	STEPFUN_API_KEY	stepfun-step-plan/	false	
+submodel	submodel	https://llm.submodel.ai	SUBMODEL_BASE_URL	SUBMODEL_INSTAGEN_ACCESS_KEY	submodel/	false	
+synthetic	Synthetic	https://api.synthetic.new/openai	SYNTHETIC_BASE_URL	SYNTHETIC_API_KEY	synthetic/	false	
+tempr	Tempr Gateway	https://api.temprhq.io	TEMPR_BASE_URL	TEMPR_API_KEY	tempr/	false	
+tencent-coding-plan	Tencent Coding Plan (China)	https://api.lkeap.cloud.tencent.com/coding/v3	TENCENT_CODING_PLAN_BASE_URL	TENCENT_CODING_PLAN_API_KEY	tencent-coding-plan/	false	
+tencent-token-plan	Tencent Token Plan	https://api.lkeap.cloud.tencent.com/plan/v3	TENCENT_TOKEN_PLAN_BASE_URL	TENCENT_TOKEN_PLAN_API_KEY	tencent-token-plan/	false	
+tencent-tokenhub	Tencent TokenHub	https://tokenhub.tencentmaas.com	TENCENT_TOKENHUB_BASE_URL	TENCENT_TOKENHUB_API_KEY	tencent-tokenhub/	false	
+tensorx	TensorX	https://api.tensorx.ai	TENSORX_BASE_URL	TENSORX_API_KEY	tensorx/	false	
+the-grid-ai	The Grid AI	https://api.thegrid.ai	THE_GRID_AI_BASE_URL	THEGRID_API_KEY	the-grid-ai/	false	
+tinfoil	Tinfoil	https://inference.tinfoil.sh	TINFOIL_BASE_URL	TINFOIL_API_KEY	tinfoil/	false	
+together	Together AI	https://api.together.xyz	TOGETHER_BASE_URL	TOGETHER_API_KEY	together/	false	images,rerank
+tokengo	TokenGo	https://api.tokengo.com	TOKENGO_BASE_URL	TOKENGO_API_KEY	tokengo/	false	
+tokenrouter	TokenRouter	https://api.tokenrouter.com	TOKENROUTER_BASE_URL	TOKENROUTER_API_KEY	tokenrouter/	false	
+trustedrouter	TrustedRouter	https://api.trustedrouter.com	TRUSTEDROUTER_BASE_URL	TRUSTEDROUTER_API_KEY	trustedrouter/	false	
+umans-ai	Umans AI	https://api.code.umans.ai	UMANS_AI_BASE_URL	UMANS_AI_API_KEY	umans-ai/	false	
+umans-ai-coding-plan	Umans AI Coding Plan	https://api.code.umans.ai	UMANS_AI_CODING_PLAN_BASE_URL	UMANS_AI_CODING_PLAN_API_KEY	umans-ai-coding-plan/	false	
+unorouter	UnoRouter	https://api.unorouter.com	UNOROUTER_BASE_URL	UNOROUTER_API_KEY	unorouter/	false	
+upstage	Upstage	https://api.upstage.ai	UPSTAGE_BASE_URL	UPSTAGE_API_KEY	solar-,upstage/	false	
+vancine	Vancine	https://vancine.com	VANCINE_BASE_URL	VANCINE_API_KEY	vancine/	false	
+vispark	Vispark	https://api.lab.vispark.in	VISPARK_BASE_URL	VISPARK_LAB_API_KEY	vispark/	false	
+volcengine	Volcengine Ark	https://ark.cn-beijing.volces.com/api/v3	VOLCENGINE_BASE_URL	ARK_API_KEY	volcengine/	false	
+volcengine-coding-plan	Volcengine Ark Coding Plan	https://ark.cn-beijing.volces.com/api/coding/v3	VOLCENGINE_CODING_PLAN_BASE_URL	ARK_CODING_PLAN_API_KEY	volcengine-coding-plan/	false	
+vultr	Vultr	https://api.vultrinference.com	VULTR_BASE_URL	VULTR_API_KEY	vultr/	false	
+wafer.ai	Wafer	https://pass.wafer.ai	WAFER_AI_BASE_URL	WAFER_API_KEY	wafer.ai/	false	
+wallaby	Wallaby	https://api.wallabytoken.com	WALLABY_BASE_URL	WALLABY_API_KEY	wallaby/	false	
+wandb	Weights & Biases	https://api.inference.wandb.ai	WANDB_BASE_URL	WANDB_API_KEY	wandb/	false	
+xai	xAI	https://api.x.ai	XAI_BASE_URL	XAI_API_KEY	grok,xai/	true	images
+xiaomi	Xiaomi	https://api.xiaomimimo.com	XIAOMI_BASE_URL	XIAOMI_API_KEY	xiaomi/	false	
+xiaomi-token-plan-ams	Xiaomi Token Plan (Europe)	https://token-plan-ams.xiaomimimo.com	XIAOMI_TOKEN_PLAN_AMS_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-ams/	false	
+xiaomi-token-plan-cn	Xiaomi Token Plan (China)	https://token-plan-cn.xiaomimimo.com	XIAOMI_TOKEN_PLAN_CN_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-cn/	false	
+xiaomi-token-plan-sgp	Xiaomi Token Plan (Singapore)	https://token-plan-sgp.xiaomimimo.com	XIAOMI_TOKEN_PLAN_SGP_BASE_URL	XIAOMI_API_KEY	xiaomi-token-plan-sgp/	false	
+xpersona	Xpersona	https://www.xpersona.co	XPERSONA_BASE_URL	XPERSONA_API_KEY	xpersona/	false	
+yi	Yi	https://api.01.ai	YI_BASE_URL	YI_API_KEY	yi-,yi/	false	
+zai	Z.AI	https://api.z.ai/api/paas/v4	ZAI_BASE_URL	ZHIPU_API_KEY	zai/,glm-	false	
+zai-coding-plan	Z.AI Coding Plan	https://api.z.ai/api/coding/paas/v4	ZAI_CODING_PLAN_BASE_URL	ZHIPU_API_KEY	zai-coding-plan/	false	
+zeldoc	Zeldoc	https://api.zeldoc.ai	ZELDOC_BASE_URL	ZELDOC_API_KEY	zeldoc/	false	
+zenifra	Zenifra	https://ai.zenifra.com	ZENIFRA_BASE_URL	ZENIFRA_AI_KEY	zenifra/	false	
+zenmux	ZenMux	https://zenmux.ai/api	ZENMUX_BASE_URL	ZENMUX_API_KEY	zenmux/	false	
+zhipuai	Zhipu AI	https://open.bigmodel.cn/api/paas/v4	ZHIPUAI_BASE_URL	ZHIPU_API_KEY	zhipuai/	false	
+zhipuai-coding-plan	Zhipu AI Coding Plan	https://open.bigmodel.cn/api/coding/paas/v4	ZHIPUAI_CODING_PLAN_BASE_URL	ZHIPU_API_KEY	zhipuai-coding-plan/	false	

@@ -34,6 +34,9 @@ type TraceListResponse = {
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
 	const qs = forwardParams(req.nextUrl.searchParams, [
+		"key",
+		"loop",
+		"rescued",
 		"limit",
 		"model",
 		"has_error",

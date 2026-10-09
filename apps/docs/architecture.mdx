@@ -8,8 +8,8 @@ Tracelane is five components in one monorepo:
 
 <CardGroup cols={2}>
   <Card title="Rust gateway" icon="bolt">
-    Axum + tokio. BYOK routing across 191 routable providers (6 native adapters
-    + 185 OpenAI-compatible catalog entries). One typed admission pipeline shared
+    Axum + tokio. BYOK routing across 205 routable providers (6 native adapters
+    + 199 OpenAI-compatible catalog entries). One typed admission pipeline shared
     by the chat, embeddings and messages routes. Predictive layer inline,
     observe-first by default. Emits its own spans. <code>crates/gateway/</code>
   </Card>
@@ -37,23 +37,50 @@ Tracelane is five components in one monorepo:
 
 ```mermaid
 flowchart LR
-  Client["OpenAI- or Anthropic-style client"] -->|"HTTPS · bearer"| Gateway["Gateway<br/>crates/gateway"]
-  SDK["OTel SDK / OTLP exporter"] -->|"POST /v1/traces · API key"| Gateway
-  SDK -.->|"OTLP · self-host, same host only"| Ingest["Ingest worker<br/>crates/ingest"]
-  Gateway -->|"HTTPS · your provider key"| Provider["LLM provider"]
-  Gateway -->|"spans · acked JetStream publish"| NATS[("NATS JetStream")]
-  Gateway -->|"audit events · acked JetStream publish"| NATS
+  subgraph clients["Clients"]
+    direction TB
+    Client["OpenAI- or Anthropic-style client"]
+    SDK["OTel SDK / OTLP exporter"]
+  end
+  subgraph gw["Gateway · crates/gateway"]
+    direction TB
+    Gateway["Admission + dispatch"]
+    HW["Audit head-writer<br/>(task inside the gateway)"]
+  end
+  subgraph pipe["Recording pipeline"]
+    direction LR
+    NATS[("NATS JetStream")]
+    Ingest["Ingest worker<br/>crates/ingest"]
+  end
+  subgraph store["Storage"]
+    direction TB
+    PG[("Postgres<br/>control plane + canonical ledger")]
+    CH[("ClickHouse<br/>spans + ledger copy")]
+  end
+  subgraph ext["External"]
+    Provider["LLM provider"]
+  end
+  Client -->|"1 · HTTPS, bearer"| Gateway
+  SDK -->|"POST /v1/traces, API key"| Gateway
+  Gateway -->|"2 · your provider key"| Provider
+  Gateway -->|"3 · spans + audit events, acked publish"| NATS
   NATS -->|"span consumer"| Ingest
-  NATS -->|"audit head-writer (a task inside the gateway)"| Gateway
-  Ingest -->|"batched inserts · ack after write"| CH[("ClickHouse")]
-  Gateway -->|"control plane · canonical ledger rows + anchors"| PG[("Postgres")]
-  Gateway -->|"ledger copy · verdicts · reads, never spans"| CH
-  Gateway -.->|"batch anchor · best-effort"| Rekor["Sigstore Rekor v2"]
-  Dashboard["Dashboard<br/>apps/web"] -->|"user JWT"| Gateway
-  Dashboard -->|"Drizzle · control-plane tables"| PG
-  MCP["MCP server<br/>apps/mcp"] -->|"HTTP transport · always via the gateway"| Gateway
-  MCP -.->|"stdio transport · self-host ClickHouse"| CH
+  Ingest -->|"4 · batched insert, ack after write"| CH
+  NATS -->|"audit events"| HW
+  HW -->|"5 · canonical ledger rows"| PG
+  SDK -.->|"OTLP, self-host same host only"| Ingest
+```
+
+The other entry points all go through the same gateway; only two read storage
+directly:
+
+```mermaid
+flowchart LR
+  Dashboard["Dashboard<br/>apps/web"] -->|"Drizzle, control-plane tables"| PG[("Postgres")]
+  Dashboard -->|"user JWT"| Gateway["Gateway"]
   CLI["tlane CLI"] -->|"HTTPS"| Gateway
+  MCP["MCP server<br/>apps/mcp"] -->|"HTTP transport"| Gateway
+  MCP -.->|"stdio transport, self-host only"| CH[("ClickHouse")]
 ```
 
 Solid edges are the hosted product's path. Dashed edges exist only in a
@@ -61,8 +88,8 @@ particular configuration: the ingest worker's own OTLP receiver is reachable
 inside the deployment network over mTLS, or on a self-host install as a
 plaintext port bound to the same host; the MCP server reads ClickHouse directly
 only on its stdio transport with `CLICKHOUSE_URL` set, and its HTTP transport
-refuses to start with that variable present; the Rekor anchor is best-effort and
-needs a configured Rekor endpoint.
+refuses to start with that variable present. The ClickHouse ledger copy and the
+best-effort Sigstore Rekor anchor appear in the ledger diagram below.
 
 
 ### Write path
@@ -203,10 +230,10 @@ measured or is enforced, so none is published here.
 
 ## Security posture
 
-- **BYOK only.** Provider keys are sealed with AES-256-GCM (`ring` AEAD) under an
-  envelope master key, with the AAD bound to `provider-key:<tenant_uuid>:<provider_id>`
-  so a ciphertext cannot be moved between tenants or providers. KMS-backed
-  master-key management is not available yet.
+- **BYOK.** Provider keys are sealed with AES-256-GCM (`ring` AEAD) and bound to
+  the tenant and provider. The gateway uses the deployment master key by default;
+  an entitled workspace can configure a customer KMS wrapped tenant data key
+  for provider-key envelopes through `/v1/security/kms`.
 - **mTLS for ingest, TLS 1.3 only.** The ingest worker's OTLP receiver
   terminates mTLS itself and is built with TLS 1.3 as its only protocol
   version; plaintext mode exists for local development.
@@ -241,6 +268,6 @@ measured or is enforced, so none is published here.
 
 - [Predictive guardrails](/predictive-guardrails) — what runs inline
 - [Audit ledger](/audit-ledger) — the chain, signing and anchoring in detail
-- [Providers](/providers) — 191 routable LLM providers
+- [Providers](/providers) — 205 routable LLM providers
 - [API reference](/api-reference) — REST surface
 - [Decisions](/decisions/index) — architectural decisions

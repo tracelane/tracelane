@@ -132,6 +132,23 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
     }
 }
 
+/// A WRITE (pin, approve, unpin): [`authenticate`], then the admin-plane gate —
+/// OG-34's `edit_policies`, OG-36's allowlist and SSO-required — which yields the
+/// actor the store's audit row carries (OG-35).
+async fn authenticate_write(
+    headers: &HeaderMap,
+) -> Result<(crate::auth::Claims, crate::control_plane::ControlActor), Response> {
+    let claims = authenticate(headers).await?;
+    let actor = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::EditPolicies,
+        headers,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    Ok((claims, actor))
+}
+
 /// May this caller WRITE `caps`?
 ///
 ///  follow-up, found by the verifier. `Claims::can_admin` grandfathers
@@ -171,7 +188,7 @@ async fn pin(
     State(state): State<AppState>,
     Json(req): Json<PinRequest>,
 ) -> Response {
-    let claims = match authenticate(&headers).await {
+    let (claims, actor) = match authenticate_write(&headers).await {
         Ok(c) => c,
         Err(e) => return e,
     };
@@ -204,10 +221,25 @@ async fn pin(
 
     let def_hash = hash_of(&req);
     let wrote = if may_write_caps {
-        crate::db::tool_capabilities::upsert(pool, &tenant, name, req.caps, Some(&def_hash)).await
+        crate::db::tool_capabilities::upsert(
+            pool,
+            &tenant,
+            name,
+            req.caps,
+            Some(&def_hash),
+            &actor.audit,
+        )
+        .await
     } else {
         // caps-preserving: never clobbers what an owner set.
-        crate::db::tool_capabilities::upsert_definition_only(pool, &tenant, name, &def_hash).await
+        crate::db::tool_capabilities::upsert_definition_only(
+            pool,
+            &tenant,
+            name,
+            &def_hash,
+            &actor.audit,
+        )
+        .await
     };
     if let Err(e) = wrote {
         tracing::error!(error = %e, "tool_capabilities upsert failed");
@@ -262,14 +294,14 @@ async fn unpin(
     State(state): State<AppState>,
     Path(tool_name): Path<String>,
 ) -> Response {
-    let tenant = match authenticate(&headers).await {
-        Ok(c) => c.tenant_id,
+    let (tenant, actor) = match authenticate_write(&headers).await {
+        Ok((c, a)) => (c.tenant_id, a),
         Err(e) => return e,
     };
     let Some(pool) = crate::db::global_pool() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "database not configured");
     };
-    match crate::db::tool_capabilities::delete(pool, &tenant, &tool_name).await {
+    match crate::db::tool_capabilities::delete(pool, &tenant, &tool_name, &actor.audit).await {
         Ok(deleted) => {
             state.guardrail.invalidate_registry(*tenant.as_uuid()).await;
             if deleted {
@@ -357,14 +389,22 @@ async fn approve(
     State(state): State<AppState>,
     Json(req): Json<ApproveRequest>,
 ) -> Response {
-    let tenant = match authenticate(&headers).await {
-        Ok(c) => c.tenant_id,
+    let (tenant, actor) = match authenticate_write(&headers).await {
+        Ok((c, a)) => (c.tenant_id, a),
         Err(e) => return e,
     };
     let Some(pool) = crate::db::global_pool() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "database not configured");
     };
-    match crate::db::observed_tools::approve(pool, &tenant, &req.tool_name, &req.def_hash).await {
+    match crate::db::observed_tools::approve(
+        pool,
+        &tenant,
+        &req.tool_name,
+        &req.def_hash,
+        &actor.audit,
+    )
+    .await
+    {
         Ok(true) => {
             state.guardrail.invalidate_registry(*tenant.as_uuid()).await;
             (StatusCode::OK, Json(serde_json::json!({"approved": true}))).into_response()
@@ -484,6 +524,7 @@ mod tests {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
+                governance: None,
             }
         }
 

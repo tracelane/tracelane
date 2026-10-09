@@ -1,0 +1,414 @@
+{
+  "kms": {
+    "dek_cache_ttl_secs": 300,
+    "dek_cache_max_entries": 10000,
+    "call_timeout_ms": 3000,
+    "failure_backoff_secs": 5,
+    "lock_wait_ms": 4000,
+    "_lock_wait_ms": "H1 (security review 2026-10-05): the longest a caller waits on its OWN tenant's KMS write fence or in-flight DEK unwrap before failing closed (kms_unavailable) for that tenant only. Above call_timeout_ms (3000) so a follower normally receives the leader's result; chosen, not measured. Replaced max_concurrent_calls (64 shared striped locks, tenant % 64, through which one tenant's slow Vault stalled ~1/64 of tenants).",
+    "response_bytes": 65536,
+    "max_calls_per_tenant": 2,
+    "_max_calls_per_tenant": "H1 round 2 (security re-review 2026-10-05): the most customer-KMS calls (wrap/unwrap) one tenant may have in flight; past it a caller waits lock_wait_ms then fails closed (kms_unavailable) for that tenant only. Two, not one, so a key write's probe can run beside the hot path's single-flighted unwrap; chosen, not measured. Every call also runs with NO pooled Postgres connection held (connections are released before the KMS await)."
+  },
+  "_what": "OG-03 reference table (CLAUDE.md §23): request-translation limits, and how a caller's OpenAI-style `reasoning_effort` becomes each native provider's own thinking control. Read by crates/gateway/src/providers/translation_policy.rs (include_str!, parsed once). Change a value here, not in Rust. A level mapped to null means the provider cannot honour it: the gateway answers 400 unsupported_parameter instead of sending something different.",
+  "_sources": {
+    "anthropic": "platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting (per-model thinking table), /effort (output_config.effort), /extended-thinking (budget_tokens), checked 2026-10-01",
+    "gemini": "generativelanguage.googleapis.com discovery doc v1beta, ThinkingConfig {thinkingBudget:int, thinkingLevel: MINIMAL|LOW|MEDIUM|HIGH, includeThoughts}, checked 2026-10-01. The thinkingBudget numbers are the gateway's own policy inside Google's documented per-model ranges, not Google constants."
+  },
+  "auth_throttle": {
+    "_what": "B-594 reference table (CLAUDE.md §23): the bounds on the ONE auth stage that reaches Postgres — an API key none of the positive / negative / stale caches has seen. Read by crates/gateway/src/providers/translation_policy.rs auth_throttle_policy() (parsed on its own, so this block and the translation table cannot void each other) and enforced in crates/gateway/src/preauth_limiter.rs + db/api_keys.rs. FIRST a set of every valid lookup_hash (loaded on the first cold lookup, read again — one query for everyone — when a miss arrives after the last read): a hash not in it is a 401 with no per-key Postgres lookup and no token; a hash in it skips the per-source bucket. Only when the set is unavailable does the per-source bucket apply: a token reserved before the lookup, refunded only when no SQL ran (pool checkout failed, or the request was cancelled before it), kept otherwise. EVERY cold lookup also takes one of a fixed number of slots (a share of the Postgres pool) or is refused 429 auth_throttled. burst = tokens a source starts with; refill_per_minute = tokens regained per minute; max_sources = buckets held at once (past it, sources share ONE overflow bucket of the same size); ipv6_prefix_len = the IPv6 network one source is (32..=64); ipv6_wide_prefix_len = the wider IPv6 network that must ALSO have a token (16..=ipv6_prefix_len; equal = off); sweep_interval_ms = least time between sweeps of refilled buckets when the map is full; cold_lookup_pool_pct = concurrent cold lookups as a percent of the pool's max_size (min 1 slot); cold_lookup_wait_ms = how long a cold lookup may wait for a slot (0 = never); trusted_proxy_cidrs = TCP peers whose forwarding headers are believed; client_ip_header = the header such a peer names the client in (\"\" = none; the rightmost x-forwarded-for entry is the fallback); known_keys_refresh_ms = least time between two miss-triggered set reads; known_keys_wait_ms = longest a miss waits for one before taking the gated lookup; known_keys_full_reload_secs = a set older than this is reloaded whole (drops revoked keys); known_keys_overlap_secs = how far back a delta read starts; known_keys_max = past this many valid keys the set is not used. Spec: specs/B-594-auth-failure-ip-limiter.md.",
+    "burst": 60,
+    "refill_per_minute": 60,
+    "max_sources": 100000,
+    "ipv6_prefix_len": 64,
+    "ipv6_wide_prefix_len": 48,
+    "sweep_interval_ms": 1000,
+    "cold_lookup_pool_pct": 25,
+    "cold_lookup_wait_ms": 500,
+    "trusted_proxy_cidrs": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"],
+    "client_ip_header": "cf-connecting-ip",
+    "known_keys_refresh_ms": 1000,
+    "known_keys_wait_ms": 2000,
+    "known_keys_full_reload_secs": 3600,
+    "known_keys_overlap_secs": 300,
+    "known_keys_max": 1000000
+  },
+  "key_policy": {
+    "_what": "OG-20 / OG-23 reference table (CLAUDE.md §23): the WRITE-side bounds on a per-key or per-project policy document and on projects. Read by crates/gateway/src/providers/translation_policy.rs key_policy_limits() (parsed on its own, like auth_throttle) and enforced by the key and project routes through tracelane_shared::key_policy::KeyPolicy::parse. The READ path (the auth SELECT) never applies them, so lowering a bound never makes a stored policy unenforceable. max_patterns = entries per models/providers allow or deny list; max_pattern_chars = one model glob's length; max_cidrs = source_ips entries; max_required_keys = required_tags or required_metadata_keys entries; max_projects_per_tenant = live (unarchived) projects; max_environments_per_project = a project's environment labels. Specs: specs/OG-20-per-key-policy.md §5, specs/OG-23-projects-environments.md §5.",
+    "max_patterns": 64,
+    "max_pattern_chars": 128,
+    "max_cidrs": 64,
+    "max_required_keys": 32,
+    "max_projects_per_tenant": 100,
+    "max_environments_per_project": 16,
+    "_og21_og22_what": "OG-21 / OG-22 write bounds on the same document: max_per_model_limits = entries in limits.per_model; max_alert_thresholds = entries in each of a budget's alert_at_percent / alert_at_usd. Specs: specs/OG-21-tpm-rpm-limits.md §5, specs/OG-22-budgets-every-level.md §5.",
+    "max_per_model_limits": 32,
+    "max_alert_thresholds": 10
+  },
+  "gateway_controls": {
+    "_what": "OG-21 / OG-22 / OG-24 / OG-25 reference table (CLAUDE.md §23): the bounds and timings of the workspace controls. Read by crates/gateway/src/controls.rs controls_config() (parsed on its own, like auth_throttle and key_policy). default_output_reserve_tokens = TPM reserved for a generating request that declares no output cap (reconciled from the recorded usage); limit_max_end_users_per_tenant = distinct end users with a live rate bucket per workspace (past it: 429 end_user_limit_capacity); limit_idle_evict_secs = a bucket untouched this long is dropped (it has fully refilled); reservation_ttl_secs / max_pending_reservations = how long and how many TPM reservations wait for their span (an unreconciled one stays charged); budget_max_end_users_per_tenant = end users with a live budget counter per workspace; budget_seed_retry_backoff_ms = least time between two ClickHouse baseline reads for one budget after a failed one; alert_* = OG-24 delivery; max_alert_channels_per_tenant = spend alert channels per workspace; max_block_entries = entries per block list; max_pause_reason_chars = pause reason length. Specs: specs/OG-21-tpm-rpm-limits.md, specs/OG-22-budgets-every-level.md, specs/OG-24-spend-alerts.md, specs/OG-25-emergency-controls.md.",
+    "default_output_reserve_tokens": 1024,
+    "limit_max_end_users_per_tenant": 50000,
+    "limit_idle_evict_secs": 120,
+    "reservation_ttl_secs": 600,
+    "max_pending_reservations": 100000,
+    "budget_max_end_users_per_tenant": 50000,
+    "budget_seed_retry_backoff_ms": 5000,
+    "alert_queue_capacity": 10000,
+    "alert_max_attempts": 8,
+    "alert_backoff_base_secs": 30,
+    "alert_poll_interval_secs": 10,
+    "alert_webhook_replay_window_secs": 300,
+    "max_alert_channels_per_tenant": 20,
+    "max_block_entries": 256,
+    "max_pause_reason_chars": 500,
+    "_end_user_cap_what": "rev5 L6 (2026-10-04): the end-user id is caller-asserted (the x-tracelane-user-id header, else the body `user`; the header wins - one integration owns both). A key rotating ids could fill the per-workspace end-user capacity (limit/budget_max_end_users_per_tenant) and push every other end user into 429/503. So, where a per-end-user rule applies, one key (or the session principal) may introduce at most end_user_ids_per_key_per_window DISTINCT ids per end_user_ids_window_secs; a further NEW id is refused 429 end_user_id_cap (an id already seen in the window keeps working). Counted in the admission rejection aggregate.",
+    "end_user_ids_per_key_per_window": 1000,
+    "end_user_ids_window_secs": 3600
+  },
+  "response_cache": {
+    "_what": "Bounds for per-workspace response-cache controls. Read by response_cache_config() in cache_controls.rs. ttl_ceiling_hours = the longest a stored answer is served, matching the semantic_cache table TTL (INTERVAL 7 DAY; a test checks both); namespace_header_max_bytes = longest x-tracelane-cache-namespace value; max_epoch_rows_per_tenant = invalidation scopes (cache_epochs rows) per workspace; stats_window_hours = the window of GET /v1/cache hits_24h / cost_saved_usd_24h; inherit_requires_capture = a workspace in mode inherit is served from and stored into the cache only while it records both prompt and response text (content capture ON); false would cache every workspace whenever the operator block exists.",
+    "ttl_ceiling_hours": 168,
+    "namespace_header_max_bytes": 64,
+    "max_epoch_rows_per_tenant": 256,
+    "stats_window_hours": 24,
+    "inherit_requires_capture": true
+  },
+  "otel_export": {
+    "_what": "OG-50 reference table (CLAUDE.md §23): the bounds of the OTLP/HTTP span export to a customer's collector. Read by crates/gateway/src/otel_export.rs config() (parsed on its own, like gateway_controls). queue_spans = spans one export may have waiting (past it the NEWEST span is dropped and counted); queued_spans_total_max = spans waiting across every export of the process; batch_max_spans / batch_flush_ms / max_request_bytes = when a batch is sent (count, time, encoded size); timeout_secs = one delivery attempt; max_retries = retries of a retryable failure (408/429/5xx/transport) with full-jitter backoff (retry_base_ms doubling to retry_cap_ms, a Retry-After honoured up to retry_after_max_secs); degraded_after_failures = consecutive failed batches before status degraded and the worker backs off (doubling to max_cooldown_secs; an export is NEVER auto-disabled); idle_stop_secs = a worker with nothing to send stops after this long; status_flush_secs = how often counters and status are written to Postgres (never per batch); directory_refresh_secs = how often the set of exporting tenants is re-read (a write refreshes at once); max_headers / max_header_value_bytes / forbidden_headers = the customer header map; max_url_bytes / validate_timeout_secs = the URL and its DNS validation. Spec: specs/OG-50-otel-export.md.",
+    "queue_spans": 2048,
+    "queued_spans_total_max": 100000,
+    "batch_max_spans": 512,
+    "batch_flush_ms": 5000,
+    "max_request_bytes": 4194304,
+    "timeout_secs": 10,
+    "max_retries": 3,
+    "degraded_after_failures": 5,
+    "max_cooldown_secs": 900,
+    "idle_stop_secs": 300,
+    "status_flush_secs": 60,
+    "directory_refresh_secs": 60,
+    "max_headers": 8,
+    "max_header_value_bytes": 4096,
+    "forbidden_headers": ["host", "content-length", "content-type", "content-encoding", "transfer-encoding", "connection"],
+    "retry_base_ms": 500,
+    "retry_cap_ms": 8000,
+    "retry_after_max_secs": 30,
+    "max_url_bytes": 2048,
+    "validate_timeout_secs": 3
+  },
+  "limits": {
+    "stop_max_entries": 4,
+    "stop_max_bytes": 256,
+    "user_max_bytes": 256,
+    "provider_message_max_chars": 512,
+    "retry_after_max_secs": 3600
+  },
+  "extra_params": {
+    "_what": "C1 security fix (2026-10-02, CLAUDE.md §23): the ONLY top-level chat fields OUTSIDE the typed ChatRequest model the gateway forwards to an OpenAI-compatible provider (/v1/chat/completions, batch chat lines). Every other unmodelled key is a 400 unsupported_parameter naming it: an unknown key can carry model input (`prompt`, `functions`, `function_call`, `prediction`, `documents`, `chat_template`) that no request rail reads. `shape` constrains the value: number | bool | string | object_of_numbers | array_of_strings | object_of_non_text_scalars (bool/number/null values only) | json (any JSON). Every STRING leaf of an accepted value is also scanned by R2/R8, redacted with the request when R2 redacts, and captured. Widening this list widens what egresses — add a key only with a provider-doc citation in _sources.",
+    "_sources": "logit_bias, store, verbosity, prompt_cache_key, safety_identifier: platform.openai.com/docs/api-reference/chat/create. top_k, min_p, repetition_penalty, provider, transforms, reasoning: openrouter.ai/docs/api-reference/parameters, /features/provider-routing, /features/message-transforms, /use-cases/reasoning-tokens. safe_prompt, random_seed: docs.mistral.ai/api (chat completion). chat_template_kwargs: docs.vllm.ai/en/latest/serving/openai_compatible_server.html (extra parameters; text values excluded here because a string kwarg is template input). Checked 2026-10-02.",
+    "allow": {
+      "logit_bias": "object_of_numbers",
+      "top_k": "number",
+      "min_p": "number",
+      "repetition_penalty": "number",
+      "store": "bool",
+      "safe_prompt": "bool",
+      "random_seed": "number",
+      "provider": "json",
+      "transforms": "array_of_strings",
+      "reasoning": "json",
+      "chat_template_kwargs": "object_of_non_text_scalars",
+      "verbosity": "string",
+      "prompt_cache_key": "string",
+      "safety_identifier": "string"
+    }
+  },
+  "responses_bridge": {
+    "_what": "OG-05 §3.4: OpenAI models /v1/chat/completions cannot serve. A chat request for one of these is translated to a Responses request and POSTed to {openai base}/v1/responses; the result is re-emitted as chat-completions JSON/chunks (span attribute tracelane.bridge=chat_to_responses). A name matches itself and its dated snapshots (name-2026-10-01), never a sibling (gpt-5.5-pro is not gpt-5.5).",
+    "_sources": "developers.openai.com/api/docs/models (Responses-only models); OpenAI, 2026-10-01: tool calling on gpt-6-astra and gpt-6.1-sol requires the Responses API; gpt-6-sol and gpt-6-luna allow chat tools only at reasoning_effort none (live 400 on 2026-10-03, frontier matrix), so they bridge too",
+    "responses_only_models": ["gpt-5.5-pro", "gpt-5.3-codex", "gpt-5.4-pro", "gpt-5.2-pro", "gpt-5-pro"],
+    "tools_need_responses": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
+  },
+  "realtime": {
+    "_what": "OG-07 reference table (CLAUDE.md §23): the Realtime WebSocket relay (crates/gateway/src/realtime.rs). `providers` are the provider ids that serve a realtime socket; `model_contains` is the substring a routed model name must carry. `limits` are the session caps (a breach closes the socket with a reason). `price_cards` price one `response.done` usage block in USD per million tokens: text and audio are billed at different rates, and a model with no card here is priced at the model_prices.tsv TEXT rate only (a floor, labelled tracelane.realtime.cost_basis=text_rate_floor) or, with no price at all, left unpriced. cached_audio_in null = no published cached-audio rate, so cached audio tokens are charged at the (higher) uncached audio rate. Image input tokens are charged at the text input rate.",
+    "_sources": "developers.openai.com/api/docs/models/gpt-realtime-2.1 (text in 4 / audio in 32 / text out 24 / audio out 64 per Mtok), checked 2026-10-01; cached_text_in 0.4 from crates/gateway/model_prices.tsv (openai gpt-realtime-2.1). developers.openai.com/api/docs/guides/realtime-websocket: wss://api.openai.com/v1/realtime?model=..., Authorization: Bearer; browser subprotocols `realtime` + `openai-insecure-api-key.<key>`; no OpenAI-Beta header required, checked 2026-10-01. H2(b) 2026-10-02: developers.openai.com/api/docs/models/gpt-realtime (text 4 / cached 0.4 / out 16; audio 32 / cached 0.4 / out 64 per Mtok) and developers.openai.com/api/docs/models/gpt-4o-realtime-preview (text 5 / cached 2.5 / out 20; audio 40 / cached 2.5 / out 80; all three snapshots 2024-10-01, 2024-12-17, 2025-06-03 the same), checked 2026-10-02.",
+    "providers": ["openai"],
+    "model_contains": ["realtime"],
+    "limits": {
+      "max_session_secs": 1800,
+      "idle_timeout_secs": 120,
+      "max_client_message_bytes": 4194304,
+      "max_upstream_message_bytes": 16777216,
+      "connect_timeout_secs": 10,
+      "_verdicts_what": "M-4 security re-review (2026-10-02): every scanned realtime event used to write its own guardrail-verdict ledger row, so one session could flood the shared audit pipeline. ALLOW verdicts are now coalesced into one guardrail.verdicts_coalesced row per verdict_coalesce_window_secs (and one at session end). A non-allow verdict that does not end the session (warn, fail-open, an observed redact) records individually the FIRST time its kind (decision + rail outcomes + reason codes) is seen in a window, at most max_recorded_verdicts_per_session times; past that the session closes 1008 verdict_limit. A repeat of a kind already recorded in the window is counted into the coalesced row (re-review 2026-10-03: warns are cheap to trigger). A block always records (it ends the session). ADR-069 amendment 2026-10-03.",
+      "verdict_coalesce_window_secs": 60,
+      "max_recorded_verdicts_per_session": 100,
+      "_control_recheck_what": "rev5 M1 (2026-10-04): a session outlived a workspace pause, a key revocation, a model/provider block and an OG-22 hard budget for up to max_session_secs. Every control_recheck_secs (and after every response.done) the session re-reads the workspace controls through the entitlement cache (warm; every control write invalidates it), re-validates its API key through the auth cache, and re-checks every hard budget; a refusal closes BOTH sockets 1008 with an error event naming the control (1011 when a control cannot be verified - fail-closed).",
+      "control_recheck_secs": 15,
+      "control_recheck_timeout_secs": 5
+    },
+    "sessions": {
+      "_what": "M4 security fix (2026-10-02): concurrent realtime sessions. A session holds two sockets for up to max_session_secs and escapes the per-request in-flight limit, so it has its own caps. Over either cap the connect is refused 429 before any upgrade.",
+      "max_per_tenant": 10,
+      "max_process": 1000,
+      "_reserve_what": "L-2 security re-review (2026-10-02): the last process_reserved_for_new_tenants process slots open only a tenant's FIRST session (429 for a tenant already holding one), so tenants at their per-tenant cap cannot use up the process cap between them. Must be below max_process or the table is refused.",
+      "process_reserved_for_new_tenants": 100
+    },
+    "price_cards": [
+      {
+        "model": "gpt-realtime-2.1",
+        "text_in": 4.0,
+        "audio_in": 32.0,
+        "cached_text_in": 0.4,
+        "cached_audio_in": null,
+        "text_out": 24.0,
+        "audio_out": 64.0
+      },
+      {
+        "model": "gpt-realtime",
+        "text_in": 4.0,
+        "audio_in": 32.0,
+        "cached_text_in": 0.4,
+        "cached_audio_in": 0.4,
+        "text_out": 16.0,
+        "audio_out": 64.0
+      },
+      {
+        "model": "gpt-4o-realtime-preview",
+        "text_in": 5.0,
+        "audio_in": 40.0,
+        "cached_text_in": 2.5,
+        "cached_audio_in": 2.5,
+        "text_out": 20.0,
+        "audio_out": 80.0
+      }
+    ]
+  },
+  "passthrough": {
+    "_what": "OG-08 reference table (CLAUDE.md §23): the raw provider passthrough (crates/gateway/src/passthrough.rs). max_request_body_bytes caps what a caller may stream upstream (413 beyond it); upstream_timeout_secs is the time to the provider's response head (504) and the per-read idle bound while the body streams. `providers` are the NATIVE (non-catalog) provider ids the route serves, each with the header that carries the provider's key; every catalog row is served with `Authorization: Bearer`. Bedrock (SigV4), Vertex (OAuth) and Azure (per-resource URL) are not served: they cannot be reached by a static header.",
+    "max_request_body_bytes": 104857600,
+    "upstream_timeout_secs": 300,
+    "native_providers": [
+      { "id": "anthropic", "auth_header": "x-api-key", "default_headers": { "anthropic-version": "2023-06-01" } },
+      { "id": "google", "auth_header": "x-goog-api-key", "default_headers": {} }
+    ]
+  },
+  "cohere": {
+    "_what": "D9: Cohere v2 chat takes images only on vision models. A model whose lower-cased name contains one of these substrings is treated as vision-capable; every other Cohere model is refused an image part (400 unsupported_content) rather than sent one it will reject.",
+    "_sources": "docs.cohere.com/docs/image-inputs (command-a-vision-07-2025 is the documented vision model; images: png/jpeg/webp/non-animated gif, data URI or https URL, 20 images or 20 MB per request), checked 2026-10-01",
+    "vision_model_contains": ["vision"]
+  },
+  "media": {
+    "_what": "OG-06 §5 caps for /v1/images, /v1/audio, /v1/moderations, /v1/rerank, /v1/files and /v1/batches. Change a value here, not in Rust. A table that fails to parse reads as all zeros: every upload is refused 413.",
+    "_sources": "developers.openai.com/api/reference/resources/files (file up to 512 MB; Batch .jsonl up to 200 MB and 50,000 requests), developers.openai.com/api/docs/guides/batch; audio 25 MB and tts input 4096 chars: developers.openai.com/api/docs/guides/speech-to-text and /text-to-speech, checked 2026-10-01. The gateway's batch buffer (100 MB) is a memory policy BELOW OpenAI's 200 MB ceiling (spec OG-06 §5), the per-line, multipart and prescan caps are the gateway's own.",
+    "json_body_max_bytes": 20971520,
+    "file_upload_max_bytes": 536870912,
+    "batch_jsonl_max_bytes": 104857600,
+    "batch_max_lines": 50000,
+    "batch_line_max_bytes": 1048576,
+    "image_upload_max_bytes": 52428800,
+    "audio_upload_max_bytes": 26214400,
+    "speech_input_max_chars": 4096,
+    "multipart_text_field_max_bytes": 65536,
+    "multipart_max_parts": 32,
+    "multipart_prescan_max_bytes": 33554432,
+    "media_response_max_bytes": 67108864,
+    "media_timeout_secs": 300,
+    "files_timeout_secs": 1800,
+    "list_limit_max": 10000,
+    "_intake_what": "H3 security fix (2026-10-02): body_buffer_budget_mb is the process-wide memory the media / files / batch routes may hold in buffered request bodies at once (reserved at the route's cap — or the declared Content-Length when smaller — BEFORE a byte is read, released when the request ends). uploads_per_tenant_max caps one tenant's concurrent body reads. Over either: 503 / 429 with Retry-After busy_retry_after_secs, never an OOM. The budget must exceed the largest single cap (batch_jsonl_max_bytes) or a large batch upload can never be served.",
+    "body_buffer_budget_mb": 1024,
+    "uploads_per_tenant_max": 4,
+    "busy_retry_after_secs": 5,
+    "_intake_m3_what": "M-3 security re-review (2026-10-02): the byte budget is reserved AS BYTES ARRIVE (1 MiB up front, then in step with the buffer), never the route's worst case. body_buffer_tenant_share_mb caps what ONE tenant may hold of the process budget (429 tenant_memory_share_exhausted + Retry-After past it), so a few tenants cannot hold all of it. A body read that goes body_read_idle_timeout_secs without a chunk, or runs past body_read_total_timeout_secs in all, is cut with 408 request_body_timeout and its reservation released. The share must be at least the largest buffered cap (batch_jsonl_max_bytes) or a large batch upload can never be served.",
+    "body_buffer_tenant_share_mb": 256,
+    "body_read_idle_timeout_secs": 30,
+    "body_read_total_timeout_secs": 300,
+    "_intake_mf_what": "M-F security re-review (2026-10-03). (1) A streamed (non-batch) /v1/files upload reads its REST through the same reader as its head: a gap of body_read_idle_timeout_secs between chunks, or a whole upload running past body_stream_total_timeout_secs from its first byte, aborts the upstream request and answers 408 request_body_timeout. body_stream_total_timeout_secs is separate from body_read_total_timeout_secs because the latter bounds BUFFERING (memory held), while a streamed upload holds one MiB after its head is handed on and may legitimately run to file_upload_max_bytes (512 MiB = 1.8 MB/s for 300 s); it should not exceed files_timeout_secs, which already ends the upstream request. Once the head is handed to the upstream stream the upload's reservation shrinks to one MiB. (2) Fairness: body_buffer_reserved_for_new_tenants_mb of the process budget is a RESERVE: a reservation may take the budget's free MiB below it only while the tenant's total holding stays within body_buffer_reserve_tenant_max_mb. Tenants holding their full share cannot fill the budget between them, and a tenant holding nothing still gets a body of up to body_buffer_reserve_tenant_max_mb buffered. The reserve must be below body_buffer_budget_mb and the per-tenant reserve allowance at most the reserve, or the table is refused (all zeros: every buffered read refused).",
+    "body_stream_total_timeout_secs": 1800,
+    "body_buffer_reserved_for_new_tenants_mb": 128,
+    "body_buffer_reserve_tenant_max_mb": 32,
+    "_tier_m4_what": "Final re-review M-4 (2026-10-03): free workspaces cost nothing to create, so the reserve above could be emptied and the budget filled by enough of them, locking paying customers out of media, files and batches. A FREE tenant (and any tenant with no control plane, per .claude/rules/tenancy.md) gets body_buffer_free_tenant_share_mb instead of body_buffer_tenant_share_mb, and may hold at most body_buffer_free_reserve_tenant_max_mb while drawing on the reserve (0 = never), so a paying tenant holding nothing is always served. The free share must still cover batch_jsonl_max_bytes, or a free tenant could never upload a full batch file.",
+    "body_buffer_free_tenant_share_mb": 128,
+    "body_buffer_free_reserve_tenant_max_mb": 0,
+    "_free_total_med3_what": "LAST review MED-3 (2026-10-03): per-tenant shares alone let enough free workspaces hold everything outside the reserve, leaving a paying tenant only the reserve allowance (too small for a full batch file). body_buffer_free_tenants_total_mb caps what ALL free tenants hold together; the table is refused unless it + the reserve + batch_jsonl_max_bytes fits in the budget.",
+    "body_buffer_free_tenants_total_mb": 768
+  },
+  "error_mapping": {
+    "_what": "OG-91 (client conformance, 2026-10-02): how a mode-T (/v1/responses translated) upstream error is re-shaped for a Responses client (Codex). An upstream 400/413 whose scrubbed message contains one of context_overflow_message_contains (lower-cased) is a context-window overflow: answered `context_length_exceeded` (streaming: an SSE response.failed — the only shape Codex maps to ContextWindowExceeded, codex-rs codex-api/src/sse/responses_error.rs; buffered: the OpenAI 400). An upstream status in overloaded_statuses is answered 503 `server_is_overloaded` (codex-api/src/api_bridge.rs maps exactly that to ServerOverloaded) with Retry-After = the upstream's, else overloaded_retry_after_default_secs.",
+    "_sources": "Anthropic: docs.anthropic.com/en/api/errors (529 overloaded_error; 400 'prompt is too long: N tokens > M maximum'). OpenAI: 'This model's maximum context length is N tokens' / code context_length_exceeded. Gemini: 'The input token count (N) exceeds the maximum number of tokens allowed (M)'. Bedrock Converse: 'Input is too long for requested model'. Cohere: 'too many tokens'. Codex: github.com/openai/codex codex-rs/codex-api/src/sse/responses_error.rs, codex-api/src/api_bridge.rs, codex-client/src/retry.rs (retry_5xx honours Retry-After), checked 2026-10-02.",
+    "context_overflow_message_contains": [
+      "prompt is too long",
+      "context_length_exceeded",
+      "maximum context length",
+      "context window",
+      "exceeds the maximum number of tokens",
+      "input is too long",
+      "too many tokens"
+    ],
+    "overloaded_statuses": [503, 529],
+    "overloaded_retry_after_default_secs": 5
+  },
+  "models_list": {
+    "_what": "M3 security fix (2026-10-02): GET /v1/models reads two Postgres tables per tenant; the answer is cached per tenant for cache_ttl_secs (a new BYOK key or alias shows up within that window). At most cache_max_tenants entries are held; past it the cache is cleared rather than grown.",
+    "cache_ttl_secs": 30,
+    "cache_max_tenants": 10000
+  },
+  "breaker": {
+    "_what": "OG-13 reference table (CLAUDE.md §23): the per-credential circuit breaker (crates/gateway/src/circuit_breaker.rs BreakerConfig::from_policy, parsed on its own). window_size / failure_rate_threshold / consecutive_failure_threshold / cooldown_secs / half_open_max_probes are the five ADR-036 tunables that were Rust literals until OG-13 (unchanged values). provider_min_open_credentials = how many DISTINCT TENANTS (owners — several keys of one tenant are one vote) must have a credential breaker Open on shared evidence for one (provider, region) before the provider-wide tier sheds every tenant — a chosen threshold (three unrelated tenants failing is the provider; one or two is an account), not a measurement. Shared evidence (S1, 2026-10-05): a trip counts only when every failure behind it was observed under DEFAULT tuning and DEFAULT deadlines; a workspace's own breaker override or deadline opens only its own credential. max_entries bounds the breaker map (past it a new credential is admitted and counted, never refused: a breaker is a fault-tolerance path, fail-OPEN); an idle Closed entry is evicted after idle_evict_secs. probe_lost_secs = how long a Half-Open probe may stay outstanding before it is treated as LOST and a fresh probe is granted (a cache hit after the check, or a client hang-up, never reports back) — the 300 s adapter ceiling, the longest any dispatch can take. Spec: specs/OG-13-timeouts-and-keyed-breaker.md.",
+    "window_size": 20,
+    "failure_rate_threshold": 0.5,
+    "consecutive_failure_threshold": 5,
+    "cooldown_secs": 10,
+    "half_open_max_probes": 3,
+    "provider_min_open_credentials": 3,
+    "max_entries": 100000,
+    "idle_evict_secs": 3600,
+    "probe_lost_secs": 300
+  },
+  "timeouts": {
+    "_what": "Per-route transport phase bounds. Unconfigured requests retain their adapter limits. A total deadline includes retries and response-body reads. Workspace tuning and workspace deadlines affect only that workspace's own credential breakers, never the provider-wide tier (S1, security review 2026-10-05). min_ms floors headers_ms / first_chunk_ms / idle_ms and total_min_ms floors total_ms (S1): a millisecond deadline is a tool for manufacturing upstream failures, not a latency bound; 1 s is below any real provider's time-to-headers under load and 5 s below any real completion, so no legitimate fast-fail rule is refused (chosen, not measured).",
+    "min_ms": 1000,
+    "total_min_ms": 5000,
+    "max_ms": 300000,
+    "max_rules": 32,
+    "consecutive_failures_min": 1,
+    "consecutive_failures_max": 100,
+    "cooldown_secs_min": 1,
+    "cooldown_secs_max": 300
+  },
+  "routing": {
+    "_what": "OG-11 reference table (CLAUDE.md §23): the workspace routing document (PUT /v1/routing) — crates/gateway/src/routing/mod.rs limits(), parsed on its own. max_virtual_models / max_targets_per_model / max_pool_keys_per_provider bound the document; max_attempts = dispatches one request may make across targets and pool keys (routed attempts do not perform hidden same-key retries); ewma_alpha and min_samples are the latency strategy's smoothing constants (chosen, not measured): a target with fewer than min_samples observations is cold and ordered by priority; explore_ratio = the fraction of latency-routed requests that try a random target first so a cold or recovered target gets samples; stats_max_entries bounds the in-process (tenant, provider, model) latency table — per tenant since M1 (security review 2026-10-05): a tenant is ordered by and shown only its own observations; past the bound a new entry stays cold (priority order), never another tenant's numbers; only targets of the tenant's own LATENCY virtual models are recorded, and an entry not observed for stats_idle_evict_secs (3600, chosen: an hour of silence makes an EWMA stale) is evicted (MED round 2, 2026-10-05); doc_max_bytes bounds the stored document. Spec: specs/OG-11-weighted-latency-cost-routing.md.",
+    "max_virtual_models": 64,
+    "max_targets_per_model": 16,
+    "max_pool_keys_per_provider": 8,
+    "max_attempts": 3,
+    "ewma_alpha": 0.2,
+    "min_samples": 5,
+    "explore_ratio": 0.05,
+    "stats_max_entries": 50000,
+    "stats_idle_evict_secs": 3600,
+    "doc_max_bytes": 65536,
+    "max_rules": 64,
+    "max_arms": 8,
+    "max_match_value_bytes": 256,
+    "sticky_key_max_bytes": 128,
+    "match_header_denylist": ["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "x-goog-api-key", "x-tracelane-zdr"]
+  },
+  "efforts":["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  "anthropic": {
+    "_levels": "\"omit\" send no thinking field; \"disabled\" thinking:{type:disabled}; \"between_tools\" thinking:{type:between_tools}; {\"effort\":X} thinking:{type:adaptive}+output_config.effort=X; {\"budget_tokens\":N} thinking:{type:enabled,budget_tokens:N}; null unsupported.",
+    "min_budget_tokens": 1024,
+    "families": [
+      {
+        "id": "extended_only",
+        "_why": "Extended thinking is the ONLY mode (adaptive is rejected): Haiku 4.5, Sonnet 4.5, Opus 4.5, Opus 4.1, Claude 3.7.",
+        "model_contains": ["haiku-4-5", "sonnet-4-5", "opus-4-5", "opus-4-1", "claude-3-7"],
+        "levels": {
+          "none": "disabled",
+          "minimal": { "budget_tokens": 1024 },
+          "low": { "budget_tokens": 2048 },
+          "medium": { "budget_tokens": 8192 },
+          "high": { "budget_tokens": 16384 },
+          "xhigh": { "budget_tokens": 24576 },
+          "max": { "budget_tokens": 32768 }
+        }
+      },
+      {
+        "id": "adaptive_effort_to_max",
+        "_why": "Opus 4.6 / Sonnet 4.6: adaptive thinking + effort low|medium|high|max (no xhigh), thinking may be disabled.",
+        "model_contains": ["opus-4-6", "sonnet-4-6"],
+        "levels": {
+          "none": "disabled",
+          "minimal": { "effort": "low" },
+          "low": { "effort": "low" },
+          "medium": { "effort": "medium" },
+          "high": { "effort": "high" },
+          "xhigh": { "effort": "max" },
+          "max": { "effort": "max" }
+        }
+      },
+      {
+        "id": "adaptive_always_on",
+        "_why": "Opus 5.5, Fable, Mythos: thinking cannot be turned off (\"disabled\" and \"enabled\" are 400s), so `none` cannot be honoured.",
+        "model_contains": ["opus-5-5", "fable", "mythos"],
+        "levels": {
+          "none": null,
+          "minimal": { "effort": "low" },
+          "low": { "effort": "low" },
+          "medium": { "effort": "medium" },
+          "high": { "effort": "high" },
+          "xhigh": { "effort": "xhigh" },
+          "max": { "effort": "max" }
+        }
+      },
+      {
+        "id": "sonnet_5_5",
+        "_why": "Sonnet 5.5 rejects \"disabled\"; between_tools is its off switch (accepted at effort high or below).",
+        "model_contains": ["sonnet-5-5"],
+        "levels": {
+          "none": "between_tools",
+          "minimal": { "effort": "low" },
+          "low": { "effort": "low" },
+          "medium": { "effort": "medium" },
+          "high": { "effort": "high" },
+          "xhigh": { "effort": "xhigh" },
+          "max": { "effort": "max" }
+        }
+      },
+      {
+        "id": "adaptive_default",
+        "_why": "Every other current model (Opus 5 / 4.8 / 4.7, Sonnet 5, and anything newer): adaptive thinking + effort low..max.",
+        "model_contains": [],
+        "levels": {
+          "none": "disabled",
+          "minimal": { "effort": "low" },
+          "low": { "effort": "low" },
+          "medium": { "effort": "medium" },
+          "high": { "effort": "high" },
+          "xhigh": { "effort": "xhigh" },
+          "max": { "effort": "max" }
+        }
+      }
+    ]
+  },
+  "gemini": {
+    "_levels": "a string is generationConfig.thinkingConfig.thinkingLevel; an integer is thinkingConfig.thinkingBudget; null unsupported.",
+    "thought_signature": {
+      "_why": "OG-02 D8. Gemini 3 400s a replayed history whose first functionCall (per step) lacks a thoughtSignature. The gateway cannot round-trip the model's real signature through an OpenAI-shaped history, so for these models it sends Google's documented imported-history placeholder on the first functionCall of an assistant turn. Source: ai.google.dev/gemini-api/docs/generate-content/thought-signatures (\"context_engineering_is_the_way_to_go\" or \"skip_thought_signature_validator\"), checked 2026-10-01.",
+      "model_contains": ["gemini-3"],
+      "placeholder": "skip_thought_signature_validator"
+    },
+    "families": [
+      {
+        "id": "thinking_level",
+        "_why": "Gemini 3.x takes thinkingLevel; the lowest documented level stands in for none/minimal, the highest for xhigh/max.",
+        "model_contains": ["gemini-3"],
+        "levels": {
+          "none": "MINIMAL",
+          "minimal": "MINIMAL",
+          "low": "LOW",
+          "medium": "MEDIUM",
+          "high": "HIGH",
+          "xhigh": "HIGH",
+          "max": "HIGH"
+        }
+      },
+      {
+        "id": "thinking_budget",
+        "_why": "Gemini 2.5 and earlier take thinkingBudget (tokens). 2.5 Pro cannot go below 128 and cannot be disabled; Google answers 400 and the gateway relays its reason.",
+        "model_contains": [],
+        "levels": {
+          "none": 0,
+          "minimal": 128,
+          "low": 1024,
+          "medium": 8192,
+          "high": 24576,
+          "xhigh": 24576,
+          "max": 24576
+        }
+      }
+    ]
+  }
+}

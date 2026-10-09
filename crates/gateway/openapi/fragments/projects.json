@@ -1,0 +1,239 @@
+{
+  "module": "crates/gateway/src/project_routes.rs",
+  "operations": {
+    "GET /v1/projects": {
+      "summary": "The workspace's live projects.",
+      "tags": [
+        "projects"
+      ],
+      "responses": {
+        "200": {
+          "description": "Projects.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "projects": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            }
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "unavailable"
+      ]
+    },
+    "POST /v1/projects": {
+      "summary": "Create a project (owner only).",
+      "tags": [
+        "projects"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "environments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "201": {
+          "description": "The project.",
+          "schema": {
+            "$ref": "#/components/schemas/Project"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "project_name_taken / project_limit_reached",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "project_name_taken",
+        "project_limit_reached",
+        "unavailable"
+      ]
+    },
+    "GET /v1/projects/{id}": {
+      "summary": "One live project and the ids of its live keys.",
+      "tags": [
+        "projects"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The project.",
+          "schema": {
+            "$ref": "#/components/schemas/Project"
+          }
+        },
+        "404": {
+          "description": "project_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "project_not_found",
+        "unavailable"
+      ]
+    },
+    "PATCH /v1/projects/{id}": {
+      "summary": "Update a project (RFC 7396: null policy clears it; name and environments cannot be cleared).",
+      "tags": [
+        "projects"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "environments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The project and the changed field names.",
+          "schema": {
+            "$ref": "#/components/schemas/Project"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "project_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "project_name_taken / environment_in_use",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "project_not_found",
+        "project_name_taken",
+        "environment_in_use",
+        "unavailable"
+      ]
+    },
+    "DELETE /v1/projects/{id}": {
+      "summary": "Archive a project; refused while live keys remain.",
+      "tags": [
+        "projects"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "204": {
+          "description": "Archived."
+        },
+        "404": {
+          "description": "project_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "project_has_keys",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "project_not_found",
+        "project_has_keys",
+        "unavailable"
+      ]
+    }
+  }
+}

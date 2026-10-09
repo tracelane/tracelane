@@ -83,6 +83,9 @@ pub(crate) enum RejectionReason {
     KeyBudgetExceeded,
     /// `Step::WorkspaceBudget` — the tenant-wide USD spend ceiling (GWY-43).
     WorkspaceBudgetExceeded,
+    /// `Step::Policy` — the key.s or its project.s policy (OG-20). A refusal at
+    /// AUTHENTICATION (`source_ips`) is not counted here: it never reaches admission.
+    PolicyDenied,
 }
 
 impl RejectionReason {
@@ -91,6 +94,7 @@ impl RejectionReason {
             Self::RateLimited => "rate_limited",
             Self::KeyBudgetExceeded => "key_budget_exceeded",
             Self::WorkspaceBudgetExceeded => "workspace_budget_exceeded",
+            Self::PolicyDenied => "policy_denied",
         }
     }
 }
@@ -232,6 +236,10 @@ impl RejectionRegistry {
             RejectionReason::KeyBudgetExceeded | RejectionReason::WorkspaceBudgetExceeded => {
                 self.record_budget_exceeded(tenant)
             }
+            // OG-20: no process-lifetime counter of its own (the two above feed the
+            // Gateway-ops live counters, which name throttling and budgets only); the
+            // per-minute aggregate span below is where a policy refusal is recorded.
+            RejectionReason::PolicyDenied => {}
         }
 
         // 2. The new per-minute bucket.

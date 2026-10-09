@@ -486,6 +486,50 @@ pub fn redact_reversible_from(value: &str, base: usize) -> ReversibleRedaction {
     }
 }
 
+/// Every `RULES` pattern in ONE set (same order, so index `i` is `RULES[i]`), for
+/// [`contains_redactable`]: one pass over the text instead of one regex per rule.
+static RULE_SET: Lazy<regex::RegexSet> = Lazy::new(|| {
+    regex::RegexSet::new(RULES.iter().map(|r| r.pattern.as_str()))
+        .expect("PII rule set must compile — every member already compiled alone")
+});
+
+/// The shortest text any `RULES` pattern can match (`a@b.co`, an email, 6 bytes). Anything
+/// shorter is clean without running a regex — the gateway's egress walk hands this every
+/// JSON key and every short schema keyword (`type`, `string`, …).
+const MIN_REDACTABLE_LEN: usize = 6;
+
+/// `true` iff [`redact_reversible`] would rewrite `value` — exactly
+/// `!redact_reversible(value).is_clean()`, without allocating the rewritten copy.
+///
+/// Why it is exact: `redact_reversible` rewrites only after some rule matches the ORIGINAL
+/// text (the first match is always on the unmodified string), and the Luhn-gated card pass
+/// runs over the original when nothing else matched. So "some non-card rule matches, or a
+/// card candidate passes Luhn" is the same predicate. Proven against the redactor in
+/// `contains_redactable_agrees_with_the_reversible_redactor`.
+///
+/// For a caller that must judge MANY small strings — every text leaf of a request body
+/// (M-1, security re-review 2026-10-02) — where calling the redactor on each would
+/// allocate a copy of every leaf.
+#[must_use]
+pub fn contains_redactable(value: &str) -> bool {
+    if value.len() < MIN_REDACTABLE_LEN {
+        return false;
+    }
+    let hits = RULE_SET.matches(value);
+    if !hits.matched_any() {
+        return false;
+    }
+    let mut card_candidate = false;
+    for i in hits.iter() {
+        if RULES[i].category == "credit_card" {
+            card_candidate = true;
+        } else {
+            return true;
+        }
+    }
+    card_candidate && CC_RE.find_iter(value).any(|m| luhn_check(m.as_str()))
+}
+
 /// Luhn-gated reversible credit-card pass: each 13–19 digit run that passes
 /// Luhn becomes a `{{TL_REDACT:credit_card:<idx>}}` placeholder; invalid runs
 /// (timestamps, ids) are left untouched.
@@ -957,5 +1001,60 @@ mod tests {
         assert!(!is_secret_category("email"));
         assert!(!is_secret_category("credit_card"));
         assert!(!is_secret_category("unknown_made_up"));
+    }
+
+    /// `contains_redactable` is the redactor's own verdict, not an approximation: over a corpus
+    /// that hits every rule, its near misses, Luhn-valid and -invalid card runs, and strings at
+    /// and below the short-circuit length, it agrees with `!redact_reversible(..).is_clean()`.
+    #[test]
+    fn contains_redactable_agrees_with_the_reversible_redactor() {
+        let corpus = [
+            "",
+            "a",
+            "a@b.c",
+            "a@b.co",
+            "type",
+            "string",
+            "1.2.3.4",
+            "1.2.3",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AKIAIOSFODNN7EXAMPL",
+            FAKE_TLANE,
+            "tlane_short",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+            concat!("sk_live_", "abcdefghijklmnopqrstuvwx"),
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "AIzaSyA-abcdefghijklmnopqrstuvwxyz01234",
+            "Bearer abcdefghijklmnop",
+            "Bearer short",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln",
+            "xoxb-1234567890-abc",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+            "mail nobody@example.com now",
+            "ssn 123-45-6789",
+            "call +1 415 555 2671",
+            "(415) 555-2671",
+            "415.555.2671",
+            "card 4111 1111 1111 1111",
+            "card 4111 1111 1111 1112",
+            "ts 1727950000000123 id",
+            "fe80:0000:0000:0000:0204:61ff:fe9d:f156",
+            "Get the current weather for a city.",
+            "The city name, e.g. Paris or San Francisco",
+            "{{TL_REDACT:aws_key:0}}",
+        ];
+        for s in corpus {
+            assert_eq!(
+                contains_redactable(s),
+                !redact_reversible(s).is_clean(),
+                "disagreement on {s:?}"
+            );
+        }
+        assert!(contains_redactable("AKIAIOSFODNN7EXAMPLE"));
+        assert!(
+            !contains_redactable("card 4111 1111 1111 1112"),
+            "Luhn-gated"
+        );
+        assert!(contains_redactable("card 4111 1111 1111 1111"));
     }
 }

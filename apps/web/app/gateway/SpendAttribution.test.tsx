@@ -118,3 +118,17 @@ it("links a key spend row to its editable settings deep link", () => {
 		"/settings/api-keys?key=0f9e8d7c-0000-0000-0000-000000000000",
 	);
 });
+
+it("discloses that tag groups can double-count a request", () => {
+	const html = renderToStaticMarkup(
+		h(SpendAttribution, {
+			data: { ...fixture, by: "tag" },
+			by: "tag",
+			hrefFor: (by) => `/gateway?by=${by}`,
+		}),
+	);
+	expect(html).toMatch(/multiple tags.*each/);
+	expect(html).toContain("Environment");
+	expect(html).toContain("Release");
+	expect(html).toContain("Service");
+});

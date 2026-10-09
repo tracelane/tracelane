@@ -134,11 +134,14 @@ pub struct SpanAttributes {
     /// Reasoning/thinking tokens (`gen_ai.usage.reasoning.output_tokens`, v1.41).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_usage_reasoning_output_tokens: Option<u32>,
-    /// Upstream-reported request cost in USD (`gen_ai.usage.cost`;).
-    /// Only set when the provider reports cost on the wire (e.g. OpenRouter);
-    /// never computed from a local price table.
+    /// Request cost in USD. Provider-reported when present; the gateway may
+    /// otherwise compute it from the model price catalog. See cost origin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_usage_cost: Option<f64>,
+    /// Provenance of the stored cost. Absent on historical spans; readers must
+    /// not label those costs computed merely because a catalog match exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_usage_cost_origin: Option<String>,
     /// Whether the request was streamed (`gen_ai.request.stream`, v1.41).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_request_stream: Option<bool>,
@@ -259,6 +262,12 @@ pub struct SpanAttributes {
     /// Argon2id verifier and nothing else).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_api_key_id: Option<String>,
+    /// `OG-23` — the project the paying API key belongs to (`api_keys.project_id`, a
+    /// UUID, resolved in the gateway's auth SELECT; never from a header). Absent for a
+    /// key in no project and for a JWT session. An older ingest that predates this field
+    /// carries it through `extra` (flattened) unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_project_id: Option<String>,
     /// RI-05 / M2 (`crates/gateway/src/rejection_metrics.rs`) — the admission-refusal
     /// reason this AGGREGATE span rolls up, one of `rate_limited` |
     /// `key_budget_exceeded` | `workspace_budget_exceeded`. Present ONLY on a
@@ -313,6 +322,9 @@ pub struct SpanAttributes {
     pub gen_ai_tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_tool_call_arguments: Option<String>,
+    /// Gateway-computed workspace-keyed equality, before capture removes text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen_ai_tool_call_arg_fp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gen_ai_tool_call_result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -525,6 +537,10 @@ pub struct SpanAttributes {
     /// 32-call cap as the names. Absent when no tool was called.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_response_tool_arg_bytes: Option<Vec<u32>>,
+    /// Workspace-keyed argument equality, aligned with the bounded called names.
+    /// Ungated; absent without a pepper. Never an unkeyed content hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_response_tool_arg_fps: Option<Vec<String>>,
     /// `GWY-49`: the request carried `x-tracelane-zdr: required`. Present (true) only
     /// then — absent means no constraint was asked for, never "not required".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -550,6 +566,16 @@ pub struct SpanAttributes {
     /// parse".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracelane_request_deployment_id: Option<String>,
+    /// `OG-03`: the NAMES (never the values) of the top-level request fields the
+    /// gateway did not model and forwarded to an OpenAI-compatible provider, sorted
+    /// and bounded. Absent when the caller sent none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_request_extra_keys: Option<Vec<String>>,
+    /// `OG-03`: how many image / audio / file parts the request carried. Rails
+    /// R2–R8 see only TEXT parts, so this makes unscanned content visible rather
+    /// than implied. Absent (not `0`) for a text-only request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracelane_request_non_text_parts: Option<u32>,
     /// `OBS-53`. Arithmetic mean of the per-token `logprob` the provider returned.
     /// **NOT a probability, NOT a calibrated confidence, and NOT comparable
     /// between models** — every surface that renders it must say so. Present only
@@ -612,7 +638,10 @@ pub struct DispatchAttempt {
     /// `model_not_found` | `provider_request_rejected` |
     /// `provider_unavailable` — `server/errors.rs::DispatchFailure::reason`);
     /// otherwise, for a SKIPPED failover candidate, one of `no_byok_key` |
-    /// `breaker_open` | `killed` | `unroutable`.
+    /// `breaker_open` | `killed` | `unroutable` | `zdr_ineligible` |
+    /// `unsupported_request` (OG-03: the candidate's wire cannot honour a field or
+    /// part the request carries) | `policy_denied` (OG-20: the key's policy denies the
+    /// candidate's model or provider).
     ///
     /// **NEVER the upstream error body.** `.claude/rules/security.md` bans a
     /// provider error body here (it routinely echoes the credential) — and
@@ -623,6 +652,11 @@ pub struct DispatchAttempt {
     /// Wall-clock milliseconds spent on this attempt. `0` for a skipped
     /// candidate — nothing was dispatched.
     pub took_ms: u32,
+    /// `OG-11`: the key-pool label this attempt dispatched with, when the workspace's
+    /// routing document gave the provider a pool. Absent otherwise (one `default` key).
+    /// A label is the customer's own name for a key, never key material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_label: Option<String>,
 }
 
 /// `RI-05` §5: a generous ceiling on how long

@@ -89,7 +89,7 @@ it("keeps the issue-filtered empty live view distinct and offers a window-preser
 		es.emit("full", JSON.stringify({ rows: [], stale: false, servedAt: 0 })),
 	);
 	expect(
-		screen.getByText("No traces in this window have Truncated."),
+		screen.getByText("No traces in this window have Hit token limit."),
 	).toBeTruthy();
 	expect(
 		screen.getByRole("link", { name: "Clear filter" }).getAttribute("href"),

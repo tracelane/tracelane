@@ -540,9 +540,27 @@ struct RateWindow {
 /// change touches). `future::Cache` is already an established dependency here
 /// (`entitlement_cache.rs`, `semantic_cache.rs`, `online_eval.rs`) and this
 /// handler is already `async`, so the `.await` costs nothing extra.
+///
+/// rev4 H2 (2026-10-03): keyed on [`crate::preauth_limiter::source_of`] — the SAME
+/// source rule the API-key throttle uses (the TCP peer unless it is a trusted
+/// proxy; then the client header; IPv6 as its /64) — and an IPv6 source must ALSO
+/// be under budget in its /48. It used to key on the raw `cf-connecting-ip` string,
+/// believed from any peer and never aggregated, so a direct caller or one IPv6 host
+/// rotating its low bits had an unlimited budget on a route that reaches Postgres.
 pub struct ShareRateLimiter {
-    buckets: moka::future::Cache<String, Arc<Mutex<RateWindow>>>,
+    buckets: moka::future::Cache<u128, Arc<Mutex<RateWindow>>>,
+    /// Share tokens that resolved to nothing within [`UNKNOWN_TOKEN_TTL`] — asked
+    /// again, they are a 404 without a Postgres round trip (rev4 H2).
+    unknown_tokens: moka::future::Cache<[u8; 32], ()>,
 }
+
+/// How long an unknown share token is remembered. Same figure and reasoning as the
+/// API-key negative cache (`db::api_keys::NEGATIVE_TTL`): long enough that a scan
+/// repeating tokens is a map probe, short enough that nothing real waits on it — a
+/// share token is 256 random bits, so a token minted AFTER a probe of the same
+/// value does not happen.
+const UNKNOWN_TOKEN_TTL: Duration = Duration::from_secs(30);
+const UNKNOWN_TOKEN_CAPACITY: u64 = 10_000;
 
 impl ShareRateLimiter {
     pub fn new() -> Self {
@@ -551,15 +569,35 @@ impl ShareRateLimiter {
                 .max_capacity(200_000)
                 .time_to_idle(Duration::from_secs((RATE_LIMIT_WINDOW_SECS as u64) * 3))
                 .build(),
+            unknown_tokens: moka::future::Cache::builder()
+                .max_capacity(UNKNOWN_TOKEN_CAPACITY)
+                .time_to_live(UNKNOWN_TOKEN_TTL)
+                .build(),
         }
+    }
+
+    /// `Some(retry_after_secs)` when `source` (or, for IPv6, its wide network) is
+    /// over budget for the current window; `None` when the request is allowed.
+    async fn check_source(
+        &self,
+        source: crate::preauth_limiter::SourceKey,
+        now_secs: i64,
+    ) -> Option<i64> {
+        let p = crate::providers::translation_policy::auth_throttle_policy();
+        let own = self.check(source.raw(), now_secs).await;
+        let wide = match source.wide(p.ipv6_wide_prefix_len, p.ipv6_prefix_len) {
+            Some(w) => self.check(w.raw(), now_secs).await,
+            None => None,
+        };
+        own.max(wide)
     }
 
     /// `Some(retry_after_secs)` when `key` is over budget for the current
     /// window; `None` when the request is allowed.
-    async fn check(&self, key: &str, now_secs: i64) -> Option<i64> {
+    async fn check(&self, key: u128, now_secs: i64) -> Option<i64> {
         let entry = self
             .buckets
-            .get_with(key.to_string(), async move {
+            .get_with(key, async move {
                 Arc::new(Mutex::new(RateWindow {
                     start_secs: now_secs,
                     count: 0,
@@ -600,46 +638,17 @@ impl Default for ShareRateLimiter {
 static RATE_LIMIT_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VIEW_COUNT_INCREMENT_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// The client identity a rate-limit bucket is keyed on: the FIRST hop of
-/// `X-Forwarded-For`.
-///
-/// TRUST ASSUMPTION: this gateway sits behind Caddy in every deployment
-/// topology it runs in (`admin_audit.rs`'s `ip_addr` doc carries the same
-/// assumption for its audit rows), and Caddy sets/overwrites this header for
-/// the real client connection — so the first hop is the value Caddy itself
-/// observed, not one an attacker appended.
-///
-/// NO SOCKET-ADDRESS FALLBACK: axum's `ConnectInfo` extractor requires the
-/// server to be served via `Router::into_make_service_with_connect_info`
-/// (`axum::extract::connect_info`), and this gateway's `axum::serve(listener,
-/// app)` call (`server.rs`) does not use it — wiring that up is a
-/// wider-blast-radius change (it touches how EVERY route is served, not just
-/// this module's mount) than this change's stated edit scope allows. A
-/// request with no `X-Forwarded-For` (direct-to-gateway: local dev, a test
-/// harness, or a misconfigured edge) is bucketed under one shared key instead
-/// of left unlimited — the conservative direction: it under-serves a fleet of
-/// direct callers sharing one bucket rather than exempting any of them from
-/// the limit entirely.
-fn client_ip_key(headers: &HeaderMap) -> String {
-    // PROVEN WRONG ON PROD 2026-09-06, first deploy of this route: 130 requests
-    // in 37 s from one client, zero 429s. Behind Cloudflare → Caddy the first
-    // hop of `X-Forwarded-For` is a ROTATING Cloudflare edge address, so every
-    // request landed in a fresh bucket and the limiter limited nothing.
-    // Cloudflare puts the real client in `CF-Connecting-IP`; prefer it, fall
-    // back to the XFF first hop for a non-Cloudflare edge, then the shared key.
-    let first_non_empty = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    first_non_empty("cf-connecting-ip")
-        .or_else(|| first_non_empty("x-forwarded-for"))
-        .unwrap_or_else(|| "__direct__".to_string())
-}
+/// Unknown share tokens answered 404 from the negative cache, no Postgres.
+static UNKNOWN_TOKEN_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// The client identity a bucket is keyed on is `preauth_limiter::source_of` (rev4
+// H2). History, kept because it explains the rule: the first cut keyed on the FIRST
+// `x-forwarded-for` hop — PROVEN WRONG ON PROD 2026-09-06 (130 requests in 37 s,
+// zero 429s: behind Cloudflare → Caddy that hop is a ROTATING Cloudflare edge
+// address); the second preferred `cf-connecting-ip` but believed it from ANY peer
+// and keyed on the raw string, so a direct caller or an IPv6 host rotating its low
+// bits minted a bucket per request. `ConnectInfo` now exists (`server.rs` serves
+// with it), so the peer decides whether a header is believed at all.
 
 // ── Router state ─────────────────────────────────────────────────────────────
 
@@ -906,12 +915,17 @@ async fn public_share_handler(
     State(state): State<ShareState>,
     Path(token): Path<String>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
 ) -> Response {
     // Rate limit FIRST — before any Postgres or ClickHouse work, so a flood
     // costs this process a header parse and a cache lookup, nothing more.
-    let ip_key = client_ip_key(&headers);
+    let source = crate::preauth_limiter::source_of(
+        &headers,
+        crate::preauth_limiter::peer_of(&extensions),
+        crate::providers::translation_policy::auth_throttle_policy(),
+    );
     let now_secs = chrono::Utc::now().timestamp();
-    if let Some(retry_after) = state.rate_limiter.check(&ip_key, now_secs).await {
+    if let Some(retry_after) = state.rate_limiter.check_source(source, now_secs).await {
         RATE_LIMIT_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
         let mut resp = error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -928,6 +942,13 @@ async fn public_share_handler(
     }
 
     let hash = hash_token(&token);
+    let unknown_key: Option<[u8; 32]> = hash.as_slice().try_into().ok();
+    if let Some(k) = unknown_key
+        && state.rate_limiter.unknown_tokens.get(&k).await.is_some()
+    {
+        UNKNOWN_TOKEN_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return not_found_share();
+    }
     let resolved = match state.store.resolve(&hash).await {
         Ok(r) => r,
         Err(err) => {
@@ -939,6 +960,10 @@ async fn public_share_handler(
         }
     };
     let Some(share) = resolved else {
+        // Missing, expired and revoked are one answer (module header); remember it.
+        if let Some(k) = unknown_key {
+            state.rate_limiter.unknown_tokens.insert(k, ()).await;
+        }
         return not_found_share();
     };
     let ResolvedShare {
@@ -1204,19 +1229,32 @@ mod tests {
         assert_ne!(t1, t2);
     }
 
+    /// The bucket key is `preauth_limiter::source_of`'s: behind the trusted proxy
+    /// `cf-connecting-ip` wins over the ROTATING Cloudflare edge hop in XFF (the
+    /// 2026-09-06 prod defect), and the rightmost XFF entry is the fallback.
     #[test]
-    fn client_ip_prefers_cf_connecting_ip_over_the_rotating_xff_edge_hop() {
+    fn behind_the_proxy_the_cf_header_beats_the_rotating_xff_edge_hop() {
+        let p = crate::providers::translation_policy::auth_throttle_policy();
+        let caddy: Option<std::net::IpAddr> = Some("172.18.0.5".parse().unwrap());
         let mut h = HeaderMap::new();
         h.insert(
             "x-forwarded-for",
-            "172.71.0.9, 203.0.113.50".parse().unwrap(),
+            "203.0.113.50, 172.71.0.9".parse().unwrap(),
         );
         h.insert("cf-connecting-ip", "198.51.100.7".parse().unwrap());
-        assert_eq!(client_ip_key(&h), "198.51.100.7");
-        let mut only_xff = HeaderMap::new();
-        only_xff.insert("x-forwarded-for", "203.0.113.50, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_ip_key(&only_xff), "203.0.113.50");
-        assert_eq!(client_ip_key(&HeaderMap::new()), "__direct__");
+        assert_eq!(
+            crate::preauth_limiter::source_of(&h, caddy, p),
+            src("198.51.100.7")
+        );
+        h.remove("cf-connecting-ip");
+        assert_eq!(
+            crate::preauth_limiter::source_of(&h, caddy, p),
+            src("172.71.0.9")
+        );
+    }
+
+    fn src(ip: &str) -> crate::preauth_limiter::SourceKey {
+        crate::preauth_limiter::SourceKey::of_ip(ip.parse().unwrap(), 64)
     }
 
     // ── rate limiter ─────────────────────────────────────────────────────
@@ -1226,11 +1264,11 @@ mod tests {
         let limiter = ShareRateLimiter::new();
         for i in 0..RATE_LIMIT_MAX_PER_WINDOW {
             assert!(
-                limiter.check("1.2.3.4", 1_000).await.is_none(),
+                limiter.check_source(src("1.2.3.4"), 1_000).await.is_none(),
                 "request {i} should be allowed"
             );
         }
-        let blocked = limiter.check("1.2.3.4", 1_000).await;
+        let blocked = limiter.check_source(src("1.2.3.4"), 1_000).await;
         assert!(blocked.is_some(), "the 61st request must be blocked");
         assert!(blocked.unwrap() > 0);
     }
@@ -1239,13 +1277,13 @@ mod tests {
     async fn window_resets_after_60_seconds() {
         let limiter = ShareRateLimiter::new();
         for _ in 0..RATE_LIMIT_MAX_PER_WINDOW {
-            assert!(limiter.check("5.6.7.8", 1_000).await.is_none());
+            assert!(limiter.check_source(src("5.6.7.8"), 1_000).await.is_none());
         }
-        assert!(limiter.check("5.6.7.8", 1_000).await.is_some());
+        assert!(limiter.check_source(src("5.6.7.8"), 1_000).await.is_some());
         // A new window (>= 60s later) resets the count.
         assert!(
             limiter
-                .check("5.6.7.8", 1_000 + RATE_LIMIT_WINDOW_SECS)
+                .check_source(src("5.6.7.8"), 1_000 + RATE_LIMIT_WINDOW_SECS)
                 .await
                 .is_none()
         );
@@ -1255,26 +1293,40 @@ mod tests {
     async fn different_ips_have_independent_buckets() {
         let limiter = ShareRateLimiter::new();
         for _ in 0..RATE_LIMIT_MAX_PER_WINDOW {
-            assert!(limiter.check("9.9.9.9", 1_000).await.is_none());
+            assert!(limiter.check_source(src("9.9.9.9"), 1_000).await.is_none());
         }
-        assert!(limiter.check("9.9.9.9", 1_000).await.is_some());
+        assert!(limiter.check_source(src("9.9.9.9"), 1_000).await.is_some());
         // A different IP is unaffected.
-        assert!(limiter.check("10.10.10.10", 1_000).await.is_none());
-    }
-
-    #[test]
-    fn client_ip_key_takes_the_first_xff_hop() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            "203.0.113.9, 10.0.0.1, 10.0.0.2".parse().unwrap(),
+        assert!(
+            limiter
+                .check_source(src("10.10.10.10"), 1_000)
+                .await
+                .is_none()
         );
-        assert_eq!(client_ip_key(&h), "203.0.113.9");
     }
 
-    #[test]
-    fn client_ip_key_falls_back_when_absent() {
-        assert_eq!(client_ip_key(&HeaderMap::new()), "__direct__");
+    /// rev4 H2: an IPv6 /48 is one site — its /64s share the wide budget.
+    #[tokio::test]
+    async fn rev4_h2_the_slash_64s_of_one_slash_48_share_its_budget() {
+        let limiter = ShareRateLimiter::new();
+        for i in 0..RATE_LIMIT_MAX_PER_WINDOW {
+            let s = src(&format!("2001:db8:9:{:x}::1", i + 1));
+            assert!(limiter.check_source(s, 1_000).await.is_none());
+        }
+        assert!(
+            limiter
+                .check_source(src("2001:db8:9:ffff::1"), 1_000)
+                .await
+                .is_some(),
+            "a fresh /64 inside the spent /48 is refused"
+        );
+        assert!(
+            limiter
+                .check_source(src("2001:db8:a::1"), 1_000)
+                .await
+                .is_none(),
+            "the next /48 is another site"
+        );
     }
 
     // ── fake reader + store, for handler-level tests ────────────────────
@@ -1302,6 +1354,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TraceReader for FakeReader {
+        async fn rescue_summary(
+            &self,
+            _tenant: &TenantId,
+            _since: i64,
+            _until: i64,
+        ) -> Result<Vec<crate::rescue::RescueRow>> {
+            Ok(vec![crate::rescue::RescueRow {
+                overall: 1,
+                ..Default::default()
+            }])
+        }
+        async fn trace_rescues(
+            &self,
+            _tenant: &TenantId,
+            _ids: &[String],
+            _since: i64,
+            _until: i64,
+        ) -> Result<Vec<crate::rescue::TraceRescueRow>> {
+            Ok(vec![])
+        }
+
         async fn generation_issue_summary(
             &self,
             _tenant_id: &TenantId,
@@ -1493,6 +1566,8 @@ mod tests {
     struct FakeShareStore {
         rows: Mutex<Vec<FakeRow>>,
         workspace_names: HashMap<String, String>,
+        /// rev4 H2: how many times `resolve` reached the "database".
+        resolve_calls: Arc<AtomicU64>,
     }
 
     #[derive(Clone)]
@@ -1511,6 +1586,7 @@ mod tests {
             Self {
                 rows: Mutex::new(Vec::new()),
                 workspace_names: HashMap::new(),
+                resolve_calls: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -1587,6 +1663,7 @@ mod tests {
         }
 
         async fn resolve(&self, token_hash: &[u8]) -> Result<Option<ResolvedShare>> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
             let rows = self.rows.lock().unwrap();
             Ok(rows
                 .iter()
@@ -1924,6 +2001,76 @@ mod tests {
             .await;
         let v: serde_json::Value = resp.json();
         assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    // ── rev4 H2: the public route's limiter keys on the REAL source ─────
+
+    fn server_behind(peer: &str, store: FakeShareStore) -> axum_test::TestServer {
+        let state = test_state(Arc::new(FakeReader::new()), Arc::new(store));
+        let peer: std::net::SocketAddr = peer.parse().unwrap();
+        axum_test::TestServer::new(
+            routes()
+                .with_state(state)
+                .layer(axum::extract::connect_info::MockConnectInfo(peer)),
+        )
+    }
+
+    /// A client talking to the gateway directly (the self-host compose publishes
+    /// :8080) writes its own `cf-connecting-ip`; a fresh one per request must not
+    /// buy a fresh window.
+    #[tokio::test]
+    async fn rev4_h2_a_public_peer_cannot_rotate_the_forwarding_header() {
+        let server = server_behind("203.0.113.77:4000", FakeShareStore::new());
+        let mut limited = 0;
+        for i in 0..(RATE_LIMIT_MAX_PER_WINDOW + 10) {
+            let resp = server
+                .get("/v1/share/not-a-real-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+                .add_header("cf-connecting-ip", format!("10.20.{}.{}", i / 250, i % 250))
+                .await;
+            if resp.status_code() == StatusCode::TOO_MANY_REQUESTS {
+                limited += 1;
+            }
+        }
+        assert_eq!(limited, 10, "the peer is the source; the header is ignored");
+    }
+
+    /// Behind the trusted proxy the header IS the source — but one IPv6 subscriber
+    /// is a /64, not 2^64 sources.
+    #[tokio::test]
+    async fn rev4_h2_ipv6_rotation_inside_one_slash_64_is_one_source() {
+        let server = server_behind("172.18.0.5:4000", FakeShareStore::new());
+        let mut limited = 0;
+        for i in 0..(RATE_LIMIT_MAX_PER_WINDOW + 10) {
+            let resp = server
+                .get("/v1/share/not-a-real-token-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy")
+                .add_header("cf-connecting-ip", format!("2001:db8:5:6::{:x}", i + 1))
+                .await;
+            if resp.status_code() == StatusCode::TOO_MANY_REQUESTS {
+                limited += 1;
+            }
+        }
+        assert_eq!(limited, 10);
+    }
+
+    /// An unknown share token is remembered: asking again (from any source) costs
+    /// no `resolve` round trip.
+    #[tokio::test]
+    async fn rev4_h2_unknown_share_tokens_are_negatively_cached() {
+        let store = FakeShareStore::new();
+        let calls = Arc::clone(&store.resolve_calls);
+        let server = server_behind("172.18.0.5:4000", store);
+        for i in 0..5 {
+            let resp = server
+                .get("/v1/share/unknown-token-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                .add_header("cf-connecting-ip", format!("198.51.100.{}", 60 + i))
+                .await;
+            assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first ask reached the store"
+        );
     }
 
     #[tokio::test]

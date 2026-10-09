@@ -21,6 +21,33 @@ const h = vi.hoisted(() => ({
 	isAdmin: true as boolean | null,
 }));
 
+const ctl = vi.hoisted(() => ({
+	record: vi.fn(
+		async (
+			..._a: unknown[]
+		): Promise<{ ok: true } | { ok: false; response: Response }> => ({
+			ok: true,
+		}),
+	),
+	failed: vi.fn(async (..._a: unknown[]) => undefined),
+}));
+const refused = (status: number, error: string) => ({
+	ok: false as const,
+	response: Response.json({ error }, { status }),
+});
+
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: ctl.record,
+	recordControlChangeFailed: ctl.failed,
+	redactEmail: (e: string) => `${e[0]}***${e.slice(e.indexOf("@"))}`,
+}));
+
+beforeEach(() => {
+	ctl.record.mockReset();
+	ctl.record.mockResolvedValue({ ok: true });
+	ctl.failed.mockReset();
+});
+
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -200,5 +227,33 @@ describe("POST /api/settings/cmk-keys/[keyId]/rotate", () => {
 		// update() and insert() were each invoked once on the rotation path.
 		expect(m.db.update).toHaveBeenCalledTimes(1);
 		expect(m.db.insert).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("POST /api/settings/cmk-keys/[keyId]/rotate — control-change recording", () => {
+	beforeEach(() => {
+		h.session = { tenantId: "org_SESSION", userId: "user_1", email: "a@b.co" };
+		h.isAdmin = true;
+		vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_unit_only");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("REJECT: recording refused -> 503 and no insert/update runs", async () => {
+		ctl.record.mockResolvedValue(refused(503, "control_audit_unavailable"));
+		const m = setDb([
+			[{ id: "tenant-db-uuid" }],
+			[
+				{
+					id: "key-1",
+					alias: "primary",
+					purpose: "all",
+					fingerprint: "cd".repeat(32),
+				},
+			],
+		]);
+		const res = await POST(req({ publicKeyPem: VALID_PEM }), params("key-1"));
+		expect(res.status).toBe(503);
+		expect(m.db.insert).not.toHaveBeenCalled();
+		expect(m.db.update).not.toHaveBeenCalled();
 	});
 });

@@ -1,20 +1,14 @@
-import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { NextResponse } from "next/server";
 
 export async function POST(
 	_req: Request,
 	{ params }: { params: Promise<{ providerId: string }> },
 ): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
 	const { providerId } = await params;
-	const response = await fetch(
-		`${gatewayBaseUrl()}/v1/provider-keys/${encodeURIComponent(providerId)}/validate`,
-		{
-			method: "POST",
-			headers: { authorization: `Bearer ${token}` },
-			cache: "no-store",
-		},
+	const response = await gatewayResponse(
+		`/v1/provider-keys/${encodeURIComponent(providerId)}/validate`,
+		{ method: "POST" },
 	);
 	if (!response.ok) {
 		const error =

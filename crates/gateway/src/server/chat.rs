@@ -23,17 +23,18 @@ use super::AppState;
 use super::buffered::buffer_provider_stream;
 use super::dispatch::{
     BENCH_MOCK_PROVIDER_ID, ProviderKey, breaker_outcome, dispatch_with_retry,
-    provider_name_from_model, resolve_provider_key, resolve_provider_key_traced,
+    provider_name_from_model,
 };
 use super::errors::{
-    invalid_zdr_constraint_response, provider_error_response, unroutable_model_response,
-    zdr_unsatisfiable_response,
+    invalid_zdr_constraint_response, provider_error_response, provider_error_response_with_detail,
+    unroutable_model_response, zdr_unsatisfiable_response,
 };
 use super::spans::{
-    CapturedInput, GatewayTiming, RequestConfig, SpanUsageMeta, build_gateway_span,
+    CapturedInput, CapturedOutput, GatewayTiming, RequestConfig, SpanUsageMeta, build_gateway_span,
     spawn_span_publish,
 };
 use super::stream::{StreamContext, provider_stream_to_sse};
+use crate::admission::Route as _;
 
 /// Does the request ask for SSE? Read from the raw body because the cache
 /// decision happens before the typed request is re-serialised anywhere.
@@ -41,12 +42,55 @@ fn is_streaming_request(body: &serde_json::Value) -> bool {
     body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
+/// `OG-20`: may this request be moved to `model` on `provider` (a ZDR re-route, a
+/// cross-provider failover)? `true` for a caller with no policy.
+fn policy_allows(
+    claims: &crate::auth::Claims,
+    controls: Option<&crate::controls::WorkspaceControls>,
+    model: &str,
+    provider: &str,
+) -> bool {
+    claims
+        .governance
+        .as_deref()
+        .is_none_or(|g| g.allows_dispatch(model, provider))
+        // OG-25: nor onto a model or provider the workspace has blocked.
+        && controls.is_none_or(|c| crate::controls::allows_dispatch(c, model, provider))
+}
+
+/// rev6 N3 — the embedding models the semantic cache tier may send THIS request's text
+/// to, in the configured order. Empty (the tier is off) when R2 redacted the request;
+/// otherwise every configured model whose provider is routable and that
+/// [`policy_allows`] (workspace blocks, the workspace policy, the key's policy) and —
+/// when the request requires ZDR (`zdr` is `Some`) — whose provider is ZDR-eligible.
+/// Fail-CLOSED: an unroutable embedding model is left out.
+fn semantic_tier_models(
+    configured: &[String],
+    redacted: bool,
+    claims: &crate::auth::Claims,
+    controls: Option<&crate::controls::WorkspaceControls>,
+    zdr: Option<&crate::zdr::ZdrCapabilities>,
+) -> Vec<String> {
+    if redacted {
+        return Vec::new();
+    }
+    configured
+        .iter()
+        .filter(|m| {
+            crate::providers::ProviderRegistry::provider_id_for_model(m).is_some_and(|pid| {
+                policy_allows(claims, controls, m, pid) && zdr.is_none_or(|caps| caps.eligible(pid))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// RI-05 M4 — one ledger element for a failover candidate that was SKIPPED
 /// without ever being dispatched. Factored out as a pure constructor (rather
 /// than four inline struct literals at the four `continue` sites in the
 /// failover loop below) so the closed token vocabulary — `no_byok_key` |
-/// `breaker_open` | `killed` | `unroutable` | `zdr_ineligible` (GWY-49) — is
-/// unit-testable without a
+/// `breaker_open` | `killed` | `unroutable` | `zdr_ineligible` (GWY-49) |
+/// `policy_denied` (OG-20) — is unit-testable without a
 /// `ChatRequest`, an `AppState`, or a fake circuit breaker.
 ///
 /// `attempt: 0` is a placeholder — `tracelane_shared::span::extend_dispatch_attempts`
@@ -54,6 +98,7 @@ fn is_streaming_request(body: &serde_json::Value) -> bool {
 /// when the caller merges this in.
 fn skipped_failover_attempt(provider: &str, model: &str, reason: &'static str) -> DispatchAttempt {
     DispatchAttempt {
+        key_label: None,
         attempt: 0,
         provider: provider.to_string(),
         model: model.to_string(),
@@ -62,6 +107,208 @@ fn skipped_failover_attempt(provider: &str, model: &str, reason: &'static str) -
         reason: Some(reason.to_string()),
         took_ms: 0,
     }
+}
+
+/// `OG-11`: stamp each attempt of one dispatch with the pool label it used (only when a
+/// pool chose it — a single `default` key records nothing new).
+fn label_attempts(attempts: &mut [DispatchAttempt], pooled: bool, label: &str) {
+    if pooled {
+        for a in attempts {
+            a.key_label = Some(label.to_owned());
+        }
+    }
+}
+
+/// `OG-11`: the key a routed request's chosen candidate dispatches with, and the rest of
+/// its pool for a key failure.
+struct RoutedKey {
+    label: String,
+    key: Arc<secrecy::SecretString>,
+    cursor: super::KeyCursor,
+    pooled: bool,
+    cold: bool,
+}
+
+/// `OG-11`: why a candidate was skipped (ledger elements) and whether the key store was
+/// unreadable while trying it.
+struct CandidateSkip {
+    attempts: Vec<DispatchAttempt>,
+    lookup_failed: bool,
+}
+
+/// What [`select_candidate`] judges a candidate against.
+struct SelectInput<'a> {
+    tenant_id: &'a TenantId,
+    claims: &'a crate::auth::Claims,
+    controls: Option<&'a crate::controls::WorkspaceControls>,
+    caller_budgeted: bool,
+    zdr_required: bool,
+    request: &'a tracelane_shared::ChatRequest,
+    routing: &'a crate::routing::RoutingState,
+    family: &'static str,
+    model: &'a str,
+    provider_id: &'static str,
+}
+
+/// `OG-11`: can this candidate serve the request right now? Killed, ZDR-ineligible,
+/// policy-denied, unpriced under a budget, unsupported, keyless, or breaker-open on
+/// every pool key → `Err` with the skip recorded. Otherwise the first pool key whose
+/// breaker would admit the call. The breaker is only PEEKED here (`would_allow`); the
+/// real `allow` runs at dispatch.
+async fn select_candidate(
+    state: &AppState,
+    i: SelectInput<'_>,
+    rng: crate::routing::Rng<'_>,
+) -> Result<RoutedKey, CandidateSkip> {
+    let skip = |reason: &'static str| CandidateSkip {
+        attempts: vec![skipped_failover_attempt(i.family, i.model, reason)],
+        lookup_failed: false,
+    };
+    if state.kill_switch.upstream_killed(i.family) {
+        return Err(skip("killed"));
+    }
+    if i.zdr_required && !state.zdr.load().eligible(i.provider_id) {
+        return Err(skip("zdr_ineligible"));
+    }
+    if !policy_allows(i.claims, i.controls, i.model, i.provider_id) {
+        return Err(skip("policy_denied"));
+    }
+    if i.caller_budgeted
+        && matches!(
+            crate::admission::token_pricing(i.model),
+            crate::admission::Pricing::Unpriced { .. }
+        )
+    {
+        return Err(skip("unpriced_under_budget"));
+    }
+    let mut probe = i.request.clone();
+    probe.model = super::config::alias(i.model)
+        .map_or_else(|| i.model.to_owned(), |a| a.upstream_model.clone());
+    if crate::request_support::check_supported(i.provider_id, &probe).is_err() {
+        return Err(skip("unsupported_request"));
+    }
+    let pool = crate::routing::pool_labels(
+        &crate::admission::Chat::ROUTING,
+        i.routing,
+        i.provider_id,
+        rng,
+    );
+    let pooled = pool.pooled;
+    let mut cursor = super::KeyCursor::new(pool.labels);
+    let env = crate::providers::ProviderRegistry::env_var_for_provider_id(i.provider_id);
+    let region = state.providers.upstream_region(i.provider_id);
+    let mut skips: Vec<DispatchAttempt> = Vec::new();
+    while let Some((label, key)) = cursor.next_key(i.tenant_id, i.provider_id, env).await {
+        let cred =
+            super::dispatch::breaker_cred(i.tenant_id, i.provider_id, &label, Some(i.routing));
+        if state.circuit_breaker.would_allow(i.family, region, &cred) {
+            let cold = cursor.cold;
+            return Ok(RoutedKey {
+                label,
+                key,
+                cursor,
+                pooled,
+                cold,
+            });
+        }
+        let mut s = skipped_failover_attempt(i.family, i.model, "breaker_open");
+        if pooled {
+            s.key_label = Some(label);
+        }
+        skips.push(s);
+    }
+    if skips.is_empty() {
+        let lookup_failed = matches!(cursor.into_failure(), ProviderKey::LookupFailed);
+        return Err(CandidateSkip {
+            attempts: vec![skipped_failover_attempt(i.family, i.model, "no_byok_key")],
+            lookup_failed,
+        });
+    }
+    Err(CandidateSkip {
+        attempts: skips,
+        lookup_failed: false,
+    })
+}
+
+/// `OG-11` §4: every candidate of a routed request was skipped — refuse with the
+/// STRICTEST skip's refusal (a control's 403 before a budget's 402 before a 400 before
+/// an outage's 503), so the caller is told the most actionable reason. The skips ride
+/// the error span.
+fn routed_refusal(
+    guard: &mut super::DispatchGuard,
+    skips: Vec<DispatchAttempt>,
+    model: &str,
+    lookup_failed: bool,
+    state: &AppState,
+) -> axum::response::Response {
+    let has = |r: &str| skips.iter().any(|a| a.reason.as_deref() == Some(r));
+    let provider = skips.first().map(|a| a.provider.clone());
+    let (status, code, message): (StatusCode, &'static str, String) = if has("policy_denied") {
+        (
+            StatusCode::FORBIDDEN,
+            "policy_model_denied",
+            "every target of this virtual model is denied by this API key's or workspace's policy"
+                .to_owned(),
+        )
+    } else if has("unpriced_under_budget") {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            crate::admission::UNPRICED_UNDER_BUDGET,
+            "every remaining target of this virtual model is unpriced, and this key or workspace has a budget".to_owned(),
+        )
+    } else if has("zdr_ineligible")
+        && !has("unsupported_request")
+        && !has("no_byok_key")
+        && !has("breaker_open")
+        && !has("killed")
+    {
+        guard.record_attempts(skips);
+        guard.abort("zdr_unsatisfiable", None);
+        return zdr_unsatisfiable_response(
+            model,
+            provider.as_deref().unwrap_or("unknown"),
+            state.zdr.load().default_count(),
+        );
+    } else if has("zdr_ineligible") || has("unsupported_request") {
+        (
+            StatusCode::BAD_REQUEST,
+            "unsupported_request",
+            "no target of this virtual model can serve this request (zero-data-retention or an unsupported field)".to_owned(),
+        )
+    } else if has("no_byok_key") && lookup_failed {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_key_unavailable",
+            "the key store could not be reached — nothing was sent to a provider; retry shortly"
+                .to_owned(),
+        )
+    } else if has("no_byok_key") && !has("breaker_open") && !has("killed") {
+        (
+            StatusCode::BAD_REQUEST,
+            "provider_not_configured",
+            "no API key is configured for any target of this virtual model — add one in Settings → LLM Providers".to_owned(),
+        )
+    } else {
+        guard.record_attempts(skips);
+        guard.abort("upstream_circuit_open", None);
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "upstream_circuit_open",
+                "message": "every target of this virtual model is temporarily unavailable through this gateway",
+                "retry_after_seconds": 10
+            })),
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("10"),
+        );
+        return resp;
+    };
+    guard.record_attempts(skips);
+    guard.abort(code, None);
+    provider_error_response(status, code, Some(&message), provider.as_deref(), None)
 }
 
 /// Optional prompt-promotion correlation extracted from the request body so
@@ -174,6 +421,18 @@ pub(super) fn spawn_prompt_metric_observation(
 ///   7. x402 payment event record (fire-and-forget)
 ///
 /// SSE chunks use OpenAI's `chat.completion.chunk` format for drop-in compatibility.
+/// `POST /v1/chat/completions` as mounted: the body through the strict parse (`M-A`,
+/// security re-review 2026-10-03 — a key repeated in any object is a 400
+/// `duplicate_json_key` before anything else runs, where `axum::Json` silently kept the
+/// last copy), then [`chat_completions_handler`].
+pub(crate) async fn chat_completions_route(
+    state: State<AppState>,
+    headers: HeaderMap,
+    crate::strict_json::StrictJson(body): crate::strict_json::StrictJson,
+) -> axum::response::Response {
+    chat_completions_handler(state, headers, Json(body)).await
+}
+
 #[instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
 pub(crate) async fn chat_completions_handler(
     State(state): State<AppState>,
@@ -182,8 +441,16 @@ pub(crate) async fn chat_completions_handler(
 ) -> axum::response::Response {
     let labels =
         super::request_labels::read(&headers, &state.rate_card.load().policy.request_labels);
-    let result =
-        chat_completions_handler_with_labels(State(state), headers, Json(body), &labels).await;
+    // Boxed: this future is the biggest on the hot path (admission, cache, routing, guardrails,
+    // KMS key resolve, dispatch and failover in one state machine). Awaited inline it overflowed
+    // a 2 MiB stack in the handler tests after the OG-11/OG-30/OG-37 merge.
+    let result = Box::pin(chat_completions_handler_with_labels(
+        State(state),
+        headers,
+        Json(body),
+        &labels,
+    ))
+    .await;
     super::request_labels::response(result, &labels)
 }
 
@@ -198,6 +465,18 @@ async fn chat_completions_handler_with_labels(
         Ok(control) => control,
         Err(err) => return err.response(false),
     };
+    // OG-51: the optional namespace header is validated with the cache header — a bad one is
+    // a 400 before anything is charged, exactly like a bad `x-tracelane-cache`.
+    let cache_namespace_header = match crate::cache_controls::namespace_header(&headers) {
+        Ok(v) => v,
+        Err(()) => {
+            return crate::semantic_cache::CacheRefusal {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_cache_control",
+            }
+            .response(false);
+        }
+    };
     // --- Step 1: ADMISSION. Nothing above this line resolves a credential. ---
     // Every refusal (401 / 403 / 400 / 429 / 402 / 503) is rendered on this wire
     // by `Chat::refuse`; an `Err` here means NO ledger row landed.
@@ -207,6 +486,7 @@ async fn chat_completions_handler_with_labels(
     };
     super::request_labels::attach(&mut admitted, labels);
     let crate::admission::Admitted {
+        attempt_security,
         claims,
         mut identity,
         request_start,
@@ -214,6 +494,7 @@ async fn chat_completions_handler_with_labels(
         inbound_parent,
         parsed,
         entitlements,
+        route_plan,
         bench_mock,
         warn_aft_id,
         correlation_id,
@@ -225,39 +506,6 @@ async fn chat_completions_handler_with_labels(
         body,
         request: mut chat_request,
     } = parsed;
-    let cache_policy = match cache_control.resolve(
-        entitlements.as_deref(),
-        state.semantic_cache.as_deref(),
-        !body
-            .get("stream")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    ) {
-        Ok(policy) => policy,
-        Err(err) => {
-            dispatch_guard.abort(err.code, None);
-            return err.response(false);
-        }
-    };
-    let cache_context = state.prompt_router.canary_cache_context(&claims.tenant_id);
-    if cache_context.suspended
-        && matches!(
-            cache_control,
-            crate::semantic_cache::CacheControl::Use | crate::semantic_cache::CacheControl::Ttl(_)
-        )
-    {
-        dispatch_guard.abort("response_cache_suspended_for_canary", None);
-        return crate::semantic_cache::CacheRefusal {
-            status: StatusCode::CONFLICT,
-            code: "response_cache_suspended_for_canary",
-        }
-        .response(false);
-    }
-    let cache_policy = if cache_context.suspended {
-        cache_policy.suspend()
-    } else {
-        cache_policy
-    };
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
     // `mut`: on a successful cross-provider failover below we reassign this to
@@ -278,15 +526,104 @@ async fn chat_completions_handler_with_labels(
     // One map probe on the already-resolved entitlements; no alias ⇒ no change. A
     // target that no longer routes fails CLOSED below (`unroutable_model`) — never a
     // default target.
-    if let Some(target) = entitlements
-        .as_deref()
-        .and_then(|e| crate::db::model_aliases::resolve(&e.model_aliases, &model))
+    //
+    // OG-11: a VIRTUAL model is resolved by the routing plan instead (its targets are
+    // concrete models, never aliases — the write refuses one), so the alias map is not
+    // consulted for it.
+    if route_plan.as_ref().is_none_or(|p| !p.dispatches())
+        && let Some(target) = entitlements
+            .as_deref()
+            .and_then(|e| crate::db::model_aliases::resolve(&e.model_aliases, &model))
     {
         let target = target.to_owned();
         chat_request.model.clone_from(&target);
         model = target;
         identity.tenant_alias_applied = true;
     }
+    // OG-51: decided ONCE, before the cache policy: whether this workspace records both prompt
+    // and response text. The privacy default reads it — a workspace that records nothing is not
+    // cached unless it explicitly opted in. The same decision every span site below reads.
+    let capture = super::config::capture_decision(
+        super::config::trace_content(),
+        entitlements.as_deref().map(|e| e.content_capture),
+        tenant_id,
+    );
+    let cache_end_user = identity.end_user_id.clone();
+    let cache_caller = crate::cache_controls::CacheCaller {
+        model: &chat_request.model,
+        key_id: claims
+            .api_key_id()
+            .and_then(|k| uuid::Uuid::parse_str(k).ok()),
+        project_id: claims.governance.as_deref().and_then(|g| g.project_id),
+        end_user: cache_end_user.as_deref(),
+        captured: capture.judge_may_read(),
+        namespace_header: cache_namespace_header.as_deref(),
+    };
+    let cache_policy = match cache_control.resolve(
+        entitlements.as_deref(),
+        state.semantic_cache.as_deref(),
+        !body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        &cache_caller,
+    ) {
+        Ok(policy) => policy,
+        Err(err) => {
+            dispatch_guard.abort(err.code, None);
+            return err.response(false);
+        }
+    };
+    // A scoped rail policy may change output enforcement. Neither exact nor semantic
+    // answers computed under another policy can satisfy it; suspend both tiers.
+    let cache_policy = if state
+        .guardrail
+        .policy_for(
+            *claims.tenant_id.as_uuid(),
+            claims.api_key_id(),
+            claims.governance.as_ref().and_then(|g| g.project_id),
+        )
+        .await
+        .has_controls()
+    {
+        cache_policy.suspend()
+    } else {
+        cache_policy
+    };
+    let cache_context = state.prompt_router.canary_cache_context(&claims.tenant_id);
+    if cache_context.suspended
+        && matches!(
+            cache_control,
+            crate::semantic_cache::CacheControl::Use | crate::semantic_cache::CacheControl::Ttl(_)
+        )
+    {
+        dispatch_guard.abort("response_cache_suspended_for_canary", None);
+        return crate::semantic_cache::CacheRefusal {
+            status: StatusCode::CONFLICT,
+            code: "response_cache_suspended_for_canary",
+        }
+        .response(false);
+    }
+    let cache_policy = if cache_context.suspended {
+        cache_policy.suspend()
+    } else {
+        cache_policy
+    };
+    // OG-11: the routing document (for key pools) and the plan's span facts.
+    let routing_state: Arc<crate::routing::RoutingState> = entitlements
+        .as_deref()
+        .map(|e| Arc::clone(&e.routing))
+        .unwrap_or_default();
+    let mut route_rng = crate::routing::thread_rng;
+    identity.route = super::RouteMeta::from_plan(route_plan.as_deref());
+    dispatch_guard.record_route(identity.route.clone());
+
+    // H2 / re-review H-3 (2026-10-02): does this caller carry a key or workspace budget?
+    // Read by every POST-admission model change below (ZDR re-route, failover) so none of
+    // them can move a budgeted request onto spend the gateway cannot price.
+    let caller_budgeted = crate::admission::caller_is_budgeted(&claims, entitlements.as_deref());
+    // OG-25: the workspace block lists, for the post-admission model moves below.
+    let ws_controls = entitlements.as_deref().map(|e| Arc::clone(&e.controls));
 
     // --- Step 2e: ONLINE-EVAL ADMISSION (EVL-28, item 11) ---
     //
@@ -312,11 +649,9 @@ async fn chat_completions_handler_with_labels(
     // workspace owner's opt-in (the entitlement cache's copy; `None` = no control
     // plane = the workspace half OFF). Every span site below and the judge read
     // THIS value; nothing re-decides later in the request.
-    let capture = super::config::capture_decision(
-        super::config::trace_content(),
-        entitlements.as_deref().map(|e| e.content_capture),
-        tenant_id,
-    );
+    // `capture` was decided above, before the response-cache policy needed it (OG-51);
+    // error spans share this workspace capture decision.
+    dispatch_guard.record_input(CapturedInput::build(capture, &chat_request));
     let (online_eval_policy, policy_round_trip) = crate::online_eval::admission(
         tenant_id,
         trace_id,
@@ -399,6 +734,77 @@ async fn chat_completions_handler_with_labels(
     // rejected 211 lines BEFORE the mock branch at :1358 — the benchmark has
     // never been reachable. BYOK resolution below is a second blocker on the
     // same path, so both are bypassed together.
+    // OG-11: a ROUTED request starts at the first candidate that can be dispatched. A
+    // candidate that is killed, ZDR-ineligible, policy-denied, unpriced under a budget,
+    // unsupported, keyless or breaker-open on every pool key is SKIPPED and recorded on
+    // the attempt ledger; nothing about the choice is silent. The candidates after the
+    // chosen one are the fallthrough targets. Every candidate is the CALLER'S OWN
+    // tenant's: the plan came from its document and each key is `(tenant, provider,
+    // label)`.
+    let mut route_skips: Vec<DispatchAttempt> = route_plan
+        .as_deref()
+        .map_or_else(Vec::new, crate::routing::RoutePlan::skipped_attempts);
+    let mut plan_rest: Vec<crate::routing::Candidate> = Vec::new();
+    let mut primary_pool: Option<RoutedKey> = None;
+    if let Some(plan) = route_plan.as_deref().filter(|p| p.dispatches()) {
+        let zdr_required = matches!(
+            crate::zdr::constraint_from_headers(&headers),
+            Ok(Some(crate::zdr::Constraint::Required))
+        );
+        let mut chosen: Option<usize> = None;
+        let mut lookup_failed = false;
+        for (i, c) in plan.candidates.iter().enumerate() {
+            let family = provider_name_from_model(&c.model);
+            match select_candidate(
+                &state,
+                SelectInput {
+                    tenant_id,
+                    claims: &claims,
+                    controls: ws_controls.as_deref(),
+                    caller_budgeted,
+                    zdr_required,
+                    request: &chat_request,
+                    routing: &routing_state,
+                    family,
+                    model: &c.model,
+                    provider_id: c.provider_id,
+                },
+                &mut route_rng,
+            )
+            .await
+            {
+                Ok(k) => {
+                    if k.cold {
+                        timer.note_cold();
+                        identity.cold_start = true;
+                    }
+                    primary_pool = Some(k);
+                    chosen = Some(i);
+                    break;
+                }
+                Err(skip) => {
+                    lookup_failed |= skip.lookup_failed;
+                    route_skips.extend(skip.attempts);
+                }
+            }
+        }
+        let Some(i) = chosen else {
+            return routed_refusal(
+                &mut dispatch_guard,
+                route_skips,
+                &model,
+                lookup_failed,
+                &state,
+            );
+        };
+        let c = &plan.candidates[i];
+        chat_request.model.clone_from(&c.model);
+        model.clone_from(&c.model);
+        identity.route.target_index = Some(c.target_index);
+        dispatch_guard.record_route(identity.route.clone());
+        plan_rest = plan.candidates[i + 1..].to_vec();
+    }
+
     let mut provider_id = if bench_mock {
         BENCH_MOCK_PROVIDER_ID
     } else {
@@ -468,6 +874,12 @@ async fn chat_completions_handler_with_labels(
             if primary_eligible {
                 eligible.push(provider_id.to_string());
             }
+            // OG-11: the virtual model's fallthrough targets the constraint leaves standing.
+            for c in &plan_rest {
+                if caps.eligible(c.provider_id) {
+                    eligible.push(c.provider_id.to_string());
+                }
+            }
             // (provider, model, provider_id) of the first candidate that is BOTH vouched
             // for and routable — an unroutable one is not a candidate (its key would be
             // the wrong one), same as the failover loop's own `unroutable` skip.
@@ -483,11 +895,27 @@ async fn chat_completions_handler_with_labels(
                     if !caps.eligible(fo_provider) {
                         continue;
                     }
+                    // Re-review H-3: the ZDR re-route happens AFTER admission priced the
+                    // primary; a budgeted caller must not be moved onto a model the
+                    // gateway cannot price (it would spend past the budget unseen).
+                    if caller_budgeted
+                        && matches!(
+                            crate::admission::token_pricing(fo_model),
+                            crate::admission::Pricing::Unpriced { .. }
+                        )
+                    {
+                        continue;
+                    }
                     let Some(fo_pid) =
                         crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
                     else {
                         continue;
                     };
+                    // OG-20: the key's policy judged the PRIMARY at admission; a re-route
+                    // must not land on a model or provider it denies.
+                    if !policy_allows(&claims, ws_controls.as_deref(), fo_model, fo_pid) {
+                        continue;
+                    }
                     if first_candidate.is_none() {
                         first_candidate = Some((fo_provider, fo_model.to_owned(), fo_pid));
                     }
@@ -533,33 +961,102 @@ async fn chat_completions_handler_with_labels(
         }
     };
 
+    // OG-03: can THIS provider honour every field and part the request carries? The
+    // provider is final here (ZDR prune ran) and nothing has touched a credential yet, so a
+    // refusal costs no key lookup and no upstream call. A field an adapter cannot map is a
+    // 400 naming it — fail CLOSED, never a different answer with no signal. A cross-provider
+    // failover candidate re-runs the same check for ITS provider (below). The bench mock
+    // never dispatches upstream, so it has nothing to translate.
+    //
+    // The `reasoning_effort` mapping keys on the model that will reach the WIRE, which a
+    // `tracelane.yaml` alias rewrites only later (after the cache key is derived, so it
+    // cannot move). Probe with the alias target — a clone, and only when an alias applies.
+    if !bench_mock {
+        let verdict = match super::config::alias(&model) {
+            Some(a) => {
+                let mut probe = chat_request.clone();
+                probe.model.clone_from(&a.upstream_model);
+                crate::request_support::check_supported(provider_id, &probe)
+            }
+            None => crate::request_support::check_supported(provider_id, &chat_request),
+        };
+        if let Err(unsupported) = verdict {
+            dispatch_guard.abort(unsupported.code, None);
+            return unsupported.into_response();
+        }
+    }
+
     // A4: BYOK lookup first — per-tenant ciphertext in `provider_keys` decrypted
-    // with AAD bound to (tenant_id, provider_id). On miss (no row, decrypt fail,
-    // pool unavailable) fall back to the legacy env var. The env var is derived
-    // from THIS provider_id, so a miss yields an empty key (upstream 401), never
-    // another provider's key.
+    // with AAD bound to (tenant_id, provider_id[, label]). On miss (no row, decrypt
+    // fail, pool unavailable) fall back to the legacy env var — `default` label only.
+    // The env var is derived from THIS provider_id, so a miss yields an empty key
+    // (upstream 401), never another provider's key.
     // The bench mock never dispatches upstream, so there is no credential
     // to resolve. Skipping the lookup also keeps the benchmark honest — it must
     // not measure a Postgres round-trip the mocked request would never make.
+    //
+    // OG-11: the key comes from the provider's POOL (`default` alone when the routing
+    // document gives the provider none): the first label whose key resolves and whose
+    // breaker would admit the call. A routed request already chose its key above.
+    let mut served_label = crate::db::provider_keys::DEFAULT_LABEL.to_owned();
+    let mut served_pooled = false;
+    let mut key_cursor: Option<super::KeyCursor> = None;
     let provider_key = if bench_mock {
         std::sync::Arc::new(secrecy::SecretString::from(String::new()))
+    } else if let Some(k) = primary_pool.take() {
+        served_label = k.label;
+        served_pooled = k.pooled;
+        key_cursor = Some(k.cursor);
+        k.key
     } else {
         let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
-        // First-value path: a launch-day user who has not added BYOK yet must be told
-        // to ADD a key, not that their key was "rejected". Dispatching an empty
-        // credential and relaying the upstream 401 read as "my key is broken" for a
-        // user who had no key at all. Fail here, before the upstream round-trip.
-        let (resolved, byok_round_trip) =
-            resolve_provider_key_traced(tenant_id, provider_id, key_env).await;
+        let pool = crate::routing::pool_labels(
+            &crate::admission::Chat::ROUTING,
+            &routing_state,
+            provider_id,
+            &mut route_rng,
+        );
+        served_pooled = pool.pooled;
+        let mut cursor = super::KeyCursor::new(pool.labels);
+        let family = provider_name_from_model(&model);
+        let region_for_pick = state.providers.upstream_region(provider_id);
+        let mut first_found: Option<(String, Arc<secrecy::SecretString>)> = None;
+        let mut picked: Option<(String, Arc<secrecy::SecretString>)> = None;
+        while let Some((label, k)) = cursor.next_key(tenant_id, provider_id, key_env).await {
+            let cred =
+                super::dispatch::breaker_cred(tenant_id, provider_id, &label, Some(&routing_state));
+            if !served_pooled
+                || state
+                    .circuit_breaker
+                    .would_allow(family, region_for_pick, &cred)
+            {
+                picked = Some((label, k));
+                break;
+            }
+            if first_found.is_none() {
+                first_found = Some((label, k));
+            }
+        }
         // B-568 I5: a BYOK cache miss read the control plane on the request path.
-        if byok_round_trip {
+        if cursor.cold {
             timer.note_cold();
             identity.cold_start = true;
         }
-        match resolved {
-            ProviderKey::Found(k) => k,
-            outcome => {
-                let (status, code, message) = match outcome {
+        // Every pool key breaker-open: keep the first, so the breaker check below
+        // answers 503 exactly as a single key does.
+        match picked.or(first_found) {
+            Some((label, k)) => {
+                served_label = label;
+                key_cursor = Some(cursor);
+                k
+            }
+            None => {
+                // First-value path: a launch-day user who has not added BYOK yet must be
+                // told to ADD a key, not that their key was "rejected". Dispatching an
+                // empty credential and relaying the upstream 401 read as "my key is
+                // broken" for a user who had no key at all. Fail here, before the
+                // upstream round-trip.
+                let (status, code, message) = match cursor.into_failure() {
                     ProviderKey::NotConfigured => (
                         StatusCode::BAD_REQUEST,
                         "provider_not_configured",
@@ -570,7 +1067,17 @@ async fn chat_completions_handler_with_labels(
                         "provider_key_unavailable",
                         "the key store could not be reached — nothing was sent to the provider; retry shortly",
                     ),
-                    _ => (
+                    ProviderKey::KmsUnavailable => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "kms_unavailable",
+                        "customer key service unavailable",
+                    ),
+                    ProviderKey::KmsDenied => (
+                        StatusCode::FORBIDDEN,
+                        "kms_access_denied",
+                        "customer key service refused access",
+                    ),
+                    ProviderKey::Unusable | ProviderKey::Found(_) => (
                         StatusCode::BAD_GATEWAY,
                         "provider_key_unusable",
                         "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
@@ -591,6 +1098,10 @@ async fn chat_completions_handler_with_labels(
             }
         }
     };
+    if served_pooled {
+        identity.route.key_label = Some(served_label.clone());
+        dispatch_guard.record_route(identity.route.clone());
+    }
 
     // GWY-24: the cache identity is derived HERE — after the parse, BEFORE the
     // guardrail redaction at `redact_request_in_place`.
@@ -602,10 +1113,20 @@ async fn chat_completions_handler_with_labels(
     // BYTE-IDENTICAL string, so hashing after redaction would treat two
     // genuinely different requests as one and serve the wrong answer to the
     // second. Hashing before redaction is the only correct window.
+    // OG-51 / OG-38: a request that REQUIRES zero data retention neither reads from nor writes
+    // into the response cache — a stored answer is a retained answer, on both tiers.
+    let cache_policy = if zdr_constraint.is_some() {
+        cache_policy.suspend()
+    } else {
+        cache_policy
+    };
     let cache_key = state.semantic_cache.as_ref().map(|cache| {
         cache.bind_key(
             tenant_id,
             cache_policy.key(crate::semantic_cache::request_key(&chat_request)),
+            route_plan
+                .as_deref()
+                .and_then(crate::routing::RoutePlan::cache_namespace),
         )
     });
 
@@ -663,21 +1184,46 @@ async fn chat_completions_handler_with_labels(
     // seam reuses the SAME id + the request-side R2 redaction map (built here,
     // re-inserted in the streamed response).
     let mut guardrail_redaction_map: Vec<tracelane_policy::pii::RedactionEntry> = Vec::new();
+    let request_hooks;
+    // rev6 N3: set when R2 redacted the request — its text then reaches no embedding
+    // provider (the semantic cache tier is off for it; see `semantic_tier_models`).
+    let mut request_redacted = false;
     {
         let rag_context = crate::guardrail::context::extract_rag_context(&body);
         let session = crate::guardrail::SessionState::fresh(identity.conversation_id.clone());
-        let gr = state
+        let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
                 tenant_id,
-                api_key_id: Some(claims.sub.as_str()),
+                api_key_id: claims.api_key_id(),
+                project_id: claims.governance.as_ref().and_then(|g| g.project_id),
                 correlation_id,
                 request: &chat_request,
                 rag_context,
                 session,
                 actor: claims.sub.as_str(),
+                egress_json: None,
             })
             .await;
+        request_hooks = gr.hooks.clone();
+        identity.hook_events.record(&gr.hook_events);
+        if !gr.is_block() && !gr.hook_redactions.is_empty() {
+            let rewritten = crate::guardrail::egress::redact_hook_request(
+                &mut chat_request,
+                &gr.hook_redactions,
+            );
+            match rewritten {
+                Ok(()) => {
+                    request_redacted = true;
+                    // CAP: an error span must not keep the pre-hook raw text.
+                    dispatch_guard.record_input(CapturedInput::build(capture, &chat_request));
+                }
+                Err(_) => {
+                    dispatch_guard.record_input(None); // never retain unredacted raw input
+                    crate::guardrail::hooks::block(&mut gr.outcome, "HOOK_REDACTION_UNSUPPORTED")
+                }
+            }
+        }
         // ADR-069 fail-closed: the guardrail verdict could not be durably captured
         // (async publish failed) — refuse rather than serve an unrecorded request.
         if gr.audit_publish_failed {
@@ -746,9 +1292,41 @@ async fn chat_completions_handler_with_labels(
         // before it leaves the gateway, and keep the map so the streamed
         // response can re-insert the user's originals. Runs before the untrusted
         // wrap + dispatch, so the redacted form is what egresses upstream.
-        if gr.outcome.decision == crate::guardrail::Decision::Redact {
-            guardrail_redaction_map =
-                crate::guardrail::streaming::redact_request_in_place(&mut chat_request);
+        // M-1: every text R2 read is rewritten — tool descriptions and schemas, tool-call
+        // arguments, `response_format`, `user`, `metadata`, extras, not only message text —
+        // and a secret left where no rewrite is possible (a tool name, a URL, an object
+        // key) BLOCKS the request instead of egressing (fail-CLOSED, §10).
+        if gr.outcome.records.iter().any(|r| {
+            r.rail == "R2_secrets_pii" && r.outcome.outcome == crate::guardrail::Outcome::Redact
+        }) {
+            request_redacted = true;
+            match crate::guardrail::egress::redact_request_with_policy(
+                &mut chat_request,
+                gr.pii_policy.as_ref(),
+            ) {
+                Ok(map) => {
+                    guardrail_redaction_map = map;
+                    dispatch_guard.record_input(CapturedInput::build(capture, &chat_request));
+                }
+                Err(crate::guardrail::egress::Unredactable) => {
+                    tracing::warn!(
+                        correlation_id = %correlation_id,
+                        "R2 redact could not cover the egress request — blocking"
+                    ); // Never retain unredactable raw input.
+                    dispatch_guard.record_input(None);
+                    dispatch_guard.abort("guardrail_block", None);
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "request blocked by Tracelane inline guardrail",
+                            "rail": crate::guardrail::egress::UNREDACTABLE_RAIL,
+                            "reason_code": crate::guardrail::egress::UNREDACTABLE_REASON,
+                            "correlation_id": correlation_id.to_string(),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
     }
 
@@ -764,16 +1342,20 @@ async fn chat_completions_handler_with_labels(
     // `X-Tracelane-Failover: cross-provider` and the primary still failed —
     // re-dispatching the universal ChatRequest to the next provider (no schema
     // translation needed; each adapter translates the canonical request).
-    // ADR-036: per-(provider, region) circuit breaker. Region is "default" —
-    // ChatRequest carries no region tag at this layer (Bedrock's region is
-    // adapter-internal). If the breaker is Open we fail fast with 503 +
-    // Retry-After rather than tying up a worker slot on a known-bad upstream.
+    // ADR-036 / OG-13: per-(provider, region, credential) circuit breaker. The region
+    // is the adapter's own (Bedrock's AWS region, Vertex's location, Azure's host;
+    // "default" elsewhere) and the credential is THIS tenant's key, so one tenant's
+    // failures open its own breaker and nobody else's. If the breaker is Open we fail
+    // fast with 503 + Retry-After rather than tying up a worker slot on a known-bad
+    // upstream.
     let upstream = provider_name_from_model(&model);
-    let region = "default";
+    let region = state.providers.upstream_region(provider_id);
+    let breaker_cred =
+        super::dispatch::breaker_cred(tenant_id, provider_id, &served_label, Some(&routing_state));
     // ADR-038 kill.upstream.<provider> force-opens the breaker (operator
     // disable / provider incident), in addition to the breaker's own state.
     let upstream_killed = state.kill_switch.upstream_killed(upstream);
-    if upstream_killed || !state.circuit_breaker.allow(upstream, region) {
+    if upstream_killed || !state.circuit_breaker.allow(upstream, region, &breaker_cred) {
         tracing::warn!(
             provider = upstream,
             killed = upstream_killed,
@@ -836,6 +1418,29 @@ async fn chat_completions_handler_with_labels(
     //
     // Only the DISPATCH is replaced. Not the ledger, not the guardrails, not the
     // budgets.
+    //
+    // rev6 N3: the semantic tier SENDS the request's text to an embedding provider with
+    // the tenant's key, so it is gated like a dispatch: off when R2 redacted the request
+    // (the key holds the PRE-redaction text — see `request_key` — and embedding the
+    // redacted form instead would let two different secrets match each other), and
+    // limited to embedding models the workspace blocks / policy and the key's policy
+    // allow, and under ZDR-required to ZDR-eligible providers. The exact tier sends
+    // nothing and is unaffected.
+    let cache_key = cache_key.map(|mut key| {
+        if let Some(cache) = state.semantic_cache.as_deref() {
+            let zdr_caps = zdr_constraint.is_some().then(|| state.zdr.load_full());
+            key.restrict_semantic_tier(semantic_tier_models(
+                cache.config().embedding_models(),
+                // OG-51: the workspace may switch the semantic (embedding) tier off; the exact
+                // tier is a hash that sends nothing anywhere and is unaffected.
+                request_redacted || !cache_policy.semantic_allowed(),
+                &claims,
+                ws_controls.as_deref(),
+                zdr_caps.as_deref(),
+            ));
+        }
+        key
+    });
     let cache_hit: Option<crate::semantic_cache::CacheHit> = match (
         state.semantic_cache.as_ref(),
         cache_key.as_ref(),
@@ -949,10 +1554,10 @@ async fn chat_completions_handler_with_labels(
         if let Some(captured) = CapturedInput::build(capture, &chat_request) {
             captured.apply(&mut span.attributes);
         }
-        // GWY-48, span site 1 of 4. A cache hit ran under the configuration the
-        // CALLER sent on THIS request, not the one that produced the stored
-        // answer — recording the caller's own settings is what makes "why did I
-        // get this" answerable on a hit at all.
+        capture_cached_answer(&mut span.attributes, capture, &hit.response_json);
+        // GWY-48: a hit records this caller's config, not the source request's.
+        // That explains why this answer was served without a provider call.
+        // The cached answer itself was captured from the JSON returned below.
         request_config.clone().apply(&mut span.attributes);
         spawn_span_publish(&state, span);
 
@@ -995,6 +1600,8 @@ async fn chat_completions_handler_with_labels(
     // happened. Stays empty (and therefore ABSENT on the span, spec §2.1) for
     // a bench-mock call and for a clean single attempt.
     let mut dispatch_attempts: Vec<DispatchAttempt> = Vec::new();
+    // OG-11: the candidates a routed request skipped before it found one to dispatch.
+    extend_dispatch_attempts(&mut dispatch_attempts, std::mem::take(&mut route_skips));
     if let Some(skip) = zdr_primary_skipped.take() {
         extend_dispatch_attempts(&mut dispatch_attempts, vec![skip]);
     }
@@ -1009,17 +1616,45 @@ async fn chat_completions_handler_with_labels(
             .chat_mock(&chat_request, provider_key.expose_secret(), tenant_id)
             .await
     } else {
-        let (result, attempts) = dispatch_with_retry(
+        let started = std::time::Instant::now();
+        let (result, mut attempts) = dispatch_with_retry(
             &state.providers,
             &chat_request,
             provider_key.expose_secret(),
             upstream,
             &model,
             tenant_id,
-            crate::providers::failover::retry_policy(state.failover),
+            crate::routing::retry_policy(
+                state.failover,
+                route_plan.as_ref().is_some_and(|p| p.dispatches()) || served_pooled,
+            ),
+            crate::routing::deadlines::Budget::for_request(
+                entitlements.as_deref(),
+                provider_id,
+                &model,
+                request_start,
+            )
+            .with_breaker(&state.circuit_breaker, upstream, region, &breaker_cred)
+            .with_attempt(
+                &attempt_security,
+                provider_id,
+                &model,
+                &served_label,
+                &provider_key,
+            ),
         )
         .await;
+        label_attempts(&mut attempts, served_pooled, &served_label);
         extend_dispatch_attempts(&mut dispatch_attempts, attempts);
+        if result.is_ok() {
+            crate::routing::stats::record(
+                tenant_id.as_uuid(),
+                &routing_state,
+                provider_id,
+                &chat_request.model,
+                started.elapsed(),
+            );
+        }
         result
     };
 
@@ -1036,7 +1671,96 @@ async fn chat_completions_handler_with_labels(
     // wrap this — a guard the compiler could prove always true, defended by a
     // comment for a case the code excluded.
     if let Some(ok) = breaker_outcome(&provider_result) {
-        state.circuit_breaker.record(upstream, region, ok);
+        crate::routing::deadlines::record_legacy(
+            &state.circuit_breaker,
+            upstream,
+            region,
+            &breaker_cred,
+            ok,
+            entitlements.as_deref(),
+            &model,
+        );
+    }
+
+    // OG-11: how many more dispatches this request may make across pool keys and
+    // targets (`routing.max_attempts`). Unbounded only for a request routing never
+    // touched, which keeps the pre-OG-11 failover chain exactly as it was.
+    let mut attempt_budget = if route_plan.as_ref().is_some_and(|p| p.dispatches()) || served_pooled
+    {
+        crate::routing::limits().max_attempts.saturating_sub(1)
+    } else {
+        usize::MAX
+    };
+    // OG-11: a KEY failure (401 / 403 / 429) on one pool key moves to the NEXT key of
+    // the same provider — never to another model first. Each key is its own breaker
+    // credential (OG-13).
+    if !bench_mock && let Some(cursor) = key_cursor.as_mut() {
+        let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
+        loop {
+            let key_failure =
+                matches!(&provider_result, Err(e) if crate::routing::is_key_failure(e));
+            if !key_failure || attempt_budget == 0 {
+                break;
+            }
+            let Some((label, key)) = cursor.next_key(tenant_id, provider_id, key_env).await else {
+                break;
+            };
+            let cred =
+                super::dispatch::breaker_cred(tenant_id, provider_id, &label, Some(&routing_state));
+            if !state.circuit_breaker.allow(upstream, region, &cred) {
+                let mut skip = skipped_failover_attempt(upstream, &model, "breaker_open");
+                skip.key_label = Some(label);
+                extend_dispatch_attempts(&mut dispatch_attempts, vec![skip]);
+                continue;
+            }
+            attempt_budget -= 1;
+            let started = std::time::Instant::now();
+            let (result, mut attempts) = dispatch_with_retry(
+                &state.providers,
+                &chat_request,
+                key.expose_secret(),
+                upstream,
+                &model,
+                tenant_id,
+                crate::routing::retry_policy(
+                    state.failover,
+                    route_plan.as_ref().is_some_and(|p| p.dispatches()) || served_pooled,
+                ),
+                crate::routing::deadlines::Budget::for_request(
+                    entitlements.as_deref(),
+                    provider_id,
+                    &model,
+                    request_start,
+                )
+                .with_breaker(&state.circuit_breaker, upstream, region, &cred)
+                .with_attempt(&attempt_security, provider_id, &model, &label, &key),
+            )
+            .await;
+            label_attempts(&mut attempts, true, &label);
+            extend_dispatch_attempts(&mut dispatch_attempts, attempts);
+            if let Some(ok) = breaker_outcome(&result) {
+                crate::routing::deadlines::record_legacy(
+                    &state.circuit_breaker,
+                    upstream,
+                    region,
+                    &cred,
+                    ok,
+                    entitlements.as_deref(),
+                    &model,
+                );
+            }
+            if result.is_ok() {
+                crate::routing::stats::record(
+                    tenant_id.as_uuid(),
+                    &routing_state,
+                    provider_id,
+                    &chat_request.model,
+                    started.elapsed(),
+                );
+                identity.route.key_label = Some(label);
+            }
+            provider_result = result;
+        }
     }
 
     // Opt-in CROSS-PROVIDER failover. Default OFF — the same-provider
@@ -1053,14 +1777,62 @@ async fn chat_completions_handler_with_labels(
     // request — threaded onto the span so the Gateway-ops rollup can count it and
     // name the primary that errored (or, GWY-49, that the ZDR prune skipped).
     let mut failover_from: Option<&'static str> = zdr_failover_from;
-    if provider_result.is_err() && cross_provider_failover {
+    // OG-11: a 5xx / timeout moves to the virtual model's NEXT target, then — only when
+    // the caller opted in — the cross-provider failover chain, within the attempt
+    // budget. Every hop re-checks price, ZDR, the kill switch, its breakers, the key's
+    // and the workspace's policy and the request's support, exactly as failover does.
+    if provider_result
+        .as_ref()
+        .is_err_and(|e| !e.is::<crate::routing::attempt::Denied>())
+        && (cross_provider_failover || !plan_rest.is_empty())
+    {
         let primary_family = provider_name_from_model(&model);
-        for (fo_provider, fo_model_owned) in crate::providers::failover::candidates_for(
-            primary_family,
-            &workspace_failover_models,
-            state.failover,
-        ) {
+        let mut hops: Vec<(&'static str, String, Option<usize>)> = plan_rest
+            .iter()
+            .map(|c| {
+                (
+                    provider_name_from_model(&c.model),
+                    c.model.clone(),
+                    Some(c.target_index),
+                )
+            })
+            .collect();
+        if cross_provider_failover {
+            hops.extend(
+                crate::providers::failover::candidates_for(
+                    primary_family,
+                    &workspace_failover_models,
+                    state.failover,
+                )
+                .into_iter()
+                .map(|(p, m)| (p, m, None)),
+            );
+        }
+        // H2 follow-up (2026-10-02): admission refused an UNPRICED primary for a budgeted
+        // caller; a failover hop must not reintroduce one (`caller_budgeted`, above).
+        for (fo_provider, fo_model_owned, target_index) in hops {
+            if attempt_budget == 0 {
+                break;
+            }
             let fo_model: &str = &fo_model_owned;
+            // H2: a budgeted caller never fails over to spend the gateway cannot price —
+            // skipped and recorded like the other skips (fail-CLOSED on money, §10).
+            if caller_budgeted
+                && matches!(
+                    crate::admission::token_pricing(fo_model),
+                    crate::admission::Pricing::Unpriced { .. }
+                )
+            {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "unpriced_under_budget",
+                    )],
+                );
+                continue;
+            }
             // GWY-49: under the constraint, a failover candidate the table does not vouch
             // for is not a candidate — skipped and recorded like the other four skips.
             if zdr_constraint.is_some() && !state.zdr.load().eligible(fo_provider) {
@@ -1081,17 +1853,6 @@ async fn chat_completions_handler_with_labels(
                 );
                 continue;
             }
-            if !state.circuit_breaker.allow(fo_provider, region) {
-                extend_dispatch_attempts(
-                    &mut dispatch_attempts,
-                    vec![skipped_failover_attempt(
-                        fo_provider,
-                        fo_model,
-                        "breaker_open",
-                    )],
-                );
-                continue;
-            }
             // Fail closed on an unroutable failover candidate — skip it,
             // never default to a provider (its key would be the wrong one).
             let Some(fo_pid) = crate::providers::ProviderRegistry::provider_id_for_model(fo_model)
@@ -1106,14 +1867,161 @@ async fn chat_completions_handler_with_labels(
                 );
                 continue;
             };
+            // OG-20: a failover hop must not reach a model or provider the key's policy
+            // denies — skipped and recorded like the other skips (fail-CLOSED).
+            if !policy_allows(&claims, ws_controls.as_deref(), fo_model, fo_pid) {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "policy_denied",
+                    )],
+                );
+                continue;
+            }
+            // OG-03: the primary passed `check_supported` for ITS wire, not this one. A
+            // candidate that cannot honour a field or part the request carries is not a
+            // candidate — skipped and recorded like the other skips, never sent a request
+            // that silently differs from the one the caller made.
+            let mut fo_request = chat_request.clone();
+            fo_request.model = fo_model.to_string();
+            if crate::request_support::check_supported(fo_pid, &fo_request).is_err() {
+                extend_dispatch_attempts(
+                    &mut dispatch_attempts,
+                    vec![skipped_failover_attempt(
+                        fo_provider,
+                        fo_model,
+                        "unsupported_request",
+                    )],
+                );
+                continue;
+            }
+            // OG-13: the hop's own region; OG-11: its own pool, key by key — a key
+            // failure moves to the next key, a 5xx / timeout to the next hop.
+            let fo_region = state.providers.upstream_region(fo_pid);
             let fo_env = crate::providers::ProviderRegistry::env_var_for_provider_id(fo_pid);
-            // Failover keeps its skip-on-unresolvable behaviour: a provider we
-            // cannot key for is simply not a failover candidate.
-            let fo_key = match resolve_provider_key(tenant_id, fo_pid, fo_env).await {
-                ProviderKey::Found(k) => k,
-                _ => std::sync::Arc::new(secrecy::SecretString::from(String::new())),
-            };
-            if fo_key.expose_secret().is_empty() {
+            let fo_pool = crate::routing::pool_labels(
+                &crate::admission::Chat::ROUTING,
+                &routing_state,
+                fo_pid,
+                &mut route_rng,
+            );
+            let mut fo_cursor = super::KeyCursor::new(fo_pool.labels);
+            let mut fo_result: Option<anyhow::Result<crate::providers::ProviderStream>> = None;
+            let mut fo_label = crate::db::provider_keys::DEFAULT_LABEL.to_owned();
+            let mut keyed = false;
+            while attempt_budget > 0 {
+                // Failover keeps its skip-on-unresolvable behaviour: a provider we
+                // cannot key for is simply not a failover candidate.
+                let Some((label, fo_key)) = fo_cursor.next_key(tenant_id, fo_pid, fo_env).await
+                else {
+                    break;
+                };
+                if fo_key.expose_secret().is_empty() {
+                    continue;
+                }
+                keyed = true;
+                let fo_cred =
+                    super::dispatch::breaker_cred(tenant_id, fo_pid, &label, Some(&routing_state));
+                if !state
+                    .circuit_breaker
+                    .allow(fo_provider, fo_region, &fo_cred)
+                {
+                    let mut skip = skipped_failover_attempt(fo_provider, fo_model, "breaker_open");
+                    if fo_pool.pooled {
+                        skip.key_label = Some(label);
+                    }
+                    extend_dispatch_attempts(&mut dispatch_attempts, vec![skip]);
+                    continue;
+                }
+                attempt_budget = attempt_budget.saturating_sub(1);
+                let started = std::time::Instant::now();
+                let (r, mut fo_attempts) = dispatch_with_retry(
+                    &state.providers,
+                    &fo_request,
+                    fo_key.expose_secret(),
+                    fo_provider,
+                    fo_model,
+                    tenant_id,
+                    crate::routing::retry_policy(
+                        state.failover,
+                        route_plan.as_ref().is_some_and(|p| p.dispatches()) || served_pooled,
+                    ),
+                    crate::routing::deadlines::Budget::for_request(
+                        entitlements.as_deref(),
+                        fo_pid,
+                        fo_model,
+                        request_start,
+                    )
+                    .with_breaker(&state.circuit_breaker, fo_provider, fo_region, &fo_cred)
+                    .with_attempt(
+                        &attempt_security,
+                        fo_pid,
+                        fo_model,
+                        &label,
+                        &fo_key,
+                    ),
+                )
+                .await;
+                label_attempts(&mut fo_attempts, fo_pool.pooled, &label);
+                extend_dispatch_attempts(&mut dispatch_attempts, fo_attempts);
+                if let Some(ok) = breaker_outcome(&r) {
+                    crate::routing::deadlines::record_legacy(
+                        &state.circuit_breaker,
+                        fo_provider,
+                        fo_region,
+                        &fo_cred,
+                        ok,
+                        entitlements.as_deref(),
+                        fo_model,
+                    );
+                }
+                if r.is_ok() {
+                    crate::routing::stats::record(
+                        tenant_id.as_uuid(),
+                        &routing_state,
+                        fo_pid,
+                        fo_model,
+                        started.elapsed(),
+                    );
+                }
+                let next_key = matches!(&r, Err(e) if crate::routing::is_key_failure(e))
+                    && fo_cursor.has_more();
+                fo_label = label;
+                fo_result = Some(r);
+                if !next_key {
+                    break;
+                }
+            }
+            if !keyed {
+                // OG-37: a customer-key-service refusal is not "no key for this provider" —
+                // it is the tenant's own control saying no, so it refuses the request.
+                match fo_cursor.into_failure() {
+                    ProviderKey::KmsUnavailable => {
+                        dispatch_guard.record_attempts(dispatch_attempts);
+                        dispatch_guard.abort("kms_unavailable", None);
+                        return provider_error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "kms_unavailable",
+                            Some("customer key service unavailable"),
+                            Some(fo_pid),
+                            None,
+                        );
+                    }
+                    ProviderKey::KmsDenied => {
+                        dispatch_guard.record_attempts(dispatch_attempts);
+                        dispatch_guard.abort("kms_access_denied", None);
+                        return provider_error_response(
+                            StatusCode::FORBIDDEN,
+                            "kms_access_denied",
+                            Some("customer key service refused access"),
+                            Some(fo_pid),
+                            None,
+                        );
+                    }
+                    _ => {}
+                }
                 tracing::debug!(
                     provider = fo_provider,
                     "cross-provider failover skipped — no BYOK key for this provider"
@@ -1128,22 +2036,9 @@ async fn chat_completions_handler_with_labels(
                 );
                 continue;
             }
-            let mut fo_request = chat_request.clone();
-            fo_request.model = fo_model.to_string();
-            let (fo_result, fo_attempts) = dispatch_with_retry(
-                &state.providers,
-                &fo_request,
-                fo_key.expose_secret(),
-                fo_provider,
-                fo_model,
-                tenant_id,
-                crate::providers::failover::retry_policy(state.failover),
-            )
-            .await;
-            extend_dispatch_attempts(&mut dispatch_attempts, fo_attempts);
-            if let Some(ok) = breaker_outcome(&fo_result) {
-                state.circuit_breaker.record(fo_provider, region, ok);
-            }
+            let Some(fo_result) = fo_result else {
+                continue;
+            };
             if fo_result.is_ok() {
                 tracing::info!(
                     from = primary_family,
@@ -1157,11 +2052,17 @@ async fn chat_completions_handler_with_labels(
                 // primary that failed.
                 model = fo_model.to_string();
                 failover_from = Some(primary_family);
+                if let Some(i) = target_index {
+                    identity.route.target_index = Some(i);
+                }
+                identity.route.key_label = fo_pool.pooled.then(|| fo_label.clone());
                 provider_result = fo_result;
                 break;
             }
+            provider_result = fo_result;
         }
     }
+    dispatch_guard.record_route(identity.route.clone());
 
     let provider_stream = match provider_result {
         Ok(s) => s,
@@ -1190,9 +2091,13 @@ async fn chat_completions_handler_with_labels(
             // Without it a hard dispatch failure was invisible — a structural 0% error
             // rate regardless of real provider 401/429/404/5xx. One span here covers
             // all four typed returns below.
-            let err_reason = if http
-                .is_some_and(crate::providers::ProviderHttpError::is_auth_rejection)
+            let err_reason = if let Some(denied) =
+                err.downcast_ref::<crate::routing::attempt::Denied>()
             {
+                denied.code()
+            } else if crate::routing::deadlines::Timeout::find(err.as_ref()).is_some() {
+                "upstream_timeout"
+            } else if http.is_some_and(crate::providers::ProviderHttpError::is_auth_rejection) {
                 "provider_key_rejected"
             } else if http.is_some_and(crate::providers::ProviderHttpError::is_rate_limited) {
                 "provider_rate_limited"
@@ -1216,6 +2121,12 @@ async fn chat_completions_handler_with_labels(
             // every attempt and skip that led here, not only the terminal reason.
             dispatch_guard.record_attempts(std::mem::take(&mut dispatch_attempts));
             dispatch_guard.abort(err_reason, None);
+            if let Some(denied) = err.downcast_ref::<crate::routing::attempt::Denied>() {
+                return Chat::refuse(denied.0.clone());
+            }
+            if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+                return timeout.response();
+            }
 
             // An upstream 401/403 means the tenant's BYOK provider key was
             // rejected — surface that distinctly instead of an opaque 502 (a
@@ -1248,13 +2159,18 @@ async fn chat_completions_handler_with_labels(
                     provider = upstream,
                     "upstream rate-limited / quota exhausted"
                 );
-                return provider_error_response(
+                return super::errors::provider_error_response_retry(
                     StatusCode::TOO_MANY_REQUESTS,
                     "provider_rate_limited",
                     Some(
                         "the upstream provider rate-limited or quota-exhausted this request — retry later, or check the provider account's plan and billing",
                     ),
                     Some(upstream),
+                    // OG-03 §3.4: scrubbed, truncated, and None for anything auth-shaped.
+                    http.and_then(|e| e.message.as_deref()),
+                    // OG-10: the PROVIDER's own wait when it gave one (header + body), so
+                    // the client's backoff works; the gateway's 60 s guess only when it did not.
+                    super::errors::upstream_retry_after_secs(&err),
                     Some("60"),
                 );
             }
@@ -1265,13 +2181,14 @@ async fn chat_completions_handler_with_labels(
             // gemini-2.5-flash as "no longer available to new users".
             if http.is_some_and(crate::providers::ProviderHttpError::is_model_not_found) {
                 tracing::warn!(provider = upstream, "upstream reports model not found");
-                return provider_error_response(
+                return provider_error_response_with_detail(
                     StatusCode::NOT_FOUND,
                     "model_not_found",
                     Some(
                         "the upstream provider does not recognise this model for this account — check the model name and that your provider account has access to it",
                     ),
                     Some(upstream),
+                    http.and_then(|e| e.message.as_deref()),
                     None,
                 );
             }
@@ -1297,7 +2214,7 @@ async fn chat_completions_handler_with_labels(
                      Verify the key for this provider, then the request itself.",
                     e.status
                 );
-                return provider_error_response(
+                return provider_error_response_with_detail(
                     // Mirror the upstream status so the caller sees exactly what the
                     // provider said. 401/403/404/429 are claimed by the branches
                     // above and can never reach here; anything unrepresentable
@@ -1306,16 +2223,24 @@ async fn chat_completions_handler_with_labels(
                     "provider_request_rejected",
                     Some(&message),
                     Some(upstream),
+                    // OG-03 §3.4: the upstream's own reason ("Unsupported parameter:
+                    // max_tokens"), scrubbed and truncated. `None` for 407 and for anything
+                    // `ProviderHttpError::from_response` judged auth-shaped.
+                    e.message.as_deref(),
                     None,
                 );
             }
 
             tracing::error!(error = %err, "provider dispatch failed after retry");
-            return provider_error_response(
+            // OG-10: a 503 that said how long to wait still maps to 502 (the existing
+            // status mapping), but carries the provider's `Retry-After`.
+            return super::errors::provider_error_response_retry(
                 StatusCode::BAD_GATEWAY,
                 "provider unavailable",
                 None,
                 None,
+                None,
+                super::errors::upstream_retry_after_secs(&err),
                 None,
             );
         }
@@ -1339,8 +2264,11 @@ async fn chat_completions_handler_with_labels(
         // redacted form (what the model sees, hence what it can leak — correct
         // for R6).
         let response_inputs = crate::guardrail::ResponseInputs {
+            hooks: Some(request_hooks.clone()),
+            hook_events: identity.hook_events.clone(),
             tenant_id: tenant_id.clone(),
-            api_key_id: Some(claims.sub.clone()),
+            api_key_id: claims.api_key_id().map(str::to_owned),
+            project_id: claims.governance.as_ref().and_then(|g| g.project_id),
             correlation_id,
             system_prompt: crate::guardrail::context::extract_system_prompt(&chat_request)
                 .map(str::to_owned),
@@ -1400,8 +2328,11 @@ async fn chat_completions_handler_with_labels(
         Sse::new(sse).into_response()
     } else {
         let response_inputs = crate::guardrail::ResponseInputs {
+            hooks: Some(request_hooks.clone()),
+            hook_events: identity.hook_events.clone(),
             tenant_id: tenant_id.clone(),
-            api_key_id: Some(claims.sub.clone()),
+            api_key_id: claims.api_key_id().map(str::to_owned),
+            project_id: claims.governance.as_ref().and_then(|g| g.project_id),
             correlation_id,
             system_prompt: crate::guardrail::context::extract_system_prompt(&chat_request)
                 .map(str::to_owned),
@@ -1457,6 +2388,126 @@ mod tests {
 
     const UUID_AB: &str = "00000000-0000-0000-0000-0000000000ab";
 
+    // ── rev6 N3: what the semantic cache tier may embed with, per request ──
+
+    fn embed_models() -> Vec<String> {
+        vec![
+            "text-embedding-3-small".to_owned(),
+            "mistral-embed".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn rev6_n3_a_redacted_request_reaches_no_embedding_provider() {
+        let claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        assert_eq!(
+            semantic_tier_models(&embed_models(), false, &claims, None, None),
+            embed_models(),
+            "the control: an unredacted request with no policy may use every model"
+        );
+        assert!(
+            semantic_tier_models(&embed_models(), true, &claims, None, None).is_empty(),
+            "R2 redacted the request: its text must reach no embedding provider"
+        );
+    }
+
+    #[test]
+    fn rev6_n3_workspace_blocks_and_policy_gate_the_embedding_provider() {
+        let claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        let blocked_provider = crate::controls::WorkspaceControls::from_row(
+            None,
+            None,
+            vec![],
+            vec!["openai".into()],
+            vec![],
+        );
+        assert_eq!(
+            semantic_tier_models(
+                &embed_models(),
+                false,
+                &claims,
+                Some(&blocked_provider),
+                None
+            ),
+            vec!["mistral-embed".to_owned()]
+        );
+        let blocked_model = crate::controls::WorkspaceControls::from_row(
+            None,
+            None,
+            vec!["mistral*".into()],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            semantic_tier_models(&embed_models(), false, &claims, Some(&blocked_model), None),
+            vec!["text-embedding-3-small".to_owned()]
+        );
+        let ws_policy = crate::controls::WorkspaceControls::from_row(
+            Some(&json!({"providers": {"deny": ["openai", "mistral"]}})),
+            None,
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            semantic_tier_models(&embed_models(), false, &claims, Some(&ws_policy), None)
+                .is_empty(),
+            "the workspace policy denies both embedding providers"
+        );
+    }
+
+    #[test]
+    fn rev6_n3_the_keys_policy_denial_gates_the_embedding_provider() {
+        let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        claims.governance = tracelane_shared::key_policy::Governance::from_columns(
+            None,
+            None,
+            None,
+            Some(&json!({"models": {"deny": ["text-embedding*"]}})),
+        )
+        .map(std::sync::Arc::new);
+        assert!(claims.governance.is_some());
+        assert_eq!(
+            semantic_tier_models(&embed_models(), false, &claims, None, None),
+            vec!["mistral-embed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rev6_n3_zdr_required_admits_only_zdr_eligible_embedding_providers() {
+        let claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        let caps = crate::zdr::ZdrCapabilities::from_rows([
+            ("openai".to_owned(), "default".to_owned()),
+            ("mistral".to_owned(), "none".to_owned()),
+        ]);
+        assert_eq!(
+            semantic_tier_models(&embed_models(), false, &claims, None, Some(&caps)),
+            vec!["text-embedding-3-small".to_owned()]
+        );
+        assert!(
+            semantic_tier_models(
+                &embed_models(),
+                false,
+                &claims,
+                None,
+                Some(&crate::zdr::ZdrCapabilities::unavailable())
+            )
+            .is_empty(),
+            "an unloaded ZDR table vouches for nothing (fail-closed)"
+        );
+        assert!(
+            semantic_tier_models(
+                &["nosuchvendor-embed-x".to_owned()],
+                false,
+                &claims,
+                None,
+                None
+            )
+            .is_empty(),
+            "an unroutable embedding model is left out"
+        );
+    }
+
     // ── RI-05 M4: the failover-skip token mapping, as a pure function ──
     //
     // NOT COVERED here: which of the four causes actually FIRES at which of
@@ -1474,6 +2525,8 @@ mod tests {
             "killed",
             "unroutable",
             "zdr_ineligible",
+            "unsupported_request",
+            "unpriced_under_budget",
         ] {
             let a = skipped_failover_attempt("openai", "gpt-4o", reason);
             assert_eq!(a.outcome, "skipped");
@@ -1573,6 +2626,129 @@ mod route_tests {
         LoopbackBypassGuard, authed, body_json, registry_pointing_ollama_at, test_state,
     };
 
+    #[test]
+    fn cached_answer_capture_obeys_output_policy_and_field_cap() {
+        let body = json!({
+            "id": "cached-id",
+            "choices": [{"finish_reason": "stop", "message": {"content": "a".repeat(70_000)}}]
+        })
+        .to_string();
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        capture_cached_answer(
+            &mut attrs,
+            crate::server::config::ContentCapture::OFF,
+            &body,
+        );
+        assert!(attrs.gen_ai_output_messages.is_none());
+        assert_eq!(attrs.gen_ai_response_id.as_deref(), Some("cached-id"));
+        let capture = crate::server::config::ContentCapture {
+            input: false,
+            output: true,
+            max_field_bytes: 64 * 1024,
+        };
+        capture_cached_answer(&mut attrs, capture, &body);
+        let text = attrs.gen_ai_output_messages.as_ref().unwrap()[0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(text.len() <= 64 * 1024);
+        assert!(text.ends_with("…[truncated]"));
+    }
+
+    /// rev6 N3, through the REAL handler: the semantic tier embeds the request's text
+    /// with the tenant's key, so a key whose policy denies the embedding model sends
+    /// NOTHING to the embeddings endpoint — while the same request from an unrestricted
+    /// caller does (the control). RED before the fix: the tier embedded with every
+    /// configured model regardless of the caller's policy.
+    #[tokio::test]
+    async fn rev6_n3_the_semantic_tier_honours_the_keys_policy_on_the_embedding_model() {
+        let _serial = CANCEL_COUNTER.lock().await;
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "n3", "object": "chat.completion", "model": "ollama/llama3",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list", "model": "ollama/embed",
+                "data": [{"object": "embedding", "index": 0, "embedding": [1.0, 0.0, 0.0]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        let cfg =
+            crate::server::config::parse("semantic_cache:\n  embedding_models: ollama/embed\n")
+                .unwrap();
+        state.semantic_cache = Some(Arc::new(crate::semantic_cache::SemanticCache::new(
+            crate::clickhouse_query::ch_client(server.uri()),
+            state.providers.clone(),
+            cfg.semantic_cache().unwrap().clone(),
+        )));
+        with_capture_entitlements(&mut state);
+        async fn embeddings(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/embeddings")
+                .count()
+        }
+
+        let mut denied = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        denied.governance = tracelane_shared::key_policy::Governance::from_columns(
+            None,
+            None,
+            None,
+            Some(&json!({"models": {"deny": ["ollama/embed"]}})),
+        )
+        .map(Arc::new);
+        {
+            let _c = crate::auth::test_claims::Guard::set(denied);
+            let body =
+                json!({"model":"ollama/llama3","messages":[{"role":"user","content":"n3 denied"}]});
+            let r = chat_completions_handler(State(state.clone()), authed(), Json(body)).await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            embeddings(&server).await,
+            0,
+            "the key's policy denies the embedding model — its text must not be embedded"
+        );
+
+        // The control: an unrestricted caller's miss does embed.
+        let body =
+            json!({"model":"ollama/llama3","messages":[{"role":"user","content":"n3 control"}]});
+        let r = chat_completions_handler(State(state), authed(), Json(body)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(embeddings(&server).await >= 1, "the control must embed");
+    }
+
+    /// OG-51: the response cache is private by default — a workspace is cached only while it
+    /// records both prompt and response text — so a test that expects a hit says so.
+    fn with_capture_entitlements(state: &mut AppState) {
+        use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
+        let mut e = ResolvedEntitlements::deny_all();
+        e.content_capture = crate::db::workspace_capture::WorkspaceCapture {
+            input: true,
+            output: true,
+        };
+        state.entitlements = Some(Arc::new(EntitlementCache::new(Arc::new(move |_t| {
+            let e = e.clone();
+            Box::pin(async move { Ok(e) })
+        }))));
+    }
+
     #[tokio::test]
     async fn request_cache_bypass_never_serves_a_warm_answer() {
         let _serial = CANCEL_COUNTER.lock().await;
@@ -1616,12 +2792,30 @@ mod route_tests {
             )
             .await;
         state.semantic_cache = Some(cache);
+        with_capture_entitlements(&mut state);
+        // The span sink is process-wide and every handler test shares the dev tenant, so the
+        // hit's span is found by THIS request's trace id, never by "any hit for the tenant".
+        let trace = Uuid::new_v4();
+        let mut first_headers = authed();
+        first_headers.insert("x-trace-id", trace.to_string().parse().unwrap());
         let first =
-            chat_completions_handler(State(state.clone()), authed(), Json(body.clone())).await;
+            chat_completions_handler(State(state.clone()), first_headers, Json(body.clone())).await;
         assert_eq!(first.headers().get("x-tracelane-cache").unwrap(), "exact");
         assert_eq!(
             body_json(first).await["choices"][0]["message"]["content"],
             "cached"
+        );
+        let cached_span = crate::otlp_emit::test_sink::for_trace(trace)
+            .into_iter()
+            .find(|s| s.attributes.tracelane_semantic_cache_hit == Some(true))
+            .expect("cache hit span");
+        assert_eq!(
+            cached_span.attributes.gen_ai_response_id.as_deref(),
+            Some("cache-control-proof")
+        );
+        assert_eq!(
+            cached_span.attributes.gen_ai_response_finish_reasons,
+            Some(vec!["stop".into()])
         );
         let mut headers = authed();
         headers.insert("x-tracelane-cache", "bypass".parse().unwrap());
@@ -1816,5 +3010,119 @@ mod route_tests {
             0,
             "a completed request must not trip the dispatch guard"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_model_error_span_keeps_opted_in_request_input() {
+        let mut state = test_state(crate::providers::ProviderRegistry::new().unwrap());
+        let mut grant = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        grant.content_capture = crate::db::workspace_capture::WorkspaceCapture {
+            input: true,
+            output: true,
+        };
+        state.entitlements = Some(Arc::new(crate::entitlement_cache::EntitlementCache::new(
+            Arc::new(move |_| {
+                let resolved = grant.clone();
+                Box::pin(async move { Ok(resolved) })
+            }),
+        )));
+        let trace = Uuid::new_v4();
+        let mut headers = authed();
+        headers.insert("x-trace-id", trace.to_string().parse().unwrap());
+        let body = json!({
+            "model":"no-such-model-xyz-9",
+            "messages":[{"role":"user","content":"CANARY_ERROR_INPUT"}]
+        });
+        let resp = chat_completions_handler(State(state), headers, Json(body)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let input = spans[0]
+            .attributes
+            .gen_ai_input_messages
+            .as_ref()
+            .expect("error span input");
+        assert!(input.to_string().contains("CANARY_ERROR_INPUT"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_client_error_span_keeps_opted_in_request_input() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message":"bad request"}
+            })))
+            .mount(&server)
+            .await;
+        let mut state = test_state(registry_pointing_ollama_at(server.uri()));
+        let mut grant = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        grant.content_capture = crate::db::workspace_capture::WorkspaceCapture {
+            input: true,
+            output: true,
+        };
+        state.entitlements = Some(Arc::new(crate::entitlement_cache::EntitlementCache::new(
+            Arc::new(move |_| {
+                let resolved = grant.clone();
+                Box::pin(async move { Ok(resolved) })
+            }),
+        )));
+        let trace = Uuid::new_v4();
+        let mut headers = authed();
+        headers.insert("x-trace-id", trace.to_string().parse().unwrap());
+        let body = json!({
+            "model":"ollama/llama3",
+            "messages":[{"role":"user","content":"CANARY_PROVIDER_4XX"}]
+        });
+        let resp = chat_completions_handler(State(state), headers, Json(body)).await;
+        assert!(!resp.status().is_success());
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let input = spans[0]
+            .attributes
+            .gen_ai_input_messages
+            .as_ref()
+            .expect("error span input");
+        assert!(input.to_string().contains("CANARY_PROVIDER_4XX"));
+    }
+}
+
+/// A cache hit serves this exact JSON body. Derive the span's response facts from it,
+/// while leaving output content behind the request's capture decision.
+fn capture_cached_answer(
+    attrs: &mut tracelane_shared::SpanAttributes,
+    capture: super::config::ContentCapture,
+    body: &str,
+) {
+    let Ok(response) = serde_json::from_str::<serde_json::Value>(body) else {
+        return;
+    };
+    attrs.gen_ai_response_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let choice = &response["choices"][0];
+    attrs.gen_ai_response_finish_reasons = choice["finish_reason"]
+        .as_str()
+        .map(|reason| vec![reason.to_owned()]);
+    let text = choice["message"]["content"].as_str().unwrap_or_default();
+    let calls: Vec<(Option<String>, Option<String>, String)> = choice["message"]["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|call| {
+            (
+                call["id"].as_str().map(str::to_owned),
+                call["function"]["name"].as_str().map(str::to_owned),
+                call["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    if let Some(output) = CapturedOutput::build(capture, text, &calls) {
+        output.apply(attrs);
     }
 }

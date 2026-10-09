@@ -14,7 +14,6 @@ vi.mock("@/lib/auth", () => ({
 		tenantId: "org_TEST",
 	})),
 }));
-vi.mock("@/lib/gateway", () => ({ gatewayBaseUrl: () => "http://gw.test" }));
 
 import { DELETE, GET, PUT } from "./route";
 
@@ -22,6 +21,9 @@ const fetchMock = vi.fn();
 beforeEach(() => {
 	global.fetch = fetchMock as unknown as typeof fetch;
 	fetchMock.mockReset();
+	// The REAL `lib/gateway` helper runs (it attaches the OG-36 attestation);
+	// only its base URL is pinned.
+	vi.stubEnv("NEXT_PUBLIC_GATEWAY_URL", "http://gw.test");
 });
 
 const putReq = (body: unknown) =>
@@ -30,12 +32,9 @@ const delReq = (qs: string) =>
 	({
 		nextUrl: new URL(`http://app.test/api/settings/model-aliases${qs}`),
 	}) as unknown as NextRequest;
+// A REAL Response: `gatewayResponse` re-wraps the upstream body and headers.
 const upstream = (status: number, body?: unknown) =>
-	({
-		status,
-		ok: status >= 200 && status < 300,
-		json: async () => body,
-	}) as unknown as Response;
+	new Response(body === undefined ? null : JSON.stringify(body), { status });
 
 describe("PUT", () => {
 	it("refuses a blank alias or target with 400 and never calls the gateway", async () => {
@@ -60,7 +59,7 @@ describe("PUT", () => {
 		expect(res.status).toBe(200);
 		const [url, opts] = fetchMock.mock.calls[0] as [string, RequestInit];
 		expect(url).toBe("http://gw.test/v1/model-aliases");
-		expect((opts.headers as Record<string, string>).authorization).toBe(
+		expect(new Headers(opts.headers).get("authorization")).toBe(
 			`Bearer ${h.token}`,
 		);
 		expect(JSON.parse(opts.body as string)).toEqual({

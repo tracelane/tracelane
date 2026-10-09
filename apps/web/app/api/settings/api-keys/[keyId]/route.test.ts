@@ -184,6 +184,27 @@ describe("PATCH /api/settings/api-keys/[keyId] (edit limits)", () => {
 		expect(h.db).not.toHaveBeenCalled();
 	});
 
+	it("OG-60: forwards the policy document, project and environment in gateway spelling (null clears)", async () => {
+		h.gatewayPatch.mockResolvedValue({});
+		const policy = { limits: { rpm: 60 }, budget: { usd: 5, mode: "hard" } };
+		await PATCH(
+			patchReq(
+				JSON.stringify({ policy, projectId: "p-1", environment: "staging" }),
+			),
+			params,
+		);
+		expect(h.gatewayPatch).toHaveBeenCalledWith("/v1/keys/key-1", {
+			policy,
+			project_id: "p-1",
+			environment: "staging",
+		});
+		await PATCH(patchReq('{"policy":null,"projectId":null}'), params);
+		expect(h.gatewayPatch).toHaveBeenLastCalledWith("/v1/keys/key-1", {
+			policy: null,
+			project_id: null,
+		});
+	});
+
 	it("an absent field is not sent at all (absent = unchanged, not null)", async () => {
 		h.gatewayPatch.mockResolvedValue({});
 		await PATCH(patchReq('{"name":"ci"}'), params);

@@ -17,8 +17,13 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
+import plansV3Json from "@/db/plans.v3.json";
 import * as schema from "@/db/schema";
 import { E2E_TEST_TENANT_ID, e2eAuthEnabled } from "@/lib/e2e-auth";
+// Type-only: importing the resolver module itself would pull `@/db` into this one.
+import type { PlansV3 } from "@/lib/entitlements";
+
+const plansV3 = plansV3Json as unknown as PlansV3;
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
@@ -118,6 +123,32 @@ export async function setupE2EDb(): Promise<E2EDatabase | null> {
 			overageAllowed: true,
 		},
 	]);
+	// B-409 (migration 0055): the versioned allowances the resolvers now read —
+	// the seed's rows, straight from plans.v3.json under its `plan_version`. Without
+	// them every authed page would resolve the fail-closed FREE allowances.
+	for (const key of ["free_v1", "team_v1"]) {
+		const p = plansV3.plans[key];
+		if (!p) throw new Error(`plans.v3.json has no ${key}`);
+		await pg.query(
+			`insert into plan_allowances (plan_version, plan_lookup_key, hot_gb_included,
+			   ingest_gb_included, cold_gb_included, series_included, scan_units_included,
+			   eval_runs_included, indexed_window_days, queryable_days, ledger_days, is_current)
+			 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true)`,
+			[
+				plansV3.plan_version,
+				key,
+				p.hot_gb_included,
+				p.ingest_gb_included,
+				p.cold_gb_included,
+				p.series_included,
+				p.scan_units_included,
+				p.eval_runs_included,
+				p.indexed_window_days,
+				p.queryable_days,
+				p.ledger_days,
+			],
+		);
+	}
 	await pg.query(
 		'insert into "tenants" ("id", "workos_org_id", "plan") values ($1, $2, $3)',
 		[E2E_INTERNAL_TENANT_ID, E2E_TEST_TENANT_ID, "team"],

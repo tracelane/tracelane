@@ -1,0 +1,214 @@
+{
+  "module": "crates/gateway/src/control_plane.rs",
+  "operations": {
+    "GET /v1/security/admin-access": {
+      "summary": "The admin IP allowlist, SSO-required, and the address the gateway sees for THIS request.",
+      "tags": [
+        "security"
+      ],
+      "responses": {
+        "200": {
+          "description": "Admin access.",
+          "schema": {
+            "$ref": "#/components/schemas/AdminAccess"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "role_forbidden"
+      ]
+    },
+    "PUT /v1/security/admin-access": {
+      "summary": "Set the admin IP allowlist and/or SSO-required. Refused 409 would_lock_you_out unless acknowledge_lockout is true.",
+      "tags": [
+        "security"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "admin_ip_allowlist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sso_required": {
+            "type": "boolean"
+          },
+          "acknowledge_lockout": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "Admin access after the change.",
+          "schema": {
+            "$ref": "#/components/schemas/AdminAccess"
+          }
+        },
+        "400": {
+          "description": "invalid_cidr / invalid_body",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "would_lock_you_out (reason: ip | sso; your_ip, your_ip_attested)",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "sso_unverifiable / control_change_unavailable",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_cidr",
+        "invalid_body",
+        "would_lock_you_out",
+        "sso_unverifiable",
+        "control_change_unavailable"
+      ]
+    },
+    "GET /v1/audit/control-changes": {
+      "summary": "The control-change trail, newest first; cursor-paged; format=ndjson downloads (x-next-cursor header).",
+      "tags": [
+        "audit"
+      ],
+      "parameters": [
+        {
+          "name": "since",
+          "in": "query",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "until",
+          "in": "query",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "action",
+          "in": "query",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "target_type",
+          "in": "query",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "format",
+          "in": "query",
+          "schema": {
+            "enum": [
+              "json",
+              "ndjson"
+            ]
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "A page.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ControlChange"
+                }
+              },
+              "next_cursor": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "invalid_query",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_query",
+        "control_audit_unavailable"
+      ]
+    },
+    "POST /v1/audit/control-changes": {
+      "summary": "The dashboard records a change it is about to make outside the gateway (WorkOS, its own tables). Only actions in WEB_CONTROL_ACTIONS.",
+      "tags": [
+        "audit"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "before": {},
+          "after": {}
+        },
+        "required": [
+          "action",
+          "target_id"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "Recorded."
+        },
+        "400": {
+          "description": "unknown_action / invalid_body / change_too_large",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unknown_action",
+        "invalid_body",
+        "change_too_large",
+        "control_audit_unavailable"
+      ]
+    }
+  }
+}

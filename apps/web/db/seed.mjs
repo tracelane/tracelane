@@ -57,6 +57,58 @@ if (!url) {
 }
 const sql = neon(url);
 
+// ── B-409 drift check — BEFORE ANY WRITE (rev4 L6, 2026-10-03) ─────────────────
+// A version's allowances are immutable: if plans.v3.json changed a number of a
+// `plan_version` that already exists on the database, the seed must refuse — and it
+// must refuse HERE, before the plan_entitlements upserts below. It used to discover
+// the drift only after rewriting the catalog, throwing half-way and leaving the
+// catalog on the new ruling while plan_allowances said the old one.
+const v3 = JSON.parse(
+	readFileSync(new URL("./plans.v3.json", import.meta.url), "utf8"),
+);
+const PLAN_VERSION = v3.plan_version;
+if (typeof PLAN_VERSION !== "string" || PLAN_VERSION.length === 0) {
+	throw new Error("[seed] plans.v3.json has no plan_version (B-409)");
+}
+const ALLOWANCE_COLUMNS = [
+	"hot_gb_included",
+	"ingest_gb_included",
+	"cold_gb_included",
+	"series_included",
+	"scan_units_included",
+	"eval_runs_included",
+	"indexed_window_days",
+	"queryable_days",
+	"ledger_days",
+];
+const sameNumber = (a, b) =>
+	(a === null || a === undefined) && (b === null || b === undefined)
+		? true
+		: a !== null && a !== undefined && b !== null && b !== undefined
+			? Number(a) === Number(b)
+			: false;
+/**
+ * Throw if any EXISTING `plan_allowances` row of `PLAN_VERSION` carries numbers
+ * that differ from plans.v3.json. Rows that do not exist yet are fine (the seed
+ * inserts them). Read-only.
+ */
+async function assertAllowanceVersionUnchanged() {
+	const have = await sql`
+		select * from plan_allowances where plan_version = ${PLAN_VERSION}`;
+	for (const row of have) {
+		const p = v3.plans[row.plan_lookup_key];
+		if (!p) continue;
+		for (const c of ALLOWANCE_COLUMNS) {
+			if (!sameNumber(row[c], p[c] ?? null)) {
+				throw new Error(
+					`[seed] plan_allowances[${PLAN_VERSION}][${row.plan_lookup_key}].${c} is ${row[c]} on the database but ${p[c]} in plans.v3.json — a version's allowances are immutable (B-409). Bump plan_version in plans.v3.json for a new ruling. NOTHING was written.`,
+				);
+			}
+		}
+	}
+}
+await assertAllowanceVersionUnchanged();
+
 // [key,
 // f_full_capture (Business+Enterprise=true),
 //   (the ADR-020 positional values that used to sit between `key` and this —
@@ -226,9 +278,7 @@ for (const [
 // to Neon BEFORE the gateway that reads them deploys). The ADR-020 columns this seed used
 // to upsert (seat caps, trace quotas, overage multiplier) were DROPPED by migration 0042
 // (2026-09-14, the contract step) — nothing writes or reads them any more.
-const v3 = JSON.parse(
-	readFileSync(new URL("./plans.v3.json", import.meta.url), "utf8"),
-);
+// (`v3` is parsed at the top, for the pre-write B-409 drift check.)
 for (const [key, p] of Object.entries(v3.plans)) {
 	await sql`
 		update plan_entitlements set
@@ -247,8 +297,11 @@ for (const [key, p] of Object.entries(v3.plans)) {
 			cold_gb_included = ${p.cold_gb_included ?? null},
 			unlimited_seats = ${p.unlimited_seats},
 			f_sso = ${p.f_sso},
+			f_customer_kms = ${p.f_customer_kms},
 			f_cache_control = ${p.f_cache_control},
 			cache_ttl_hours = ${p.cache_ttl_hours},
+			f_otel_export = ${p.f_otel_export ?? false},
+			max_exports = ${p.max_exports ?? 0},
 			overage_allowed = ${p.overage_allowed},
 			rate_limit_rpm = ${p.rate_limit_rpm},
 			updated_at = now()
@@ -256,6 +309,48 @@ for (const [key, p] of Object.entries(v3.plans)) {
 }
 console.log(
 	`[seed] pricing v3: updated ${Object.keys(v3.plans).length} plan rows from plans.v3.json`,
+);
+
+// ── B-409: versioned allowances (migration 0055) ──────────────────────────────
+// The JSON's `plan_version` names the version its `plans` allowances ARE. A
+// version is INSERTED, never edited: a row that already exists under this
+// version must carry exactly the JSON's numbers, or the seed REFUSES (and the
+// 0055 trigger would refuse the UPDATE anyway) — a ruling that changes an
+// allowance bumps `plan_version`, so no tenant pinned to the old one moves.
+// Then the version becomes `is_current` for every plan, in ONE transaction
+// (the partial unique index allows one current row per plan at any instant).
+// The drift check ran at the TOP, before any write (rev4 L6); the per-row check
+// below stays as the race guard (a row inserted between that check and this one).
+for (const [key, p] of Object.entries(v3.plans)) {
+	await sql`
+		insert into plan_allowances (
+			plan_version, plan_lookup_key, hot_gb_included, ingest_gb_included,
+			cold_gb_included, series_included, scan_units_included, eval_runs_included,
+			indexed_window_days, queryable_days, ledger_days)
+		values (${PLAN_VERSION}, ${key}, ${p.hot_gb_included}, ${p.ingest_gb_included},
+			${p.cold_gb_included ?? null}, ${p.series_included}, ${p.scan_units_included},
+			${p.eval_runs_included}, ${p.indexed_window_days}, ${p.queryable_days},
+			${p.ledger_days})
+		on conflict (plan_version, plan_lookup_key) do nothing`;
+	const [have] = await sql`
+		select * from plan_allowances
+		where plan_version = ${PLAN_VERSION} and plan_lookup_key = ${key}`;
+	for (const c of ALLOWANCE_COLUMNS) {
+		if (!sameNumber(have?.[c], p[c] ?? null)) {
+			throw new Error(
+				`[seed] plan_allowances[${PLAN_VERSION}][${key}].${c} is ${have?.[c]} on the database but ${p[c]} in plans.v3.json — a version's allowances are immutable (B-409). Bump plan_version in plans.v3.json for a new ruling.`,
+			);
+		}
+	}
+}
+await sql.transaction([
+	sql`update plan_allowances set is_current = false
+		where is_current and plan_version <> ${PLAN_VERSION}`,
+	sql`update plan_allowances set is_current = true
+		where plan_version = ${PLAN_VERSION} and not is_current`,
+]);
+console.log(
+	`[seed] B-409: plan_allowances version ${PLAN_VERSION} holds ${Object.keys(v3.plans).length} plan rows and is current`,
 );
 
 // Reference tables (founder 2026-09-13: no hardcoded prices / limits / config — tables).
@@ -285,6 +380,18 @@ for (const [meter, lo, hi, usd, unit] of rateRows) {
 }
 const pol = v3.policy;
 const policyRows = {
+	retention_sweep: pol.retention_sweep,
+	workspace_glance: pol.workspace_glance,
+	trace_reads: pol.trace_reads,
+	attempt_records_since: pol.attempt_records_since,
+	trace_reads_tenant_key_multiplier: pol.trace_reads_tenant_key_multiplier,
+	agent_loop: pol.agent_loop,
+	spend_spikes: pol.spend_spikes,
+	// Includes incident_max_candidates and incident_reads_per_minute_per_tenant;
+	// outcome_session_window_hours is independent of the last-good lookback.
+	// incident_max_sessions_per_candidate bounds session fan-out on every trace.
+	// Upsert the whole policy row together.
+	incident_regression: pol.incident_regression,
 	generation_issues: pol.generation_issues,
 	otlp_capture: pol.otlp_capture,
 	request_labels: pol.request_labels,
@@ -358,6 +465,16 @@ for (const [providerId, c] of Object.entries(caps.providers)) {
 	if (c.zdr !== "none" && !(c.policy_url && c.verified_at)) {
 		throw new Error(
 			`[seed] provider_capabilities: ${providerId} claims zdr=${c.zdr} without policy_url + verified_at — a claim about a third party needs its source and date`,
+		);
+	}
+	// ADR-079 §4: a read row carries `review_by` (verified_at + 90 days). Past it, the
+	// claim is stale — say so loudly at every seed (seed runs before every deploy), so
+	// the operator re-reads the page and re-dates the row. Advisory, not a refusal: a
+	// stale row must not block an unrelated pricing seed; gateway-side expiry is the
+	// named follow-up in ADR-079 §4.
+	if (c.zdr !== "none" && c.review_by && new Date(c.review_by) < new Date()) {
+		console.warn(
+			`[seed] WARN provider_capabilities: ${providerId} zdr=${c.zdr} is past review_by ${c.review_by} (read ${c.verified_at}) — re-read ${c.policy_url} and re-date the row (ADR-079 §4)`,
 		);
 	}
 	await sql`

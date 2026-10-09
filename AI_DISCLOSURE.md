@@ -5,23 +5,17 @@ Tracelane is built with significant AI assistance. We are transparent about this
 
 ## How we build
 
-**Primary tool:** [Claude Code](https://claude.ai/code) (Anthropic) — used for
-architecture planning, code generation, documentation, and autonomous task
-execution under founder direction.
-
-**Model:** the main session runs Claude Opus 5. Delegated subagents run the
-models pinned per-agent in the canonical repository — claude-sonnet-4-6 (implementer tasks),
-claude-opus-4-7 (security review), claude-haiku-4-5-20251001 (PR descriptions
-and changelogs).
+Coding agents assist with architecture planning, code generation, documentation,
+and tasks under maintainer direction. Tools and models vary by change.
 
 Model IDs change as new ones ship, and a hand-maintained list here drifts. The
-**authoritative per-commit record is the `Co-Authored-By` trailer on each
-commit** — `git log --format='%(trailers:key=Co-Authored-By,valueonly)'` shows
-exactly which model assisted which change.
+`Co-Authored-By` trailer on a commit can identify an assisting model. Run
+`git log --format='%(trailers:key=Co-Authored-By,valueonly)'` to see the trailers
+that were supplied; absence of one is not proof of no AI assistance.
 
 **Provenance:** Commits are reviewed by the maintainer before they are published.
 AI-generated code is intended to be merged only with human sign-off.
-Commits co-authored by Claude include:
+Some commits co-authored by Claude include:
 
 ```
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>

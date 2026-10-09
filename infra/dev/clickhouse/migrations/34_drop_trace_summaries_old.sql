@@ -1,0 +1,11 @@
+-- 34 — retire `trace_summaries_old` (2026-09-30).
+--
+-- Migration 15 swapped trace_summaries for the AggregatingMergeTree and KEPT the old table
+-- as `trace_summaries_old` for rollback, "dropped by hand only after the new table has been
+-- verified". Prod dropped it long ago (absent from system.tables, read 2026-09-30), so this
+-- is a no-op there; any other install that replayed migration 15 still holds a tenant-keyed
+-- copy of every trace summary that no purge, sweep or TTL would ever remove.
+-- `scripts/ci/check-ch-purge-classification.py` found it on its first run.
+--
+-- Hand-applied like every ClickHouse migration; safe to run at any time (IF EXISTS).
+DROP TABLE IF EXISTS tracelane.trace_summaries_old;

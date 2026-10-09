@@ -69,7 +69,7 @@ mapfile -t FILES < <(git ls-files '*.rs' '*.sql' '*.sh' \
   | grep -vE '^(docs/|infra/dev/postgres/migrations/|scripts/ci/check-tenants-pk-column\.sh$)')
 
 # 1. FK / INSERT column-list referencing tenants(tenant_id) — SQL-exclusive.
-hits=$(printf '%s\n' "${FILES[@]}" | xargs -r grep -nE 'tenants[[:space:]]*\([[:space:]]*tenant_id' 2>/dev/null || true)
+hits=$(printf '%s\n' "${FILES[@]}" | xargs -r grep -nE '(^|[^[:alnum:]_])tenants[[:space:]]*\([[:space:]]*tenant_id' 2>/dev/null || true)
 [ -n "$hits" ] && report $'tenants(tenant_id) — FK/insert must target tenants(id):\n'"$hits"
 
 # 2. Qualified column `tenants.tenant_id` — SQL-exclusive (tenants has no such col).

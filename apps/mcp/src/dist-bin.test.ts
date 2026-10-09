@@ -71,6 +71,8 @@ let installed: string;
 /** The `bin` target inside the installed package. */
 let binPath: string;
 
+// The hook BUILDS the package (tsc) and packs it: ~5 s idle, past vitest's 10 s default
+// under the full gate's parallel load (timed out in gates z8 and z8b, 2026-10-04).
 beforeAll(() => {
 	execFileSync("pnpm", ["run", "build"], { cwd: PKG_ROOT, stdio: "pipe" });
 
@@ -121,7 +123,7 @@ beforeAll(() => {
 	// direct-exec assertion below tests the HASHBANG rather than the umask
 	// of whoever ran `pnpm pack`.
 	if (existsSync(binPath)) chmodSync(binPath, 0o755);
-});
+}, 120_000);
 
 afterAll(() => {
 	if (scratch) rmSync(scratch, { recursive: true, force: true });

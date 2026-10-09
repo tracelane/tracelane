@@ -26,9 +26,13 @@
 pub mod capability;
 pub mod context;
 pub mod dispatcher;
+pub mod egress;
 pub mod engine;
 pub mod metrics;
 pub mod outcome;
+pub mod policy;
+pub mod policy_api;
+pub mod policy_store;
 pub mod rail;
 pub mod rails;
 pub mod recorder;
@@ -53,3 +57,18 @@ pub use engine::{GuardrailEngine, RequestInputs};
 pub use outcome::{Decision, Outcome};
 pub use registry_loader::{RegistryLoader, pg_registry_resolver};
 pub use streaming::{GuardStep, ResponseGuard};
+
+#[cfg(all(test, debug_assertions))]
+pub mod policy_tests;
+
+pub mod pii_policy;
+
+#[cfg(all(test, debug_assertions))]
+pub mod hook_tests;
+pub mod hooks;
+
+pub mod hooks_api;
+
+#[cfg(test)]
+pub mod adapter_tests;
+pub mod adapters;

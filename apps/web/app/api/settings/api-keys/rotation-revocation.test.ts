@@ -1,13 +1,25 @@
+import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({ db: null as unknown, members: [] as unknown[] }));
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: vi.fn(async () => ({ ok: true })),
+	recordControlChangeFailed: vi.fn(async () => undefined),
+}));
+
 vi.mock("@/db", () => ({
 	get db() {
 		return h.db;
 	},
+}));
+vi.mock("@workos-inc/authkit-nextjs", () => ({
+	withAuth: async () => ({
+		user: { id: "owner", email: "owner@example.test" },
+		organizationId: "org-test",
+	}),
 }));
 vi.mock("@/lib/auth", () => ({
 	requireSession: async () => ({
@@ -38,10 +50,19 @@ beforeEach(async () => {
 	h.db = drizzle(pg);
 	await pg.exec(`CREATE TABLE tenants (id uuid, workos_org_id text, name text, archived_at timestamptz);
       CREATE TABLE api_keys (tenant_id uuid, minted_by text, revoked_at timestamptz);
-      CREATE TABLE users (workos_user_id text, email text, name text);
+      CREATE TABLE users (workos_user_id text, email text, name text, last_login_at timestamptz);
       INSERT INTO tenants VALUES ('${tenant}', 'org-test', 'Test', NULL);
       INSERT INTO api_keys VALUES ('${tenant}', 'member', '2030-01-01T00:00:00Z');
       INSERT INTO api_keys VALUES ('00000000-0000-0000-0000-000000000002', 'member', '2030-01-01T00:00:00Z');`);
+	for (const file of ["0063_signups.sql", "0064_account_deletions.sql"]) {
+		await pg.exec(
+			readFileSync(
+				new URL(`../../../../db/migrations/${file}`, import.meta.url),
+				"utf8",
+			),
+		);
+	}
+
 	h.members = [
 		{ id: "owner-membership", user_id: "owner", role: { slug: "owner" } },
 		{ id: "member-membership", user_id: "member", role: { slug: "member" } },

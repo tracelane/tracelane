@@ -319,6 +319,10 @@ pub mod reason_codes {
     pub const RAIL_TIMEOUT: &str = "RAIL_TIMEOUT";
     /// A detector errored/panicked on a security rail → fail-closed block.
     pub const DETECTOR_ERROR: &str = "DETECTOR_ERROR";
+    /// LAST review Low 3 (2026-10-03): a media payload the walker cannot read the way the
+    /// provider may (over the decode cap, data after padding, not clean text in its declared
+    /// charset) → fail-closed block. It used to report `DETECTOR_ERROR`, which read as a fault.
+    pub const UNSCANNABLE_MEDIA: &str = "UNSCANNABLE_MEDIA";
     #[cfg(test)]
     pub const DEPENDENCY_UNAVAILABLE: &str = "DEPENDENCY_UNAVAILABLE";
 

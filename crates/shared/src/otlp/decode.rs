@@ -377,6 +377,9 @@ fn build_attributes_with_policy(attrs: &[KeyValue], policy: &OtlpCapturePolicy) 
             }
             "gen_ai.usage.cost" => {
                 out.gen_ai_usage_cost = any_value_f64(av).filter(|v| v.is_finite() && *v >= 0.0);
+                if out.gen_ai_usage_cost.is_some() {
+                    out.tracelane_usage_cost_origin = Some("provider_reported".to_string());
+                }
             }
             "gen_ai.usage.input_tokens" => {
                 out.gen_ai_usage_input_tokens = any_value_u32(av);

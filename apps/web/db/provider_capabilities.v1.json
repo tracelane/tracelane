@@ -1,5 +1,5 @@
 {
-  "_comment": "GWY-49 reference data (CLAUDE.md \u00a723): the zero-data-retention capability of every provider the gateway can route to. `zdr` is one of none | default | enterprise. EVERY row ships as `none` with `verified_at: null` \u2014 a claim about a third party's data handling is not data until someone has read that provider's policy page and dated it (specs/GWY-49 \u00a79 Q1). A `default`/`enterprise` row MUST carry `policy_url` and `verified_at`; the seed refuses otherwise. Seeded into Neon `provider_capabilities` by apps/web/db/seed.mjs; read by the gateway through its refresher, never per request.",
+  "_comment": "GWY-49 reference data (CLAUDE.md \u00a723): the zero-data-retention capability of every provider the gateway can route to. `zdr` is one of none | default | enterprise, with the meanings and the mapping rule fixed by decisions/ADR-079-zdr-provider-policy-data.md \u00a72: `default` = the provider's own page says the endpoint the gateway calls retains no prompt/response content for ANY purpose (abuse monitoring included) and trains on none, for EVERY account, with no account or model condition; `enterprise` = a documented ZDR mode exists but the CUSTOMER's account must hold it (contract, approval or self-serve setting) -- NOT eligible until slice 2's per-key declaration; `none` = neither, or not read. A row with `verified_at` was read on that date at `policy_url` (the full citation table, with the quoted sentences, is ADR-079 \u00a71); `review_by` is verified_at + 90 days, after which the row must be re-read and re-dated (ADR-079 \u00a74). A row with `verified_at: null` has never been read and ships `none`. A `default`/`enterprise` row MUST carry `policy_url` and `verified_at`; the seed refuses otherwise. Seeded into Neon `provider_capabilities` by apps/web/db/seed.mjs; read by the gateway through its refresher, never per request.",
   "version": "v1",
   "providers": {
     "302ai": {
@@ -103,9 +103,10 @@
       "verified_at": null
     },
     "anthropic": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://privacy.claude.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "anyapi": {
       "zdr": "none",
@@ -128,9 +129,10 @@
       "verified_at": null
     },
     "azure": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/concepts/abuse-monitoring",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "bailing": {
       "zdr": "none",
@@ -143,9 +145,10 @@
       "verified_at": null
     },
     "bedrock": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "berget": {
       "zdr": "none",
@@ -164,8 +167,9 @@
     },
     "cerebras": {
       "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "policy_url": "https://www.cerebras.ai/privacy-policy",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "chutes": {
       "zdr": "none",
@@ -198,9 +202,10 @@
       "verified_at": null
     },
     "cohere": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://cohere.com/enterprise-data-commitments",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "coralbricks": {
       "zdr": "none",
@@ -234,13 +239,15 @@
     },
     "deepinfra": {
       "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "policy_url": "https://docs.deepinfra.com/account/data-privacy",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "deepseek": {
       "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "policy_url": "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "digitalocean": {
       "zdr": "none",
@@ -289,8 +296,9 @@
     },
     "fireworks": {
       "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "policy_url": "https://docs.fireworks.ai/guides/security_compliance/data_handling",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "friendli": {
       "zdr": "none",
@@ -314,8 +322,9 @@
     },
     "google": {
       "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "policy_url": "https://ai.google.dev/gemini-api/docs/zdr",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "greenpt": {
       "zdr": "none",
@@ -323,9 +332,10 @@
       "verified_at": null
     },
     "groq": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://console.groq.com/docs/your-data",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "helicone": {
       "zdr": "none",
@@ -488,9 +498,10 @@
       "verified_at": null
     },
     "mistral": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://help.mistral.ai/en/articles/347612-can-i-activate-zero-data-retention-zdr",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "mixlayer": {
       "zdr": "none",
@@ -593,9 +604,10 @@
       "verified_at": null
     },
     "openai": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://developers.openai.com/api/docs/guides/your-data",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "opencode": {
       "zdr": "none",
@@ -613,9 +625,10 @@
       "verified_at": null
     },
     "openrouter": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://openrouter.ai/docs/guides/features/zdr",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "opper": {
       "zdr": "none",
@@ -638,9 +651,10 @@
       "verified_at": null
     },
     "perplexity": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "default",
+      "policy_url": "https://docs.perplexity.ai/docs/resources/privacy-security",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "pioneer": {
       "zdr": "none",
@@ -813,9 +827,10 @@
       "verified_at": null
     },
     "together": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://docs.together.ai/docs/zero-data-retention",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "tokengo": {
       "zdr": "none",
@@ -858,9 +873,10 @@
       "verified_at": null
     },
     "vertex": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/vertex-ai-zero-data-retention",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "volcengine": {
       "zdr": "none",
@@ -888,9 +904,10 @@
       "verified_at": null
     },
     "xai": {
-      "zdr": "none",
-      "policy_url": null,
-      "verified_at": null
+      "zdr": "enterprise",
+      "policy_url": "https://docs.x.ai/developers/faq/security",
+      "verified_at": "2026-10-03",
+      "review_by": "2027-01-01"
     },
     "xiaomi": {
       "zdr": "none",

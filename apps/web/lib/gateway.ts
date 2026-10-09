@@ -18,6 +18,11 @@
  */
 
 import { requireGatewayToken } from "@/lib/auth";
+import {
+	ATTESTATION_HEADER,
+	maybeAttestationHeader,
+} from "@/lib/client-ip-attestation";
+import { headers as requestHeaders } from "next/headers";
 
 /**
  * Resolve the gateway base URL (no trailing slash). Throws in production when
@@ -60,6 +65,28 @@ export function gatewayBaseUrl(): string {
 		);
 	}
 	return raw.replace(/\/$/, "");
+}
+
+/**
+ * Extra headers every gateway request carries: the signed client-IP
+ * attestation (ONE GATEWAY OG-36), so the gateway's admin IP allowlist sees the
+ * browser's address rather than the Worker's. Env is read lazily (Workers).
+ * Fail-soft by design: no secret, no request scope or an unusable IP -> no
+ * header, and the gateway falls back to its own derivation.
+ */
+async function attestationHeaders(
+	token: string,
+): Promise<Record<string, string>> {
+	const secret = process.env.TRACELANE_CLIENT_IP_ATTEST_SECRET;
+	if (!secret) return {};
+	try {
+		const ip = (await requestHeaders()).get("cf-connecting-ip");
+		const value = await maybeAttestationHeader(token, ip, secret);
+		return value ? { [ATTESTATION_HEADER]: value } : {};
+	} catch {
+		// Outside a request scope `headers()` throws — omit the header.
+		return {};
+	}
 }
 
 /**
@@ -135,7 +162,10 @@ export async function gatewayGet<T>(path: string): Promise<T> {
 	let res: Response;
 	try {
 		res = await fetch(`${base}${path}`, {
-			headers: { authorization: `Bearer ${token}` },
+			headers: {
+				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
+			},
 			cache: "no-store",
 			// Bound the tail. There was NO timeout here, so a single stalled
 			// subrequest held the whole page open — and /dashboard fans out to
@@ -180,6 +210,7 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 			method: "POST",
 			headers: {
 				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
 				"content-type": "application/json",
 			},
 			body: JSON.stringify(body),
@@ -221,6 +252,7 @@ export async function gatewayPatch<T>(path: string, body: unknown): Promise<T> {
 			method: "PATCH",
 			headers: {
 				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
 				"content-type": "application/json",
 			},
 			body: JSON.stringify(body),
@@ -265,7 +297,10 @@ export async function gatewayDelete(path: string): Promise<void> {
 	try {
 		res = await fetch(`${base}${path}`, {
 			method: "DELETE",
-			headers: { authorization: `Bearer ${token}` },
+			headers: {
+				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
+			},
 			cache: "no-store",
 			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
@@ -312,6 +347,7 @@ export async function gatewayPostText<T>(
 			method: "POST",
 			headers: {
 				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
 				"content-type": contentType,
 			},
 			body: text,
@@ -361,7 +397,10 @@ export async function gatewayGetText(path: string): Promise<string> {
 	let res: Response;
 	try {
 		res = await fetch(`${base}${path}`, {
-			headers: { authorization: `Bearer ${token}` },
+			headers: {
+				authorization: `Bearer ${token}`,
+				...(await attestationHeaders(token)),
+			},
 			cache: "no-store",
 			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
@@ -392,4 +431,54 @@ export function forwardParams(
 		if (v !== null && v !== "") out.set(k, v);
 	}
 	return out;
+}
+
+/** Preserve download metadata and typed outcome refusals for the incident proxies. */
+export async function gatewayResponse(
+	path: string,
+	init: RequestInit = {},
+): Promise<Response> {
+	const { token } = await requireGatewayToken();
+	const base = gatewayBaseUrl();
+	const headers = new Headers(init.headers);
+	headers.set("authorization", `Bearer ${token}`);
+	for (const [k, v] of Object.entries(await attestationHeaders(token))) {
+		headers.set(k, v);
+	}
+	try {
+		const upstream = await fetch(`${base}${path}`, {
+			...init,
+			headers,
+			cache: "no-store",
+			// NOT `redirect: "error"`: workerd rejects that mode with a TypeError, which the
+			// catch below masked as 502 gateway_unreachable on EVERY route using this helper
+			// (prod, 2026-10-04). "manual" never follows; a 3xx is refused explicitly below.
+			redirect: "manual",
+			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+		});
+		if (upstream.status >= 300 && upstream.status < 400) {
+			// The gateway never redirects an API call; refuse rather than forward a Location.
+			return Response.json({ code: "gateway_unreachable" }, { status: 502 });
+		}
+		const responseHeaders = new Headers();
+		const allowed = new Set([
+			"content-type",
+			"content-disposition",
+			"retry-after",
+			"idempotency-key",
+			"x-truncated",
+		]);
+		for (const [name, value] of upstream.headers) {
+			if (allowed.has(name) || name.startsWith("x-regression-")) {
+				responseHeaders.set(name, value);
+			}
+		}
+		return new Response(upstream.body, {
+			status: upstream.status,
+			statusText: upstream.statusText,
+			headers: responseHeaders,
+		});
+	} catch {
+		return Response.json({ code: "gateway_unreachable" }, { status: 502 });
+	}
 }

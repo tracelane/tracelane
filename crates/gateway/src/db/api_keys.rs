@@ -200,6 +200,9 @@ pub struct KeyAuth {
     /// BILL-01 A3 — this key's budget reset cadence (`api_keys.budget_reset`).
     /// `Monthly` for every key minted before A3.
     pub budget_reset: tracelane_shared::spend::BudgetReset,
+    /// OG-20 / OG-23 — the key's project, environment and policy layers. `None` for a
+    /// key with none of them (the common case: no allocation, today's behaviour).
+    pub governance: Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
     /// B-568 I1: which branch answered. Carries no secret and changes nothing
     /// about the grant — it exists so the slow-request line can say `auth=cold`
     /// and the span can say `tracelane_gateway_cold_start`.
@@ -254,6 +257,10 @@ type CachedAuth = (
     Option<u32>,
     tracelane_shared::spend::BudgetReset,
     Option<DateTime<Utc>>, // earlier of expiry and scheduled revocation
+    // OG-20 / OG-23: project, environment and the parsed policy layers, resolved in the
+    // SAME SELECT. Cached WITH the grant: a warm hit that dropped it would serve the
+    // key unrestricted, which is the privilege escalation A13 named for scope.
+    Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
 );
 
 // Only cold lookups and refreshes lock cache writes. Rotation holds the write
@@ -376,6 +383,623 @@ fn negative_cache() -> &'static Cache<[u8; 32], ()> {
 /// a just-minted key authenticates immediately).
 pub async fn forget_negative(lookup: &[u8; 32]) {
     negative_cache().invalidate(lookup).await;
+}
+
+/// A key was minted IN THIS PROCESS: it must authenticate on its first request.
+/// Clears a negative entry left by a probe of the same key before it existed, and
+/// adds its digest to the valid-key set at once (other instances and any writer
+/// outside this process are caught by the set's miss-triggered refresh).
+async fn note_minted(lookup: &[u8; 32]) {
+    forget_negative(lookup).await;
+    if let Some(k) = known_keys() {
+        k.note_minted(*lookup);
+    }
+}
+
+// ---------------------------------------------------------------------
+// B-594 (2026-10-03): the COLD-LOOKUP GATE
+// ---------------------------------------------------------------------
+//
+// The positive cache, the negative cache and the stale last-known answer cost
+// no round trip. The one branch that does — the `SELECT … WHERE lookup_hash`
+// below — is where a flood of never-seen keys lands, one Neon query each, and
+// the negative cache cannot absorb a key it has never seen. Three bounds sit on
+// that branch, in this order (security review rev4, 2026-10-03):
+//
+// 1. THE VALID-KEY SET ([`KnownKeys`], H1 d / M1) — every live `lookup_hash`,
+//    loaded on the first cold lookup and read again (ONE query for everyone, at
+//    most once per `known_keys_refresh_ms`) when a miss arrives after the last
+//    read. A digest not in the set after that read is a 401 with NO per-key
+//    Postgres lookup and NO token. A digest IN the set skips the per-source bucket,
+//    so a valid cold key behind a shared egress is never throttled by a scanner on
+//    that egress. Set unavailable (never loaded, load failed, past
+//    `known_keys_max`) → the per-source gate below, i.e. today's behaviour
+//    (fail-OPEN on a fault-tolerance path, never a refusal of a valid key).
+// 2. THE PER-SOURCE BUCKET ([`ColdLookupGate`], only when the set could not
+//    answer) — a token RESERVED before `pool.get()` (reserving first is the point:
+//    counting after the fact lets N concurrent junk keys through before the first
+//    is counted). REFUNDED only when no SQL ran: the pool checkout failed, or the
+//    request was cancelled before the checkout completed (drop guard). Kept on
+//    not-found, a failed Argon2id, and a store error AFTER the SQL ran — a refund
+//    there made a slow or exhausted Neon free for an attacker (rev4 H1 b).
+// 3. THE SLOTS ([`ColdSlots`], H1 a) — a fixed number of concurrent cold lookups
+//    across ALL sources, a share of the Postgres pool. Over it, a lookup waits up
+//    to `cold_lookup_wait_ms` and is then refused 429 `auth_throttled` — never
+//    queued without bound. Per-source buckets cannot bound total load: 65,536 /64s
+//    each with a full bucket all reach a 16-connection pool at once.
+//
+// The trait, the task-local and the set live HERE, not in `preauth_limiter`,
+// because `tests/postgres_tenant_integration.rs` mounts `db/` by `#[path]` and
+// cannot reach other crate modules. A lookup with no scope (that integration
+// crate, a spawned task that lost the task-local) has no source to key on: it is
+// counted ([`AUTH_UNGATED_COLD_LOOKUPS_TOTAL`], rev4 L4) and still takes a slot
+// from the process-wide set the gateway installs at boot.
+
+/// What one reservation charged, opaque to this module: the limiter encodes which
+/// buckets (the source's, a wider IPv6 network's, the shared overflow) took a
+/// token so `refund` returns exactly those.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reservation(pub u8);
+
+/// A per-source token ledger for store-reaching key lookups. `source` is an
+/// opaque key the limiter derived from the request (`preauth_limiter::SourceKey`).
+pub trait ColdLookupGate: Send + Sync + 'static {
+    /// Reserve one token. `Err(retry_after_secs)` when the source has none.
+    fn try_acquire(&self, source: u128) -> std::result::Result<Reservation, u64>;
+    /// Give the reserved token back — no SQL ran for it.
+    fn refund(&self, source: u128, reservation: Reservation);
+    /// The reserved token stays spent — the store found no valid key.
+    fn charge(&self, source: u128);
+    /// The process's concurrent cold-lookup slots (rev4 H1 a); `None` = unbounded.
+    fn slots(&self) -> Option<&ColdSlots> {
+        None
+    }
+}
+
+/// A fixed number of concurrent store-reaching key lookups (rev4 H1 a). Cheap to
+/// clone (one `Arc`).
+#[derive(Clone, Debug)]
+pub struct ColdSlots {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    size: usize,
+    wait: Duration,
+}
+
+impl ColdSlots {
+    /// `size` slots (at least one); a lookup over them waits up to `wait`.
+    #[must_use]
+    pub fn new(size: usize, wait: Duration) -> Self {
+        let size = size.max(1);
+        Self {
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(size)),
+            size,
+            wait,
+        }
+    }
+
+    /// Slots in total.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// One slot, or `None` once `wait` has passed with none free.
+    async fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(p) = std::sync::Arc::clone(&self.sem).try_acquire_owned() {
+            return Some(p);
+        }
+        if self.wait.is_zero() {
+            return None;
+        }
+        tokio::time::timeout(self.wait, std::sync::Arc::clone(&self.sem).acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+}
+
+/// The slots a lookup with NO request scope takes — the same set the request
+/// gate holds, installed once at boot (`preauth_limiter::PreAuthLimiter::from_policy`).
+static UNSCOPED_SLOTS: OnceLock<ColdSlots> = OnceLock::new();
+
+/// Install the process-wide slots for unscoped cold lookups. First call wins.
+pub fn install_unscoped_cold_slots(slots: ColdSlots) {
+    let _ = UNSCOPED_SLOTS.set(slots);
+}
+
+/// Cold lookups refused 429 because every slot stayed busy for the whole wait.
+pub static AUTH_COLD_SATURATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// rev4 L4: cold lookups that ran with NO request scope (no source to key a bucket
+/// on) while the valid-key set could not answer — the bucket could not bound them.
+pub static AUTH_UNGATED_COLD_LOOKUPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Keys refused 401 by the valid-key set with no per-key Postgres lookup.
+pub static AUTH_KNOWN_KEY_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// One request's gate: the ledger, who is asking, and whether this request was
+/// refused (the retry-after seconds; 0 = not refused) so the middleware can
+/// normalise whatever the route answered into one 429.
+pub struct ColdGateScope {
+    pub gate: std::sync::Arc<dyn ColdLookupGate>,
+    pub source: u128,
+    /// `OG-20`: the client's address, by B-594's ONE derivation
+    /// (`preauth_limiter::client_ip`) — what a key's `source_ips` rule is judged on.
+    /// `None` when neither a peer nor a believable header gave one.
+    pub client_ip: Option<std::net::IpAddr>,
+    pub throttled_retry_after: AtomicU64,
+}
+
+impl ColdGateScope {
+    #[must_use]
+    pub fn new(
+        gate: std::sync::Arc<dyn ColdLookupGate>,
+        source: u128,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Self {
+        Self {
+            gate,
+            source,
+            client_ip,
+            throttled_retry_after: AtomicU64::new(0),
+        }
+    }
+}
+
+tokio::task_local! {
+    static COLD_GATE: ColdGateScope;
+}
+
+/// `OG-20`: the address this request came from, as the pre-auth layer derived it.
+/// `None` outside a request scope (a background caller, the integration crate) or when
+/// no address could be derived — and a key with a `source_ips` rule is then DENIED
+/// (`Governance::check_source`, fail-CLOSED).
+#[must_use]
+pub fn current_client_ip() -> Option<std::net::IpAddr> {
+    COLD_GATE.try_with(|s| s.client_ip).ok().flatten()
+}
+
+/// Run `fut` with `scope` as its cold-lookup gate.
+pub fn with_cold_gate<F: std::future::Future>(
+    scope: ColdGateScope,
+    fut: F,
+) -> tokio::task::futures::TaskLocalFuture<ColdGateScope, F> {
+    COLD_GATE.scope(scope, fut)
+}
+
+/// The cold lookup was refused before the store: this request's source spent its
+/// failed-lookup budget, or every cold-lookup slot stayed busy. Typed so
+/// `auth::failure` answers 429 — never the 503 a store error gets, never the 401 a
+/// wrong key gets.
+#[derive(Debug, thiserror::Error)]
+#[error("authentication lookups are rate limited — retry after {retry_after_secs} s")]
+pub struct AuthThrottled {
+    pub retry_after_secs: u64,
+}
+
+/// Set by the lookup the moment its connection is checked out: from here on SQL
+/// runs, so a failure or a cancellation keeps the source's token (rev4 H1 b).
+#[derive(Clone, Debug, Default)]
+pub struct SqlMark(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl SqlMark {
+    /// The connection is held; the next await may run SQL.
+    pub fn started(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn is_started(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Which bound a cold lookup is under (see the section comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gating {
+    /// The valid-key set could not answer: per-source bucket, then a slot.
+    Source,
+    /// The digest is in the valid-key set: a slot only — a valid key is never
+    /// charged to its source's bucket (rev4 M1).
+    Known,
+}
+
+/// A reserved token that goes back unless the lookup settles it: dropped before
+/// its SQL ran (a cancelled request, a refused slot, a failed checkout) it refunds;
+/// dropped after, it stays spent (rev4 M2 + H1 b).
+struct Held {
+    gate: std::sync::Arc<dyn ColdLookupGate>,
+    source: u128,
+    reservation: Reservation,
+    mark: SqlMark,
+    settled: bool,
+}
+
+impl Held {
+    fn refund(&mut self) {
+        self.settled = true;
+        self.gate.refund(self.source, self.reservation);
+    }
+    fn charge(&mut self) {
+        self.settled = true;
+        self.gate.charge(self.source);
+    }
+    fn keep(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !self.settled && !self.mark.is_started() {
+            self.gate.refund(self.source, self.reservation);
+        }
+    }
+}
+
+fn note_throttled(retry_after_secs: u64) {
+    let _ = COLD_GATE.try_with(|s| {
+        s.throttled_retry_after
+            .store(retry_after_secs, Ordering::Relaxed);
+    });
+}
+
+/// Run a store-reaching lookup under the request's bounds (B-594 + rev4). `f` gets
+/// a [`SqlMark`] and must call [`SqlMark::started`] once its connection is checked
+/// out.
+///
+/// # Errors
+/// Fail-CLOSED: [`AuthThrottled`] when the source's bucket is empty (under
+/// [`Gating::Source`]) or no slot frees within the wait — `f` is never called, so
+/// no connection is taken and no SQL runs. Otherwise `f`'s own result. A lookup
+/// with no request scope has no bucket to charge (counted, rev4 L4) but still
+/// takes a slot when the process installed them.
+pub(crate) async fn gated_cold_lookup<T, Fut>(
+    gating: Gating,
+    f: impl FnOnce(SqlMark) -> Fut,
+) -> Result<Option<T>>
+where
+    Fut: std::future::Future<Output = Result<Option<T>>>,
+{
+    let mark = SqlMark::default();
+    let scoped = COLD_GATE
+        .try_with(|s| (std::sync::Arc::clone(&s.gate), s.source))
+        .ok();
+    let mut held = None;
+    if gating == Gating::Source {
+        match &scoped {
+            Some((gate, source)) => match gate.try_acquire(*source) {
+                Ok(reservation) => {
+                    held = Some(Held {
+                        gate: std::sync::Arc::clone(gate),
+                        source: *source,
+                        reservation,
+                        mark: mark.clone(),
+                        settled: false,
+                    });
+                }
+                Err(retry_after) => {
+                    let retry_after_secs = retry_after.max(1);
+                    note_throttled(retry_after_secs);
+                    return Err(AuthThrottled { retry_after_secs }.into());
+                }
+            },
+            None => {
+                AUTH_UNGATED_COLD_LOOKUPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let slots = scoped
+        .as_ref()
+        .and_then(|(gate, _)| gate.slots().cloned())
+        .or_else(|| UNSCOPED_SLOTS.get().cloned());
+    let _slot = match slots {
+        Some(s) => {
+            if let Some(p) = s.take().await {
+                Some(p)
+            } else {
+                AUTH_COLD_SATURATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                note_throttled(1);
+                // `held` drops here with no SQL run → its token goes back.
+                return Err(AuthThrottled {
+                    retry_after_secs: 1,
+                }
+                .into());
+            }
+        }
+        None => None,
+    };
+    let result = f(mark.clone()).await;
+    if let Some(h) = held.as_mut() {
+        match &result {
+            Ok(None) => h.charge(),
+            Ok(Some(_)) => h.refund(),
+            // The checkout failed — no SQL ran (an outage is not an auth failure).
+            Err(_) if !mark.is_started() => h.refund(),
+            // The SQL ran and failed: the token stays spent.
+            Err(_) => h.keep(),
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------
+// rev4 H1 d / M1 (2026-10-03): the VALID-KEY SET
+// ---------------------------------------------------------------------
+//
+// Why a set rather than a bloom filter: a few hundred to a few hundred thousand
+// 32-byte digests is ~32 B each plus hash-set overhead — tens of MB at the
+// `known_keys_max` ceiling — and an exact set has NO false positive to measure
+// or tune. Kept current WITHOUT a timer and without NOTIFY: the control-plane
+// LISTEN is off by default because it measured structurally unreliable on Neon
+// (110 drop/reconnect cycles in 21 h — see the auth-cache block comment above), and
+// a timer would keep an idle Neon compute awake. Instead a MISS asks: if no read
+// of the set has STARTED since this request arrived, one read runs (single
+// flight, at most once per `refresh`), and every miss queued behind it decides on
+// its answer. So a key minted anywhere — another instance, any writer — is
+// accepted on its first request within `refresh` + one query; a flood of junk
+// costs at most one cheap read per `refresh` for everyone, and no per-key lookup.
+// Mints in THIS process add the digest at once ([`note_minted`]).
+//
+// Deletions: revoked/expired digests leave the set only on a FULL read (the first
+// read, and any read once the last full one is `full_reload` old). A revoked digest
+// still in the set costs one ordinary cold lookup, which refuses it (the SELECT
+// filters `revoked_at`/`expires_at`) and negative-caches it — membership admits a
+// lookup, it never grants anything.
+
+/// The valid-key set's tunables (`auth_throttle` table, `known_keys_*`).
+#[derive(Debug, Clone, Copy)]
+pub struct KnownKeysConfig {
+    /// Least time between two reads a miss triggers.
+    pub refresh: Duration,
+    /// Longest a miss waits for its read before taking the gated lookup.
+    pub wait: Duration,
+    /// A set whose last FULL read is older than this is read whole again.
+    pub full_reload: Duration,
+    /// How far behind the last read a delta read starts.
+    pub overlap: Duration,
+    /// Past this many digests the set is dropped (the gated lookup applies).
+    pub max: usize,
+}
+
+/// What the set says about one digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// A live key's digest (as of the last read): look it up, no bucket.
+    Present,
+    /// Not in a read that started after this request arrived: 401, no lookup.
+    Absent,
+    /// The set cannot answer (never loaded, the read failed or timed out, too
+    /// large): the gated lookup decides, exactly as before the set existed.
+    Unknown,
+}
+
+/// One read of `api_keys`: the database's `now()` at the read, and the digests.
+#[derive(Debug, Clone)]
+pub struct KeySnapshot {
+    pub at: DateTime<Utc>,
+    pub hashes: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct KnownState {
+    last_ok_start: Option<Instant>,
+    last_attempt: Option<Instant>,
+    last_failed: Option<Instant>,
+    last_full: Option<Instant>,
+    watermark: Option<DateTime<Utc>>,
+}
+
+/// Reads of the valid-key set (full or delta) that succeeded / failed.
+pub static KNOWN_KEYS_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static KNOWN_KEYS_READ_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// The set of live `lookup_hash` digests (see the section comment).
+pub struct KnownKeys {
+    cfg: KnownKeysConfig,
+    set: parking_lot::RwLock<Option<std::collections::HashSet<[u8; 32]>>>,
+    state: parking_lot::Mutex<KnownState>,
+    reading: tokio::sync::Mutex<()>,
+}
+
+impl KnownKeys {
+    #[must_use]
+    pub fn new(cfg: KnownKeysConfig) -> Self {
+        Self {
+            cfg,
+            set: parking_lot::RwLock::new(None),
+            state: parking_lot::Mutex::new(KnownState::default()),
+            reading: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Whether a read has populated the set (and it was not dropped since).
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        self.set.read().is_some()
+    }
+
+    /// Digests held (0 when not loaded).
+    #[must_use]
+    pub fn digest_count(&self) -> usize {
+        self.set
+            .read()
+            .as_ref()
+            .map_or(0, std::collections::HashSet::len)
+    }
+
+    /// A key minted in this process: present at once (no-op before the first read,
+    /// which will see it).
+    pub fn note_minted(&self, digest: [u8; 32]) {
+        if let Some(s) = self.set.write().as_mut() {
+            s.insert(digest);
+        }
+    }
+
+    fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.set.read().as_ref().is_some_and(|s| s.contains(digest))
+    }
+
+    /// Whether `digest` belongs to a live key. `fetch(None)` reads every live
+    /// digest; `fetch(Some(t))` reads every digest created at or after `t`.
+    ///
+    /// # Errors
+    /// None — every failure (the read failed, it timed out, the set is too large)
+    /// is [`Membership::Unknown`]: fail-OPEN to the gated lookup, never a refusal
+    /// of a valid key.
+    pub async fn classify<F, Fut>(&self, digest: &[u8; 32], fetch: F) -> Membership
+    where
+        F: FnOnce(Option<DateTime<Utc>>) -> Fut,
+        Fut: std::future::Future<Output = Result<KeySnapshot>>,
+    {
+        if self.contains(digest) {
+            return Membership::Present;
+        }
+        let arrival = Instant::now();
+        tokio::time::timeout(self.cfg.wait, self.confirm(digest, arrival, fetch))
+            .await
+            .unwrap_or(Membership::Unknown)
+    }
+
+    async fn confirm<F, Fut>(&self, digest: &[u8; 32], arrival: Instant, fetch: F) -> Membership
+    where
+        F: FnOnce(Option<DateTime<Utc>>) -> Fut,
+        Fut: std::future::Future<Output = Result<KeySnapshot>>,
+    {
+        let _single_flight = self.reading.lock().await;
+        if self.contains(digest) {
+            return Membership::Present;
+        }
+        let st = *self.state.lock();
+        let loaded = self.is_loaded();
+        // A read that STARTED after this request arrived did not see the key.
+        if loaded && st.last_ok_start.is_some_and(|s| s >= arrival) {
+            return Membership::Absent;
+        }
+        // Never loaded and the last attempt failed recently: do not make every
+        // request wait on a store that is down — the gated lookup answers.
+        if !loaded
+            && st
+                .last_failed
+                .is_some_and(|f| arrival.saturating_duration_since(f) < self.cfg.refresh)
+        {
+            return Membership::Unknown;
+        }
+        if let Some(last) = st.last_attempt {
+            tokio::time::sleep_until((last + self.cfg.refresh).into()).await;
+        }
+        let started = Instant::now();
+        let full = !loaded
+            || st.watermark.is_none()
+            || st
+                .last_full
+                .is_none_or(|f| started.saturating_duration_since(f) >= self.cfg.full_reload);
+        let since = if full {
+            None
+        } else {
+            st.watermark.map(|w| {
+                w - chrono::Duration::from_std(self.cfg.overlap).unwrap_or(chrono::Duration::zero())
+            })
+        };
+        self.state.lock().last_attempt = Some(started);
+        let snap = match fetch(since).await {
+            Ok(s) => s,
+            Err(err) => {
+                KNOWN_KEYS_READ_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                self.state.lock().last_failed = Some(started);
+                tracing::debug!(error = %err, "valid-key set read failed; the gated lookup answers");
+                return Membership::Unknown;
+            }
+        };
+        KNOWN_KEYS_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut set = self.set.write();
+            if full {
+                *set = Some(snap.hashes.into_iter().collect());
+            } else if let Some(s) = set.as_mut() {
+                s.extend(snap.hashes);
+            }
+            if set.as_ref().is_some_and(|s| s.len() > self.cfg.max) {
+                // Too many keys to hold: drop the set — the gated lookup applies.
+                *set = None;
+                self.state.lock().last_failed = Some(started);
+                return Membership::Unknown;
+            }
+        }
+        {
+            let mut s = self.state.lock();
+            s.last_ok_start = Some(started);
+            s.watermark = Some(snap.at);
+            if full {
+                s.last_full = Some(started);
+            }
+        }
+        if self.contains(digest) {
+            Membership::Present
+        } else {
+            Membership::Absent
+        }
+    }
+}
+
+static KNOWN_KEYS: OnceLock<KnownKeys> = OnceLock::new();
+
+/// Turn the valid-key set on for this process (boot, with a Postgres pool). First
+/// call wins. Unconfigured — tests, the integration crate, a no-Postgres gateway —
+/// every lookup takes the gated path, as before the set existed.
+pub fn configure_known_keys(cfg: KnownKeysConfig) {
+    let _ = KNOWN_KEYS.set(KnownKeys::new(cfg));
+}
+
+/// The process's valid-key set, if configured.
+#[must_use]
+pub fn known_keys() -> Option<&'static KnownKeys> {
+    KNOWN_KEYS.get()
+}
+
+/// One read of `api_keys` for the valid-key set: `since = None` reads every LIVE
+/// digest (not revoked, not expired); `Some(t)` reads every digest created at or
+/// after `t` (revoked or not — membership admits a lookup, it grants nothing).
+/// At most `max + 1` digests, so an oversized table is detected without loading it.
+///
+/// # Errors
+/// The checkout or the query failed.
+async fn fetch_known_keys(
+    pool: &Pool,
+    since: Option<DateTime<Utc>>,
+    max: usize,
+) -> Result<KeySnapshot> {
+    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let limit = i64::try_from(max).unwrap_or(i64::MAX).saturating_add(1);
+    let row = match since {
+        None => {
+            client
+                .query_one(
+                    "SELECT now(), ARRAY(SELECT lookup_hash FROM api_keys \
+                     WHERE lookup_hash IS NOT NULL \
+                       AND (revoked_at IS NULL OR revoked_at > now()) \
+                       AND (expires_at IS NULL OR expires_at > now()) \
+                     LIMIT $1)",
+                    &[&limit],
+                )
+                .await
+        }
+        Some(t) => {
+            client
+                .query_one(
+                    "SELECT now(), ARRAY(SELECT lookup_hash FROM api_keys \
+                     WHERE lookup_hash IS NOT NULL AND created_at >= $2 LIMIT $1)",
+                    &[&limit, &t],
+                )
+                .await
+        }
+    }
+    .context("SELECT api_keys digests for the valid-key set failed")?;
+    let raw: Vec<Vec<u8>> = row.get(1);
+    Ok(KeySnapshot {
+        at: row.get(0),
+        hashes: raw
+            .into_iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -692,11 +1316,17 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
     // is what makes that obvious in review.
     let row = client
         .query_opt(
-            "SELECT tenant_id, id, scope, budget_usd_monthly::text, rate_limit_rpm, budget_reset, expires_at, revoked_at
-             FROM api_keys
-             WHERE lookup_hash = $1
-               AND (revoked_at IS NULL OR revoked_at > now())
-               AND (expires_at IS NULL OR expires_at > now())",
+            // OG-20/OG-23: the governance columns + the project JOIN are the SAME text as
+            // the miss path's (`AUTH_GOVERNANCE_COLUMNS`, `AUTH_PROJECT_JOIN`), so a
+            // refresh can never cache a key without the policy the miss path would read.
+            &format!(
+                "SELECT k.tenant_id, k.id, k.scope, k.budget_usd_monthly::text, k.rate_limit_rpm, \
+                        k.budget_reset, k.expires_at, k.revoked_at, {AUTH_GOVERNANCE_COLUMNS}
+                 FROM api_keys k {AUTH_PROJECT_JOIN}
+                 WHERE k.lookup_hash = $1
+                   AND (k.revoked_at IS NULL OR k.revoked_at > now())
+                   AND (k.expires_at IS NULL OR k.expires_at > now())"
+            ),
             &[&digest.as_slice()],
         )
         .await
@@ -737,10 +1367,55 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
         rate_limit_rpm,
         budget_reset,
         auth_deadline(row.get(6), row.get(7)),
+        governance_from_row(&row, 8),
     );
     auth_cache().insert(digest, entry.clone()).await;
     remember_last_known(digest, entry);
     Ok(true)
+}
+
+/// `OG-20` / `OG-23`: the four governance columns every auth SELECT reads, in
+/// [`governance_from_row`]'s order. `p.id`, not `k.project_id`: the JOIN repeats the
+/// tenant predicate, so a hand-edited cross-tenant `project_id` resolves to NO project
+/// (and no project policy) rather than to another tenant's.
+pub(crate) const AUTH_GOVERNANCE_COLUMNS: &str = "p.id, k.environment, k.policy, p.policy";
+
+/// The project JOIN of every auth SELECT (`k` = `api_keys`).
+pub(crate) const AUTH_PROJECT_JOIN: &str =
+    "LEFT JOIN projects p ON p.id = k.project_id AND p.tenant_id = k.tenant_id";
+
+/// The `(table, column)` pairs the auth SELECT reads beyond the original key columns —
+/// named so the boot check (`entitlement_cache::verify_schema`) refuses to start a
+/// gateway whose control plane lacks migrations 0056/0057 (S2), instead of every API
+/// key failing its lookup with a 503.
+pub const AUTH_SCHEMA_COLUMNS: &[(&str, &str)] = &[
+    ("api_keys", "project_id"),
+    ("api_keys", "environment"),
+    ("api_keys", "policy"),
+    ("projects", "id"),
+    ("projects", "tenant_id"),
+    ("projects", "policy"),
+];
+
+/// Parse the governance columns at `base` (`AUTH_GOVERNANCE_COLUMNS`' order). Parsed
+/// ONCE per cold lookup / refresh, never per request. A stored policy that does not
+/// parse becomes an INVALID layer (fail-CLOSED: every request on the key is refused),
+/// never "no policy".
+fn governance_from_row(
+    row: &tokio_postgres::Row,
+    base: usize,
+) -> Option<std::sync::Arc<tracelane_shared::key_policy::Governance>> {
+    let project_id: Option<Uuid> = row.get(base);
+    let environment: Option<String> = row.get(base + 1);
+    let key_policy: Option<serde_json::Value> = row.get(base + 2);
+    let project_policy: Option<serde_json::Value> = row.get(base + 3);
+    tracelane_shared::key_policy::Governance::from_columns(
+        project_id,
+        environment,
+        project_policy.as_ref(),
+        key_policy.as_ref(),
+    )
+    .map(std::sync::Arc::new)
 }
 
 /// Start the warm-refresh task. No-op when `TRACELANE_AUTH_REFRESH_SECS=0`.
@@ -799,6 +1474,25 @@ pub async fn invalidate(digest: [u8; 32]) {
     // An explicit invalidation (our own revoke path) is immediate: the
     // last-known answer must not outlive it.
     forget_last_known(digest);
+}
+
+/// `OG-20` / `OG-23`: commit `tx` under the auth-cache WRITE lock, then evict every
+/// digest in `digests` — [`update`]'s ordering, for a write that changes the governance
+/// of MANY keys at once (a project's policy). A cold lookup that read the OLD rows before
+/// the commit finishes populating first, so it cannot put the old policy back.
+///
+/// # Errors
+/// The commit failed: nothing was written and nothing is evicted.
+pub async fn commit_and_invalidate(
+    tx: deadpool_postgres::Transaction<'_>,
+    digests: Vec<[u8; 32]>,
+) -> Result<()> {
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit().await.context("commit failed")?;
+    for d in digests {
+        invalidate(d).await;
+    }
+    Ok(())
 }
 
 // `auth_cache_stats` (a `(hits, misses)` reader for the health/metrics
@@ -1003,7 +1697,7 @@ pub async fn rotate(
     pool: &Pool,
     tenant: &TenantId,
     id: Uuid,
-    actor: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
     grace_hours: i64,
 ) -> Result<Option<RotatedKey>> {
     if !valid_rotation_grace(grace_hours) {
@@ -1027,12 +1721,16 @@ pub async fn rotate(
         .try_into()
         .map_err(|_| anyhow!("invalid lookup digest"))?;
     let row = tx.query_one(
+        // OG-20 / OG-23: the successor inherits the project, the environment and the
+        // POLICY — a rotation must never shed a restriction.
         "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by,
-             scope, expires_at, budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker)
+             scope, expires_at, budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker,
+             project_id, environment, policy)
          SELECT tenant_id, name, $3, $4, $5, minted_by, scope, expires_at, budget_usd_monthly,
-             rate_limit_rpm, budget_reset, velocity_breaker FROM api_keys WHERE tenant_id = $1 AND id = $2
+             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy
+             FROM api_keys WHERE tenant_id = $1 AND id = $2
          RETURNING id, name, created_at, scope, expires_at, budget_usd_monthly::text,
-             rate_limit_rpm, budget_reset, velocity_breaker",
+             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy",
         &[tenant.as_uuid(), &id, &material.lookup_hash.as_slice(), &material.argon2id_phc, &prefix],
     ).await?;
     let successor_id: Uuid = row.get(0);
@@ -1045,12 +1743,24 @@ pub async fn rotate(
         )
         .await?
         .get(0);
-    tx.execute(
-        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, after_json)
-         VALUES ($1, $2, 'api_key.rotate', 'api_key', $3,
-             jsonb_build_object('successorId', $4::text, 'revokedAt', $5::timestamptz))",
-        &[&actor, tenant.as_uuid(), &id.to_string(), &successor_id.to_string(), &revoked_at],
-    ).await?;
+    // OG-35: through the ONE writer (request id, role, method; redaction). Same
+    // transaction as before — a refused audit row still rolls the rotation back.
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "api_key.rotate",
+            target_type: "api_key",
+            target_id: id.to_string(),
+            before: Some(serde_json::json!({ "revokedAt": null })),
+            after: Some(serde_json::json!({
+                "successorId": successor_id.to_string(),
+                "revokedAt": revoked_at.to_rfc3339(),
+            })),
+        },
+    )
+    .await?;
     let options = MintOptions {
         scope: row.get(3),
         expires_at: row.get(4),
@@ -1063,13 +1773,16 @@ pub async fn rotate(
             row.get(7),
         )),
         velocity_breaker: row.get(8),
+        project_id: row.get(9),
+        environment: row.get(10),
+        policy: row.get(11),
     };
     // A cold lookup that started before this transaction must finish populating
     // before invalidation. No request can restore its pre-rotation cache entry.
     let _cache_write = AUTH_CACHE_WRITES.write().await;
     tx.commit().await?;
     invalidate(digest).await;
-    forget_negative(&material.lookup_hash).await;
+    note_minted(&material.lookup_hash).await;
     Ok(Some(RotatedKey {
         minted: MintedKey {
             api_key: ApiKey {
@@ -1102,7 +1815,11 @@ pub async fn rotate(
 /// keys from either surface verify through `lookup_tenant_by_key_body`.
 ///
 /// # Errors
-/// RNG failure, pepper-not-initialized, Argon2id hashing, or the DB insert.
+/// RNG failure, pepper-not-initialized, Argon2id hashing, or the DB insert —
+/// including its OG-35 `api_key.create` audit row (fail-CLOSED: no row, no key).
+///
+/// The actor is the minter as a SYSTEM actor (`minted_by`, else `system`); the
+/// HTTP path calls [`mint_as`] with the full request actor instead. Both record.
 pub async fn mint(
     pool: &Pool,
     tenant_id: &TenantId,
@@ -1110,10 +1827,27 @@ pub async fn mint(
     minted_by: Option<&str>,
     opts: MintOptions,
 ) -> Result<MintedKey> {
+    let actor = crate::db::control_audit::Actor::system(minted_by.unwrap_or("system"));
+    mint_as(pool, tenant_id, name, minted_by, opts, &actor).await
+}
+
+/// [`mint`], recording `actor` (role, method, request id, address) on the
+/// `api_key.create` row — the `POST /v1/keys` path.
+///
+/// # Errors
+/// As [`mint`].
+pub async fn mint_as(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    name: &str,
+    minted_by: Option<&str>,
+    opts: MintOptions,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<MintedKey> {
     let body = generate_key_body()?;
     let material = KeyMaterial::from_body(&body)?;
     let key_prefix: String = body.chars().take(KEY_PREFIX_LEN).collect();
-    let api_key = create(
+    let api_key = create_as(
         pool,
         tenant_id,
         &material,
@@ -1121,6 +1855,7 @@ pub async fn mint(
         &key_prefix,
         minted_by,
         &opts,
+        actor,
     )
     .await?;
     Ok(MintedKey {
@@ -1190,6 +1925,24 @@ pub struct MintOptions {
     /// default (the column's own `DEFAULT false`) — a customer must ask for
     /// anomaly-triggered promotion freezes, not receive them unasked.
     pub velocity_breaker: bool,
+    /// OG-23: the project to mint the key into (live, this tenant — checked by
+    /// [`create`]) and its environment label.
+    pub project_id: Option<Uuid>,
+    pub environment: Option<String>,
+    /// OG-20: the key's own policy, ALREADY validated and canonical.
+    pub policy: Option<serde_json::Value>,
+}
+
+/// OG-23: why [`create`] refused an assignment. Typed so the mint route answers 404 / 409
+/// instead of a 500.
+#[derive(Debug, thiserror::Error)]
+pub enum AssignmentError {
+    #[error("project not found")]
+    ProjectNotFound,
+    #[error("environment `{0}` is not one of the project's environments")]
+    EnvironmentNotInProject(String),
+    #[error("an environment needs a project")]
+    EnvironmentNeedsProject,
 }
 
 impl MintOptions {
@@ -1253,6 +2006,14 @@ const BUDGET_NUMERIC_CAST: &str = "::text::numeric";
 /// (`apps/web/app/api/settings/api-keys`); this gateway-side `create` is used by
 /// integration tests and any future gateway-side mint path. Both must produce
 /// identical `lookup_hash`/`argon2id_phc` from the key body.
+///
+/// # Errors
+/// Fail-CLOSED (OG-35): the insert and its `api_key.create` audit row are ONE
+/// transaction — a refused audit row means no key exists.
+// The raw writer the real-Postgres crate (`tests/postgres_tenant_integration.rs`,
+// which mounts this module by `#[path]`) drives directly; the gateway binary mints
+// through `mint` / `mint_as` → `create_as`, so in THIS crate it has no caller.
+#[allow(dead_code)]
 pub async fn create(
     pool: &Pool,
     tenant_id: &TenantId,
@@ -1262,7 +2023,48 @@ pub async fn create(
     minted_by: Option<&str>,
     opts: &MintOptions,
 ) -> Result<ApiKey> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let actor = crate::db::control_audit::Actor::system(minted_by.unwrap_or("system"));
+    create_as(
+        pool, tenant_id, material, name, key_prefix, minted_by, opts, &actor,
+    )
+    .await
+}
+
+/// [`create`], recording `actor` on the `api_key.create` row.
+///
+/// # Errors
+/// As [`create`] — fail-CLOSED.
+// Eight inputs, each a distinct column or the audit actor; a params struct would
+// only rename the same list (OG-35 added the actor).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_as(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    material: &KeyMaterial,
+    name: &str,
+    key_prefix: &str,
+    minted_by: Option<&str>,
+    opts: &MintOptions,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<ApiKey> {
+    // OG-35: the key and its `api_key.create` row commit together, or neither does.
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    // OG-23: the project must be a LIVE project of THIS tenant, and the environment one
+    // of its own. (An archive racing this INSERT is harmless: an archived project still
+    // governs its keys.)
+    match (opts.project_id, &opts.environment) {
+        (None, None) => {}
+        (None, Some(_)) => return Err(AssignmentError::EnvironmentNeedsProject.into()),
+        (Some(project), env) => {
+            let Some(envs) = live_project_environments(&tx, tenant_id, project).await? else {
+                return Err(AssignmentError::ProjectNotFound.into());
+            };
+            if let Some(e) = env.as_ref().filter(|e| !envs.contains(e)) {
+                return Err(AssignmentError::EnvironmentNotInProject(e.clone()).into());
+            }
+        }
+    }
     let budget_text: Option<String> = opts.budget_usd_monthly.map(|b| format!("{b:.4}"));
     // `budget_reset` binds as TEXT into a `CHECK`-constrained column, same
     // shape as the `plan` enum cast (`db/tenants.rs::PLAN_ENUM_CAST`) — a bare
@@ -1279,12 +2081,12 @@ pub async fn create(
         // are likewise bare — `text` and `boolean` both bind natively.
         "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by, \
                                scope, expires_at, budget_usd_monthly, rate_limit_rpm, \
-                               budget_reset, velocity_breaker)
+                               budget_reset, velocity_breaker, project_id, environment, policy)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST}, $10, \
-                 COALESCE($11, 'monthly'), $12)
+                 COALESCE($11, 'monthly'), $12, $13, $14, $15)
          RETURNING id, tenant_id, name, created_at, last_used_at, revoked_at, scope, expires_at"
     );
-    let row = client
+    let row = tx
         .query_one(
             &sql,
             &[
@@ -1300,13 +2102,47 @@ pub async fn create(
                 &opts.rate_limit_rpm,
                 &budget_reset,
                 &opts.velocity_breaker,
+                &opts.project_id,
+                &opts.environment,
+                &opts.policy,
             ],
         )
         .await
         .context("INSERT INTO api_keys failed")?;
+    let id: Uuid = row.get(0);
+    // Never the body, the lookup digest or the PHC: the display prefix is the one
+    // key-derived field, and it is already what the dashboard shows.
+    crate::db::control_audit::record(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "api_key.create",
+            target_type: "api_key",
+            target_id: id.to_string(),
+            before: None,
+            after: Some(serde_json::json!({
+                "name": name,
+                "keyPrefix": key_prefix,
+                "mintedBy": minted_by,
+                "scope": opts.scope,
+                "expiresAt": opts.expires_at.map(|t| t.to_rfc3339()),
+                "budgetUsdMonthly": opts.budget_usd_monthly,
+                "rateLimitRpm": opts.rate_limit_rpm,
+                "budgetReset": budget_reset,
+                "velocityBreaker": opts.velocity_breaker,
+                "projectId": opts.project_id,
+                "environment": opts.environment,
+                "policy": opts.policy,
+            })),
+        },
+    )
+    .await
+    .context("admin_audit_log api_key.create insert failed")?;
+    tx.commit().await.context("api_keys create commit failed")?;
     // B-383 (f): a probe of this exact key before it existed would have left a
     // negative entry; a freshly minted key must authenticate at once.
-    forget_negative(&material.lookup_hash).await;
+    note_minted(&material.lookup_hash).await;
     Ok(ApiKey {
         id: row.get(0),
         name: row.get(2),
@@ -1334,6 +2170,15 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
     key_body: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<KeyAuth>> {
+    lookup_with_known(pool, key_body, now, known_keys()).await
+}
+
+async fn lookup_with_known(
+    pool: &Pool,
+    key_body: &str,
+    now: DateTime<Utc>,
+    known: Option<&KnownKeys>,
+) -> Result<Option<KeyAuth>> {
     let lookup = peppered_lookup(key_body)?;
 
     // fix B: warm-cache hit — the peppered-HMAC digest matched a previously
@@ -1346,6 +2191,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
         rate_limit_rpm,
         budget_reset,
         valid_until,
+        governance,
     )) = auth_cache().get(&lookup).await
     {
         // Fail CLOSED at the deadline even while the cache TTL is live.
@@ -1374,6 +2220,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
             budget_usd_monthly,
             rate_limit_rpm,
             budget_reset,
+            governance,
             path: LookupPath::Warm,
         }));
     }
@@ -1392,6 +2239,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
         rate_limit_rpm,
         budget_reset,
         valid_until,
+        governance,
     )) = last_known_fresh_enough(lookup)
     {
         // Stale grants never extend known expiry or scheduled revocation.
@@ -1414,11 +2262,82 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
             budget_usd_monthly,
             rate_limit_rpm,
             budget_reset,
+            governance,
             path: LookupPath::Stale,
         }));
     }
 
+    lookup_cold_stage(pool, key_body, lookup, now, known).await
+}
+
+/// The miss path past every cache, against an explicit valid-key set — what
+/// [`lookup_tenant_by_key_body`] runs with the process's set, and what the
+/// real-Postgres integration test runs with its OWN set over its own database
+/// (the process set would answer for a different database).
+///
+/// # Errors
+/// As [`lookup_tenant_by_key_body`].
+///
+/// Called only from `crates/gateway/tests/postgres_tenant_integration.rs` (a
+/// separate crate, invisible to this crate's `dead_code` analysis) — allowed the
+/// same way as [`revoke`].
+#[allow(dead_code)]
+pub async fn lookup_tenant_by_key_body_with(
+    pool: &Pool,
+    key_body: &str,
+    known: Option<&KnownKeys>,
+) -> Result<Option<KeyAuth>> {
+    lookup_with_known(pool, key_body, Utc::now(), known).await
+}
+
+/// The ONE store-reaching stage. The valid-key set answers first (rev4 H1 d): a
+/// digest absent from a read that started after this request arrived is a 401 with
+/// no per-key lookup; a present one is looked up under a slot only; when the set
+/// cannot answer, the request's per-source bucket and a slot both apply (B-594).
+async fn lookup_cold_stage(
+    pool: &Pool,
+    key_body: &str,
+    lookup: [u8; 32],
+    now: DateTime<Utc>,
+    known: Option<&KnownKeys>,
+) -> Result<Option<KeyAuth>> {
+    let gating = match known {
+        None => Gating::Source,
+        Some(k) => {
+            let max = k.cfg.max;
+            match k
+                .classify(&lookup, |since| fetch_known_keys(pool, since, max))
+                .await
+            {
+                Membership::Present => Gating::Known,
+                Membership::Absent => {
+                    AUTH_KNOWN_KEY_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    negative_cache().insert(lookup, ()).await;
+                    return Ok(None);
+                }
+                Membership::Unknown => Gating::Source,
+            }
+        }
+    };
+    gated_cold_lookup(gating, |mark| {
+        cold_lookup(pool, key_body, lookup, now, mark)
+    })
+    .await
+}
+
+/// The Postgres stage of [`lookup_tenant_by_key_body_at`]: SELECT by the
+/// peppered digest, Argon2id verify, populate the caches. `Ok(None)` = no valid
+/// key (and the miss is remembered); `Err` = the store failed.
+async fn cold_lookup(
+    pool: &Pool,
+    key_body: &str,
+    lookup: [u8; 32],
+    now: DateTime<Utc>,
+    mark: SqlMark,
+) -> Result<Option<KeyAuth>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    // From here on SQL runs: a failure or a cancellation keeps the source's token.
+    mark.started();
 
     let cache_write = AUTH_CACHE_WRITES.read().await;
 
@@ -1439,12 +2358,17 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
             // cannot deserialize into f64 directly, so it is cast to text here
             // and parsed — the mirror image of the `::text::numeric` cast the
             // INSERT side needs, and for the same reason.
-            "SELECT tenant_id, id, argon2id_phc, scope, expires_at,
-                    budget_usd_monthly::text, rate_limit_rpm, budget_reset, revoked_at
-             FROM api_keys
-             WHERE lookup_hash = $1
-               AND (revoked_at IS NULL OR revoked_at > now())
-               AND (expires_at IS NULL OR expires_at > now())",
+            // OG-20/OG-23: the project JOIN and the governance columns ride the SAME
+            // round trip (no second query on a cold key).
+            &format!(
+                "SELECT k.tenant_id, k.id, k.argon2id_phc, k.scope, k.expires_at,
+                        k.budget_usd_monthly::text, k.rate_limit_rpm, k.budget_reset, k.revoked_at,
+                        {AUTH_GOVERNANCE_COLUMNS}
+                 FROM api_keys k {AUTH_PROJECT_JOIN}
+                 WHERE k.lookup_hash = $1
+                   AND (k.revoked_at IS NULL OR k.revoked_at > now())
+                   AND (k.expires_at IS NULL OR k.expires_at > now())"
+            ),
             &[&lookup.as_slice()],
         )
         .await
@@ -1506,6 +2430,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
     }
 
     let valid_until = auth_deadline(row.get(4), row.get(8));
+    let governance = governance_from_row(&row, 9);
     if valid_until.is_some_and(|deadline| now.max(Utc::now()) >= deadline) {
         return Ok(None);
     }
@@ -1522,6 +2447,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
         rate_limit_rpm,
         budget_reset,
         valid_until,
+        governance.clone(),
     );
     auth_cache().insert(lookup, entry.clone()).await;
     remember_last_known(lookup, entry);
@@ -1539,6 +2465,7 @@ pub(crate) async fn lookup_tenant_by_key_body_at(
         budget_usd_monthly,
         rate_limit_rpm,
         budget_reset,
+        governance,
         path: LookupPath::Cold,
     }))
 }
@@ -1602,6 +2529,17 @@ pub struct KeyPatch {
     pub rate_limit_rpm: Option<Option<i32>>,
     pub budget_reset: Option<tracelane_shared::spend::BudgetReset>,
     pub velocity_breaker: Option<bool>,
+    /// OG-23: move the key into a project (`Some(Some(id))`) or out of one (`Some(None)`).
+    /// The project must be live and in THIS tenant — checked under the row lock.
+    pub project_id: Option<Option<Uuid>>,
+    /// OG-23: the key's environment label (one of its project's environments).
+    pub environment: Option<Option<String>>,
+    /// OG-20: the key's own policy, ALREADY validated and canonical (`KeyPolicy::to_value`);
+    /// `Some(None)` clears it.
+    pub policy: Option<Option<serde_json::Value>>,
+    /// OG-51: the key's own cache narrowing, ALREADY validated and canonical
+    /// (`KeyCache::to_json`); `Some(None)` clears it (which WIDENS — an owner decision).
+    pub cache: Option<Option<serde_json::Value>>,
 }
 
 /// One key as the settings surface reads it. No secret-derived column.
@@ -1621,6 +2559,13 @@ pub struct KeyRecord {
     pub velocity_breaker: bool,
     /// A FUTURE value means the key is retiring (rotated, in its grace window).
     pub revoked_at: Option<DateTime<Utc>>,
+    /// OG-23: the key's project, and its environment label.
+    pub project_id: Option<Uuid>,
+    pub environment: Option<String>,
+    /// OG-20: the key's own policy document as stored.
+    pub policy: Option<serde_json::Value>,
+    /// OG-51: the key's own cache narrowing as stored (`{"mode":"off"?,"namespace_by"?}`).
+    pub cache: Option<serde_json::Value>,
 }
 
 /// The result of [`update`]. Every refusal is decided under the row lock.
@@ -1638,13 +2583,25 @@ pub enum UpdateOutcome {
         record: Box<KeyRecord>,
         changed: Vec<&'static str>,
     },
+    /// OG-23: the named project is not a LIVE project of this tenant (one answer for
+    /// absent, archived and another tenant's — no existence oracle).
+    ProjectNotFound,
+    /// OG-23: the environment the key would carry is not one of its project's.
+    EnvironmentNotInProject { environment: String },
+    /// OG-23: an environment label needs a project (the key would have none).
+    EnvironmentNeedsProject,
 }
 
 /// The record columns, in [`record_from_row`]'s order. ONE list for the
 /// `SELECT … FOR UPDATE`, the `UPDATE … RETURNING` and [`get`], so they cannot
 /// disagree about positions.
 const RECORD_COLUMNS: &str = "id, name, key_prefix, created_at, last_used_at, minted_by, scope, \
-     expires_at, budget_usd_monthly::text, rate_limit_rpm, budget_reset, velocity_breaker, revoked_at";
+     expires_at, budget_usd_monthly::text, rate_limit_rpm, budget_reset, velocity_breaker, revoked_at, \
+     project_id, environment, policy, cache";
+
+/// How many columns [`RECORD_COLUMNS`] names — the index of the first column a query
+/// appends after it.
+const RECORD_LEN: usize = 17;
 
 fn record_from_row(row: &tokio_postgres::Row) -> KeyRecord {
     KeyRecord {
@@ -1663,6 +2620,10 @@ fn record_from_row(row: &tokio_postgres::Row) -> KeyRecord {
         budget_reset: tracelane_shared::spend::BudgetReset::from_column(row.get::<_, &str>(10)),
         velocity_breaker: row.get(11),
         revoked_at: row.get(12),
+        project_id: row.get(13),
+        environment: row.get(14),
+        policy: row.get(15),
+        cache: row.get(16),
     }
 }
 
@@ -1776,7 +2737,85 @@ fn diff_patch(
         );
         eff.velocity_breaker = Some(vb);
     }
+    if let Some(pid) = patch.project_id
+        && pid != current.project_id
+    {
+        note(
+            "project_id",
+            json!(current.project_id.map(|p| p.to_string())),
+            json!(pid.map(|p| p.to_string())),
+        );
+        eff.project_id = Some(pid);
+    }
+    if let Some(env) = &patch.environment
+        && *env != current.environment
+    {
+        note("environment", json!(current.environment), json!(env));
+        eff.environment = Some(env.clone());
+    }
+    if let Some(policy) = &patch.policy
+        && *policy != current.policy
+    {
+        // Before AND after, whole: the audit row is the record of who changed a
+        // security control and from what (OG-35 reads it).
+        note("policy", json!(current.policy), json!(policy));
+        eff.policy = Some(policy.clone());
+    }
+    if let Some(cache) = &patch.cache
+        && *cache != current.cache
+    {
+        // OG-51: before AND after, whole — removing a narrowing widens the cache, and the
+        // audit row is the record of who did it.
+        note("cache", json!(current.cache), json!(cache));
+        eff.cache = Some(cache.clone());
+    }
     (eff, changed, before, after)
+}
+
+/// OG-23: the environments of a LIVE project of `tenant`, or `None` (absent, archived,
+/// or another tenant's — one answer).
+async fn live_project_environments(
+    client: &impl deadpool_postgres::GenericClient,
+    tenant: &TenantId,
+    project: Uuid,
+) -> Result<Option<Vec<String>>> {
+    Ok(client
+        .query_opt(
+            "SELECT environments FROM projects \
+             WHERE tenant_id = $1 AND id = $2 AND archived_at IS NULL",
+            &[tenant.as_uuid(), &project],
+        )
+        .await
+        .context("SELECT projects (assignment) failed")?
+        .map(|r| r.get(0)))
+}
+
+/// OG-23: the assignment a key would END with after `eff` (project, environment) is
+/// valid — the project live and in this tenant, the environment one of its own. Checked
+/// under the key's row lock; `None` = valid.
+async fn assignment_refusal(
+    client: &impl deadpool_postgres::GenericClient,
+    tenant: &TenantId,
+    current: &KeyRecord,
+    eff: &KeyPatch,
+) -> Result<Option<UpdateOutcome>> {
+    if eff.project_id.is_none() && eff.environment.is_none() {
+        return Ok(None);
+    }
+    let project = eff.project_id.unwrap_or(current.project_id);
+    let environment = eff
+        .environment
+        .clone()
+        .unwrap_or_else(|| current.environment.clone());
+    let Some(project) = project else {
+        return Ok(environment.map(|_| UpdateOutcome::EnvironmentNeedsProject));
+    };
+    let Some(envs) = live_project_environments(client, tenant, project).await? else {
+        return Ok(Some(UpdateOutcome::ProjectNotFound));
+    };
+    Ok(environment
+        .filter(|e| !envs.contains(e))
+        .map(|environment| UpdateOutcome::EnvironmentNotInProject { environment }))
 }
 
 /// Read one key of `tenant` for the settings surface. `None` when the key is not
@@ -1816,7 +2855,7 @@ pub async fn update(
     id: Uuid,
     editor: KeyEditor<'_>,
     patch: &KeyPatch,
-    actor: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<UpdateOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
@@ -1834,9 +2873,9 @@ pub async fn update(
         return Ok(UpdateOutcome::NotFound);
     };
     let current = record_from_row(&row);
-    let digest: Option<Vec<u8>> = row.get(13);
-    let revoked_now: bool = row.get(14);
-    let expired_now: bool = row.get(15);
+    let digest: Option<Vec<u8>> = row.get(RECORD_LEN);
+    let revoked_now: bool = row.get(RECORD_LEN + 1);
+    let expired_now: bool = row.get(RECORD_LEN + 2);
     if revoked_now || expired_now {
         return Ok(UpdateOutcome::NotFound);
     }
@@ -1849,6 +2888,11 @@ pub async fn update(
         return Ok(UpdateOutcome::Retiring { revoked_at });
     }
     let (eff, changed, before, after) = diff_patch(&current, patch);
+    // OG-23: a key may only join a LIVE project of its own tenant, with one of that
+    // project's environments. Under the row lock, before anything is written.
+    if let Some(refusal) = assignment_refusal(&tx, tenant, &current, &eff).await? {
+        return Ok(refusal);
+    }
     if changed.is_empty() {
         // A no-op writes nothing: no UPDATE, no audit row, no invalidation.
         return Ok(UpdateOutcome::Updated {
@@ -1877,10 +2921,18 @@ pub async fn update(
            budget_usd_monthly = CASE WHEN $9 THEN $10{BUDGET_NUMERIC_CAST} ELSE budget_usd_monthly END, \
            rate_limit_rpm = CASE WHEN $11 THEN $12::int4 ELSE rate_limit_rpm END, \
            budget_reset = CASE WHEN $13 THEN $14::text ELSE budget_reset END, \
-           velocity_breaker = CASE WHEN $15 THEN $16::bool ELSE velocity_breaker END \
+           velocity_breaker = CASE WHEN $15 THEN $16::bool ELSE velocity_breaker END, \
+           project_id = CASE WHEN $17 THEN $18::uuid ELSE project_id END, \
+           environment = CASE WHEN $19 THEN $20::text ELSE environment END, \
+           policy = CASE WHEN $21 THEN $22::jsonb ELSE policy END, \
+           cache = CASE WHEN $23 THEN $24::jsonb ELSE cache END \
          WHERE tenant_id = $1 AND id = $2 \
          RETURNING {RECORD_COLUMNS}"
     );
+    let project_id: Option<Uuid> = eff.project_id.flatten();
+    let environment: Option<String> = eff.environment.clone().flatten();
+    let policy: Option<serde_json::Value> = eff.policy.clone().flatten();
+    let cache: Option<serde_json::Value> = eff.cache.clone().flatten();
     let updated = tx
         .query_one(
             sql.as_str(),
@@ -1901,6 +2953,14 @@ pub async fn update(
                 &budget_reset,
                 &eff.velocity_breaker.is_some(),
                 &eff.velocity_breaker,
+                &eff.project_id.is_some(),
+                &project_id,
+                &eff.environment.is_some(),
+                &environment,
+                &eff.policy.is_some(),
+                &policy,
+                &eff.cache.is_some(),
+                &cache,
             ],
         )
         .await
@@ -1908,10 +2968,17 @@ pub async fn update(
     let record = record_from_row(&updated);
     let before = serde_json::Value::Object(before);
     let after = serde_json::Value::Object(after);
-    tx.execute(
-        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, before_json, after_json)
-         VALUES ($1, $2, 'api_key.update', 'api_key', $3, $4, $5)",
-        &[&actor, tenant.as_uuid(), &id.to_string(), &before, &after],
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "api_key.update",
+            target_type: "api_key",
+            target_id: id.to_string(),
+            before: Some(before),
+            after: Some(after),
+        },
     )
     .await
     .context("admin_audit_log api_key.update insert failed")?;
@@ -1946,7 +3013,7 @@ pub async fn revoke_key(
     pool: &Pool,
     tenant: &TenantId,
     id: Uuid,
-    actor: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<Option<DateTime<Utc>>> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
@@ -1982,10 +3049,17 @@ pub async fn revoke_key(
         "scheduledRevokedAt": json_time(scheduled),
     });
     let after = serde_json::json!({ "revokedAt": revoked_at.to_rfc3339() });
-    tx.execute(
-        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, before_json, after_json)
-         VALUES ($1, $2, 'api_key.revoke', 'api_key', $3, $4, $5)",
-        &[&actor, tenant.as_uuid(), &id.to_string(), &before, &after],
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "api_key.revoke",
+            target_type: "api_key",
+            target_id: id.to_string(),
+            before: Some(before),
+            after: Some(after),
+        },
     )
     .await
     .context("admin_audit_log api_key.revoke insert failed")?;
@@ -1997,6 +3071,62 @@ pub async fn revoke_key(
         invalidate(d).await;
     }
     Ok(Some(revoked_at))
+}
+
+/// `OG-25` — revoke EVERY live and retiring key of a tenant in one transaction:
+/// `UPDATE … SET revoked_at = clock_timestamp()` over the tenant's not-yet-revoked rows →
+/// ONE control-change record (`api_key.revoke_all`, the ids and the count) → cache WRITE
+/// lock → `COMMIT` → every revoked key's cache entry invalidated, exactly as
+/// [`revoke_key`] does for one. Irreversible: there is no un-revoke; mint new keys.
+///
+/// Returns the revoked key ids.
+///
+/// # Errors
+/// Fail CLOSED: an audit-insert or commit failure rolls every revocation back.
+#[tracing::instrument(skip(pool, tenant, actor), fields(tenant_id = %tenant))]
+pub async fn revoke_all_keys(pool: &Pool, tenant: &TenantId, actor: &str) -> Result<Vec<Uuid>> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let rows = tx
+        .query(
+            "UPDATE api_keys SET revoked_at = clock_timestamp()
+             WHERE tenant_id = $1
+               AND (revoked_at IS NULL OR revoked_at > clock_timestamp())
+             RETURNING id, lookup_hash",
+            &[tenant.as_uuid()],
+        )
+        .await
+        .context("UPDATE api_keys revoke-all failed")?;
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.get(0)).collect();
+    let digests: Vec<[u8; 32]> = rows
+        .iter()
+        .filter_map(|r| r.get::<_, Option<Vec<u8>>>(1))
+        .filter_map(|d| <[u8; 32]>::try_from(d).ok())
+        .collect();
+    crate::db::controls::record_control_change(
+        &tx,
+        &crate::db::controls::ControlChange {
+            tenant: *tenant.as_uuid(),
+            actor,
+            action: "api_key.revoke_all",
+            target_type: "workspace",
+            target_id: tenant.to_string(),
+            before: None,
+            after: Some(serde_json::json!({
+                "revoked": ids.len(),
+                "keyIds": ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })),
+        },
+    )
+    .await?;
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit()
+        .await
+        .context("api_keys revoke-all commit failed")?;
+    for d in digests {
+        invalidate(d).await;
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -2473,6 +3603,7 @@ mod stale_while_revalidate {
             None,
             tracelane_shared::spend::BudgetReset::Monthly,
             None,
+            None,
         );
         for n in 0..5u8 {
             m.insert(mk(n), (sample.clone(), Instant::now()));
@@ -2508,6 +3639,7 @@ mod stale_while_revalidate {
             None,
             tracelane_shared::spend::BudgetReset::Monthly,
             None,
+            None,
         );
         remember_last_known(digest, entry);
         assert!(
@@ -2542,6 +3674,7 @@ mod rotation_cache_tests {
             None,
             tracelane_shared::spend::BudgetReset::Monthly,
             Some(deadline),
+            None,
         );
         let mut config = deadpool_postgres::Config::new();
         config.host = Some("unused.invalid".into());
@@ -2593,5 +3726,207 @@ mod rotation_cache_tests {
         assert!(valid_rotation_grace(0));
         assert!(!valid_rotation_grace(-1));
         assert!(!valid_rotation_grace(i64::MAX));
+    }
+}
+
+/// rev4 H1 d / M1: the valid-key set, against a counting fake `api_keys` read
+/// (the real read runs in `tests/postgres_tenant_integration.rs`).
+#[cfg(test)]
+mod known_keys_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    fn cfg(refresh_ms: u64) -> KnownKeysConfig {
+        KnownKeysConfig {
+            refresh: Duration::from_millis(refresh_ms),
+            wait: Duration::from_secs(5),
+            full_reload: Duration::from_secs(3600),
+            overlap: Duration::from_secs(300),
+            max: 1_000,
+        }
+    }
+
+    fn digest(n: u32) -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d[..4].copy_from_slice(&n.to_be_bytes());
+        d
+    }
+
+    /// A fake `api_keys`: the live digests, and every read it served
+    /// (`None` = full, `Some(_)` = delta).
+    #[derive(Clone, Default)]
+    struct Table {
+        keys: Arc<parking_lot::Mutex<Vec<[u8; 32]>>>,
+        reads: Arc<parking_lot::Mutex<Vec<Option<DateTime<Utc>>>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    type Read = std::pin::Pin<Box<dyn std::future::Future<Output = Result<KeySnapshot>> + Send>>;
+
+    impl Table {
+        fn with(keys: &[[u8; 32]]) -> Self {
+            let t = Self::default();
+            t.keys.lock().extend_from_slice(keys);
+            t
+        }
+        fn fetch(&self) -> impl FnOnce(Option<DateTime<Utc>>) -> Read + use<> {
+            let t = self.clone();
+            move |since| {
+                Box::pin(async move {
+                    t.reads.lock().push(since);
+                    if t.fail.load(Ordering::SeqCst) {
+                        anyhow::bail!("pool: connection refused");
+                    }
+                    Ok(KeySnapshot {
+                        at: Utc::now(),
+                        hashes: t.keys.lock().clone(),
+                    })
+                })
+            }
+        }
+        fn reads(&self) -> usize {
+            self.reads.lock().len()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_junk_is_refused_with_one_read_for_everyone() {
+        let table = Table::with(&[digest(1)]);
+        let k = Arc::new(KnownKeys::new(cfg(200)));
+        // 500 different never-seen digests, all at once.
+        let flood = (100..600u32).map(|n| {
+            let (k, t) = (Arc::clone(&k), table.clone());
+            async move { k.classify(&digest(n), t.fetch()).await }
+        });
+        let answers = futures::future::join_all(flood).await;
+        assert!(
+            answers.iter().all(|m| *m == Membership::Absent),
+            "{answers:?}"
+        );
+        assert!(
+            table.reads() <= 2,
+            "500 junk digests cost {} reads; one load (+ one refresh for late arrivals)",
+            table.reads()
+        );
+        // The valid key is present, with no further read.
+        let before = table.reads();
+        assert_eq!(
+            k.classify(&digest(1), table.fetch()).await,
+            Membership::Present
+        );
+        assert_eq!(table.reads(), before);
+    }
+
+    #[tokio::test]
+    async fn a_key_minted_elsewhere_is_present_after_one_refresh_and_a_local_mint_at_once() {
+        let table = Table::with(&[digest(1)]);
+        let k = KnownKeys::new(cfg(50));
+        assert_eq!(
+            k.classify(&digest(9), table.fetch()).await,
+            Membership::Absent
+        );
+        // Another instance mints digest 2.
+        table.keys.lock().push(digest(2));
+        let t0 = Instant::now();
+        assert_eq!(
+            k.classify(&digest(2), table.fetch()).await,
+            Membership::Present
+        );
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert!(
+            table.reads.lock().last().is_some_and(Option::is_some),
+            "the refresh is a DELTA read, not a reload"
+        );
+        // A mint in THIS process needs no read at all.
+        let before = table.reads();
+        k.note_minted(digest(3));
+        assert_eq!(
+            k.classify(&digest(3), table.fetch()).await,
+            Membership::Present
+        );
+        assert_eq!(table.reads(), before);
+    }
+
+    #[tokio::test]
+    async fn a_full_reload_drops_a_revoked_key() {
+        let table = Table::with(&[digest(1), digest(2)]);
+        let mut c = cfg(10);
+        c.full_reload = Duration::from_millis(30);
+        let k = KnownKeys::new(c);
+        assert_eq!(
+            k.classify(&digest(2), table.fetch()).await,
+            Membership::Present
+        );
+        // Digest 2 is revoked; the next FULL read no longer returns it.
+        table.keys.lock().retain(|d| *d != digest(2));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            k.classify(&digest(7), table.fetch()).await,
+            Membership::Absent
+        );
+        assert!(
+            table.reads.lock().last().is_some_and(Option::is_none),
+            "past full_reload the read is FULL"
+        );
+        assert_eq!(
+            k.classify(&digest(2), table.fetch()).await,
+            Membership::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_falls_back_to_the_gated_lookup_without_waiting() {
+        let table = Table::with(&[digest(1)]);
+        table.fail.store(true, Ordering::SeqCst);
+        let k = KnownKeys::new(cfg(60_000));
+        assert_eq!(
+            k.classify(&digest(1), table.fetch()).await,
+            Membership::Unknown
+        );
+        // A second miss inside the refresh interval does not wait on a dead store.
+        let t0 = Instant::now();
+        assert_eq!(
+            k.classify(&digest(5), table.fetch()).await,
+            Membership::Unknown
+        );
+        assert!(t0.elapsed() < Duration::from_millis(500));
+        assert_eq!(table.reads(), 1, "no second read inside the interval");
+        assert!(!k.is_loaded());
+    }
+
+    #[tokio::test]
+    async fn more_keys_than_the_ceiling_disables_the_set() {
+        let keys: Vec<[u8; 32]> = (0..20).map(digest).collect();
+        let table = Table::with(&keys);
+        let mut c = cfg(10);
+        c.max = 10;
+        let k = KnownKeys::new(c);
+        assert_eq!(
+            k.classify(&digest(3), table.fetch()).await,
+            Membership::Unknown
+        );
+        assert!(
+            !k.is_loaded(),
+            "an oversized set is dropped, never half-held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_that_outwaits_its_read_takes_the_gated_lookup() {
+        let k = KnownKeys::new(KnownKeysConfig {
+            wait: Duration::from_millis(20),
+            ..cfg(10)
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let m = k
+            .classify(&digest(1), move |_since| {
+                c.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<KeySnapshot>>()
+            })
+            .await;
+        assert_eq!(m, Membership::Unknown);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

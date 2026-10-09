@@ -66,18 +66,20 @@ Provider API keys (Anthropic, OpenAI, etc.) are **envelope-encrypted at rest**
 with AES-256-GCM (`ring` AEAD). The workflow:
 
 1. Each provider key is sealed with AES-256-GCM under the deployment envelope
-   master key (`TRACELANE_BYOK_MASTER_KEY`).
+   master key (`TRACELANE_BYOK_MASTER_KEY`) or, when configured, a tenant data
+   key wrapped by the customer's KMS.
 2. The ciphertext is bound with Additional Authenticated Data (AAD) =
    `provider-key:<tenant_id>:<provider_id>`, so a ciphertext cannot be replayed
    under another tenant or provider.
 3. The ciphertext (plus 16-byte GCM tag) is stored in Postgres. The plaintext
    key never persists.
-4. On request dispatch, the provider key is decrypted in-memory, used for the
-   single request, and the plaintext is zeroed.
+4. For dispatch, the provider key is decrypted in memory. A bounded cache can
+   retain the plaintext across requests; its secret value is zeroized on drop.
 
 You may also register a Customer-Managed Key **public-key fingerprint** in
-Settings → BYOK Keys for audit and labeling; it is recorded but does not itself
-wrap provider keys in V1. See [BYOK](/byok).
+Settings → BYOK Keys for audit and labeling. That registry does not itself
+configure gateway KMS encryption. The separate customer KMS API can wrap a
+tenant data key for provider-key envelopes. See [BYOK](/byok).
 
 Provider keys **never** appear in:
 - Logs (a `tracing` redaction layer scrubs `Authorization`, `x-api-key`,
@@ -168,7 +170,7 @@ and who made the change — so you can show when recording was on. The setting i
 On a self-hosted deployment the operator can also turn recording on for named
 workspaces with a `trace_content:` block in `tracelane.yaml` (workspace IDs and the
 maximum field size). That block does not ask the workspace owner and writes no
-ledger event; Tracelane Cloud uses it only for its own test workspace. The gateway
+ledger event. The gateway
 applies this combined decision to proxy requests and OTLP spans. The direct mTLS
 ingest receiver uses the workspace decision only; without a control plane it
 keeps metadata and drops content.

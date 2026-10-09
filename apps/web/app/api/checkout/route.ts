@@ -36,7 +36,7 @@ import { db } from "@/db";
 import { planEntitlements, tenants } from "@/db/schema";
 import { requireGatewayToken, requireSession } from "@/lib/auth";
 import { PLANS_V3 } from "@/lib/entitlements";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -84,17 +84,10 @@ function failure(
 	);
 }
 
-async function portalRedirect(
-	req: NextRequest,
-	token: string,
-): Promise<NextResponse> {
-	const base = gatewayBaseUrl();
-	const upstream = await fetch(`${base}/v1/billing/portal`, {
+async function portalRedirect(req: NextRequest): Promise<NextResponse> {
+	const upstream = await gatewayResponse("/v1/billing/portal", {
 		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			authorization: `Bearer ${token}`,
-		},
+		headers: { "content-type": "application/json" },
 		body: JSON.stringify({}),
 	});
 	if (!upstream.ok) {
@@ -132,7 +125,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	// Auth first: mint the per-user JWT (the gateway derives the tenant from it)
 	// and read the customer email the gateway checkout endpoint requires. Both
 	// redirect (NEXT_REDIRECT) when there is no session — never swallowed.
-	const { token } = await requireGatewayToken();
+	// `gatewayResponse` re-reads the token (memoized per request) and attaches
+	// the signed client-IP attestation (OG-36), so it is not threaded through.
+	await requireGatewayToken();
 	const session = await requireSession();
 	const { email } = session;
 
@@ -175,7 +170,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		.where(eq(tenants.workosOrgId, session.tenantId))
 		.limit(1);
 	if (tenantRow?.polarSubscriptionId || tenantRow?.polarBaseSubscriptionId) {
-		return portalRedirect(req, token);
+		return portalRedirect(req);
 	}
 
 	// BILL-02 (B14 → option (c)): an annual plan is bought as its yearly BASE
@@ -208,11 +203,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	// Reuse the fail-loud resolver (throws in prod when NEXT_PUBLIC_GATEWAY_URL is
-	// unset) instead of a silent `?? localhost` fallback — the localhost fallback
-	// is what let a dropped env var reach Cloudflare as a `localhost` subrequest
-	// (error 1003) instead of failing loud. Same helper the read path uses.
-	const base = gatewayBaseUrl();
+	// `gatewayResponse` reuses the fail-loud resolver (throws in prod when
+	// NEXT_PUBLIC_GATEWAY_URL is unset) instead of a silent `?? localhost`
+	// fallback — the localhost fallback is what let a dropped env var reach
+	// Cloudflare as a `localhost` subrequest (error 1003) instead of failing loud.
 	// Pass explicit redirect targets. The gateway's own defaults point at
 	// `/billing` (checkout.rs), but that route does not exist in this app — the
 	// billing page is `/settings/billing`, so the gateway default would 404 the
@@ -220,12 +214,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 	// prod (app.tracelane.dev) and any *.tracelane.dev host resolve correctly and
 	// pass the gateway's host allowlist.
 	const origin = req.nextUrl.origin;
-	const upstream = await fetch(`${base}/v1/billing/checkout`, {
+	const upstream = await gatewayResponse("/v1/billing/checkout", {
 		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			authorization: `Bearer ${token}`,
-		},
+		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
 			product_id: productId,
 			customer_email: email,

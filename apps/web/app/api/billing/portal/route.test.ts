@@ -25,15 +25,34 @@ import { POST } from "./route";
 
 const fetchMock = vi.fn();
 
+/**
+ * `gatewayResponse` (lib/gateway.ts) re-wraps the upstream body and status,
+ * so the stubbed fetch must hand it a REAL Response — this converts the
+ * `{ ok, status, json }` shape these tests were written with into one.
+ */
+async function asResponse(fake: {
+	ok?: boolean;
+	status?: number;
+	json?: () => Promise<unknown>;
+}): Promise<Response> {
+	const body = fake.json ? JSON.stringify(await fake.json()) : null;
+	return new Response(body, { status: fake.status ?? (fake.ok ? 200 : 500) });
+}
+
 function sentHeaders(callIndex = 0): Record<string, string> {
-	return (
-		fetchMock.mock.calls[callIndex]?.[1] as { headers: Record<string, string> }
-	).headers;
+	// The helper sends a `Headers` instance; flatten it for the assertions.
+	return Object.fromEntries(
+		new Headers(
+			(fetchMock.mock.calls[callIndex]?.[1] as { headers: HeadersInit })
+				.headers,
+		),
+	);
 }
 
 beforeEach(() => {
 	h.token = "wos_jwt_user_a";
-	global.fetch = fetchMock as unknown as typeof fetch;
+	global.fetch = (async (...args: unknown[]) =>
+		asResponse(await fetchMock(...args))) as unknown as typeof fetch;
 	fetchMock.mockReset();
 	vi.stubEnv("NEXT_PUBLIC_GATEWAY_URL", "https://gateway.example");
 });

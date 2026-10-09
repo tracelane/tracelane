@@ -22,6 +22,11 @@
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+	redactEmail,
+} from "@/lib/control-change";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { clientIp, rateLimit } from "@/lib/rate-limit";
 import {
@@ -34,11 +39,11 @@ import { type NextRequest, NextResponse } from "next/server";
 
 interface InviteBody {
 	email: string;
-	/** member | viewer. Absent → member (WorkOS default). owner is not grantable here. */
+	/** member | developer | billing | viewer. Absent → member (WorkOS default). owner is not grantable here. */
 	role?: string;
 }
 
-const INVITABLE_ROLES = new Set(["member", "viewer"]);
+const INVITABLE_ROLES = new Set(["member", "developer", "billing", "viewer"]);
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
 	const workosKey = process.env.WORKOS_API_KEY;
@@ -81,7 +86,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	const role = body.role ?? "member";
 	if (!INVITABLE_ROLES.has(role)) {
 		return NextResponse.json(
-			{ error: "role must be member or viewer" },
+			{ error: "role must be member, developer, billing, or viewer" },
 			{ status: 422 },
 		);
 	}
@@ -168,6 +173,17 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		}
 	}
 
+	// Gateway control-change audit BEFORE the invite; refuse if not recorded.
+	// Email is redacted — the audit never holds a full address.
+	const after = { email: redactEmail(normalizedEmail), role };
+	const rec = await recordControlChange(
+		"member.invite",
+		redactEmail(normalizedEmail),
+		undefined,
+		after,
+	);
+	if (!rec.ok) return rec.response;
+
 	const res = await fetch(
 		"https://api.workos.com/user_management/invitations",
 		{
@@ -185,6 +201,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	);
 
 	if (!res.ok) {
+		await recordControlChangeFailed(
+			"member.invite",
+			redactEmail(normalizedEmail),
+			undefined,
+			after,
+		);
 		// Never echo the provider body — WorkOS bodies can reflect our ids and are
 		// leak-prone (billing.md). Log the status server-side; return an opaque code.
 		console.error(`[team/invite] WorkOS invitation failed: ${res.status}`);

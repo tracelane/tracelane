@@ -141,14 +141,20 @@ function assertBypassActiveToMint(fn: string): void {
  * bypass is active ({@link e2eAuthEnabled} is `true`); throws otherwise. The
  * tenant is the hardcoded disposable id, never derived from a request.
  */
+const E2E_ROLES = new Set(["owner", "admin", "developer", "viewer", "billing"]);
+
 export function e2eTestSession(): Session {
 	assertBypassActiveToMint("e2eTestSession");
 	return {
 		tenantId: E2E_TEST_TENANT_ID,
 		userId: E2E_TEST_USER_ID,
 		email: E2E_TEST_EMAIL,
-		// Disposable test workspace acts as owner (full-access UI paths).
-		role: "owner",
+		// Disposable test workspace acts as owner (full-access UI paths) unless a render
+		// proof asks for a lesser role (`TRACELANE_E2E_ROLE=viewer`, OG-60: role-gated
+		// controls must be SEEN disabled). Only these slugs; anything else stays owner.
+		role: E2E_ROLES.has(process.env.TRACELANE_E2E_ROLE ?? "")
+			? (process.env.TRACELANE_E2E_ROLE as string)
+			: "owner",
 	};
 }
 

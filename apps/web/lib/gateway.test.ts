@@ -20,7 +20,16 @@ vi.mock("@/lib/auth", () => ({
 	})),
 }));
 
-import { gatewayDelete, gatewayPostText } from "./gateway";
+// `attestationHeaders` reads the browser address from the inbound request's
+// `cf-connecting-ip` via `next/headers`; pinned here so the OG-36 test below can
+// prove the header rides on `gatewayResponse` (the helper the admin-plane
+// proxies use). Tests that never set the secret never reach it.
+vi.mock("next/headers", () => ({
+	headers: async () => new Headers({ "cf-connecting-ip": "203.0.113.9" }),
+}));
+
+import { ATTESTATION_HEADER } from "./client-ip-attestation";
+import { gatewayDelete, gatewayPostText, gatewayResponse } from "./gateway";
 
 const originalFetch = global.fetch;
 afterEach(() => {
@@ -96,5 +105,41 @@ describe("gatewayPostText", () => {
 			status: 413,
 			body: { error: "import_too_large" },
 		});
+	});
+});
+
+describe("gatewayResponse — OG-36 client-IP attestation (M4)", () => {
+	afterEach(() => vi.unstubAllEnvs());
+
+	function captureHeaders(): { get: () => Headers } {
+		let sent = new Headers();
+		global.fetch = vi.fn(async (_url, init?: RequestInit) => {
+			sent = new Headers(init?.headers);
+			return new Response(null, { status: 204 });
+		}) as unknown as typeof fetch;
+		return { get: () => sent };
+	}
+
+	it("signs the browser address onto an admin-plane call when the secret is set", async () => {
+		vi.stubEnv(
+			"TRACELANE_CLIENT_IP_ATTEST_SECRET",
+			"unit-test-attest-secret-do-not-use-in-prod-0123456789",
+		);
+		const cap = captureHeaders();
+		const res = await gatewayResponse("/v1/billing/ceiling", { method: "PUT" });
+		expect(res.status).toBe(204);
+		expect(cap.get().get("authorization")).toBe("Bearer jwt-x");
+		// v1;<ip>;<unix-s>;<hex HMAC-SHA256> — the browser's address, not the Worker's.
+		expect(cap.get().get(ATTESTATION_HEADER)).toMatch(
+			/^v1;203\.0\.113\.9;\d+;[0-9a-f]{64}$/,
+		);
+	});
+
+	it("sends no attestation when the secret is unset (the gateway falls back to its own derivation)", async () => {
+		vi.stubEnv("TRACELANE_CLIENT_IP_ATTEST_SECRET", "");
+		const cap = captureHeaders();
+		await gatewayResponse("/v1/billing/ceiling", { method: "PUT" });
+		expect(cap.get().get("authorization")).toBe("Bearer jwt-x");
+		expect(cap.get().has(ATTESTATION_HEADER)).toBe(false);
 	});
 });

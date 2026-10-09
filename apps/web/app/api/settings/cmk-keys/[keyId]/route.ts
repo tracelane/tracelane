@@ -13,6 +13,10 @@ import { cmkKeys, tenants } from "@/db/schema";
 import { ipFromRequest, recordAdminAction } from "@/lib/admin-audit";
 import { requireOrgAdmin } from "@/lib/admin-gate";
 import { requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { and, eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -35,21 +39,34 @@ export async function DELETE(
 		return NextResponse.json({ error: "tenant not found" }, { status: 404 });
 	}
 
-	const updated = await db
-		.update(cmkKeys)
-		.set({ status: "revoked" })
-		.where(and(eq(cmkKeys.id, keyId), eq(cmkKeys.tenantId, tenant[0].id)))
-		.returning({
-			id: cmkKeys.id,
-			alias: cmkKeys.alias,
-			fingerprint: cmkKeys.fingerprint,
-		});
+	// Gateway control-change audit BEFORE the revoke; refuse if not recorded.
+	const after = { status: "revoked" };
+	const rec = await recordControlChange("cmk.revoke", keyId, undefined, after);
+	if (!rec.ok) return rec.response;
+
+	let updated: { id: string; alias: string; fingerprint: string }[];
+	try {
+		updated = await db
+			.update(cmkKeys)
+			.set({ status: "revoked" })
+			.where(and(eq(cmkKeys.id, keyId), eq(cmkKeys.tenantId, tenant[0].id)))
+			.returning({
+				id: cmkKeys.id,
+				alias: cmkKeys.alias,
+				fingerprint: cmkKeys.fingerprint,
+			});
+	} catch (err) {
+		await recordControlChangeFailed("cmk.revoke", keyId, undefined, after);
+		throw err;
+	}
 
 	if (updated.length === 0) {
+		await recordControlChangeFailed("cmk.revoke", keyId, undefined, after);
 		return NextResponse.json({ error: "key not found" }, { status: 404 });
 	}
 
-	// ADR-031: key-material changes leave an audit trail.
+	// ADR-031: local admin_audit_log row, kept alongside the gateway
+	// control-change row recorded above (which now precedes the change).
 	await recordAdminAction({
 		actorUserId: session.userId,
 		actorWorkspaceId: tenant[0].id,

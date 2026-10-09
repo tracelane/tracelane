@@ -89,7 +89,7 @@ Retrieve the stored span tree for a trace (read-only; it does not re-execute any
 }
 ```
 
-**Returns:** Full span tree with all OTel GenAI attributes, predictive layer annotations, and audit log entries for the trace.
+**Returns:** Recorded spans for the trace, including their OTel GenAI attributes and predictive layer annotations when present.
 
 ---
 

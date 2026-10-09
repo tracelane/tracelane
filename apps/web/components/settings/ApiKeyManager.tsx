@@ -108,6 +108,11 @@ const SCOPES: { value: string; label: string; hint: string }[] = [
 		label: "Admin",
 		hint: "Manage keys, providers and settings",
 	},
+	{
+		value: "passthrough",
+		label: "Passthrough",
+		hint: "Call provider endpoints the gateway has not modelled, with this workspace's provider key. Request bodies are opaque: no guardrails or per-model budgets apply. Never implied by another scope, including Admin",
+	},
 ];
 
 /** Human label for a key's capability. */

@@ -21,6 +21,7 @@
 
 pub mod content;
 pub mod decode;
+pub mod encode;
 pub mod limits;
 
 mod openinference;

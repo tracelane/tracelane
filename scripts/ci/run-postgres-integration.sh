@@ -56,8 +56,25 @@ esac
 # GWY-53 (2026-09-28): +1 discovered (db::workspace_capture's round trip compiles into
 # that crate too) and +3 --bin filters below. Re-measured with the real run: that crate
 # lists 32 and the whole runner executed 42.
-EXPECTED_PG_TESTS=32
-EXPECTED_PG_EXECUTED=42
+# B-409 (2026-10-03): +7 executed — entitlement_cache::b409_tests (5), the metering
+# job's and the retention sweep's b409_tests (1 each), each on its own fresh migrated
+# database. 43 + 7.
+# B-594/B-409 rev4 (2026-10-03): re-measured 34 discovered / 54 executed (see git log).
+# OG-20 / OG-23 (2026-10-03): +4 in postgres_tenant_integration (og23_* x3, og20_* x1 —
+# the auth JOIN, cross-tenant projects, assignment/archive/rotation, an unparseable
+# stored policy). 34 + 4 discovered; executed floor raised by the same 4 below.
+# OG-24 / OG-25 (2026-10-04): +3 in postgres_tenant_integration (og25_* x2 — revoke-all,
+# the controls round trip; og24_* x1 — the outbox dedup). Measured with the real run:
+# 41 discovered in that crate, 61 executed by the whole runner.
+# OG-35 / OG-36 (2026-10-04): +5 executed — the `control_plane::pg_tests` filter (audited
+# admin-access put + refusal, append-only trigger, tenant-scoped paging, CIDR CHECK, the
+# route end to end), run and passed 5/5 on a fresh database. Discovered floor unchanged
+# (they live in the --bin, not the integration crate).
+# OG-51 / OG-50 (2026-10-05): +2 in postgres_tenant_integration (og51_* — cache settings,
+# epochs, a key's narrowing; og50_* — exports sealed, isolated, audited). Both ran green
+# on a fresh database (2 passed); 41 + 2 discovered, 66 + 2 executed.
+EXPECTED_PG_TESTS=43
+EXPECTED_PG_EXECUTED=68
 case "${1:-}" in
   ""|--selftest) ;;
 esac
@@ -289,7 +306,10 @@ EXECUTED=0
 run_and_count() {
   local out
   out="$(cargo test "$@" 2>&1)"; local rc=$?
-  printf '%s\n' "$out" | grep -E '^test |panicked|test result' || true
+  # 2026-09-30: a panic's PAYLOAD (the assertion, left/right) is printed too — b378 went
+  # red on 2026-09-30 with only its `panicked at` line visible, and the cause had to be
+  # inferred from a line number.
+  printf '%s\n' "$out" | awk -v pat='^test |test result' 'n>0{print;n--;next} /panicked/{print;n=6;next} $0~pat{print}' || true
   local n
   for n in $(printf '%s\n' "$out" | sed -n 's/^test result: [a-z]*\. \([0-9]*\) passed.*/\1/p'); do
     EXECUTED=$((EXECUTED + n))
@@ -329,6 +349,13 @@ run_and_count -p gateway --bin gateway entitlement_cache::tests::gwy52_attach_wo
 run_and_count -p gateway --bin gateway db::workspace_capture::tests::gwy53_workspace_capture_round_trip -- --ignored || RC=1
 run_and_count -p gateway --bin gateway entitlement_cache::tests::gwy53_attach_content_capture -- --ignored || RC=1
 run_and_count -p gateway --bin gateway workspace_capture_routes::tests::gwy53_put_records_the_change_on_the_ledger -- --ignored || RC=1
+run_and_count -p gateway --bin gateway retention_sweep::tests::postgres_retention_tombstone_and_policy_roundtrip -- --ignored --test-threads=1 || RC=1
+run_and_count -p gateway --bin gateway entitlement_cache::b409_tests -- --ignored || RC=1
+run_and_count -p gateway --bin gateway billing::metering_job::b409_tests -- --ignored || RC=1
+run_and_count -p gateway --bin gateway retention_sweep::b409_tests -- --ignored || RC=1
+# OG-35/OG-36: the audited admin-access write + its refusal, the append-only trigger,
+# tenant-scoped paging of the trail, the CIDR CHECK, and the route end to end.
+run_and_count -p gateway --bin gateway control_plane::pg_tests -- --ignored || RC=1
 if [ "$EXECUTED" -lt "$EXPECTED_PG_EXECUTED" ]; then
   echo "postgres integration: FAIL — executed $EXECUTED test(s), floor is $EXPECTED_PG_EXECUTED: the suite shrank or a filter matched nothing (B-494)"
   exit 1

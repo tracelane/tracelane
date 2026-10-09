@@ -186,6 +186,17 @@ async fn put_capture(
         Ok(c) => c,
         Err(r) => return r,
     };
+    // OG-36: the admin-plane gate (allowlist, SSO-required) → the OG-35 actor.
+    let control = match crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::EditPolicies,
+        &headers,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(r) => return r.into_response(),
+    };
     let Ok(Json(body)) = body else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -219,7 +230,8 @@ async fn put_capture(
             })
             .await
     };
-    let outcome = match store::set_recorded(pool, &claims.tenant_id, new, &claims.sub, record).await
+    let outcome = match store::set_recorded(pool, &claims.tenant_id, new, &control.audit, record)
+        .await
     {
         Ok(o) => o,
         Err(SetError::Ledger(e)) => {

@@ -36,12 +36,165 @@
 //!
 //! This is a background GC path, not a user-driven dashboard read: a bounded
 //! per-tenant `count()` (the dryrun report / enforce audit) and a tenant-scoped
-//! lightweight `DELETE` (CH 24.12). No caps needed; both queries are tenant-scoped
+//! heavy `ALTER DELETE` (CH 24.12). Counts are capped; both queries are tenant-scoped
 //! (`WHERE tenant_id = ?`), satisfying the isolation guard.
 
 use std::time::Duration;
 
+use crate::billing::rating::RetentionSweepPolicy;
 use crate::db::DbPool;
+use tracelane_shared::degradation::{self, Degradation};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    Done,
+    SkippedPending,
+    WaitExceeded,
+    BudgetExhausted,
+    Failed,
+}
+
+pub(crate) struct SweepRun {
+    policy: RetentionSweepPolicy,
+    deadline: tokio::time::Instant,
+    statements_left: u64,
+    mutations: u64,
+    skipped: u64,
+    failed: u64,
+    budget_reported: bool,
+}
+impl SweepRun {
+    pub(crate) fn new(policy: RetentionSweepPolicy) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            policy,
+            deadline: now
+                .checked_add(Duration::from_secs(policy.max_run_secs))
+                .unwrap_or(now),
+            statements_left: policy.max_mutations_per_run,
+            mutations: 0,
+            skipped: 0,
+            failed: 0,
+            budget_reported: false,
+        }
+    }
+    fn skip(&mut self) {
+        self.skipped += 1;
+        degradation::note(Degradation::RetentionSweepSkipped);
+    }
+    fn failure(&mut self) {
+        self.failed += 1;
+        degradation::note(Degradation::RetentionSweepFailed);
+    }
+    fn exhausted(&mut self, mode: SweepMode) -> bool {
+        if tokio::time::Instant::now() >= self.deadline
+            || (mode == SweepMode::Enforce && self.statements_left == 0)
+        {
+            if !self.budget_reported {
+                self.budget_reported = true;
+                self.skip();
+                tracing::warn!(
+                    "retention sweep budget exhausted; remaining work waits for next slot"
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+    fn finish(&self) {
+        if self.skipped == 0 {
+            degradation::resolve(Degradation::RetentionSweepSkipped);
+        }
+        if self.failed == 0 {
+            degradation::resolve(Degradation::RetentionSweepFailed);
+        }
+    }
+}
+
+// System-wide mutation state has no tenant column: it only prevents submitting a
+// tenant-scoped deletion. Failure to read it must never authorize a mutation.
+const PENDING_MUTATIONS_SQL: &str = "SELECT count() AS n FROM system.mutations WHERE database = 'tracelane' AND table = ? AND is_done = 0";
+
+/// Submit a deletion only after checking pending mutations and the run budget.
+///
+/// # Errors
+/// Fail-CLOSED to new mutations when pending state is unreadable or time/budget
+/// is exhausted; returns a counted `DeleteOutcome` instead of propagating errors.
+/// Fail-OPEN for gateway availability. A timed-out submitted mutation may finish
+/// on the server after the client stops waiting.
+pub(crate) async fn delete_bounded(
+    ch: &clickhouse::Client,
+    label: &str,
+    query: clickhouse::query::Query,
+    run: &mut SweepRun,
+) -> DeleteOutcome {
+    if run.exhausted(SweepMode::Enforce) {
+        return DeleteOutcome::BudgetExhausted;
+    }
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct Pending {
+        n: u64,
+    }
+    let wait_deadline = run.deadline.min(
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(run.policy.delete_wait_secs))
+            .unwrap_or(run.deadline),
+    );
+    let pending = tokio::time::timeout_at(
+        wait_deadline,
+        ch.query(&crate::clickhouse_query::ceiling(PENDING_MUTATIONS_SQL))
+            .bind(label)
+            .fetch_one::<Pending>(),
+    )
+    .await;
+    match pending {
+        Ok(Ok(Pending { n })) if n > 0 => {
+            run.skip();
+            return DeleteOutcome::SkippedPending;
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            // Fail-OPEN for service availability, CLOSED to mutations when state is unknown.
+            run.failure();
+            tracing::warn!(table = label, %error, "retention sweep: pending state unreadable; table skipped");
+            return DeleteOutcome::Failed;
+        }
+        Err(error) => {
+            run.failure();
+            tracing::warn!(table = label, %error, "retention sweep: pending state timed out; table skipped");
+            return DeleteOutcome::Failed;
+        }
+    }
+    if run.exhausted(SweepMode::Enforce) {
+        return DeleteOutcome::BudgetExhausted;
+    }
+    run.statements_left -= 1;
+    run.mutations += 1;
+    // No ceiling(): this SQL already has SETTINGS mutations_sync. A dropped HTTP
+    // wait does not cancel the enqueued mutation (real-server survival test).
+    let wait_deadline = run.deadline.min(
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(run.policy.delete_wait_secs))
+            .unwrap_or(run.deadline),
+    );
+    match tokio::time::timeout_at(wait_deadline, query.execute()).await {
+        Ok(Ok(())) => DeleteOutcome::Done,
+        Err(_) => {
+            run.skip();
+            tracing::warn!(
+                table = label,
+                "retention sweep: mutation wait exceeded; queued mutation may still finish"
+            );
+            DeleteOutcome::WaitExceeded
+        }
+        Ok(Err(error)) => {
+            run.failure();
+            tracing::warn!(table = label, %error, "retention sweep: delete refused; table skipped");
+            DeleteOutcome::Failed
+        }
+    }
+}
 
 /// Enforcement mode from `TRACELANE_RETENTION_SWEEP`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,13 +336,20 @@ struct SweepTable {
 
 const SWEEP_TABLES: &[SweepTable] = &[
     SweepTable {
+        label: "outcomes",
+        count_sql: "SELECT count() AS n FROM tracelane.outcomes WHERE tenant_id = ? AND recorded_at < now() - toIntervalDay(?)",
+        delete_sql: "ALTER TABLE tracelane.outcomes DELETE WHERE tenant_id = ? AND recorded_at < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.outcomes WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.outcomes DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    SweepTable {
         label: "spans",
         count_sql: "SELECT count() AS n FROM tracelane.spans \
                     WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.spans \
-                     WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.spans WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.spans WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.spans DELETE \
+                     WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.spans WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.spans DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     SweepTable {
         label: "trace_summaries",
@@ -209,9 +369,9 @@ const SWEEP_TABLES: &[SweepTable] = &[
         delete_sql: "ALTER TABLE tracelane.trace_summaries DELETE \
                      WHERE tenant_id = ? AND start_time < now() - toIntervalDay(?) \
                      SETTINGS mutations_sync = 2",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_summaries WHERE tenant_id NOT IN ?",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_summaries WHERE tenant_id IN ?",
         orphan_delete_sql: "ALTER TABLE tracelane.trace_summaries DELETE \
-                            WHERE tenant_id NOT IN ? SETTINGS mutations_sync = 2",
+                            WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     // B-387 (2026-09-12): the sweep covered TWO of the content-bearing tables;
     // the privacy policy's per-plan window applies to every table that holds a
@@ -225,37 +385,37 @@ const SWEEP_TABLES: &[SweepTable] = &[
         label: "guardrail_verdicts",
         count_sql: "SELECT count() AS n FROM tracelane.guardrail_verdicts \
                     WHERE tenant_id = ? AND event_time < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.guardrail_verdicts \
-                     WHERE tenant_id = ? AND event_time < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.guardrail_verdicts WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.guardrail_verdicts WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.guardrail_verdicts DELETE \
+                     WHERE tenant_id = ? AND event_time < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.guardrail_verdicts WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.guardrail_verdicts DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     SweepTable {
         label: "online_eval_scores",
         count_sql: "SELECT count() AS n FROM tracelane.online_eval_scores \
                     WHERE tenant_id = ? AND scored_at < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.online_eval_scores \
-                     WHERE tenant_id = ? AND scored_at < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.online_eval_scores WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.online_eval_scores WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.online_eval_scores DELETE \
+                     WHERE tenant_id = ? AND scored_at < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.online_eval_scores WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.online_eval_scores DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     SweepTable {
         label: "trace_content_snapshots",
         count_sql: "SELECT count() AS n FROM tracelane.trace_content_snapshots \
                     WHERE tenant_id = ? AND captured_at < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.trace_content_snapshots \
-                     WHERE tenant_id = ? AND captured_at < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_content_snapshots WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.trace_content_snapshots WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.trace_content_snapshots DELETE \
+                     WHERE tenant_id = ? AND captured_at < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.trace_content_snapshots WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.trace_content_snapshots DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     SweepTable {
         label: "semantic_cache",
         count_sql: "SELECT count() AS n FROM tracelane.semantic_cache \
                     WHERE tenant_id = ? AND created_at < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.semantic_cache \
-                     WHERE tenant_id = ? AND created_at < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.semantic_cache WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.semantic_cache WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.semantic_cache DELETE \
+                     WHERE tenant_id = ? AND created_at < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.semantic_cache WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.semantic_cache DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
     // BILL-01 / ADR-076 §2.3 (step 9): `blob_refs` carries the SAME per-tenant
     // queryable-history predicate as every content table above — a reference
@@ -270,10 +430,10 @@ const SWEEP_TABLES: &[SweepTable] = &[
         label: "blob_refs",
         count_sql: "SELECT count() AS n FROM tracelane.blob_refs \
                     WHERE tenant_id = ? AND day < now() - toIntervalDay(?)",
-        delete_sql: "DELETE FROM tracelane.blob_refs \
-                     WHERE tenant_id = ? AND day < now() - toIntervalDay(?)",
-        orphan_count_sql: "SELECT count() AS n FROM tracelane.blob_refs WHERE tenant_id NOT IN ?",
-        orphan_delete_sql: "DELETE FROM tracelane.blob_refs WHERE tenant_id NOT IN ?",
+        delete_sql: "ALTER TABLE tracelane.blob_refs DELETE \
+                     WHERE tenant_id = ? AND day < now() - toIntervalDay(?) SETTINGS mutations_sync = 2",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.blob_refs WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.blob_refs DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
     },
 ];
 
@@ -333,11 +493,51 @@ pub fn spawn_retention_task(pool: DbPool, ch_url: Option<String>, mode: SweepMod
 
 /// One sweep pass: resolve per-tenant retention, then trim each tenant/table.
 async fn run_sweep(pool: &DbPool, ch_url: &str, mode: SweepMode) -> anyhow::Result<()> {
-    let tenants = resolve_retentions(pool).await?;
-    let ch = crate::clickhouse_query::ch_client(ch_url.to_string());
+    let mut run = SweepRun::new(RetentionSweepPolicy::load(pool).await);
+    // The wall limit also covers identity/control-plane reads, not only mutations.
+    match tokio::time::timeout_at(run.deadline, run_sweep_inner(pool, ch_url, mode, &mut run)).await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            run.skip();
+            run.finish();
+            tracing::warn!(
+                mutations = run.mutations,
+                skipped = run.skipped,
+                failed = run.failed,
+                "retention sweep wall budget exceeded; remaining work waits for next slot"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn run_sweep_inner(
+    pool: &DbPool,
+    ch_url: &str,
+    mode: SweepMode,
+    run: &mut SweepRun,
+) -> anyhow::Result<()> {
+    let tenants = resolve_retentions(pool).await.inspect_err(|_| {
+        degradation::note(Degradation::RetentionSweepFailed);
+    })?;
+    let ch = crate::clickhouse_query::sweeper_client(ch_url.to_string());
+    // Observe the authenticated identity once per process, retrying after a failed read.
+    static IDENTITY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    if let Err(error) = IDENTITY
+        .get_or_try_init(|| async {
+            let user = crate::clickhouse_query::current_user(&ch).await?;
+            tracing::info!(ch_user = %user, "sweeper");
+            Ok::<(), clickhouse::error::Error>(())
+        })
+        .await
+    {
+        run.failure();
+        tracing::warn!(%error, "sweeper identity unavailable");
+    }
     let mut total: u64 = 0;
     let mut swept = 0usize;
-    for tr in &tenants {
+    'tenants: for tr in &tenants {
         let Some(days) = sweep_days(tr.queryable_days) else {
             tracing::warn!(
                 tenant_id = %tr.tenant_id,
@@ -348,27 +548,50 @@ async fn run_sweep(pool: &DbPool, ch_url: &str, mode: SweepMode) -> anyhow::Resu
         };
         swept += 1;
         for t in SWEEP_TABLES {
-            match sweep_one(&ch, t, &tr.tenant_id, days, mode).await {
+            if run.exhausted(mode) {
+                break 'tenants;
+            }
+            match sweep_one(&ch, t, &tr.tenant_id, days, mode, run).await {
                 Ok(n) => total += n,
                 // A single tenant/table failure never aborts the run — skip + log.
-                Err(e) => tracing::warn!(
-                    error = %e, tenant_id = %tr.tenant_id, table = t.label,
-                    "retention sweep: tenant/table failed — skipping"
-                ),
+                Err(e) => {
+                    run.failure();
+                    tracing::warn!(error = %e, tenant_id = %tr.tenant_id, table = t.label,
+                        "retention sweep: tenant/table failed — skipping");
+                }
             }
         }
     }
-    // RI-02 rule 5 (2026-09-20): rows of tenants that no longer exist. After the
-    // per-tenant pass so a live tenant's window is applied first; the tenant list is
-    // the SAME Neon read (`resolve_retentions`), so a failed read already aborted the
-    // run above (`?`) and can never reach this step with a partial list.
-    let orphans = sweep_orphans(&ch, &tenants, mode).await;
+    // RI-02 rule 5, B-459 shape: rows of tenants RECORDED as purged. An unreadable
+    // tombstone table (migration 0053 not applied, a Neon error) deletes NOTHING.
+    let mut conflicts = 0;
+    let orphans = match resolve_purged(pool).await {
+        Ok(purged) => {
+            conflicts = observe_tombstone_conflicts(&purged, &tenants, &run.policy);
+            let ids = purged.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+            let targets = purge_targets(&ids, &tenants);
+            sweep_orphans(&ch, &targets, mode, run).await
+        }
+        Err(e) => {
+            run.failure();
+            tracing::warn!(
+                error = %e,
+                "retention sweep: purged_tenants unreadable — orphan step skipped (fail-safe: nothing deleted)"
+            );
+            0
+        }
+    };
     total += orphans;
+    run.finish();
     tracing::info!(
         ?mode,
         tenants = swept,
         rows = total,
         orphan_rows = orphans,
+        conflicts,
+        mutations = run.mutations,
+        skipped = run.skipped,
+        failed = run.failed,
         "retention sweep complete ({})",
         if mode == SweepMode::Enforce {
             "deleted"
@@ -379,89 +602,277 @@ async fn run_sweep(pool: &DbPool, ch_url: &str, mode: SweepMode) -> anyhow::Resu
     Ok(())
 }
 
-/// RI-02 rule 5 — the orphan-tenant step. Every `SWEEP_TABLES` entry: rows whose
-/// `tenant_id` is not in `tenants` (the live Neon list) are counted, and deleted in
-/// `Enforce`. The 2026-09-12 restore put 10,155 spans of purged / never-registered
-/// tenants back into prod (B-236's three ids, `max(ingested_at)` five days AFTER the
-/// purge); nothing removed them, because the per-tenant pass visits only tenants Neon
-/// still knows.
+/// B-459 (2026-09-29): every OTHER table `scripts/ops/tenant-purge.sh` deletes a tenant
+/// from (`CH_PURGE`) — the SLO/operability aggregates, prompt and promotion history, and
+/// the customer's own datasets and experiments. They carry no per-plan TIME window (the
+/// B-387 note above says why the curated ones are excluded from it), but a PURGED tenant
+/// must leave none of them behind: a stream replay resurrected one on 2026-09-20
+/// (`runbooks/RCA-stream-replay-resurrected-a-purged-tenant.md`), and this boot-time orphan
+/// step is the net for that. Orphan-swept only. Held equal to `CH_PURGE` in both directions
+/// by `scripts/ci/check-orphan-sweep-covers-purge.py`.
 ///
-/// FAIL-SAFE, stated at the site: an EMPTY tenant list would make `NOT IN` match every
-/// row — "delete everything" — so it is REFUSED with a WARN and the step deletes
-/// nothing. `orphan_step_allowed` is the pure decision, unit-tested; a per-table
-/// failure skips that table and continues, like the per-tenant pass.
+/// A HEAVY `ALTER … DELETE`, not a lightweight one, on purpose: a lightweight DELETE needs
+/// `ALTER UPDATE(_row_exists)`. The grants proof observed writes to that hidden mask
+/// being accepted, but did NOT reproduce resurrection in its row readback. These
+/// tables get `ALTER DELETE` only; no visibility-mask UPDATE permission. The mutation is issued only when the count found rows.
+struct OrphanOnlyTable {
+    label: &'static str,
+    orphan_count_sql: &'static str,
+    orphan_delete_sql: &'static str,
+}
+
+const ORPHAN_ONLY_TABLES: &[OrphanOnlyTable] = &[
+    OrphanOnlyTable {
+        label: "spend_hourly",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.spend_hourly WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.spend_hourly DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "slo_hourly_stats",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.slo_hourly_stats WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.slo_hourly_stats DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "slo_minute_stats",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.slo_minute_stats WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.slo_minute_stats DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "ttft_stats",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.ttft_stats WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.ttft_stats DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "token_economics",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.token_economics WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.token_economics DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "eval_runs",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.eval_runs WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.eval_runs DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "prompts",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.prompts WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.prompts DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "prompt_versions",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.prompt_versions WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.prompt_versions DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "promotion_decisions",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.promotion_decisions WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.promotion_decisions DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "rollback_events",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.rollback_events WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.rollback_events DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "datasets",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.datasets WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.datasets DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "dataset_items",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.dataset_items WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.dataset_items DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "dataset_snapshots",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.dataset_snapshots WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.dataset_snapshots DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "dataset_snapshot_items",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.dataset_snapshot_items WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.dataset_snapshot_items DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "experiments",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.experiments WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.experiments DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "experiment_arms",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.experiment_arms WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.experiment_arms DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "eval_run_items",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.eval_run_items WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.eval_run_items DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "blobs",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.blobs WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.blobs DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+    OrphanOnlyTable {
+        label: "prompt_canaries",
+        orphan_count_sql: "SELECT count() AS n FROM tracelane.prompt_canaries WHERE tenant_id IN ?",
+        orphan_delete_sql: "ALTER TABLE tracelane.prompt_canaries DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2",
+    },
+];
+
+/// Every orphan step, time-swept tables first: (label, count SQL, delete SQL).
+fn orphan_steps() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    SWEEP_TABLES
+        .iter()
+        .map(|t| (t.label, t.orphan_count_sql, t.orphan_delete_sql))
+        .chain(
+            ORPHAN_ONLY_TABLES
+                .iter()
+                .map(|t| (t.label, t.orphan_count_sql, t.orphan_delete_sql)),
+        )
+}
+
+/// RI-02 rule 5 — the orphan-tenant step, REDESIGNED by B-459 (2026-09-30).
+///
+/// Deletes, from every table in [`orphan_steps`], the rows of tenants RECORDED as
+/// purged in Postgres `purged_tenants` (written by `scripts/ops/tenant-purge.sh` before
+/// it deletes the tenant) — `WHERE tenant_id IN <purged ids>`. The 2026-09-12 restore and
+/// the 2026-09-20 stream replay both put a purged tenant's rows back; this is the net.
+///
+/// WHY NOT "every tenant missing from `tenants`" (the RI-02 shape): the security review
+/// of B-459 found that `NOT IN <live list>` deletes a LIVE tenant's rows whenever the list
+/// is merely INCOMPLETE — a tenant created between the list read and the DELETE, or a
+/// control plane restored to an earlier point in time. With B-459 that would have reached
+/// datasets, prompts and experiments a customer cannot regenerate. A tombstone can only
+/// name a tenant someone deliberately purged; losing one leaves orphans behind (the safe
+/// direction), never deletes a live tenant. `purge_targets` also drops any purged id that
+/// is somehow ALSO live.
 ///
 /// # Errors
 /// None returned — fault-tolerance path (CLAUDE.md §10): a failure here means the
 /// orphans wait for the next slot, never that the sweep aborts.
 async fn sweep_orphans(
     ch: &clickhouse::Client,
-    tenants: &[TenantRetention],
+    targets: &[String],
     mode: SweepMode,
+    run: &mut SweepRun,
 ) -> u64 {
-    if !orphan_step_allowed(tenants.len()) {
-        tracing::warn!(
-            "retention sweep: orphan-tenant step REFUSED — the live tenant list is empty, \
-             and `NOT IN ()` would delete every row (RI-02 rule 5 fail-safe)"
-        );
+    if !orphan_step_allowed(targets.len()) {
+        // Nothing recorded as purged (or every recorded id is live): nothing to delete.
         return 0;
     }
-    let ids: Vec<String> = tenants.iter().map(|t| t.tenant_id.clone()).collect();
+    let ids: Vec<String> = targets.to_vec();
     let mut total = 0;
-    for t in SWEEP_TABLES {
-        match sweep_orphans_one(ch, t, &ids, mode).await {
+    for (label, count_sql, delete_sql) in orphan_steps() {
+        if run.exhausted(mode) {
+            break;
+        }
+        match sweep_orphans_one(ch, label, count_sql, delete_sql, &ids, mode, run).await {
             Ok(n) => total += n,
-            Err(e) => tracing::warn!(
-                error = %e, table = t.label,
-                "retention sweep: orphan step failed for a table — skipping"
-            ),
+            Err(e) => {
+                run.failure();
+                tracing::warn!(error = %e, table = label,
+                    "retention sweep: orphan step failed for a table — skipping");
+            }
         }
     }
     total
 }
 
-/// The orphan step runs only against a NON-EMPTY tenant list. Pure, so the
-/// fail-safe is assertable without ClickHouse or Neon.
+/// ClickHouse's "table does not exist" (code 60, `UNKNOWN_TABLE`). Pure, so the one
+/// error the orphan step treats as "nothing here" is pinned by a test; every other
+/// error stays an error.
+fn is_unknown_table(err: &str) -> bool {
+    err.contains("UNKNOWN_TABLE") || err.contains("Code: 60.")
+}
+
+/// The orphan step runs only for a NON-EMPTY set of purged tenants (an empty bind is
+/// never sent). Pure, so the decision is assertable without ClickHouse or Neon.
 const fn orphan_step_allowed(live_tenants: usize) -> bool {
     live_tenants > 0
 }
 
 async fn sweep_orphans_one(
     ch: &clickhouse::Client,
-    table: &SweepTable,
+    label: &'static str,
+    orphan_count_sql: &'static str,
+    orphan_delete_sql: &'static str,
     live_tenant_ids: &[String],
     mode: SweepMode,
+    run: &mut SweepRun,
 ) -> anyhow::Result<u64> {
     #[derive(serde::Deserialize, clickhouse::Row)]
     struct CountRow {
         n: u64,
     }
-    let CountRow { n } = ch
-        .query(&crate::clickhouse_query::ceiling(table.orphan_count_sql))
-        .bind(live_tenant_ids)
-        .fetch_one::<CountRow>()
-        .await?;
+    if run.exhausted(mode) {
+        return Ok(0);
+    }
+    let counted = match tokio::time::timeout_at(
+        run.deadline,
+        ch.query(&crate::clickhouse_query::ceiling(orphan_count_sql))
+            .bind(live_tenant_ids)
+            .fetch_one::<CountRow>(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            run.skip();
+            return Ok(0);
+        }
+    };
+    let n = match counted {
+        Ok(CountRow { n }) => n,
+        // B-459: a purge-list table this deployment never created (e.g. migration 05's
+        // operability tables are not on the hosted node) holds no rows to sweep. Any
+        // OTHER error still propagates and is warned about by the caller.
+        Err(e) if is_unknown_table(&e.to_string()) => {
+            // Visible ONCE per table per process: a migration that never ran here is worth
+            // one line, not one per sweep (.claude/rules/logging.md).
+            static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+            if let Ok(mut seen) = SEEN.lock()
+                && !seen.contains(&label)
+            {
+                seen.push(label);
+                tracing::info!(
+                    table = label,
+                    "retention sweep: table absent on this deployment — nothing to sweep"
+                );
+            }
+            return Ok(0);
+        }
+        Err(e) => return Err(e.into()),
+    };
     if n == 0 {
         return Ok(0);
     }
     match mode {
         SweepMode::DryRun => {
             tracing::info!(
-                table = table.label,
+                table = label,
                 would_delete = n,
-                "retention sweep [dryrun]: rows of tenants with no `tenants` row"
+                "retention sweep [dryrun]: rows of recorded purges absent from the live tenant list"
             );
             Ok(rows_accounted(mode, n))
         }
         SweepMode::Enforce => {
-            ch.query(table.orphan_delete_sql)
-                .bind(live_tenant_ids)
-                .execute()
-                .await?;
+            // A mutation, not a read (the caps are read protection; the count above is
+            // capped). All sweep mutations use the heavy ALTER DELETE form.
+            if delete_bounded(
+                ch,
+                label,
+                ch.query(orphan_delete_sql).bind(live_tenant_ids), // "ALTER TABLE … DELETE": bounded mutation
+                run,
+            )
+            .await
+                != DeleteOutcome::Done
+            {
+                return Ok(0);
+            }
             tracing::info!(
-                table = table.label,
+                table = label,
                 deleted = n,
-                "retention sweep [enforce]: deleted rows of tenants with no `tenants` row (RI-02 rule 5)"
+                "retention sweep [enforce]: deleted rows of recorded purges absent from the live tenant list (RI-02 rule 5)"
             );
             Ok(rows_accounted(mode, n))
         }
@@ -482,13 +893,21 @@ async fn sweep_orphans_one(
 /// its plan's window like any other until the 30-day purge
 /// (`scripts/ops/tlane-purge-archived.sh`) removes what is left. Module-level so
 /// the test can assert the shape of the query rather than grep the source.
-const RETENTION_TENANTS_SQL: &str = "\
+///
+/// B-409: `queryable_days` comes from the tenant's PINNED `plan_allowances` row
+/// (`allowance_pin_join!`, the resolver's own rule) — a later ruling that
+/// shortens the window must not delete a price-protected tenant's data early. A
+/// missing row keeps the 730-day fail-safe: never delete early.
+const RETENTION_TENANTS_SQL: &str = concat!(
+    "\
     SELECT t.id::text, \
-           COALESCE(we.queryable_days, pe.queryable_days, 730)::int \
+           COALESCE(we.queryable_days, pa.queryable_days, 730)::int \
     FROM tenants t \
-    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
-    LEFT JOIN plan_entitlements pe \
-      ON pe.plan_lookup_key = COALESCE(we.plan_lookup_key, t.plan::text || '_v1')";
+    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id",
+    crate::entitlement_cache::allowance_pin_join!(
+        "COALESCE(we.plan_lookup_key, t.plan::text || '_v1')"
+    ),
+);
 
 async fn resolve_retentions(pool: &DbPool) -> anyhow::Result<Vec<TenantRetention>> {
     let client = pool
@@ -503,6 +922,79 @@ async fn resolve_retentions(pool: &DbPool) -> anyhow::Result<Vec<TenantRetention
             queryable_days: r.get(1),
         })
         .collect())
+}
+
+/// B-459: the tombstones `scripts/ops/tenant-purge.sh` writes (migration 0053).
+// ponytail: the purged ids are bound as ONE array literal in the SQL text, so ClickHouse's
+// default 256 KiB `max_query_size` caps a single orphan step near ~6,500 purged tenants;
+// past that every table's step errors (fail-safe — nothing deleted, warned per table).
+// Chunk the id list when `purged_tenants` approaches that.
+const PURGED_TENANTS_SQL: &str =
+    "SELECT tenant_id::text, EXTRACT(EPOCH FROM (now() - purged_at))::float8 FROM purged_tenants";
+
+async fn resolve_purged(pool: &DbPool) -> anyhow::Result<Vec<(String, f64)>> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| anyhow::anyhow!("retention pool: {e}"))?;
+    let rows = client.query(PURGED_TENANTS_SQL, &[]).await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))
+        .collect())
+}
+
+fn tombstone_conflicts(
+    purged: &[(String, f64)],
+    live: &[TenantRetention],
+    grace_secs: f64,
+) -> Vec<String> {
+    let live = live
+        .iter()
+        .map(|t| t.tenant_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut conflicts = purged
+        .iter()
+        .filter(|(id, age)| live.contains(id.as_str()) && *age > grace_secs)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+}
+
+fn observe_tombstone_conflicts(
+    purged: &[(String, f64)],
+    live: &[TenantRetention],
+    policy: &RetentionSweepPolicy,
+) -> usize {
+    let conflicts = tombstone_conflicts(
+        purged,
+        live,
+        policy.tombstone_live_grace_hours as f64 * 3600.0,
+    );
+    if conflicts.is_empty() {
+        degradation::resolve(Degradation::TombstoneLiveConflict);
+    } else {
+        degradation::note(Degradation::TombstoneLiveConflict);
+        tracing::warn!(conflicts = conflicts.len(), tenant_ids = ?&conflicts[..conflicts.len().min(10)],
+            "live tenant still has an aged purge tombstone: finish with tenant-purge.sh <id> --execute; only if deliberately abandoned, manually remove that tenant id from purged_tenants");
+    }
+    conflicts.len()
+}
+
+/// The ids the orphan step may delete: recorded as purged AND not live. Pure — the
+/// "a live tenant is never a target" rule is pinned by a test, not by the SQL alone.
+fn purge_targets(purged: &[String], live: &[TenantRetention]) -> Vec<String> {
+    let live: std::collections::HashSet<&str> = live.iter().map(|t| t.tenant_id.as_str()).collect();
+    let mut out: Vec<String> = purged
+        .iter()
+        .filter(|id| !live.contains(id.as_str()))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// How many rows a mode ACCOUNTS FOR, given `n` rows past the window.
@@ -541,17 +1033,30 @@ async fn sweep_one(
     tenant_id: &str,
     days: u64,
     mode: SweepMode,
+    run: &mut SweepRun,
 ) -> anyhow::Result<u64> {
     #[derive(serde::Deserialize, clickhouse::Row)]
     struct CountRow {
         n: u64,
     }
-    let CountRow { n } = ch
-        .query(&crate::clickhouse_query::ceiling(table.count_sql))
-        .bind(tenant_id)
-        .bind(days)
-        .fetch_one::<CountRow>()
-        .await?;
+    if run.exhausted(mode) {
+        return Ok(0);
+    }
+    let CountRow { n } = match tokio::time::timeout_at(
+        run.deadline,
+        ch.query(&crate::clickhouse_query::ceiling(table.count_sql))
+            .bind(tenant_id)
+            .bind(days)
+            .fetch_one::<CountRow>(),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            run.skip();
+            return Ok(0);
+        }
+    };
     if n == 0 {
         return Ok(0);
     }
@@ -566,11 +1071,17 @@ async fn sweep_one(
             Ok(rows_accounted(mode, n))
         }
         SweepMode::Enforce => {
-            ch.query(table.delete_sql)
-                .bind(tenant_id)
-                .bind(days)
-                .execute()
-                .await?;
+            if delete_bounded(
+                ch,
+                table.label,
+                ch.query(table.delete_sql).bind(tenant_id).bind(days), // "ALTER TABLE … DELETE": bounded mutation
+                run,
+            )
+            .await
+                != DeleteOutcome::Done
+            {
+                return Ok(0);
+            }
             tracing::info!(
                 %tenant_id, table = table.label, queryable_days = days, deleted = n,
                 "retention sweep [enforce]: deleted rows past window"
@@ -583,10 +1094,543 @@ async fn sweep_one(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outcomes_time_sweep_uses_plan_window_and_heavy_delete() {
+        let table = SWEEP_TABLES
+            .iter()
+            .find(|t| t.label == "outcomes")
+            .expect("outcomes must join the per-plan TIME sweep");
+        assert_eq!(
+            table.count_sql,
+            "SELECT count() AS n FROM tracelane.outcomes WHERE tenant_id = ? AND recorded_at < now() - toIntervalDay(?)"
+        );
+        assert_eq!(
+            table.delete_sql,
+            "ALTER TABLE tracelane.outcomes DELETE WHERE tenant_id = ? AND recorded_at < now() - toIntervalDay(?) SETTINGS mutations_sync = 2"
+        );
+        assert_eq!(
+            orphan_steps()
+                .filter(|(label, _, _)| *label == "outcomes")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn outcomes_expire_and_are_purgeable_with_heavy_delete_grant() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+        for path in [
+            "infra/dev/clickhouse/migrations/33_outcomes.sql",
+            "infra/dev/clickhouse/schema.sql",
+        ] {
+            let text = read(path);
+            let table = text
+                .split("CREATE TABLE IF NOT EXISTS tracelane.outcomes")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            assert!(
+                table.contains("TTL toDate(recorded_at) + INTERVAL 365 DAY"),
+                "outcomes must mirror span TTL: {path}"
+            );
+        }
+        let table = SWEEP_TABLES
+            .iter()
+            .find(|t| t.label == "outcomes")
+            .expect("outcomes orphan sweep");
+        assert_eq!(
+            table.orphan_delete_sql,
+            "ALTER TABLE tracelane.outcomes DELETE WHERE tenant_id IN ? SETTINGS mutations_sync = 2"
+        );
+        let purge = read("scripts/ops/tenant-purge.sh");
+        assert!(
+            purge
+                .split("CH_PURGE=(")
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .any(|v| v == "outcomes")
+        );
+        // B-601 (merged 2026-10-01): deletes belong to tl_sweeper ONLY; the request-path
+        // tl_gateway holds no delete of any kind.
+        let grants = read("infra/prod/clickhouse/users.d/services.xml");
+        let gateway = grants
+            .split("<tl_gateway>")
+            .nth(1)
+            .and_then(|b| b.split("</tl_gateway>").next())
+            .expect("tl_gateway block");
+        let sweeper = grants
+            .split("<tl_sweeper>")
+            .nth(1)
+            .and_then(|b| b.split("</tl_sweeper>").next())
+            .expect("tl_sweeper block");
+        assert!(sweeper.contains("GRANT SELECT, ALTER DELETE ON tracelane.outcomes</query>"));
+        assert!(!gateway.contains("tracelane.outcomes"));
+        assert!(!grants.contains("ALTER UPDATE(_row_exists) ON tracelane.outcomes"));
+    }
     use super::*;
 
-    /// RI-02 rule 5 fail-safe: the orphan step never runs against an EMPTY live
-    /// list, because `tenant_id NOT IN ()` is "every row". Pure decision, pinned.
+    fn proof_policy() -> RetentionSweepPolicy {
+        RetentionSweepPolicy {
+            delete_wait_secs: 2,
+            max_mutations_per_run: 3,
+            max_run_secs: 30,
+            tombstone_live_grace_hours: 36,
+        }
+    }
+
+    async fn proof_table(name: &str) -> clickhouse::Client {
+        let ch = clickhouse::Client::default()
+            .with_url(std::env::var("CLICKHOUSE_TEST_URL").expect("throwaway URL"));
+        ch.query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .unwrap();
+        ch.query(&format!("DROP TABLE IF EXISTS tracelane.{name}"))
+            .execute()
+            .await
+            .unwrap();
+        ch.query(&format!("CREATE TABLE tracelane.{name} (tenant_id String, value UInt8) ENGINE=MergeTree ORDER BY (tenant_id, value)")).execute().await.unwrap();
+        ch.query(&format!(
+            "INSERT INTO tracelane.{name} VALUES ('a',1),('a',2),('b',1)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+        ch
+    }
+    async fn proof_count(ch: &clickhouse::Client, sql: &str) -> u64 {
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct N {
+            n: u64,
+        }
+        ch.query(sql).fetch_one::<N>().await.unwrap().n
+    }
+
+    #[test]
+    fn tombstone_conflict_boundary_and_live_filter() {
+        let live = vec![TenantRetention {
+            tenant_id: "live".into(),
+            queryable_days: 30,
+        }];
+        assert!(tombstone_conflicts(&[], &live, 36.0).is_empty());
+        assert!(
+            tombstone_conflicts(
+                &[("live".into(), 35.999), ("gone".into(), 72.0)],
+                &live,
+                36.0
+            )
+            .is_empty()
+        );
+        assert!(tombstone_conflicts(&[("live".into(), 36.0)], &live, 36.0).is_empty());
+        assert_eq!(
+            tombstone_conflicts(
+                &[("live".into(), 36.001), ("gone".into(), 72.0)],
+                &live,
+                36.0
+            ),
+            vec!["live".to_string()]
+        );
+    }
+
+    async fn tombstone_pg_fixture() -> DbPool {
+        let config: tokio_postgres::Config = std::env::var("POSTGRES_TEST_URL")
+            .expect("throwaway Postgres URL")
+            .parse()
+            .unwrap();
+        let pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            config,
+            tokio_postgres::NoTls,
+        ))
+        .max_size(1)
+        .build()
+        .unwrap();
+        {
+            // Session-local tables: no application database is migrated or seeded.
+            let pg = pool.get().await.unwrap();
+            pg.batch_execute("CREATE TEMP TABLE tenants (id uuid, plan text, plan_version text, price_protected_until timestamptz);
+                CREATE TEMP TABLE workspace_entitlements (tenant_id uuid, queryable_days int, plan_lookup_key text);
+                CREATE TEMP TABLE plan_entitlements (plan_lookup_key text, queryable_days int);
+                CREATE TEMP TABLE plan_allowances (plan_version text, plan_lookup_key text, queryable_days int, is_current boolean);
+                INSERT INTO plan_allowances VALUES ('v3', 'free_v1', 30, true);
+                CREATE TEMP TABLE purged_tenants (tenant_id uuid, purged_at timestamptz NOT NULL DEFAULT now());
+                CREATE TEMP TABLE billing_policy (key text, value jsonb);
+                INSERT INTO tenants VALUES ('00000000-0000-0000-0000-00000000fa11', 'free', NULL, NULL);
+                INSERT INTO plan_entitlements VALUES ('free_v1', 30);
+                INSERT INTO purged_tenants VALUES ('00000000-0000-0000-0000-00000000fa11', now() - interval '72 hours');").await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    #[ignore = "throwaway Postgres; run-postgres-integration.sh"]
+    async fn postgres_retention_tombstone_and_policy_roundtrip() {
+        let pool = tombstone_pg_fixture().await;
+        let live = resolve_retentions(&pool).await.unwrap();
+        let purged = resolve_purged(&pool).await.unwrap();
+        let policy = RetentionSweepPolicy::load(&pool).await;
+        assert_eq!(
+            policy,
+            RetentionSweepPolicy::embedded(),
+            "missing row fallback"
+        );
+        let before = degradation::count(Degradation::TombstoneLiveConflict);
+        assert_eq!(observe_tombstone_conflicts(&purged, &live, &policy), 1);
+        assert!(degradation::count(Degradation::TombstoneLiveConflict) > before);
+        assert!(
+            degradation::snapshot()
+                .iter()
+                .any(|s| s.kind == "tombstone_live_conflict" && s.open)
+        );
+        assert!(
+            purge_targets(
+                &purged.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                &live
+            )
+            .is_empty()
+        );
+        {
+            let pg = pool.get().await.unwrap();
+            pg.batch_execute("UPDATE purged_tenants SET purged_at = now() - interval '1 hour';
+                INSERT INTO billing_policy VALUES ('retention_sweep', '{\"delete_wait_secs\":1,\"max_mutations_per_run\":2,\"max_run_secs\":3,\"tombstone_live_grace_hours\":4}');").await.unwrap();
+        }
+        let custom = RetentionSweepPolicy::load(&pool).await;
+        assert_eq!(
+            custom,
+            RetentionSweepPolicy {
+                delete_wait_secs: 1,
+                max_mutations_per_run: 2,
+                max_run_secs: 3,
+                tombstone_live_grace_hours: 4
+            }
+        );
+        assert_eq!(
+            observe_tombstone_conflicts(&resolve_purged(&pool).await.unwrap(), &live, &custom),
+            0
+        );
+        assert!(
+            degradation::snapshot()
+                .iter()
+                .any(|s| s.kind == "tombstone_live_conflict" && !s.open)
+        );
+        {
+            let pg = pool.get().await.unwrap();
+            pg.batch_execute("UPDATE billing_policy SET value = '{}'::jsonb")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            RetentionSweepPolicy::load(&pool).await,
+            RetentionSweepPolicy::embedded(),
+            "malformed row fallback"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "both throwaway stores; run-ledger-integration.sh"]
+    async fn retention_dual_store_live_conflict_never_deletes() {
+        let pool = tombstone_pg_fixture().await;
+        let ch = clickhouse::Client::default()
+            .with_url(std::env::var("CLICKHOUSE_TEST_URL").expect("throwaway URL"));
+        let live = resolve_retentions(&pool).await.unwrap();
+        for sql in crate::clickhouse_query::split_migration_statements(include_str!(
+            "../../../infra/dev/clickhouse/schema.sql"
+        )) {
+            ch.query(&sql).execute().await.unwrap();
+        }
+        ch.query("ALTER TABLE tracelane.guardrail_verdicts DELETE WHERE tenant_id = ? AND correlation_id = 'live-conflict' SETTINGS mutations_sync = 2").bind(&live[0].tenant_id).execute().await.unwrap();
+        ch.query("INSERT INTO tracelane.guardrail_verdicts (tenant_id, correlation_id, event_time) VALUES (?, 'live-conflict', '2090-01-01')").bind(&live[0].tenant_id).execute().await.unwrap();
+        let purged = resolve_purged(&pool).await.unwrap();
+        let policy = RetentionSweepPolicy::embedded();
+        assert_eq!(observe_tombstone_conflicts(&purged, &live, &policy), 1);
+        let ids = purged.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let targets = purge_targets(&ids, &live);
+        let mut run = SweepRun::new(policy);
+        assert!(targets.is_empty());
+        assert_eq!(
+            sweep_orphans(&ch, &targets, SweepMode::Enforce, &mut run).await,
+            0
+        );
+        assert_eq!(proof_count(&ch, "SELECT count() AS n FROM tracelane.guardrail_verdicts WHERE tenant_id='00000000-0000-0000-0000-00000000fa11' AND correlation_id='live-conflict'").await, 1);
+        assert_eq!(run.mutations, 0);
+        // The young twin must not alert either; neither age authorizes deletion.
+        {
+            let pg = pool.get().await.unwrap();
+            pg.batch_execute("UPDATE purged_tenants SET purged_at=now()-interval '1 hour'")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            observe_tombstone_conflicts(&resolve_purged(&pool).await.unwrap(), &live, &policy),
+            0
+        );
+    }
+    #[test]
+    fn retention_policy_is_seeded_and_forwarded() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json")).unwrap();
+        let policy: RetentionSweepPolicy =
+            serde_json::from_value(seed["policy"]["retention_sweep"].clone())
+                .expect("reviewed policy row");
+        assert_eq!(RetentionSweepPolicy::embedded(), policy);
+        assert!(
+            include_str!("../../../apps/web/db/seed.mjs")
+                .contains("retention_sweep: pol.retention_sweep")
+        );
+        assert_eq!(policy.delete_wait_secs, 300);
+        assert_eq!(policy.max_mutations_per_run, 400);
+        assert_eq!(policy.max_run_secs, 3000);
+        assert_eq!(policy.tombstone_live_grace_hours, 36);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs throwaway ClickHouse; run-clickhouse-integration.sh"]
+    async fn retention_hardening_pending_skip() {
+        let ch = proof_table("s1_pending").await;
+        ch.query("SYSTEM STOP MERGES tracelane.s1_pending")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("ALTER TABLE tracelane.s1_pending DELETE WHERE tenant_id = 'a' AND value = 1 SETTINGS mutations_sync = 0").execute().await.unwrap();
+        let before = proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND table='s1_pending'").await;
+        let mut run = SweepRun::new(proof_policy());
+        let result = tokio::time::timeout(Duration::from_secs(4), delete_bounded(&ch, "s1_pending", ch.query("ALTER TABLE tracelane.s1_pending DELETE WHERE tenant_id = 'a' SETTINGS mutations_sync = 2"), &mut run)).await;
+        let after = proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND table='s1_pending'").await;
+        let table = SweepTable {
+            label: "s1_pending",
+            count_sql: "SELECT count() AS n FROM tracelane.s1_pending WHERE tenant_id = ? AND value > ?",
+            delete_sql: "ALTER TABLE tracelane.s1_pending DELETE WHERE tenant_id = ? AND value > ? SETTINGS mutations_sync=2",
+            orphan_count_sql: "SELECT count() AS n FROM tracelane.s1_pending WHERE tenant_id IN ?",
+            orphan_delete_sql: "ALTER TABLE tracelane.s1_pending DELETE WHERE tenant_id IN ? SETTINGS mutations_sync=2",
+        };
+        let time_result = tokio::time::timeout(
+            Duration::from_secs(4),
+            sweep_one(&ch, &table, "a", 0, SweepMode::Enforce, &mut run),
+        )
+        .await;
+        let orphan_result = tokio::time::timeout(
+            Duration::from_secs(4),
+            sweep_orphans_one(
+                &ch,
+                table.label,
+                table.orphan_count_sql,
+                table.orphan_delete_sql,
+                &["a".into()],
+                SweepMode::Enforce,
+                &mut run,
+            ),
+        )
+        .await;
+        ch.query("SYSTEM START MERGES tracelane.s1_pending")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap(), DeleteOutcome::SkippedPending);
+        assert_eq!(time_result.unwrap().unwrap(), 0);
+        assert_eq!(orphan_result.unwrap().unwrap(), 0);
+        assert_eq!(proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND table='s1_pending'").await, before);
+        assert_eq!(before, after, "pending skip must submit no mutation");
+        assert!(run.skipped > 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs throwaway ClickHouse; run-clickhouse-integration.sh"]
+    async fn retention_hardening_wait_and_survival() {
+        let ch = proof_table("s1_wait").await;
+        ch.query("SYSTEM STOP MERGES tracelane.s1_wait")
+            .execute()
+            .await
+            .unwrap();
+        let before = degradation::count(Degradation::RetentionSweepSkipped);
+        let mut run = SweepRun::new(proof_policy());
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(4), delete_bounded(&ch, "s1_wait", ch.query("ALTER TABLE tracelane.s1_wait DELETE WHERE tenant_id = 'a' SETTINGS mutations_sync = 2"), &mut run)).await;
+        let pending = proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND table='s1_wait' AND is_done=0").await;
+        ch.query("SYSTEM START MERGES tracelane.s1_wait")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap(), DeleteOutcome::WaitExceeded);
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(pending > 0, "mutation survives the dropped HTTP wait");
+        assert!(degradation::count(Degradation::RetentionSweepSkipped) > before);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND table='s1_wait' AND is_done=0").await == 0 { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(
+            proof_count(
+                &ch,
+                "SELECT count() AS n FROM tracelane.s1_wait WHERE tenant_id='a'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            proof_count(
+                &ch,
+                "SELECT count() AS n FROM tracelane.s1_wait WHERE tenant_id='b'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs throwaway ClickHouse; run-clickhouse-integration.sh"]
+    async fn retention_hardening_statement_and_wall_budgets() {
+        let ch = proof_table("s1_budget0").await;
+        for i in 1..10 {
+            proof_table(&format!("s1_budget{i}")).await;
+        }
+        let before = degradation::count(Degradation::RetentionSweepSkipped);
+        let mut run = SweepRun::new(proof_policy());
+        for i in 0..10 {
+            let table = format!("s1_budget{i}");
+            delete_bounded(&ch, &table, ch.query(&format!("ALTER TABLE tracelane.{table} DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2")), &mut run).await;
+        }
+        assert_eq!(proof_count(&ch, "SELECT count() AS n FROM system.mutations WHERE database='tracelane' AND startsWith(table,'s1_budget')").await, 3);
+        assert_eq!(run.mutations, 3);
+        assert!(degradation::count(Degradation::RetentionSweepSkipped) > before);
+        let mut run = SweepRun::new(proof_policy());
+        run.deadline = tokio::time::Instant::now();
+        assert_eq!(delete_bounded(&ch, "s1_budget9", ch.query("ALTER TABLE tracelane.s1_budget9 DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2"), &mut run).await, DeleteOutcome::BudgetExhausted);
+        assert_eq!(run.mutations, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs throwaway ClickHouse; run-clickhouse-integration.sh"]
+    async fn retention_hardening_failures_continue_and_settings_verdict() {
+        let ch = proof_table("s1_failure").await;
+        ch.query("DROP USER IF EXISTS s1_restricted")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("CREATE USER s1_restricted")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("GRANT SELECT ON system.mutations TO s1_restricted")
+            .execute()
+            .await
+            .unwrap();
+        let restricted = ch.clone().with_user("s1_restricted");
+        let mut run = SweepRun::new(proof_policy());
+        let before = degradation::count(Degradation::RetentionSweepFailed);
+        assert_eq!(delete_bounded(&restricted, "s1_failure", restricted.query("ALTER TABLE tracelane.s1_failure DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2"), &mut run).await, DeleteOutcome::Failed);
+        assert!(degradation::count(Degradation::RetentionSweepFailed) > before);
+        assert_eq!(delete_bounded(&ch, "s1_failure", ch.query("ALTER TABLE tracelane.s1_failure DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2"), &mut run).await, DeleteOutcome::Done);
+        let error = ch.query(&crate::clickhouse_query::ceiling("ALTER TABLE tracelane.s1_failure DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2")).execute().await.unwrap_err();
+        assert!(error.to_string().contains("SYNTAX_ERROR"), "{error}");
+        let option_ch = proof_table("s1_option").await;
+        option_ch
+            .query("SYSTEM STOP MERGES tracelane.s1_option")
+            .execute()
+            .await
+            .unwrap();
+        let waited = tokio::time::timeout(Duration::from_secs(2), option_ch.query("ALTER TABLE tracelane.s1_option DELETE WHERE tenant_id='a' SETTINGS mutations_sync=2").with_option("max_execution_time", "1").execute()).await;
+        option_ch
+            .query("SYSTEM START MERGES tracelane.s1_option")
+            .execute()
+            .await
+            .unwrap();
+        assert!(
+            waited.is_err(),
+            "max_execution_time does not bound a mutation wait: {waited:?}"
+        );
+        // Drive the real loop: an early refused table must not hide a later permitted one.
+        for sql in crate::clickhouse_query::split_migration_statements(include_str!(
+            "../../../infra/dev/clickhouse/schema.sql"
+        )) {
+            ch.query(&sql).execute().await.unwrap();
+        }
+        ch.query("GRANT SELECT ON tracelane.* TO s1_restricted")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("GRANT ALTER DELETE ON tracelane.guardrail_verdicts TO s1_restricted")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, start_time, end_time) VALUES ('00000000-0000-0000-0000-00000000fa12','00000000-0000-0000-0000-00000000fa12','s1', '2090-01-01','2090-01-01')").execute().await.unwrap();
+        ch.query("INSERT INTO tracelane.guardrail_verdicts (tenant_id, correlation_id, event_time) VALUES ('00000000-0000-0000-0000-00000000fa12','s1','2090-01-01')").execute().await.unwrap();
+        let mut loop_run = SweepRun::new(RetentionSweepPolicy::embedded());
+        let deleted = sweep_orphans(
+            &restricted,
+            &["00000000-0000-0000-0000-00000000fa12".into()],
+            SweepMode::Enforce,
+            &mut loop_run,
+        )
+        .await;
+        assert!(deleted > 0, "the later allowed table was still swept");
+        assert!(loop_run.failed > 0);
+        assert_eq!(proof_count(&ch, "SELECT count() AS n FROM tracelane.guardrail_verdicts WHERE tenant_id='00000000-0000-0000-0000-00000000fa12'").await, 0);
+        assert!(proof_count(&ch, "SELECT count() AS n FROM tracelane.spans WHERE tenant_id='00000000-0000-0000-0000-00000000fa12'").await > 0);
+        ch.query("DROP USER s1_restricted").execute().await.unwrap();
+    }
+    #[test]
+    fn retention_deletes_are_heavy_and_tenant_first() {
+        for table in SWEEP_TABLES {
+            assert!(
+                table.delete_sql.starts_with("ALTER TABLE tracelane."),
+                "{} must use heavy delete",
+                table.label
+            );
+            assert!(table.delete_sql.contains("WHERE tenant_id = ? AND"));
+            assert!(table.delete_sql.ends_with("SETTINGS mutations_sync = 2"));
+        }
+        for (label, count, delete) in orphan_steps() {
+            assert!(
+                delete.starts_with("ALTER TABLE tracelane."),
+                "{label} must use heavy delete"
+            );
+            assert!(delete.contains("WHERE tenant_id IN ?"));
+            assert!(count.contains("WHERE tenant_id IN ?"));
+            assert!(delete.ends_with("SETTINGS mutations_sync = 2"));
+        }
+    }
+
+    /// B-459: only UNKNOWN_TABLE is "nothing to sweep"; a timeout, an auth refusal or a
+    /// syntax error must still surface (must-reject twin in the same test).
+    #[test]
+    fn only_an_unknown_table_error_is_treated_as_nothing_to_sweep() {
+        assert!(is_unknown_table(
+            "bad response: Code: 60. DB::Exception: Table tracelane.ttft_stats does not exist. (UNKNOWN_TABLE)"
+        ));
+        assert!(!is_unknown_table(
+            "bad response: Code: 497. DB::Exception: tl_gateway: Not enough privileges. (ACCESS_DENIED)"
+        ));
+        assert!(!is_unknown_table(
+            "bad response: Code: 159. Timeout exceeded (TIMEOUT_EXCEEDED)"
+        ));
+        assert!(!is_unknown_table("Code: 600. something else"));
+    }
+
+    /// B-459 security review CRITICAL: a tenant absent from the live list is NOT a
+    /// target unless it was recorded as purged; a purged id that is somehow live is
+    /// never a target either.
+    #[test]
+    fn purge_targets_are_recorded_purges_that_are_not_live() {
+        let live = vec![TenantRetention {
+            tenant_id: "live".into(),
+            queryable_days: 730,
+        }];
+        let purged = vec!["gone".to_string(), "live".to_string(), "gone".to_string()];
+        assert_eq!(purge_targets(&purged, &live), vec!["gone".to_string()]);
+        // A brand-new tenant missing from `live` is simply not in `purged`: untouched.
+        assert!(purge_targets(&[], &live).is_empty());
+        assert!(PURGED_TENANTS_SQL.contains("FROM purged_tenants"));
+    }
+
+    /// The orphan step never sends an EMPTY target list (nothing recorded as purged =
+    /// nothing to do). Pure decision, pinned.
     #[test]
     fn orphan_step_refuses_an_empty_tenant_list() {
         assert!(!orphan_step_allowed(0));
@@ -594,32 +1638,36 @@ mod tests {
         assert!(orphan_step_allowed(19));
     }
 
-    /// RI-02 §2 guard: the sweep's tenant list still comes from `tenants` (a purged
-    /// tenant's row absence is the tombstone this whole spec relies on), and every
-    /// content table carries an orphan count + delete that filter on `tenant_id NOT IN ?`
-    /// against the table the label names — never a different table, never unfiltered.
+    /// RI-02 §2 guard, B-459 shape: every content table carries an orphan count + delete
+    /// that filter on `tenant_id IN ?` (the RECORDED purged tenants) against the table the
+    /// label names — never a different table, never unfiltered, never `NOT IN`.
     #[test]
     fn orphan_sql_exists_for_every_sweep_table_and_reads_the_live_tenant_list_from_tenants() {
         assert!(RETENTION_TENANTS_SQL.contains("FROM tenants t"));
-        for t in SWEEP_TABLES {
-            for sql in [t.orphan_count_sql, t.orphan_delete_sql] {
+        for (label, count_sql, delete_sql) in orphan_steps() {
+            for sql in [count_sql, delete_sql] {
                 assert!(
-                    sql.contains(&format!("tracelane.{}", t.label)),
-                    "{}: orphan SQL names another table: {sql}",
-                    t.label
+                    sql.contains(&format!("tracelane.{label} ")),
+                    "{label}: orphan SQL names another table: {sql}"
                 );
                 assert!(
-                    sql.contains("WHERE tenant_id NOT IN ?"),
-                    "{}: orphan SQL is not the NOT IN shape: {sql}",
-                    t.label
+                    sql.contains("WHERE tenant_id IN ?") && !sql.contains("NOT IN"),
+                    "{label}: orphan SQL must name purged tenants (IN), never exclude live ones (NOT IN): {sql}"
                 );
             }
         }
+        // 8 time-swept + 19 orphan-only = every CH_PURGE table (the guard holds the
+        // names; this pins that nothing was silently dropped from either list).
+        assert_eq!(
+            orphan_steps().count(),
+            SWEEP_TABLES.len() + ORPHAN_ONLY_TABLES.len()
+        );
+        assert_eq!(ORPHAN_ONLY_TABLES.len(), 19);
     }
 
     /// RI-02 §7 proofs 2 + 3(b), against a REAL ClickHouse (`run-clickhouse-integration.sh`).
     /// One orphan tenant (no `tenants` row) and one live tenant, one row each in all
-    /// SEVEN content tables. `sweep_orphans(Enforce)` with the live list → the orphan's
+    /// SEVEN time-swept tables plus the EIGHTEEN orphan-only ones (B-459). `sweep_orphans(Enforce)` with the live list → the orphan's
     /// rows are gone from every table and the bystander's are untouched (counted before
     /// and after). Then the fail-safe: an EMPTY list deletes nothing. RED first: with the
     /// orphan step absent this test's first assertion reads 7, not 0.
@@ -646,6 +1694,18 @@ mod tests {
             include_str!(
                 "../../../infra/dev/clickhouse/migrations/21_evl29_trace_content_snapshots.sql"
             ),
+            // B-459: the orphan-only tables' homes.
+            include_str!("../../../infra/dev/clickhouse/migrations/03_prompt_promotion.sql"),
+            include_str!("../../../infra/dev/clickhouse/migrations/05_operability_mvs.sql"),
+            include_str!(
+                "../../../infra/dev/clickhouse/migrations/18_datasets_and_experiments.sql"
+            ),
+            include_str!("../../../infra/dev/clickhouse/migrations/19_evl02_experiment_arms.sql"),
+            include_str!(
+                "../../../infra/dev/clickhouse/migrations/24_bill01_meters_blobs_tiering.sql"
+            ),
+            include_str!("../../../infra/dev/clickhouse/migrations/30_prompt_canaries.sql"),
+            include_str!("../../../infra/dev/clickhouse/migrations/33_outcomes.sql"),
         ] {
             for stmt in crate::clickhouse_query::split_migration_statements(sql) {
                 let _ = ch.query(&stmt).execute().await;
@@ -653,9 +1713,13 @@ mod tests {
         }
         let orphan = uuid::Uuid::new_v4().to_string();
         let live = uuid::Uuid::new_v4().to_string();
+        // B-459: in NO list at all — the tenant created between the list read and the
+        // DELETE (or lost by a restored control plane). The old NOT-IN step deleted it.
+        let unlisted = uuid::Uuid::new_v4().to_string();
         // (table, time column) — one row per tenant per table; a span also lands its
         // trace_summaries row through the MV, so that table is seeded by the span.
-        let seeds: [(&str, &str); 6] = [
+        let seeds: [(&str, &str); 7] = [
+            ("outcomes", "recorded_at"),
             ("spans", "start_time"),
             ("guardrail_verdicts", "event_time"),
             ("online_eval_scores", "scored_at"),
@@ -663,7 +1727,7 @@ mod tests {
             ("semantic_cache", "created_at"),
             ("blob_refs", "day"),
         ];
-        for tenant in [&orphan, &live] {
+        for tenant in [&orphan, &live, &unlisted] {
             for (table, col) in seeds {
                 let sql = if table == "spans" {
                     "INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) \
@@ -684,50 +1748,80 @@ mod tests {
                     .await
                     .unwrap_or_else(|e| panic!("seed {table} for {tenant}: {e:#}"));
             }
+            // B-459: one row per orphan-only table; every other column takes its type
+            // default, which is all the orphan step reads (`tenant_id`).
+            for t in ORPHAN_ONLY_TABLES {
+                // Two tables drop a defaulted row on insert: a 1970 time is already past
+                // their TTL, and a SummingMergeTree row whose sums are all zero is removed.
+                let sql = match t.label {
+                    "token_economics" => "INSERT INTO tracelane.token_economics (tenant_id, day, request_count) VALUES (?, today(), 1)".to_string(),
+                    "ttft_stats" => "INSERT INTO tracelane.ttft_stats (tenant_id, bucket_hour) VALUES (?, now())".to_string(),
+                    // A+C merge (2026-10-01): a default 1970 bucket_hour is already past
+                    // spend_hourly's 365-day TTL and is dropped at insert — seed a live hour.
+                    "spend_hourly" => "INSERT INTO tracelane.spend_hourly (tenant_id, bucket_hour) VALUES (?, toStartOfHour(now()))".to_string(),
+                    other => format!("INSERT INTO tracelane.{other} (tenant_id) VALUES (?)"),
+                };
+                ch.query(&sql)
+                    .bind(tenant.as_str())
+                    .execute()
+                    .await
+                    .unwrap_or_else(|e| panic!("seed {} for {tenant}: {e:#}", t.label));
+            }
         }
         async fn rows_for(ch: &clickhouse::Client, tenant: &str) -> Vec<(String, u64)> {
             let mut out = Vec::new();
-            for t in SWEEP_TABLES {
+            for (label, _, _) in orphan_steps() {
                 let n: u64 = ch
                     .query(&format!(
-                        "SELECT count() FROM tracelane.{} WHERE tenant_id = ?",
-                        t.label
+                        "SELECT count() FROM tracelane.{label} WHERE tenant_id = ?"
                     ))
                     .bind(tenant)
                     .fetch_one()
                     .await
                     .expect("count");
-                out.push((t.label.to_string(), n));
+                out.push((label.to_string(), n));
             }
             out
         }
         let orphan_before = rows_for(&ch, &orphan).await;
         let live_before = rows_for(&ch, &live).await;
+        let unlisted_before = rows_for(&ch, &unlisted).await;
         assert!(
             orphan_before.iter().all(|(_, n)| *n >= 1),
             "every content table must hold the orphan's row before the step: {orphan_before:?}"
         );
 
-        // 3(b) first: an EMPTY live list must delete NOTHING.
-        let refused = sweep_orphans(&ch, &[], SweepMode::Enforce).await;
-        assert_eq!(
-            refused, 0,
-            "an empty tenant list is refused, never 'everything'"
-        );
+        // 3(b) first: an EMPTY target list must delete NOTHING.
+        let refused = sweep_orphans(
+            &ch,
+            &[],
+            SweepMode::Enforce,
+            &mut SweepRun::new(RetentionSweepPolicy::embedded()),
+        )
+        .await;
+        assert_eq!(refused, 0, "an empty target list deletes nothing");
         assert_eq!(
             rows_for(&ch, &orphan).await,
             orphan_before,
             "nothing deleted on refusal"
         );
 
-        // Proof 2: the live list names only `live` → the orphan's rows go, the bystander's stay.
+        // Proof 2: only `orphan` is RECORDED as purged → its rows go; the live tenant's AND the
+        // unlisted tenant's stay (the B-459 CRITICAL: the old NOT-IN step took both).
         let live_list = vec![TenantRetention {
             tenant_id: live.clone(),
             queryable_days: 730,
         }];
-        let deleted = sweep_orphans(&ch, &live_list, SweepMode::Enforce).await;
+        let targets = purge_targets(std::slice::from_ref(&orphan), &live_list);
+        let deleted = sweep_orphans(
+            &ch,
+            &targets,
+            SweepMode::Enforce,
+            &mut SweepRun::new(RetentionSweepPolicy::embedded()),
+        )
+        .await;
         assert!(
-            deleted >= 7,
+            deleted >= (SWEEP_TABLES.len() + ORPHAN_ONLY_TABLES.len()) as u64,
             "at least one orphan row per table was accounted: {deleted}"
         );
         let orphan_after = rows_for(&ch, &orphan).await;
@@ -739,6 +1833,11 @@ mod tests {
             rows_for(&ch, &live).await,
             live_before,
             "the bystander's rows are byte-for-byte untouched (same counts in every table)"
+        );
+        assert_eq!(
+            rows_for(&ch, &unlisted).await,
+            unlisted_before,
+            "a tenant missing from the live list but NOT recorded as purged is untouched"
         );
     }
 
@@ -898,6 +1997,7 @@ mod tests {
     fn sweep_covers_the_content_tables_and_never_the_ledger() {
         let labels: Vec<&str> = SWEEP_TABLES.iter().map(|t| t.label).collect();
         for want in [
+            "outcomes",
             "spans",
             "trace_summaries",
             "guardrail_verdicts",
@@ -1006,16 +2106,74 @@ mod tests {
         .execute()
         .await
         .expect("seed span");
+        // The same TIME sweep must enforce Free's plan window on explicit outcomes.
+        let policy: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json")).unwrap();
+        let free_days = policy["plans"]["free_v1"]["queryable_days"]
+            .as_i64()
+            .unwrap() as i32;
+        assert_eq!(free_days, 30);
+        let owner = uuid::Uuid::new_v4().to_string();
+        let foreign = uuid::Uuid::new_v4().to_string();
+        for (t, subject, age) in [
+            (&owner, "old", 31_u64),
+            (&owner, "young", 29),
+            (&foreign, "foreign", 31),
+        ] {
+            ch.query("INSERT INTO tracelane.outcomes (tenant_id, subject_kind, subject_id, result, source, version, recorded_at) VALUES (?, 'session', ?, 'failure', 'retention-test', 1, now64(3) - toIntervalDay(?))")
+                .bind(t).bind(subject).bind(age).execute().await.unwrap();
+        }
+        let subjects = |t: &str| {
+            ch.query("SELECT subject_id FROM tracelane.outcomes FINAL WHERE tenant_id = ? ORDER BY subject_id LIMIT 3").bind(t).fetch_all::<String>()
+        };
+        assert_eq!(subjects(&owner).await.unwrap(), ["old", "young"]);
+        let table = SWEEP_TABLES.iter().find(|t| t.label == "outcomes").unwrap();
+        assert_eq!(
+            sweep_one(
+                &ch,
+                table,
+                &owner,
+                sweep_days(free_days).unwrap(),
+                SweepMode::Enforce,
+                // B-601 merge (2026-10-01): sweeps now run inside a bounded SweepRun.
+                &mut SweepRun::new(RetentionSweepPolicy::embedded()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            subjects(&owner).await.unwrap(),
+            ["young"],
+            "Free must remove the 31-day outcome but retain the 29-day outcome"
+        );
+        assert_eq!(
+            subjects(&foreign).await.unwrap(),
+            ["foreign"],
+            "another tenant's old outcome must survive"
+        );
+        ch.query(table.orphan_delete_sql)
+            .bind(vec![owner, foreign])
+            .execute()
+            .await
+            .unwrap();
         for table in SWEEP_TABLES {
-            let deleted = sweep_one(&ch, table, tenant, 7, SweepMode::Enforce)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "enforce DELETE on `{}` was REJECTED by the server: {e:#} — the sweep \
+            let deleted = sweep_one(
+                &ch,
+                table,
+                tenant,
+                7,
+                SweepMode::Enforce,
+                &mut SweepRun::new(RetentionSweepPolicy::embedded()),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "enforce DELETE on `{}` was REJECTED by the server: {e:#} — the sweep \
                          would fail on prod for this table",
-                        table.label
-                    )
-                });
+                    table.label
+                )
+            });
             if table.label == "spans" || table.label == "trace_summaries" {
                 assert_eq!(
                     deleted, 1,
@@ -1065,5 +2223,32 @@ mod tests {
             msg.contains("344") || msg.contains("lightweight_mutation_projection_mode"),
             "{msg}"
         );
+    }
+}
+
+/// B-409, real Postgres: the DELETION boundary reads the tenant's PINNED
+/// `queryable_days` — a later ruling that shortens it must not delete a protected
+/// tenant's data early. Run by `run-postgres-integration.sh`.
+#[cfg(test)]
+mod b409_tests {
+    use super::*;
+    use crate::entitlement_cache::b409_fixture::*;
+
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_retention_reads_the_pinned_queryable_days() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let pinned = builder_tenant(&pool, Some("v3"), Some(200)).await;
+        let fresh = builder_tenant(&pool, None, None).await;
+        let live = resolve_retentions(&pool).await.expect("retentions");
+        let days = |id: uuid::Uuid| {
+            live.iter()
+                .find(|r| r.tenant_id == id.to_string())
+                .map(|r| r.queryable_days)
+                .expect("tenant in the retention map")
+        };
+        assert_eq!(days(pinned), v3_builder().queryable, "pinned tenant");
+        assert_eq!(days(fresh), v4_builder().queryable, "unpinned tenant");
     }
 }

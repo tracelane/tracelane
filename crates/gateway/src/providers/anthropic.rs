@@ -19,9 +19,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::instrument;
 
-use tracelane_shared::{ChatRequest, MessageContent, Role, TenantId, ToolChoice};
+use tracelane_shared::{ChatRequest, ContentPart, MessageContent, Role, TenantId, ToolChoice};
 
+use crate::providers::translation_policy::AnthropicThinking;
 use crate::providers::{FinishReason, ProviderEvent, ProviderStream};
+
+/// `max_tokens` is REQUIRED by Anthropic; this is what the adapter sends when the caller
+/// sent neither `max_tokens` nor `max_completion_tokens` (pre-existing value, now named so
+/// `request_support` clamps a reasoning budget against the same number).
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Anthropic Messages API provider adapter.
 ///
@@ -96,32 +102,37 @@ impl AnthropicProvider {
             .await
             .context("SSRF guard rejected Anthropic base URL")?;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "interleaved-thinking-2025-05-14")
-            .header("content-type", "application/json")
-            .json(&anthropic_request)
-            .send()
-            .await
-            .context("failed to send request to Anthropic API")?;
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+                .header("content-type", "application/json")
+                .json(&anthropic_request),
+        )
+        .await
+        .context("failed to send request to Anthropic API")?;
 
         let status = response.status();
         if !status.is_success() {
             // SECURITY: drop the response body — Anthropic
             // 401/403 bodies can echo the x-api-key header value, leaking
             // the customer's BYOK key to logs.
-            let _body = response.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(response.headers());
+            let body = crate::routing::deadlines::error_text(response).await?;
             tracing::warn!(status = %status, "Anthropic API error");
             // Typed so the gateway distinguishes an auth rejection (401/403) from
             // an outage (5xx). Status only, never the body (credential echo).
-            return Err(crate::providers::ProviderHttpError {
-                provider: "anthropic",
-                status: status.as_u16(),
-                reason: None,
-            }
+            // OG-03 §3.4: a relayable 4xx carries the scrubbed upstream message.
+            return Err(crate::providers::ProviderHttpError::from_response(
+                "anthropic",
+                status.as_u16(),
+                None,
+                &body,
+                api_key,
+            )
+            .with_retry_after(retry_after)
             .into());
         }
 
@@ -149,7 +160,7 @@ fn build_event_stream(
 
         use futures::StreamExt as _;
         while let Some(chunk) = byte_stream.next().await {
-            let chunk: Bytes = chunk.context("error reading response chunk")?;
+            let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("error reading response chunk")?;
             lines.push(&chunk);
 
             // Process complete SSE lines
@@ -339,6 +350,20 @@ struct AnthropicRequest {
     /// who were being ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// OG-03. OpenAI `stop` → Anthropic `stop_sequences`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequences: Option<Vec<String>>,
+    /// OG-03. `reasoning_effort` → `thinking`, per the reference table
+    /// (`translation_policy`); never a literal budget here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+    /// OG-03. `{effort}` (adaptive-thinking models) and/or `{format}` (a `json_schema`
+    /// `response_format`) — Anthropic keeps both under one `output_config`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
+    /// OG-03. OpenAI `user` → `metadata.user_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
     stream: bool,
 }
 
@@ -372,6 +397,54 @@ struct AnthropicTool {
 
 impl AnthropicRequest {
     fn from_universal(req: ChatRequest) -> Result<Self> {
+        // OG-03: resolved FIRST, while `req` is still whole. `check_supported` has already
+        // refused anything unmappable; this re-derives the same value from the same
+        // function, so the two cannot disagree.
+        let thinking_cfg = crate::request_support::anthropic_thinking_for(&req)
+            .map_err(|u| anyhow::anyhow!("{}", u.message))?;
+        let mut output_config = serde_json::Map::new();
+        let thinking = match thinking_cfg {
+            None | Some(AnthropicThinking::Omit) => None,
+            Some(AnthropicThinking::Disabled) => Some(serde_json::json!({ "type": "disabled" })),
+            Some(AnthropicThinking::BetweenTools) => {
+                Some(serde_json::json!({ "type": "between_tools" }))
+            }
+            Some(AnthropicThinking::Adaptive { effort }) => {
+                output_config.insert("effort".into(), Value::String(effort));
+                Some(serde_json::json!({ "type": "adaptive" }))
+            }
+            Some(AnthropicThinking::Budget(n)) => {
+                Some(serde_json::json!({ "type": "enabled", "budget_tokens": n }))
+            }
+        };
+        if let Some(schema) = req
+            .response_format
+            .as_ref()
+            .filter(|rf| rf.get("type").and_then(Value::as_str) == Some("json_schema"))
+            .and_then(|rf| rf.get("json_schema"))
+            .and_then(|js| js.get("schema"))
+        {
+            output_config.insert(
+                "format".into(),
+                serde_json::json!({ "type": "json_schema", "schema": schema }),
+            );
+        }
+        let output_config = (!output_config.is_empty()).then_some(Value::Object(output_config));
+        let stop_sequences = req.stop.as_ref().map(|s| {
+            s.sequences()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+        let metadata = req
+            .user
+            .as_ref()
+            .map(|u| serde_json::json!({ "user_id": u }));
+        let max_tokens = req
+            .max_completion_tokens
+            .or(req.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        let no_parallel_tools = req.parallel_tool_calls == Some(false);
         let mut system: Option<String> = req.system.clone();
         let mut messages: Vec<AnthropicMessage> = Vec::with_capacity(req.messages.len());
 
@@ -390,7 +463,7 @@ impl AnthropicRequest {
                 }
                 Role::User => messages.push(AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: translate_content(msg.content),
+                    content: translate_content(msg.content)?,
                 }),
                 Role::Assistant => messages.push(AnthropicMessage {
                     role: AnthropicRole::Assistant,
@@ -404,7 +477,7 @@ impl AnthropicRequest {
                     // the OpenAI history shape on the way IN would have bought
                     // the caller a provider 400 instead of a gateway 400.
                     content: append_tool_use_blocks(
-                        translate_content(msg.content),
+                        translate_content(msg.content)?,
                         msg.tool_calls.as_deref(),
                     ),
                 }),
@@ -442,6 +515,23 @@ impl AnthropicRequest {
             }
         };
 
+        // OG-03: `parallel_tool_calls: false` is `disable_parallel_tool_use: true` INSIDE the
+        // tool_choice object. With tools offered and no explicit choice, the choice is
+        // `auto` — Anthropic's own default — so the flag has somewhere to live.
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        let tool_choice = match tool_choice {
+            Some(mut tc) if no_parallel_tools => {
+                if let Some(obj) = tc.as_object_mut() {
+                    obj.insert("disable_parallel_tool_use".into(), Value::Bool(true));
+                }
+                Some(tc)
+            }
+            None if no_parallel_tools && has_tools && !forbid_tools => {
+                Some(serde_json::json!({ "type": "auto", "disable_parallel_tool_use": true }))
+            }
+            other => other,
+        };
+
         let tools = if forbid_tools {
             None
         } else {
@@ -460,7 +550,7 @@ impl AnthropicRequest {
         Ok(Self {
             model: req.model,
             messages,
-            max_tokens: req.max_tokens.unwrap_or(4096),
+            max_tokens,
             system,
             tools,
             tool_choice,
@@ -494,6 +584,10 @@ impl AnthropicRequest {
             // 0.0–1.0-and-above scalar the OpenAI-shaped request carries, so there
             // is no translation to get wrong. `None` stays absent.
             temperature: req.temperature,
+            stop_sequences,
+            thinking,
+            output_config,
+            metadata,
             stream: true,
         })
     }
@@ -531,16 +625,58 @@ fn append_tool_use_blocks(
     AnthropicContent::Blocks(blocks)
 }
 
-fn translate_content(content: MessageContent) -> AnthropicContent {
+fn translate_content(content: MessageContent) -> Result<AnthropicContent> {
     match content {
-        MessageContent::Text(t) => AnthropicContent::Text(t),
+        MessageContent::Text(t) => Ok(AnthropicContent::Text(t)),
         MessageContent::Parts(parts) => {
-            let blocks: Vec<Value> = parts
+            let blocks = parts
                 .into_iter()
-                .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
-                .collect();
-            AnthropicContent::Blocks(blocks)
+                .map(translate_part)
+                .collect::<Result<Vec<Value>>>()?;
+            Ok(AnthropicContent::Blocks(blocks))
         }
+    }
+}
+
+/// OG-03 (D2). OpenAI-shaped parts are TRANSLATED, not serialised verbatim: an `image_url`
+/// part went out as `{"type":"image_url",…}`, which Anthropic does not accept. Text and
+/// tool blocks already carry Anthropic's own names and pass through as before.
+///
+/// `check_supported` has refused every part this cannot map before dispatch; the `bail!`s
+/// are defence in depth, never the user-facing refusal.
+fn translate_part(part: ContentPart) -> Result<Value> {
+    match part {
+        ContentPart::ImageUrl { image_url } => {
+            if let Some((media_type, data)) = crate::request_support::split_data_uri(&image_url.url)
+            {
+                Ok(serde_json::json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": data },
+                }))
+            } else if image_url.url.starts_with("https://") {
+                // Anthropic fetches it; the gateway never does.
+                Ok(serde_json::json!({
+                    "type": "image",
+                    "source": { "type": "url", "url": image_url.url },
+                }))
+            } else {
+                bail!("image_url must be a data: URI or an https:// URL")
+            }
+        }
+        ContentPart::File { file } => {
+            let Some(data_uri) = file.file_data.as_deref() else {
+                bail!("a file part needs file_data for Anthropic");
+            };
+            let Some((media_type, data)) = crate::request_support::split_data_uri(data_uri) else {
+                bail!("file_data must be a data: URI");
+            };
+            Ok(serde_json::json!({
+                "type": "document",
+                "source": { "type": "base64", "media_type": media_type, "data": data },
+            }))
+        }
+        ContentPart::InputAudio { .. } => bail!("audio input is not supported by Anthropic"),
+        other => Ok(serde_json::to_value(other).unwrap_or(Value::Null)),
     }
 }
 
@@ -791,7 +927,167 @@ mod tests {
             stream: Some(true),
             system: None,
             metadata: None,
+            ..Default::default()
         }
+    }
+
+    // ── OG-03 D2: an OpenAI-shaped image part must be translated for Anthropic ─
+
+    #[test]
+    fn og03_d2_anthropic_receives_an_image_block_not_an_openai_image_url_part() {
+        use tracelane_shared::{ContentPart, ImageUrl};
+        let mut req = make_simple_request();
+        req.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAAA".into(),
+                    detail: None,
+                },
+            }]),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let wire = serde_json::to_value(AnthropicRequest::from_universal(req).unwrap()).unwrap();
+        let block = &wire["messages"][0]["content"][0];
+        assert_ne!(
+            block["type"], "image_url",
+            "Anthropic does not accept image_url blocks: {wire}"
+        );
+        assert_eq!(block["type"], "image", "{wire}");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "image/png");
+        assert_eq!(block["source"]["data"], "AAAA");
+    }
+
+    // ── OG-03: every translated field, asserted on the exact upstream JSON ────
+
+    fn og03_wire(req: ChatRequest) -> serde_json::Value {
+        serde_json::to_value(AnthropicRequest::from_universal(req).expect("builds")).expect("ser")
+    }
+
+    #[test]
+    fn og03_stop_cap_user_and_json_schema_reach_the_anthropic_wire() {
+        let mut req = make_simple_request();
+        req.stop = Some(tracelane_shared::Stop::Many(vec![
+            "END".into(),
+            "STOP".into(),
+        ]));
+        req.max_tokens = Some(100);
+        req.max_completion_tokens = Some(300);
+        req.user = Some("end-user-1".into());
+        req.response_format = Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {"type": "object", "properties": {}}}
+        }));
+        let wire = og03_wire(req);
+        assert_eq!(wire["stop_sequences"], serde_json::json!(["END", "STOP"]));
+        assert_eq!(wire["max_tokens"], 300, "max_completion_tokens wins");
+        assert_eq!(
+            wire["metadata"],
+            serde_json::json!({"user_id": "end-user-1"})
+        );
+        assert_eq!(
+            wire["output_config"]["format"],
+            serde_json::json!({"type": "json_schema", "schema": {"type": "object", "properties": {}}})
+        );
+        // The control: a plain request carries none of the new keys.
+        let plain = og03_wire(make_simple_request());
+        for k in ["stop_sequences", "thinking", "output_config", "metadata"] {
+            assert!(
+                plain.get(k).is_none(),
+                "{k} leaked into a plain request: {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn og03_reasoning_effort_becomes_adaptive_effort_or_a_clamped_budget_per_model() {
+        // An adaptive-only model: thinking:{adaptive} + output_config.effort, NO budget.
+        let mut req = make_simple_request();
+        req.model = "claude-opus-5-5".into();
+        req.reasoning_effort = Some("xhigh".into());
+        let wire = og03_wire(req);
+        assert_eq!(wire["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(wire["output_config"]["effort"], "xhigh");
+        assert!(wire["thinking"].get("budget_tokens").is_none());
+        // An extended-only model: a budget from the table, clamped below max_tokens.
+        let mut req = make_simple_request();
+        req.model = "claude-haiku-4-5".into();
+        req.reasoning_effort = Some("medium".into());
+        req.max_tokens = Some(4000);
+        let wire = og03_wire(req);
+        assert_eq!(
+            wire["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 3999})
+        );
+        assert!(wire.get("output_config").is_none());
+        // effort `none` where the model can switch thinking off.
+        let mut req = make_simple_request();
+        req.model = "claude-opus-4-8".into();
+        req.reasoning_effort = Some("none".into());
+        assert_eq!(
+            og03_wire(req)["thinking"],
+            serde_json::json!({"type": "disabled"})
+        );
+    }
+
+    #[test]
+    fn og03_parallel_tool_calls_false_becomes_disable_parallel_tool_use() {
+        let mut req = make_request_with_tools();
+        req.parallel_tool_calls = Some(false);
+        let wire = og03_wire(req);
+        assert_eq!(
+            wire["tool_choice"],
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        let mut req = make_request_with_tools();
+        req.parallel_tool_calls = Some(false);
+        req.tool_choice = Some(ToolChoice::Required);
+        assert_eq!(
+            og03_wire(req)["tool_choice"],
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        // `true` is Anthropic's default: nothing is sent.
+        let mut req = make_request_with_tools();
+        req.parallel_tool_calls = Some(true);
+        assert!(og03_wire(req).get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn og03_https_image_and_pdf_parts_are_translated() {
+        use tracelane_shared::{ContentPart, FilePart, ImageUrl};
+        let mut req = make_simple_request();
+        req.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/a.png".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::File {
+                    file: FilePart {
+                        file_data: Some("data:application/pdf;base64,AAAA".into()),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let wire = og03_wire(req);
+        let blocks = &wire["messages"][0]["content"];
+        // The gateway does not fetch: Anthropic is handed the URL.
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}})
+        );
+        assert_eq!(
+            blocks[1],
+            serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AAAA"}})
+        );
     }
 
     #[test]

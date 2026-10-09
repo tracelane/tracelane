@@ -18,7 +18,7 @@
 //! third-party auditor, and the only key we could hand over granted everything.
 //!
 //! **The vocabulary is CLOSED and deliberately small** — `chat`, `read`, `ingest`,
-//! `admin`.
+//! `admin`, `passthrough`.
 //! A closed set is the whole point: an unrecognised scope grants nothing. That is
 //! the same lesson as `Role::from_slug` (PL-9), where an unknown role slug had to
 //! deny rather than fall through to a default, and it is why this parses into an
@@ -65,6 +65,16 @@ pub enum Scope {
     Ingest,
     /// Manage the workspace — mint/revoke keys, provider keys, settings.
     Admin,
+    /// `OG-08` — raw provider passthrough (`/v1/passthrough/{provider}/…`). The body is
+    /// opaque to the gateway, so NO guardrail and no per-model budget sees it.
+    ///
+    /// **The ONE scope a legacy `NULL`-scope key does NOT get** — see
+    /// [`KeyScope::allows`]. That is the single deliberate exception to the
+    /// "legacy keys keep the full surface" compatibility direction: a capability
+    /// that bypasses guardrails must be granted by name, per key, and never be
+    /// inherited by a key minted before the capability existed. `admin` does not
+    /// imply it either (nothing implies anything).
+    Passthrough,
 }
 
 impl Scope {
@@ -77,6 +87,7 @@ impl Scope {
             "read" => Some(Self::Read),
             "ingest" => Some(Self::Ingest),
             "admin" => Some(Self::Admin),
+            "passthrough" => Some(Self::Passthrough),
             _ => None,
         }
     }
@@ -88,6 +99,7 @@ impl Scope {
             Self::Read => "read",
             Self::Ingest => "ingest",
             Self::Admin => "admin",
+            Self::Passthrough => "passthrough",
         }
     }
 
@@ -98,8 +110,14 @@ impl Scope {
     /// resolves to, use [`Scope::default_mint_set`] — the two are deliberately
     /// different and conflating them is the defect below.
     #[must_use]
-    pub fn all() -> [Scope; 4] {
-        [Scope::Chat, Scope::Read, Scope::Ingest, Scope::Admin]
+    pub fn all() -> [Scope; 5] {
+        [
+            Scope::Chat,
+            Scope::Read,
+            Scope::Ingest,
+            Scope::Admin,
+            Scope::Passthrough,
+        ]
     }
 
     /// The scope set that keys minted between 2026-08-14 and 2026-08-22 carry.
@@ -172,14 +190,21 @@ impl KeyScope {
 
     /// Does this key carry `needed`?
     ///
-    /// `LegacyFullSurface` allows everything — the compatibility case. A scoped
+    /// `LegacyFullSurface` allows everything **except [`Scope::Passthrough`]** (OG-08):
+    /// the compatibility case, with its one deliberate carve-out. A scoped
     /// key allows exactly what it lists; `admin` does **not** imply `chat` or
     /// `read`, because an implication hierarchy is how a narrow grant quietly
     /// becomes a wide one. A key that needs two capabilities lists two.
     #[must_use]
     pub fn allows(&self, needed: Scope) -> bool {
         match self {
-            Self::LegacyFullSurface => true,
+            // OG-08: a capability that bypasses guardrails is never inherited by a
+            // key minted before it existed. An EXPLICIT `match`, not `!=`, so a
+            // future scope added to the enum forces a decision here.
+            Self::LegacyFullSurface => match needed {
+                Scope::Chat | Scope::Read | Scope::Ingest | Scope::Admin => true,
+                Scope::Passthrough => false,
+            },
             Self::Scoped(s) => s.contains(&needed),
         }
     }
@@ -233,7 +258,13 @@ mod tests {
         let k = KeyScope::from_column(None);
         assert_eq!(k, KeyScope::LegacyFullSurface);
         for s in Scope::all() {
-            assert!(k.allows(s), "legacy key must retain {s:?}");
+            // OG-08: every scope that existed before `passthrough` is retained;
+            // `passthrough` itself is the one deliberate exception.
+            assert_eq!(
+                k.allows(s),
+                s != Scope::Passthrough,
+                "legacy key must retain {s:?} (and only `passthrough` is withheld)"
+            );
         }
         assert_eq!(k.slugs(), None);
     }
@@ -333,5 +364,36 @@ mod tests {
         for s in Scope::all() {
             assert!(!k.allows(s));
         }
+    }
+
+    /// OG-08, the property that matters most: a legacy `NULL`-scope key does NOT
+    /// get `passthrough`, `admin` does not imply it, and an explicit grant does.
+    #[test]
+    fn passthrough_is_never_inherited_and_never_implied() {
+        assert!(
+            !KeyScope::from_column(None).allows(Scope::Passthrough),
+            "a legacy NULL-scope key must not reach the guardrail-bypassing route"
+        );
+        for other in [
+            vec!["admin".to_string()],
+            vec!["chat".to_string()],
+            vec!["chat".to_string(), "read".to_string(), "ingest".to_string()],
+            vec!["admin".to_string(), "chat".to_string()],
+        ] {
+            let k = KeyScope::from_column(Some(&other));
+            assert!(
+                !k.allows(Scope::Passthrough),
+                "{other:?} must not imply `passthrough`"
+            );
+        }
+        let k = KeyScope::from_column(Some(&["passthrough".to_string()]));
+        assert!(k.allows(Scope::Passthrough));
+        assert!(
+            !k.allows(Scope::Chat) && !k.allows(Scope::Admin) && !k.allows(Scope::Read),
+            "`passthrough` implies nothing else"
+        );
+        assert_eq!(k.slugs(), Some(vec!["passthrough"]));
+        assert_eq!(Scope::from_slug(" PassThrough "), Some(Scope::Passthrough));
+        assert!(!Scope::default_mint_set().contains(&Scope::Passthrough));
     }
 }

@@ -28,7 +28,7 @@ You're now logged in.
 
 In the dashboard: **Settings → API Keys → Create**. We display the
 raw key (`tlane_<base62>`) **once** — copy it now; we never store it
-in plaintext (only a SHA-256 hash). Lost keys must be revoked + re-issued; revocation propagates within 60 seconds (an idle key may be accepted once more on its next use while the gateway re-checks it).
+in plaintext (the lookup uses a peppered HMAC-SHA256 value and the verifier uses Argon2id). Lost keys must be revoked + re-issued; revocation propagates within 60 seconds (an idle key may be accepted once more on its next use while the gateway re-checks it).
 
 ### 3. Configure your client
 

@@ -1,12 +1,11 @@
 <!-- tracelane:classification: PUBLIC -->
 # `@tracelanedev/mcp` — Tracelane MCP Server
 
-[![npm](https://img.shields.io/badge/npm-not%20published%20yet-lightgrey?style=flat-square)](#quick-start)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](../../LICENSE)
 
 Read-only MCP server exposing Tracelane trace data to any MCP-compatible client — Claude Desktop, Claude Code, Cursor, or any agent using the Model Context Protocol.
 
-> **On npm since 2026-09-07:** `npx @tracelanedev/mcp` installs `@tracelanedev/mcp@0.3.0`; the
+> **On npm since 2026-09-07:** `npx @tracelanedev/mcp` installs the published version; the
 > config blocks below work as written. From-source is still documented under [self-hosting](#self-hosting).
 > The same run submits `apps/mcp/server.json` to the MCP registry; the name it will be listed under is `io.github.tracelane/tracelane-mcp`.
 
@@ -43,7 +42,7 @@ No `CLICKHOUSE_URL` — its absence is what selects gateway mode. Every read goe
 the gateway's existing tenant-scoped routes, so a key from another tenant, or one lacking
 the `read` scope, gets a clear tool error rather than an empty result.
 
-### Until it is on npm
+### Run from a clone
 
 Swap the two launch keys for a path into your clone — every `env` key is unchanged:
 
@@ -140,7 +139,7 @@ pnpm dev:mcp
 ```
 
 No container image is published for the MCP server — `ghcr.io/tracelane/mcp` does not
-exist. Run it from source or from the npm package once it ships.
+exist. Run it from source or from the npm package.
 
 ## Stack
 

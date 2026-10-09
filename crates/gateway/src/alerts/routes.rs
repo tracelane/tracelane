@@ -88,7 +88,7 @@ async fn gate(
     headers: &HeaderMap,
     state: &AlertRoutesState,
     write: bool,
-) -> Result<Uuid, Response> {
+) -> Result<(Uuid, crate::auth::Claims), Response> {
     let header = headers
         .get("authorization")
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
@@ -114,13 +114,30 @@ async fn gate(
             "alerting is not enabled for this workspace (f_alerts)",
         ));
     }
-    if write && !claims.can_mint_keys() {
+    if write && !claims.can(crate::auth::capability::Capability::ManageAlerts) {
         return Err(err(
             StatusCode::FORBIDDEN,
             "viewers cannot modify alerts (member role required)",
         ));
     }
-    Ok(tenant)
+    Ok((tenant, claims))
+}
+
+/// A WRITE: [`gate`], then the admin-plane gate (OG-36 allowlist + SSO-required),
+/// which yields the actor the store's OG-35 audit row carries.
+async fn gate_write(
+    headers: &HeaderMap,
+    state: &AlertRoutesState,
+) -> Result<(Uuid, crate::control_plane::ControlActor), Response> {
+    let (tenant, claims) = gate(headers, state, true).await?;
+    let actor = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageAlerts,
+        headers,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    Ok((tenant, actor))
 }
 
 // ── Rules ────────────────────────────────────────────────────────────────────
@@ -139,7 +156,7 @@ struct RuleView {
 
 async fn list_rules_handler(State(state): State<AlertRoutesState>, headers: HeaderMap) -> Response {
     let tenant = match gate(&headers, &state, false).await {
-        Ok(t) => t,
+        Ok((t, _)) => t,
         Err(r) => return r,
     };
     match super::list_rules(&state.pool, tenant).await {
@@ -182,7 +199,7 @@ async fn create_rule_handler(
     headers: HeaderMap,
     Json(body): Json<CreateRuleBody>,
 ) -> Response {
-    let tenant = match gate(&headers, &state, true).await {
+    let (tenant, actor) = match gate_write(&headers, &state).await {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -220,6 +237,7 @@ async fn create_rule_handler(
         body.threshold,
         window,
         body.destination_id,
+        &actor,
     )
     .await
     {
@@ -236,11 +254,11 @@ async fn delete_rule_handler(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let tenant = match gate(&headers, &state, true).await {
+    let (tenant, actor) = match gate_write(&headers, &state).await {
         Ok(t) => t,
         Err(r) => return r,
     };
-    match super::delete_rule(&state.pool, tenant, id).await {
+    match super::delete_rule(&state.pool, tenant, id, &actor).await {
         Ok(0) => err(StatusCode::NOT_FOUND, "rule not found"),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -262,7 +280,7 @@ struct DestView {
 
 async fn list_dest_handler(State(state): State<AlertRoutesState>, headers: HeaderMap) -> Response {
     let tenant = match gate(&headers, &state, false).await {
-        Ok(t) => t,
+        Ok((t, _)) => t,
         Err(r) => return r,
     };
     match super::list_destinations(&state.pool, tenant).await {
@@ -303,7 +321,7 @@ async fn create_dest_handler(
     headers: HeaderMap,
     Json(body): Json<CreateDestBody>,
 ) -> Response {
-    let tenant = match gate(&headers, &state, true).await {
+    let (tenant, actor) = match gate_write(&headers, &state).await {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -323,7 +341,7 @@ async fn create_dest_handler(
         "slack" | "discord" | "webhook" => kind,
         _ => "webhook".into(),
     };
-    match super::create_destination(&state.pool, tenant, name, &kind, &body.url).await {
+    match super::create_destination(&state.pool, tenant, name, &kind, &body.url, &actor).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "create destination failed");
@@ -337,11 +355,11 @@ async fn delete_dest_handler(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let tenant = match gate(&headers, &state, true).await {
+    let (tenant, actor) = match gate_write(&headers, &state).await {
         Ok(t) => t,
         Err(r) => return r,
     };
-    match super::delete_destination(&state.pool, tenant, id).await {
+    match super::delete_destination(&state.pool, tenant, id, &actor).await {
         Ok(0) => err(StatusCode::NOT_FOUND, "destination not found"),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -426,7 +444,7 @@ async fn test_fire_handler(
     headers: HeaderMap,
     Json(body): Json<TestBody>,
 ) -> Response {
-    let tenant = match gate(&headers, &state, true).await {
+    let (tenant, _actor) = match gate_write(&headers, &state).await {
         Ok(t) => t,
         Err(r) => return r,
     };

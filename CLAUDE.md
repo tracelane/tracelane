@@ -46,7 +46,7 @@ Every edge carries its invariant.
         spans │ NATS    │      audit │ NATS          │ Postgres    │ HTTPS
         tracelane.      │      tracelane.            │ (control    │
         spans.{tenant}  │      audit.{tenant}        │  plane)     ▼
-                        ▼              ▼              │        191 upstream
+                        ▼              ▼              │        205 upstream
               ┌──────────────┐  ┌─────────────┐       │        providers
               │ INGEST       │  │ audit head- │  ┌────┴─────┐  BYOK, AAD-bound
               │ crates/      │  │ writer      │  │ entitle- │  to (tenant,
@@ -197,12 +197,12 @@ Stated plainly, so nothing here is read as delivered:
   carry, so they do not fire on LLM traffic today. The guardrail rails do run inline.
 - Detection is **observe-first**: a `Block` verdict is logged, not a 403, unless
   `TRACELANE_PREDICTIVE_ENFORCE=1` is set. This is the intended posture, not a bug.
-- There is no cold storage tier; spans live in ClickHouse.
+- Hosted spans use ClickHouse hot and cold volumes; the cold volume is backed by object storage.
 - End-to-end latency budgets are not published as measurements; see
   `apps/docs/benchmarks.mdx` for what has been measured.
 - The eval suite's merge gate runs with mock providers, so behavioural assertions are skipped
   there; only the live-stack job exercises real behaviour.
-- **Provider coverage:** 191 providers — every row of `crates/gateway/providers.tsv` plus 6
+- **Provider coverage:** 205 providers — every row of `crates/gateway/providers.tsv` plus 6
   native adapters (Anthropic, Google, Vertex, Bedrock, Azure, Cohere). The total is derived
   from those two sources, never maintained by hand.
 

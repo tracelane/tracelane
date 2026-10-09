@@ -13,13 +13,16 @@ import { PageHeader } from "@tracelanedev/ui";
  * dashboard, and shows blank when the model isn't priced (V-1 honesty note).
  */
 
+import { Providers } from "@/app/providers";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { ChainStatusChip } from "@/components/trace-viewer/ChainStatusChip";
+import { IncidentPanel } from "@/components/trace-viewer/IncidentPanel";
 import { TraceDetailView } from "@/components/trace-viewer/TraceDetailView";
 import { TraceFlagPanel } from "@/components/trace-viewer/TraceFlagPanel";
 import { TraceHeaderActions } from "@/components/trace-viewer/TraceHeaderActions";
 import type { Span } from "@/components/trace-viewer/types";
 import { GatewayError, gatewayGet, gatewayGetOrNull } from "@/lib/gateway";
+import { getListPageSettings } from "@/lib/list-page-settings";
 import { fetchSignaturesFor } from "@/lib/metrics/fetch";
 import { parseTimeRange } from "@/lib/metrics/time-range";
 import { EmptyState, ErrorState, Skeleton } from "@tracelanedev/ui";
@@ -111,9 +114,31 @@ async function SpanData({ traceId }: { traceId: string }) {
 	} catch {
 		hitCounts = undefined;
 	}
+	const listSizes = (await getListPageSettings()).sizes;
+	let minGenerationMs: number | undefined;
+	try {
+		const settings = await gatewayGet<{
+			output_speed?: { min_generation_ms?: number };
+		}>("/v1/gateway/settings");
+		minGenerationMs = settings.output_speed?.min_generation_ms;
+	} catch (error) {
+		if (!(error instanceof GatewayError)) throw error;
+	}
 
 	return (
-		<TraceDetailView traceId={traceId} spans={spans} hitCounts={hitCounts} />
+		<>
+			<TraceDetailView
+				traceId={traceId}
+				spans={spans}
+				hitCounts={hitCounts}
+				toolPreviewLimit={listSizes.span_tool_names_preview}
+				conversationLimit={listSizes.trace_conversation_messages}
+				minGenerationMs={minGenerationMs}
+			/>
+			<Providers>
+				<IncidentPanel traceId={traceId} />
+			</Providers>
+		</>
 	);
 }
 

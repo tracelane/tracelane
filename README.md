@@ -18,7 +18,7 @@ Tracelane sits between your AI agents and your LLM providers. You get:
 
 - **BYOK proxy** — point agents at `https://gateway.tracelane.dev`, pass your own API key. 0% markup.
 - **Full-fidelity traces** — LLM calls, tool invocations, agent steps and retries captured as OTel spans using the GenAI semantic conventions, at full fidelity for everything routed through the gateway. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
-- **Tamper-evident audit ledger** — every recorded event is hash-chained per tenant and batch-anchored to a public transparency log. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us. That is the part you can hand to an auditor.
+- **Tamper-evident audit ledger** — recorded gateway audit events are hash-chained per tenant. Batches are signed; public transparency-log anchoring is best-effort when configured, and an unanchored batch is reported as such. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
 - **Cross-language ledger conformance** — the audit verifier is implemented three times, in Rust, Python and TypeScript, and all three are held to **one shared corpus of 8 conformance vectors** that includes deliberately-forged and boundary-numeric cases. **10 Rust + 14 Python + 19 TypeScript** conformance tests run in CI, plus a round-trip job asserting the three implementations agree. That is the suite behind "a third party can verify offline" — you can run it in this clone.
   Note the honest scope: `evals/` here carries the 20 conformance evals; some internal suites target private ADRs and infrastructure and are not part of this repo, so the `test` script says so rather than pretending to pass.
@@ -172,7 +172,7 @@ Agent / SDK
     ▼
 ┌─────────────────────────────────────┐
 │  Rust Gateway (Axum + tokio)        │
-│  - BYOK routing to 191 providers    │
+│  - BYOK routing to 205 providers    │
 │  - Inline heuristic guardrails      │
 │  - OTLP span emit                   │
 └────────────────┬────────────────────┘
@@ -310,5 +310,4 @@ Apache 2.0 grants are perpetual and irrevocable, so every release already publis
 under Apache 2.0 stays Apache 2.0 — neither we nor any future owner can take that back.
 [LICENSE-PLEDGE.md](./LICENSE-PLEDGE.md) sets out what we commit to beyond that, and is
 explicit about where the commitment is enforceable and where it is only a promise.
-
 

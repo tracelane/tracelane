@@ -67,8 +67,22 @@ struct ServiceAccountJson {
     token_uri: String,
 }
 
+/// Google's OAuth2 token endpoint — the ONLY `token_uri` a service account may name
+/// (SB, security re-review round 2, 2026-10-05). The field comes from the tenant's JSON,
+/// so any other value pointed the gateway's token exchange at a tenant-chosen host (one
+/// answering 500 manufactured provider failures). A wire invariant, not a tunable.
+const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+
 fn default_token_uri() -> String {
-    "https://oauth2.googleapis.com/token".to_owned()
+    GOOGLE_TOKEN_URI.to_owned()
+}
+
+fn token_uri_allowed(uri: &str) -> bool {
+    #[cfg(test)]
+    if test_host_override().is_some_and(|origin| uri == format!("{origin}/token")) {
+        return true;
+    }
+    uri == GOOGLE_TOKEN_URI
 }
 
 /// Parsed service account with the private key contained.
@@ -91,6 +105,9 @@ impl ServiceAccount {
             .context("service-account JSON is malformed or missing required fields")?;
         if raw.private_key.is_empty() || raw.client_email.is_empty() || raw.project_id.is_empty() {
             bail!("service-account JSON missing client_email / private_key / project_id");
+        }
+        if !token_uri_allowed(&raw.token_uri) {
+            bail!("service-account token_uri must be {GOOGLE_TOKEN_URI}");
         }
         Ok(Self {
             client_email: raw.client_email,
@@ -129,6 +146,12 @@ pub struct VertexProvider {
 }
 
 impl VertexProvider {
+    /// `OG-13`: the region the circuit breaker keys this adapter's dispatches on.
+    #[must_use]
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: crate::ssrf_guard::safe_client_builder()
@@ -147,6 +170,10 @@ impl VertexProvider {
     /// Host for the configured location. `global` is un-prefixed; every other
     /// location is `{location}-aiplatform.googleapis.com`.
     fn host(&self) -> String {
+        #[cfg(test)]
+        if let Some(origin) = test_host_override() {
+            return origin;
+        }
         if self.location == "global" {
             "https://aiplatform.googleapis.com".to_owned()
         } else {
@@ -202,23 +229,28 @@ impl VertexProvider {
             .build()
             .context("token-exchange client build failed")?;
 
-        let resp = token_client
-            .post(&sa.token_uri)
-            .form(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)])
-            .send()
-            .await
-            .context("failed to reach Google's OAuth2 token endpoint")?;
+        let resp = crate::routing::deadlines::send_auxiliary(
+            token_client
+                .post(&sa.token_uri)
+                .form(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)]),
+        )
+        .await
+        .context("failed to reach Google's OAuth2 token endpoint")?;
 
         let status = resp.status();
         if !status.is_success() {
             // SECURITY: the token endpoint echoes the assertion (which is signed
             // with the customer's private key) in some error bodies. Status only.
-            let _body = resp.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(resp.headers());
+            let _body = crate::routing::deadlines::error_text(resp).await?;
             tracing::warn!(status = %status, "Vertex OAuth2 token exchange failed");
             return Err(ProviderHttpError {
                 provider: "vertex",
                 status: status.as_u16(),
                 reason: crate::providers::reason_from_body(&_body),
+                // The token endpoint echoes the signed assertion: never relayed.
+                message: None,
+                retry_after,
             }
             .into());
         }
@@ -226,6 +258,7 @@ impl VertexProvider {
         let parsed: TokenResponse = resp
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("token endpoint returned an unparseable body")?;
         let token: Arc<str> = Arc::from(parsed.access_token.as_str());
         self.tokens.insert(cache_key, Arc::clone(&token)).await;
@@ -244,8 +277,11 @@ impl VertexProvider {
         sa_json: &str,
         tenant_id: &TenantId,
     ) -> Result<(String, SecretString)> {
-        let sa = ServiceAccount::parse(sa_json)?;
-        let token = self.access_token(&sa, tenant_id).await?;
+        let sa = ServiceAccount::parse(sa_json).map_err(super::credential_derived)?;
+        let token = self
+            .access_token(&sa, tenant_id)
+            .await
+            .map_err(super::credential_derived)?;
         let mut url = reqwest::Url::parse(&self.host())?;
         url.path_segments_mut()
             .map_err(|()| anyhow::anyhow!("invalid Vertex models host"))?
@@ -282,9 +318,17 @@ impl VertexProvider {
         sa_json: &str,
         tenant_id: &TenantId,
     ) -> Result<ProviderStream> {
-        let sa = ServiceAccount::parse(sa_json)?;
-        let model = strip_vertex_prefix(&request.model).to_owned();
-        let token = self.access_token(&sa, tenant_id).await?;
+        let sa = ServiceAccount::parse(sa_json).map_err(super::credential_derived)?;
+        // OG-02 §3.1: the model is a URL path segment — validated, never interpolated raw.
+        let Some(model) = super::google::safe_path_segment(strip_vertex_prefix(&request.model))
+            .map(str::to_owned)
+        else {
+            return Err(super::google::invalid_model_error("vertex"));
+        };
+        let token = self
+            .access_token(&sa, tenant_id)
+            .await
+            .map_err(super::credential_derived)?;
 
         // Identical contract to AI Studio — reuse the translation rather than
         // maintaining a second Gemini serialiser that can drift.
@@ -302,30 +346,68 @@ impl VertexProvider {
             .await
             .context("SSRF guard rejected the Vertex URL")?;
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token.as_ref())
-            .header("content-type", "application/json")
-            .json(&gemini_request)
-            .send()
-            .await
-            .context("failed to send request to Vertex AI")?;
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .bearer_auth(token.as_ref())
+                .header("content-type", "application/json")
+                .json(&gemini_request),
+        )
+        .await
+        .context("failed to send request to Vertex AI")?;
 
         let status = response.status();
         if !status.is_success() {
             // Status only — never the body (: provider error bodies echo credentials).
-            let _body = response.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(response.headers());
+            let body = crate::routing::deadlines::error_text(response).await?;
             tracing::warn!(status = %status, "Vertex AI API error");
-            return Err(ProviderHttpError {
-                provider: "vertex",
-                status: status.as_u16(),
-                reason: crate::providers::reason_from_body(&_body),
-            }
+            // OG-03 §3.4. The "key" scrubbed from the message is the OAuth bearer.
+            return Err(ProviderHttpError::from_response(
+                "vertex",
+                status.as_u16(),
+                crate::providers::reason_from_body(&body),
+                &body,
+                token.as_ref(),
+            )
+            .with_retry_after(retry_after)
             .into());
         }
 
         Ok(Box::pin(build_gemini_stream(response)))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `OG-90`. The Vertex host is a fixed Google origin, so a test that dispatches through
+    /// the REAL adapter to a mock server needs a way to point it elsewhere. Thread-local, like
+    /// the SSRF loopback bypass it is always used with: no process env, no cross-test leak.
+    static TEST_HOST_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_host_override() -> Option<String> {
+    TEST_HOST_OVERRIDE.with(|h| h.borrow().clone())
+}
+
+/// RAII guard: Vertex requests on this thread go to `origin` until it drops.
+#[cfg(test)]
+pub(crate) struct HostOverrideGuard;
+
+#[cfg(test)]
+impl HostOverrideGuard {
+    pub(crate) fn new(origin: impl Into<String>) -> Self {
+        TEST_HOST_OVERRIDE.with(|h| *h.borrow_mut() = Some(origin.into()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for HostOverrideGuard {
+    fn drop(&mut self) {
+        TEST_HOST_OVERRIDE.with(|h| *h.borrow_mut() = None);
     }
 }
 
@@ -381,6 +463,9 @@ mod tests {
         crate::ssrf_guard::set_loopback_bypass_for_tests(true);
         let _guard = LoopbackGuard;
         let server = MockServer::start().await;
+        // SB: a token_uri other than Google's is refused unless a test points the
+        // adapter at a mock origin.
+        let _host = HostOverrideGuard::new(server.uri());
         let secret = serde_json::json!({
             "client_email": "unit-test@example.test",
             "project_id": "unit-test-project",
@@ -466,6 +551,26 @@ mod tests {
     #[test]
     fn api_key_pasted_as_credential_is_rejected() {
         assert!(ServiceAccount::parse("AQ.AbSomeApiKeyNotAServiceAccount").is_err());
+        // SB (round 2, 2026-10-05): the tenant's JSON may not redirect the token exchange.
+        for uri in [
+            "https://attacker.example/token",
+            "http://oauth2.googleapis.com/token",
+            "https://oauth2.googleapis.com.evil.test/token",
+            "https://oauth2.googleapis.com/token?x=1",
+        ] {
+            let sa = serde_json::json!({
+                "client_email": "a@b.test", "private_key": "k", "project_id": "p",
+                "token_uri": uri,
+            })
+            .to_string();
+            assert!(ServiceAccount::parse(&sa).is_err(), "{uri} must be refused");
+        }
+        let google = serde_json::json!({
+            "client_email": "a@b.test", "private_key": "k", "project_id": "p",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string();
+        assert!(ServiceAccount::parse(&google).is_ok());
     }
 
     #[test]

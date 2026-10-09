@@ -12,6 +12,7 @@
  * Defense-in-depth: requireSession() makes the route unreachable anonymously.
  */
 
+import { copyGatewayTraceFilters } from "@/app/traces/filter-registry";
 import { requireGatewayToken, requireSession } from "@/lib/auth";
 import { gatewayBaseUrl } from "@/lib/gateway";
 import { parseOptionalTimeRange, windowParams } from "@/lib/metrics/time-range";
@@ -34,24 +35,7 @@ export async function GET(req: NextRequest) {
 	// Page filters → gateway /v1/traces/export params (same mapping as the list).
 	const g = new URLSearchParams();
 	g.set("format", format);
-	const model = sp.get("model");
-	if (model) g.set("model", model);
-	const minLat = sp.get("min_latency_ms");
-	if (minLat) g.set("min_latency_ms", minLat);
-	const sig = sp.get("signature_id");
-	if (sig) g.set("signature_id", sig);
-	// OBS-20. THE ONE THAT MATTERS MOST of the three: without it, "Export CSV" on a
-	// user-filtered view silently exports EVERY user's traces. A wrong export reads
-	// as data the customer can act on, and nothing on the page says it is wrong.
-	const endUser = sp.get("end_user");
-	if (endUser) g.set("end_user", endUser);
-	for (const name of ["agent", "model_family", "issue"]) {
-		const value = sp.get(name);
-		if (value) g.set(name, value);
-	}
-	const status = sp.get("status");
-	if (status === "error") g.set("has_error", "true");
-	else if (status === "ok") g.set("has_error", "false");
+	copyGatewayTraceFilters(g, sp, "export");
 	const w = parseOptionalTimeRange(
 		{
 			range: sp.get("range") ?? undefined,
@@ -61,12 +45,6 @@ export async function GET(req: NextRequest) {
 		{ defaultPreset: "1h", nowMs: Date.now() },
 	);
 	if (w) for (const [k, v] of windowParams(w)) g.set(k, v);
-	// Forward the active sort so the CSV matches what the user sees on /traces
-	// (without this the gateway defaults to start_time DESC — a different set).
-	const sort = sp.get("sort");
-	if (sort) g.set("sort", sort);
-	const order = sp.get("order");
-	if (order) g.set("order", order);
 
 	const url = `${gatewayBaseUrl()}/v1/traces/export?${g.toString()}`;
 	let upstream: Response;
@@ -89,11 +67,17 @@ export async function GET(req: NextRequest) {
 	const filename = format === "json" ? "traces.json" : "traces.csv";
 	const contentType =
 		format === "json" ? "application/json" : "text/csv; charset=utf-8";
-	return new NextResponse(body, {
-		status: 200,
-		headers: {
-			"content-type": contentType,
-			"content-disposition": `attachment; filename="${filename}"`,
-		},
+	const headers = new Headers({
+		"content-type": contentType,
+		"content-disposition": `attachment; filename="${filename}"`,
 	});
+	for (const name of [
+		"x-tracelane-truncated",
+		"x-tracelane-row-count",
+		"x-tracelane-next-cursor",
+	]) {
+		const value = upstream.headers?.get(name);
+		if (value) headers.set(name, value);
+	}
+	return new NextResponse(body, { status: 200, headers });
 }

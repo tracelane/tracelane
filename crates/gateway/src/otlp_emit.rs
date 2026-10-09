@@ -278,6 +278,23 @@ pub async fn publish_span_bytes(
 /// lost. Off the hot path, so generous; bounded, so an outage cannot grow memory.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `OG-50`: the span tap — the function the customer's OTLP export registers to see every span
+/// the gateway publishes. A registration, not a direct call, because this file is also mounted
+/// by `tests/span_publish_integration.rs` (`#[path]`), which has no export module.
+static SPAN_TAP: std::sync::OnceLock<fn(&TracelaneSpan)> = std::sync::OnceLock::new();
+
+/// Register the span tap (once; a second registration is ignored).
+pub fn set_span_tap(tap: fn(&TracelaneSpan)) {
+    let _ = SPAN_TAP.set(tap);
+}
+
+/// Offer `span` to the registered tap, if any. Synchronous, no I/O, never fails.
+pub fn tap_span(span: &TracelaneSpan) {
+    if let Some(tap) = SPAN_TAP.get() {
+        tap(span);
+    }
+}
+
 /// The most span publishes that may be in flight at once. Beyond this a span is
 /// counted as lost WITHOUT spawning — the alternative under a NATS slowdown is one
 /// task per request until the process is OOM-killed, which loses every span.
@@ -316,6 +333,10 @@ pub(crate) mod test_sink {
         if let Ok(mut v) = sink().lock() {
             v.push(span.clone());
         }
+        // OG-50: unit tests have no NATS, so `spawn_publish` (the production tap) is never
+        // reached; every span a handler builds passes this recorder instead, and is offered to
+        // the export here — the same call, the same span.
+        super::tap_span(span);
     }
 
     /// Every span built for `trace_id` so far, in order.
@@ -416,6 +437,11 @@ pub fn spawn_publish(nats: Arc<async_nats::Client>, span: TracelaneSpan, site: &
             Err(now) => cur = now,
         }
     }
+    // OG-50: the customer's own OTLP export — the first of the two tap sites (the second is
+    // `trace_ingest`, for an SDK batch). Reached only for a span whose publish is actually
+    // being spawned, so the export count equals the publish count. Synchronous, no I/O, never
+    // fails: a tenant with no export costs one directory probe and nothing else.
+    tap_span(&span);
     // The slot is released by `Drop`, so a panic inside `publish_span` (a
     // pathological span that will not serialise, say) cannot leak it and make
     // every later shutdown wait the full drain timeout on a phantom.

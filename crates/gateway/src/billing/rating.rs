@@ -76,6 +76,161 @@ pub struct Band {
     pub usd_per_unit: f64,
 }
 
+/// Retention job bounds: billing_policy.retention_sweep, refreshed once per run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct RetentionSweepPolicy {
+    pub delete_wait_secs: u64,
+    pub max_mutations_per_run: u64,
+    pub max_run_secs: u64,
+    pub tombstone_live_grace_hours: u64,
+}
+
+impl RetentionSweepPolicy {
+    pub(crate) fn embedded() -> Self {
+        // A malformed compiled seed disables mutation submission, never an unbounded fallback.
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../../apps/web/db/plans.v3.json"
+        ))
+        .ok()
+        .and_then(|v| serde_json::from_value(v["policy"]["retention_sweep"].clone()).ok())
+        .unwrap_or_default()
+    }
+
+    /// Fail-OPEN to the reviewed embedded row if Postgres cannot supply the policy.
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn load(pool: &crate::db::DbPool) -> Self {
+        let result = async {
+            let client = pool.get().await?;
+            let row = client
+                .query_opt(
+                    "SELECT value::text FROM billing_policy WHERE key = 'retention_sweep'",
+                    &[],
+                )
+                .await?;
+            let text: String = row
+                .ok_or_else(|| anyhow::anyhow!("retention_sweep row missing"))?
+                .get(0);
+            let policy: Self = serde_json::from_str(&text)?;
+            anyhow::ensure!(
+                policy.delete_wait_secs > 0 && policy.max_run_secs > 0,
+                "retention sweep wait/run duration must be positive"
+            );
+            Ok::<_, anyhow::Error>(policy)
+        }
+        .await;
+        match result {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(%error, "retention sweep policy unavailable; using embedded reference row");
+                Self::embedded()
+            }
+        }
+    }
+}
+
+/// Read-time identical-tool detection parameters, from billing_policy.agent_loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct AgentLoopPolicy {
+    pub min_repeats: u32,
+    pub window_secs: u32,
+    pub max_instances: u32,
+    pub max_span_ids_per_instance: u32,
+}
+impl AgentLoopPolicy {
+    pub fn valid(&self) -> bool {
+        // Packaged caps are the safety ceilings. Cached policy may lower them;
+        // raising the ceilings requires reviewing the packaged reference data.
+        static CEILINGS: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        let Some((instances, spans)) = *CEILINGS.get_or_init(|| {
+            let seed: serde_json::Value =
+                serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).ok()?;
+            let policy: Self = serde_json::from_value(seed["policy"]["agent_loop"].clone()).ok()?;
+            Some((policy.max_instances, policy.max_span_ids_per_instance))
+        }) else {
+            return false;
+        };
+        (2..=50).contains(&self.min_repeats)
+            && (10..=86400).contains(&self.window_secs)
+            && (1..=instances).contains(&self.max_instances)
+            && (1..=spans).contains(&self.max_span_ids_per_instance)
+    }
+    pub fn embedded() -> Option<Self> {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).ok()?;
+        serde_json::from_value::<Self>(seed["policy"]["agent_loop"].clone())
+            .ok()
+            .filter(Self::valid)
+    }
+}
+
+/// Display-only spend-spike parameters, shared by every workspace.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct SpendSpikeParams {
+    pub baseline_buckets: u32,
+    pub ratio: f64,
+    pub min_usd: f64,
+    pub min_history_buckets: u32,
+    pub max_window_buckets: u32,
+    pub max_spikes_returned: u32,
+    pub drill_top_n: u32,
+}
+impl SpendSpikeParams {
+    fn valid(&self, ceiling: Self) -> bool {
+        self.baseline_buckets > 0
+            && self.baseline_buckets <= ceiling.baseline_buckets
+            && self.min_history_buckets > 0
+            && self.min_history_buckets <= self.baseline_buckets
+            && self.min_history_buckets <= ceiling.min_history_buckets
+            && self.max_window_buckets > 0
+            && self.max_window_buckets <= ceiling.max_window_buckets
+            && self.max_spikes_returned > 0
+            && self.max_spikes_returned <= ceiling.max_spikes_returned
+            && self.drill_top_n > 0
+            && self.drill_top_n <= ceiling.drill_top_n
+            && self.ratio.is_finite()
+            && self.ratio > 1.
+            && self.ratio <= ceiling.ratio
+            && self.min_usd.is_finite()
+            && self.min_usd > 0.
+            && self.min_usd <= ceiling.min_usd
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct SpendSpikePolicy {
+    pub hour: SpendSpikeParams,
+    pub day: SpendSpikeParams,
+    pub backfill_days: u32,
+    pub backfill_max_memory_bytes: u64,
+    pub backfill_max_execution_seconds: u32,
+}
+impl SpendSpikePolicy {
+    pub fn valid(&self) -> bool {
+        // Packaged reference data is the reviewed ceiling for cached overrides.
+        // Parse without calling valid/embedded here: validation must not recurse.
+        static CEILINGS: std::sync::OnceLock<Option<SpendSpikePolicy>> = std::sync::OnceLock::new();
+        let Some(ceiling) = CEILINGS.get_or_init(|| {
+            let seed: serde_json::Value =
+                serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).ok()?;
+            serde_json::from_value(seed["policy"]["spend_spikes"].clone()).ok()
+        }) else {
+            return false;
+        };
+        self.hour.valid(ceiling.hour)
+            && self.day.valid(ceiling.day)
+            && (1..=ceiling.backfill_days).contains(&self.backfill_days)
+            && (1..=ceiling.backfill_max_memory_bytes).contains(&self.backfill_max_memory_bytes)
+            && (1..=ceiling.backfill_max_execution_seconds)
+                .contains(&self.backfill_max_execution_seconds)
+    }
+    pub fn embedded() -> Option<Self> {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).ok()?;
+        serde_json::from_value::<Self>(seed["policy"]["spend_spikes"].clone())
+            .ok()
+            .filter(Self::valid)
+    }
+}
+
 /// Non-price policy knobs from `billing_policy` (`key`, `value jsonb`).
 /// **Only the keys this gateway build actually consumes are modeled** — the
 /// row exists in Postgres for every ADR-076 §0.5 mechanic (dunning, prepaid
@@ -84,6 +239,13 @@ pub struct Band {
 /// once and this default is used), never a silent literal price.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
+    pub workspace_glance: WorkspaceGlancePolicy,
+    pub trace_reads: TraceReadPolicy,
+    pub attempt_records_since: Option<String>,
+    pub trace_reads_tenant_key_multiplier: Option<u32>,
+    pub agent_loop: Option<AgentLoopPolicy>,
+    pub spend_spikes: Option<SpendSpikePolicy>,
+    pub incident_regression: Option<crate::incident_routes::IncidentPolicy>,
     pub generation_issues: crate::generation_issues::SummaryPolicy,
     pub window_breakdown_max_rows: usize,
     pub request_labels: tracelane_shared::labels::LabelCaps,
@@ -110,6 +272,86 @@ pub struct Policy {
     /// (ingest now writes blobs/refs INSIDE the durable flush) closes long before.
     /// `billing_policy.blob_gc_grace_days`, seeded from `plans.v3.json`.
     pub blob_gc_grace_days: i64,
+}
+
+/// Reference-backed bounds for the workspace overview. Kept together so the
+/// gateway route and its cache consume the same validated values.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Deserialize)]
+pub struct WorkspaceGlancePolicy {
+    pub volume_window_days: u32,
+    pub activity_window_days: u32,
+    pub cache_ttl_seconds: u64,
+    pub storage_cache_ttl_seconds: u64,
+    pub providers_top: u32,
+    pub storage_tables_top: u32,
+}
+
+impl WorkspaceGlancePolicy {
+    fn valid(self) -> bool {
+        self.volume_window_days > 0
+            && self.activity_window_days > 0
+            && self.cache_ttl_seconds > 0
+            && self.storage_cache_ttl_seconds > 0
+            && self.providers_top > 0
+            && self.storage_tables_top > 0
+    }
+
+    fn seeded() -> Option<Self> {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).ok()?;
+        serde_json::from_value::<Self>(seed["policy"]["workspace_glance"].clone())
+            .ok()
+            .filter(|value| value.valid())
+    }
+
+    pub fn selftest() -> bool {
+        let default = Self::default();
+        let mut stale = default;
+        stale.volume_window_days += 1;
+        Self::seeded() == Some(default) && Self::seeded() != Some(stale)
+    }
+}
+
+impl Default for WorkspaceGlancePolicy {
+    fn default() -> Self {
+        Self {
+            volume_window_days: 30,
+            activity_window_days: 7,
+            cache_ttl_seconds: 300,
+            storage_cache_ttl_seconds: 900,
+            providers_top: 8,
+            storage_tables_top: 8,
+        }
+    }
+}
+
+/// Cached, seeded bounds for trace reads. A missing control plane uses the
+/// packaged seed values so display paths remain available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct TraceReadPolicy {
+    pub export_max_rows: u32,
+    pub list_max_page: u32,
+    pub cost_sort_max_window_hours: u32,
+}
+
+impl TraceReadPolicy {
+    fn valid(self) -> bool {
+        self.export_max_rows > 0 && self.list_max_page > 0 && self.cost_sort_max_window_hours > 0
+    }
+
+    fn embedded() -> Self {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json"))
+                .unwrap_or_default();
+        serde_json::from_value(seed["policy"]["trace_reads"].clone())
+            .ok()
+            .filter(|p: &Self| p.valid())
+            .unwrap_or(Self {
+                export_max_rows: 10_000,
+                list_max_page: 200,
+                cost_sort_max_window_hours: 168,
+            })
+    }
 }
 
 /// Existing breakdown bounds, sourced from the reviewed row cap and Free plan.
@@ -141,6 +383,27 @@ impl Default for Policy {
     /// no row for a key, which this module warns about once when it happens.
     fn default() -> Self {
         Self {
+            workspace_glance: WorkspaceGlancePolicy::default(),
+            trace_reads: TraceReadPolicy::embedded(),
+            trace_reads_tenant_key_multiplier: serde_json::from_str::<serde_json::Value>(
+                include_str!("../../../../apps/web/db/plans.v3.json"),
+            )
+            .ok()
+            .and_then(|v| v["policy"]["trace_reads_tenant_key_multiplier"].as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+            attempt_records_since: serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../../apps/web/db/plans.v3.json"
+            ))
+            .ok()
+            .and_then(|v| {
+                v["policy"]["attempt_records_since"]
+                    .as_str()
+                    .map(str::to_owned)
+            }),
+            agent_loop: AgentLoopPolicy::embedded(),
+            spend_spikes: SpendSpikePolicy::embedded(),
+            incident_regression: crate::incident_routes::IncidentPolicy::embedded(),
             generation_issues: crate::generation_issues::SummaryPolicy::embedded(),
             window_breakdown_max_rows: breakdown_defaults().0,
             request_labels: tracelane_shared::labels::LabelCaps::embedded(),
@@ -304,6 +567,50 @@ impl Policy {
             }
         };
         Self {
+            workspace_glance: raw
+                .get("workspace_glance")
+                .and_then(|value| serde_json::from_str::<WorkspaceGlancePolicy>(value).ok())
+                .filter(|value| value.valid())
+                .unwrap_or_else(|| {
+                    tracing::warn!(policy_key = "workspace_glance", "billing_policy row missing/invalid — using the documented default");
+                    default.workspace_glance
+                }),
+            // Fail RESTRICTED to the packaged multiplier on a missing/invalid row.
+            trace_reads: raw.get("trace_reads")
+                .and_then(|v| serde_json::from_str::<TraceReadPolicy>(v).ok())
+                .filter(|p| p.valid())
+                .unwrap_or_else(|| {
+                    tracing::warn!(policy_key = "trace_reads", "billing_policy row missing/invalid — using the embedded read bounds");
+                    default.trace_reads
+                }),
+            // No valid packaged value leaves finite-plan API-key reads CLOSED.
+            trace_reads_tenant_key_multiplier: raw.get("trace_reads_tenant_key_multiplier")
+                .and_then(|v| serde_json::from_str::<u32>(v).ok()).filter(|n| *n > 0)
+                .or(default.trace_reads_tenant_key_multiplier),
+            attempt_records_since: raw.get("attempt_records_since")
+                .and_then(|v| serde_json::from_str::<String>(v).ok())
+                .filter(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()),
+            spend_spikes: raw
+                .get("spend_spikes")
+                .and_then(|s| serde_json::from_str::<SpendSpikePolicy>(s).ok())
+                .filter(SpendSpikePolicy::valid)
+                .or(default.spend_spikes),
+            agent_loop: raw
+                .get("agent_loop")
+                .and_then(|v| serde_json::from_str::<AgentLoopPolicy>(v).ok())
+                .filter(AgentLoopPolicy::valid)
+                .or(default.agent_loop),
+            incident_regression: raw
+                .get("incident_regression")
+                .and_then(|v| serde_json::from_str(v).ok())
+                .filter(crate::incident_routes::IncidentPolicy::valid)
+                .or_else(|| {
+                    tracing::warn!(
+                        policy_key = "incident_regression",
+                        "billing_policy row missing/invalid — incident and outcome routes fail closed"
+                    );
+                    None
+                }),
             generation_issues: raw
                 .get("generation_issues")
                 .and_then(|v| {
@@ -525,6 +832,251 @@ pub fn burst_exempt_days(daily: &[f64], multiple: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trace_read_limits_are_seeded() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let limits = &seed["policy"]["trace_reads"];
+        assert_eq!(limits["export_max_rows"], 10_000);
+        assert_eq!(limits["list_max_page"], 200);
+        assert_eq!(limits["cost_sort_max_window_hours"], 168);
+    }
+    #[test]
+    fn incident_policy_requires_independent_read_budget() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let mut value = seed["policy"]["incident_regression"].clone();
+        assert_eq!(value["incident_reads_per_minute_per_tenant"], 120);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("incident_reads_per_minute_per_tenant");
+        let raw = HashMap::from([("incident_regression".to_owned(), value.to_string())]);
+        assert!(Policy::from_raw(&raw).incident_regression.is_none());
+        value["incident_reads_per_minute_per_tenant"] = serde_json::json!(0);
+        let raw = HashMap::from([("incident_regression".to_owned(), value.to_string())]);
+        assert!(Policy::from_raw(&raw).incident_regression.is_none());
+    }
+    #[test]
+    fn cf3_retired_read_policy_does_not_alert() {
+        Policy::from_raw(&HashMap::new());
+        assert!(
+            !tracelane_shared::degradation::snapshot()
+                .iter()
+                .any(|s| s.kind == "trace_read_policy_fallback" && s.count > 0),
+            "unused trace-read policy must not ask operators to seed it"
+        );
+    }
+
+    #[test]
+    fn cf3_tenant_key_multiplier_uses_seed_and_cached_policy() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let packaged = Policy::default().trace_reads_tenant_key_multiplier;
+        assert_eq!(
+            packaged.map(u64::from),
+            seed["policy"]["trace_reads_tenant_key_multiplier"].as_u64()
+        );
+        assert_eq!(packaged, Some(3));
+        let mut raw = HashMap::from([("trace_reads_tenant_key_multiplier".into(), "2".into())]);
+        assert_eq!(
+            Policy::from_raw(&raw).trace_reads_tenant_key_multiplier,
+            Some(2)
+        );
+        for invalid in ["0", "null", "-1", "4294967296", "1.5", "\"3\""] {
+            raw.insert("trace_reads_tenant_key_multiplier".into(), invalid.into());
+            assert_eq!(
+                Policy::from_raw(&raw).trace_reads_tenant_key_multiplier,
+                packaged
+            );
+        }
+        assert_eq!(
+            Policy::from_raw(&HashMap::new()).trace_reads_tenant_key_multiplier,
+            packaged
+        );
+        assert!(
+            include_str!("../../../../apps/web/db/seed.mjs").contains(
+                "trace_reads_tenant_key_multiplier: pol.trace_reads_tenant_key_multiplier"
+            )
+        );
+        assert!(
+            seed["policy"]
+                .get("trace_reads_per_minute_per_tenant")
+                .is_none()
+        );
+    }
+    #[test]
+    fn cf_low_attempt_cutover_uses_seed_and_cached_policy() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        assert_eq!(
+            Policy::default().attempt_records_since.as_deref(),
+            seed["policy"]["attempt_records_since"].as_str()
+        );
+        let mut raw = HashMap::from([("attempt_records_since".into(), "\"2026-09-20\"".into())]);
+        assert_eq!(
+            Policy::from_raw(&raw).attempt_records_since.as_deref(),
+            Some("2026-09-20")
+        );
+        raw.insert("attempt_records_since".into(), "\"invalid\"".into());
+        assert_eq!(Policy::from_raw(&raw).attempt_records_since, None);
+        assert!(
+            include_str!("../../../../apps/web/db/seed.mjs")
+                .contains("attempt_records_since: pol.attempt_records_since")
+        );
+    }
+
+    #[test]
+    fn cf_low_loop_caps_have_upper_bounds() {
+        let mut policy = super::AgentLoopPolicy::embedded().unwrap();
+        policy.max_instances = u32::MAX;
+        assert!(!policy.valid(), "instance cap cannot be unbounded");
+        policy = super::AgentLoopPolicy::embedded().unwrap();
+        policy.max_span_ids_per_instance = u32::MAX;
+        assert!(!policy.valid(), "evidence cap cannot be unbounded");
+    }
+
+    #[test]
+    fn incident_policy_requires_seeded_candidate_cap() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let mut value = seed["policy"]["incident_regression"].clone();
+        let raw = HashMap::from([("incident_regression".to_owned(), value.to_string())]);
+        assert_eq!(
+            Policy::from_raw(&raw)
+                .incident_regression
+                .unwrap()
+                .incident_max_candidates,
+            50
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("incident_max_candidates");
+        let raw = HashMap::from([("incident_regression".to_owned(), value.to_string())]);
+        assert!(Policy::from_raw(&raw).incident_regression.is_none());
+        value["incident_max_candidates"] = serde_json::json!(0);
+        let raw = HashMap::from([("incident_regression".to_owned(), value.to_string())]);
+        assert!(Policy::from_raw(&raw).incident_regression.is_none());
+    }
+
+    #[test]
+    fn spend_policy_rejects_every_value_above_packaged_ceiling() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let policy = seed["policy"]["spend_spikes"].clone();
+        let mut accepted = Vec::new();
+        for unit in ["hour", "day"] {
+            for key in [
+                "baseline_buckets",
+                "ratio",
+                "min_usd",
+                "min_history_buckets",
+                "max_window_buckets",
+                "max_spikes_returned",
+                "drill_top_n",
+            ] {
+                let mut bad = policy.clone();
+                bad[unit][key] = if ["ratio", "min_usd"].contains(&key) {
+                    serde_json::json!(bad[unit][key].as_f64().unwrap() + 1.)
+                } else {
+                    serde_json::json!(bad[unit][key].as_u64().unwrap() + 1)
+                };
+                let raw = HashMap::from([("spend_spikes".to_owned(), bad.to_string())]);
+                assert_eq!(
+                    Policy::from_raw(&raw).spend_spikes,
+                    super::SpendSpikePolicy::embedded()
+                );
+                if serde_json::from_value::<super::SpendSpikePolicy>(bad)
+                    .unwrap()
+                    .valid()
+                {
+                    accepted.push(format!("{unit}.{key}"));
+                }
+            }
+        }
+        for key in [
+            "backfill_days",
+            "backfill_max_memory_bytes",
+            "backfill_max_execution_seconds",
+        ] {
+            let mut bad = policy.clone();
+            bad[key] = serde_json::json!(bad[key].as_u64().unwrap() + 1);
+            if serde_json::from_value::<super::SpendSpikePolicy>(bad)
+                .unwrap()
+                .valid()
+            {
+                accepted.push(key.to_owned());
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "unbounded spend policy values: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn spend_spikes_seed_and_cached_override_are_validated() {
+        let policy =
+            super::SpendSpikePolicy::embedded().expect("spend_spikes policy must be seeded");
+        assert!(policy.valid());
+        assert_eq!(super::Policy::default().spend_spikes, Some(policy));
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let mut value = seed["policy"]["spend_spikes"].clone();
+        value["hour"]["ratio"] = serde_json::json!(policy.hour.ratio - 0.5);
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("spend_spikes".into(), value.to_string());
+        assert_eq!(
+            super::Policy::from_raw(&raw)
+                .spend_spikes
+                .unwrap()
+                .hour
+                .ratio,
+            policy.hour.ratio - 0.5
+        );
+        value["hour"]["min_history_buckets"] = serde_json::json!(0);
+        raw.insert("spend_spikes".into(), value.to_string());
+        assert_eq!(super::Policy::from_raw(&raw).spend_spikes, Some(policy));
+        assert!(
+            include_str!("../../../../apps/web/db/seed.mjs")
+                .contains("spend_spikes: pol.spend_spikes")
+        );
+    }
+
+    #[test]
+    fn agent_loop_seed_is_present_and_bounded() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../apps/web/db/plans.v3.json")).unwrap();
+        let value = &seed["policy"]["agent_loop"];
+        assert!(value.is_object(), "agent_loop policy must be seeded");
+        let embedded = super::AgentLoopPolicy::embedded().unwrap();
+        assert_eq!(
+            serde_json::from_value::<super::AgentLoopPolicy>(value.clone()).unwrap(),
+            embedded
+        );
+        assert_eq!(super::Policy::default().agent_loop, Some(embedded));
+        let mut raw = std::collections::HashMap::new();
+        let mut changed = value.clone();
+        changed["min_repeats"] = 4.into();
+        raw.insert("agent_loop".into(), changed.to_string());
+        assert_eq!(
+            super::Policy::from_raw(&raw)
+                .agent_loop
+                .unwrap()
+                .min_repeats,
+            4
+        );
+        changed["min_repeats"] = 1.into();
+        raw.insert("agent_loop".into(), changed.to_string());
+        assert_eq!(super::Policy::from_raw(&raw).agent_loop, Some(embedded));
+        assert!((2..=50).contains(&value["min_repeats"].as_u64().unwrap()));
+        assert!((10..=86400).contains(&value["window_secs"].as_u64().unwrap()));
+        assert!(
+            include_str!("../../../../apps/web/db/seed.mjs").contains("agent_loop: pol.agent_loop")
+        );
+    }
+
     #[test]
     fn breakdown_reference_preserves_existing_bounds_and_loads_override() {
         assert_eq!(super::breakdown_defaults(), (200, 3));
@@ -892,9 +1444,31 @@ mod tests {
     }
 
     #[test]
-    fn policy_from_raw_falls_back_to_documented_defaults_on_missing_keys() {
+    fn policy_from_raw_preserves_display_defaults_and_fails_closed_for_strict_keys() {
         let p = Policy::from_raw(&HashMap::new());
-        assert_eq!(p, Policy::default());
+        let expected = Policy {
+            attempt_records_since: None,
+            // This existing strict policy also refuses an embedded fallback.
+            incident_regression: None,
+            ..Policy::default()
+        };
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn workspace_glance_default_matches_seed_and_missing_row_warns_to_default() {
+        assert!(super::WorkspaceGlancePolicy::selftest());
+        let default = super::WorkspaceGlancePolicy::default();
+        assert_eq!(Policy::from_raw(&HashMap::new()).workspace_glance, default);
+        let mut raw = HashMap::new();
+        raw.insert(
+            "workspace_glance".to_owned(),
+            r#"{"volume_window_days":14,"activity_window_days":7,"cache_ttl_seconds":300,"storage_cache_ttl_seconds":900,"providers_top":8,"storage_tables_top":8}"#.to_owned(),
+        );
+        assert_eq!(
+            Policy::from_raw(&raw).workspace_glance.volume_window_days,
+            14
+        );
     }
 
     #[test]

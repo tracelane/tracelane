@@ -173,6 +173,13 @@ export function SessionRow({
 				{formatCost(s.cost_usd)}
 			</TD>
 			<TD className="px-3 py-2">
+				{s.loops_available && (s.loop_calls ?? 0) > 0 && (
+					<StatusBadge
+						status="loop"
+						tone="warn"
+						label={`Repeated tool call ×${s.loop_calls}`}
+					/>
+				)}
 				{isError ? <StatusBadge status="error" /> : <StatusBadge status="ok" />}
 			</TD>
 			<TD className="px-3 py-2 text-right text-xs text-ink-2">

@@ -103,15 +103,19 @@ async fn handler(
         }
     };
 
-    // IDENTITY_TEAM_SPEC §1: billing is owner-only. Members/viewers are denied
-    // at the gateway (authoritative), typed `role_forbidden`.
-    if !claims.can_admin() {
-        return (
-            StatusCode::FORBIDDEN,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            crate::auth::role_forbidden_json("owner"),
-        )
-            .into_response();
+    // IDENTITY_TEAM_SPEC §1 + OG-34: billing is the `manage_billing` capability —
+    // the admin and the billing role; developers and viewers are denied at the
+    // gateway (authoritative), typed `role_forbidden`. Then OG-36's allowlist and
+    // SSO-required. Opening checkout changes no Tracelane state, so no audit row
+    // (`CONTROL_ROUTES`); the plan changes only through the Polar webhook.
+    if let Err(r) = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageBilling,
+        &headers,
+    )
+    .await
+    {
+        return r.into_response();
     }
 
     // 2. Basic input validation.

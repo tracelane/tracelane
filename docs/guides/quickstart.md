@@ -137,12 +137,13 @@ today:
 > completion text.** The gateway records the model, tokens, cost, timings,
 > status and guardrail verdicts — not the message bodies. The audit-ledger
 > payload is likewise metadata (model, trace id, warn id, optional business
-> reference), PII-redacted. Content capture is off unless an operator turns it
-> on for a named workspace with a `trace_content:` block in `tracelane.yaml`
-> (`crates/gateway/src/config.rs`); for an allowlisted workspace the message
-> bodies (`gen_ai.input_messages` / `gen_ai.output_messages`) are stored on
-> gateway spans too. Otherwise they reach ClickHouse only from **OTLP spans
-> your own SDK emits**. Separately, `f_full_capture` — the entitlement that
+> reference), PII-redacted. Content capture is off by default. A workspace
+> owner can enable input and output capture in settings; an operator can also
+> allowlist a workspace with `trace_content:` in `tracelane.yaml`. Enabled
+> message bodies (`gen_ai.input_messages` / `gen_ai.output_messages`) are
+> stored on gateway spans. OTLP and SDK spans have their own capture path,
+> subject to the workspace's input and output settings. Separately,
+> `f_full_capture` — the entitlement that
 > forces the full-capture sampling policy — is **false on Free, Builder and
 > Team** (`apps/web/db/seed.mjs`); it is granted on Business and Enterprise,
 > and the Enterprise export grant forces full capture on any plan.

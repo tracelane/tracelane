@@ -30,6 +30,19 @@ export function inferSpanKind(attributesJson: string): SpanKind {
 	} catch {
 		return "unknown";
 	}
+	const explicit = attrs.openinference_span_kind;
+	if (typeof explicit === "string") {
+		const kind = explicit.toLowerCase();
+		if (
+			kind === "llm" ||
+			kind === "agent" ||
+			kind === "tool" ||
+			kind === "retriever" ||
+			kind === "retrieval"
+		) {
+			return kind === "retriever" ? "retrieval" : kind;
+		}
+	}
 
 	const keys = Object.keys(attrs);
 	// The STORED form is underscore-flattened (`gen_ai_*`, ADR-043; ingest

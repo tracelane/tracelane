@@ -1,6 +1,6 @@
 ---
 title: Migrating onto Tracelane ingest mTLS (SPIFFE)
-description: Move design partners from plaintext OTLP or shared-secret ingest to SPIFFE-authenticated mTLS with zero span loss, step by step from a fresh cluster.
+description: Move design partners from plaintext OTLP or shared-secret ingest to SPIFFE-authenticated mTLS, step by step from a fresh cluster.
 sidebarTitle: SPIFFE bootstrap (migration)
 classification: PUBLIC
 ---
@@ -16,7 +16,7 @@ Multi-tenant ingest enforces SPIFFE mTLS in release builds: those binaries bail 
 startup unless `TRACELANE_SPIRE_SOCKET` is set. The documented exception is
 single-tenant self-host, which can run plaintext (see below). This page walks you
 from a fresh cluster (or one running plaintext dev ingest) to a
-mTLS-only deployment with zero span loss.
+mTLS-only deployment. Confirm your exporters can buffer across the cutover before restarting ingest.
 
 ## Pre-flight
 

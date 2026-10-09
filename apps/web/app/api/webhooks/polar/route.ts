@@ -27,7 +27,10 @@
  *   - The FIRST paid activation (no `price_protected_until` yet) sets it to
  *     now + `billing_policy.price_protection_months`, and pins
  *     `tenants.price_version` to the CURRENT `pricing_rates.price_version` —
- *     both read from the tables, never literals.
+ *     both read from the tables, never literals. B-409: in the SAME update it
+ *     pins `tenants.plan_version` to the plan's CURRENT
+ *     `plan_allowances.plan_version`, so protection covers what the price
+ *     buys, not only the price. A later plan change does not re-pin.
  *   - `subscription.past_due` sets `dunning_started_at = now`; any active
  *     status clears it. The PLAN NEVER CHANGES on past_due — ingest is never
  *     gated on billing state (spec §0.4).
@@ -59,6 +62,7 @@
 import { db } from "@/db";
 import {
 	billingPolicy,
+	planAllowances,
 	planEntitlements,
 	pricingRates,
 	tenants,
@@ -88,6 +92,7 @@ import {
 	isPastDueStatus,
 	isStale,
 	logSafe,
+	pinRefusals,
 	planForLookupKey,
 	resolvePair,
 	resolvePlan,
@@ -311,10 +316,67 @@ async function readCurrentPriceVersion(): Promise<string | null> {
 	return row?.priceVersion ?? null;
 }
 
+/**
+ * B-409: the `plan_allowances.plan_version` currently marked `is_current` for
+ * `lookupKey` — what a first paid activation pins `tenants.plan_version` to.
+ * `null` when the table has no current row for the plan (unseeded): nothing is
+ * pinned and the tenant tracks the current version, exactly as before B-409.
+ */
+async function readCurrentPlanVersion(
+	lookupKey: string,
+): Promise<string | null> {
+	const [row] = await db
+		.select({ planVersion: planAllowances.planVersion })
+		.from(planAllowances)
+		.where(
+			and(
+				eq(planAllowances.planLookupKey, lookupKey),
+				eq(planAllowances.isCurrent, true),
+			),
+		)
+		.limit(1);
+	return row?.planVersion ?? null;
+}
+
 function addMonths(d: Date, months: number): Date {
 	const out = new Date(d);
 	out.setUTCMonth(out.getUTCMonth() + months);
 	return out;
+}
+
+/**
+ * The price-protection pin a FIRST paid activation writes, in the SAME update as
+ * the plan: the expiry (`billing_policy.price_protection_months` from now) and the
+ * two versions (`pricing_rates` / `plan_allowances` current), all read from the
+ * tables.
+ *
+ * rev4 L8 (2026-10-03): with NO `price_protection_months` row this pins NOTHING —
+ * it used to pin the versions with a NULL expiry, which (a) the allowance join
+ * reads as "protected forever" and (b) leaves `price_protected_until` NULL, so the
+ * next paid event re-pinned the tenant onto whatever was current then. Refused,
+ * counted (`pinRefusals`) and logged; the next paid event retries once the policy
+ * row is seeded.
+ */
+async function firstActivationPin(
+	lookupKey: string,
+	now: Date,
+): Promise<Record<string, unknown>> {
+	const months = await readPolicyNumber("price_protection_months");
+	if (months === null) {
+		pinRefusals.total += 1;
+		console.error(
+			`[polar-webhook] billing_policy.price_protection_months is missing — this first paid activation is NOT price-protected (no pin written; refused ${pinRefusals.total} time(s) since boot). Seed billing_policy.`,
+		);
+		return {};
+	}
+	const pin: Record<string, unknown> = {
+		priceProtectedUntil: addMonths(now, months),
+	};
+	const version = await readCurrentPriceVersion();
+	const planVersion = await readCurrentPlanVersion(lookupKey);
+	if (version) pin.priceVersion = version;
+	if (planVersion) pin.planVersion = planVersion;
+	return pin;
 }
 
 /** A Polar ISO-8601 timestamp field, or null when absent / not a string / unparsable. */
@@ -485,10 +547,7 @@ async function handleSubscriptionChange(
 	// — the property that matters is "this tenant has never been price
 	// -protected before", however that transition arrived.
 	if (planValue !== "free" && !tenant.priceProtectedUntil) {
-		const months = await readPolicyNumber("price_protection_months");
-		const version = await readCurrentPriceVersion();
-		if (months !== null) extra.priceProtectedUntil = addMonths(now, months);
-		if (version) extra.priceVersion = version;
+		Object.assign(extra, await firstActivationPin(resolution.lookupKey, now));
 	}
 
 	await db
@@ -642,10 +701,7 @@ async function applyPairEvent(args: {
 		if (holdDays !== null) extra.dataHoldUntil = addDays(now, holdDays);
 	}
 	if (planValue !== "free" && !tenant.priceProtectedUntil) {
-		const months = await readPolicyNumber("price_protection_months");
-		const version = await readCurrentPriceVersion();
-		if (months !== null) extra.priceProtectedUntil = addMonths(now, months);
-		if (version) extra.priceVersion = version;
+		Object.assign(extra, await firstActivationPin(`${planValue}_v1`, now));
 	}
 
 	await db

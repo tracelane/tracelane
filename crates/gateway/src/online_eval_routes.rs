@@ -206,7 +206,24 @@ async fn require_entitled(
 /// or a machine credential, and a `member`/`viewer` never. A viewer being able
 /// to switch on a money path would be the A8/EVL-18 defect in a more expensive
 /// place.
-fn require_writer(claims: &Claims) -> Result<(), ApiError> {
+pub(crate) fn require_writer(claims: &Claims) -> Result<(), ApiError> {
+    // rev5 H1: the `admin` SCOPE too, as every other `write_prompts` surface asks
+    // (`prompt_routes`, `dataset_routes`, `experiment_routes`). The role gate below is not
+    // a scope gate: `can_write_prompts` holds for ANY API key, so a `read`- or `chat`-scoped
+    // key — one a developer may mint — could switch on a money path. A session and a
+    // legacy NULL-scope key are `LegacyFullSurface` and pass, as before.
+    if claims.can_write_prompts() && !claims.allows_scope(crate::auth::scope::Scope::Admin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "This API key is not scoped to change the online-eval policy. A \
+                          policy spends this workspace's provider budget; it needs the \
+                          `admin` scope.",
+                "type": "insufficient_scope",
+                "required_scope": "admin",
+            })),
+        ));
+    }
     if claims.can_write_prompts() {
         return Ok(());
     }
@@ -217,6 +234,35 @@ fn require_writer(claims: &Claims) -> Result<(), ApiError> {
     let body: serde_json::Value = serde_json::from_str(&crate::auth::role_forbidden_json("owner"))
         .unwrap_or_else(|_| serde_json::json!({ "error": "role_forbidden" }));
     Err((StatusCode::FORBIDDEN, Json(body)))
+}
+
+/// The admin-plane gate on a policy WRITE (OG-36 allowlist + SSO-required), in this
+/// family's error shape; yields the actor the OG-35 audit row carries.
+async fn require_control_api(
+    claims: &Claims,
+    headers: &HeaderMap,
+) -> Result<crate::control_plane::ControlActor, ApiError> {
+    crate::control_plane::require_control(
+        claims,
+        crate::auth::capability::Capability::WritePrompts,
+        headers,
+    )
+    .await
+    .map_err(|r| {
+        let body = serde_json::from_str(&r.body)
+            .unwrap_or_else(|_| serde_json::json!({ "error": "forbidden" }));
+        (r.status, Json(body))
+    })
+}
+
+/// A failed policy write (store or OG-35 audit insert): nothing changed.
+fn write_failed(what: &str, e: &dyn std::fmt::Display) -> ApiError {
+    tracing::error!(error = %e, "online-eval policy {what}");
+    err(
+        StatusCode::BAD_GATEWAY,
+        "policy_write_failed",
+        "could not save the online-eval policy",
+    )
 }
 
 // ─────────────────────────────── the policy ────────────────────────────────
@@ -447,16 +493,29 @@ async fn upsert_policy_handler(
     tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
     require_entitled(&state, &claims.tenant_id).await?;
     require_writer(&claims)?;
+    let actor = require_control_api(&claims, &headers).await?;
     let (budget, rate, rubric_kind, rubric, judge_model, enabled) = validate_policy(&body)?;
 
-    let client = state.pool.get().await.map_err(|e| {
-        tracing::error!(error = %e, "online-eval policy write: pool");
-        err(
-            StatusCode::BAD_GATEWAY,
-            "policy_write_failed",
-            "could not save the online-eval policy",
+    let mut client = state
+        .pool
+        .get()
+        .await
+        .map_err(|e| write_failed("write: pool", &e))?;
+    // OG-35: the policy and its `online_eval.policy.set` row commit together.
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| write_failed("write: begin", &e))?;
+    let before = tx
+        .query_opt(
+            &format!(
+                "SELECT {POLICY_COLS} FROM online_eval_policies WHERE tenant_id = $1 FOR UPDATE"
+            ),
+            &[claims.tenant_id.as_uuid()],
         )
-    })?;
+        .await
+        .map_err(|e| write_failed("write: read", &e))?
+        .map(|r| serde_json::to_value(row_to_dto(&r)).unwrap_or_default());
 
     // ONE statement, and the salt clause is the interesting half:
     // `EXCLUDED.sample_salt` is used only on INSERT; on CONFLICT the stored
@@ -465,7 +524,7 @@ async fn upsert_policy_handler(
     // of the traces the old rate selected, which is what makes the surface's
     // configured-vs-achieved pair comparable across an edit.
     let salt = Uuid::new_v4().to_string();
-    let row = client
+    let row = tx
         .query_one(
             &format!(
                 "INSERT INTO online_eval_policies
@@ -495,14 +554,25 @@ async fn upsert_policy_handler(
             ],
         )
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "online-eval policy upsert");
-            err(
-                StatusCode::BAD_GATEWAY,
-                "policy_write_failed",
-                "could not save the online-eval policy",
-            )
-        })?;
+        .map_err(|e| write_failed("upsert", &e))?;
+    let dto = row_to_dto(&row);
+    crate::db::control_audit::record(
+        &tx,
+        &claims.tenant_id,
+        &actor.audit,
+        crate::db::control_audit::Change {
+            action: "online_eval.policy.set",
+            target_type: "online_eval_policy",
+            target_id: dto.id.to_string(),
+            before,
+            after: serde_json::to_value(&dto).ok(),
+        },
+    )
+    .await
+    .map_err(|e| write_failed("upsert: audit", &format!("{e:#}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| write_failed("upsert: commit", &e))?;
 
     // The cache is what the hot path reads, and its TTL is 900s. Without this an
     // enable would take up to fifteen minutes to take effect and a DISABLE would
@@ -515,7 +585,7 @@ async fn upsert_policy_handler(
         enabled, rate, budget,
         "online-eval policy saved"
     );
-    Ok(Json(row_to_dto(&row)))
+    Ok(Json(dto))
 }
 
 /// `DELETE` = **disable**, not destroy.
@@ -534,32 +604,61 @@ async fn disable_policy_handler(
     tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
     require_entitled(&state, &claims.tenant_id).await?;
     require_writer(&claims)?;
+    let actor = require_control_api(&claims, &headers).await?;
 
-    let client = state.pool.get().await.map_err(|e| {
-        tracing::error!(error = %e, "online-eval policy disable: pool");
-        err(
-            StatusCode::BAD_GATEWAY,
-            "policy_write_failed",
-            "could not disable the online-eval policy",
-        )
-    })?;
-    let n = client
-        .execute(
-            "UPDATE online_eval_policies SET enabled = false, updated_at = now()
-              WHERE tenant_id = $1",
+    let mut client = state
+        .pool
+        .get()
+        .await
+        .map_err(|e| write_failed("disable: pool", &e))?;
+    // OG-35: the disable and its `online_eval.policy.disable` row commit together.
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| write_failed("disable: begin", &e))?;
+    let before = tx
+        .query_opt(
+            &format!(
+                "SELECT {POLICY_COLS} FROM online_eval_policies WHERE tenant_id = $1 FOR UPDATE"
+            ),
             &[claims.tenant_id.as_uuid()],
         )
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "online-eval policy disable");
-            err(
-                StatusCode::BAD_GATEWAY,
-                "policy_write_failed",
-                "could not disable the online-eval policy",
-            )
-        })?;
+        .map_err(|e| write_failed("disable: read", &e))?
+        .map(|r| serde_json::to_value(row_to_dto(&r)).unwrap_or_default());
+    let row = tx
+        .query_opt(
+            &format!(
+                "UPDATE online_eval_policies SET enabled = false, updated_at = now()
+                  WHERE tenant_id = $1 RETURNING {POLICY_COLS}"
+            ),
+            &[claims.tenant_id.as_uuid()],
+        )
+        .await
+        .map_err(|e| write_failed("disable", &e))?;
+    let disabled = row.is_some();
+    if let Some(row) = row {
+        let after = row_to_dto(&row);
+        crate::db::control_audit::record(
+            &tx,
+            &claims.tenant_id,
+            &actor.audit,
+            crate::db::control_audit::Change {
+                action: "online_eval.policy.disable",
+                target_type: "online_eval_policy",
+                target_id: after.id.to_string(),
+                before,
+                after: serde_json::to_value(&after).ok(),
+            },
+        )
+        .await
+        .map_err(|e| write_failed("disable: audit", &format!("{e:#}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| write_failed("disable: commit", &e))?;
     crate::online_eval::invalidate(&claims.tenant_id).await;
-    Ok(Json(serde_json::json!({ "disabled": n > 0 })))
+    Ok(Json(serde_json::json!({ "disabled": disabled })))
 }
 
 // ─────────────────────────────── the scores ────────────────────────────────

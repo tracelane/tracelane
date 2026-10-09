@@ -63,7 +63,8 @@ async function listAll<T>(key: string, path: string): Promise<T[] | null> {
 			data?: T[];
 			list_metadata?: { after?: string | null };
 		};
-		if (Array.isArray(json.data)) out.push(...json.data);
+		if (!Array.isArray(json.data)) return null;
+		out.push(...json.data);
 		after = json.list_metadata?.after ?? null;
 		if (!after) break;
 	}
@@ -81,6 +82,17 @@ export function listMemberships(
 	return listAll<OrgMembership>(
 		key,
 		`/user_management/organization_memberships?organization_id=${encodeURIComponent(orgId)}`,
+	);
+}
+
+/** Find actual memberships even when the authenticated session has no selected org. */
+export function listUserMemberships(
+	key: string,
+	userId: string,
+): Promise<OrgMembership[] | null> {
+	return listAll<OrgMembership>(
+		key,
+		`/user_management/organization_memberships?user_id=${encodeURIComponent(userId)}`,
 	);
 }
 

@@ -3,8 +3,8 @@
 //! A request that carries `x-tracelane-zdr: required` may only reach a provider whose
 //! data-handling capability, per the Neon reference table `provider_capabilities`
 //! (seeded from `apps/web/db/provider_capabilities.v1.json`, CLAUDE.md §23), is
-//! `default` — no retention, no training, for every account. `enterprise` (only under a
-//! contract the customer holds) is NOT eligible until the customer can declare that
+//! `default` — no retention, no training, for every account. `enterprise` (a ZDR mode the
+//! customer's account must hold — ADR-079 §2) is NOT eligible until the customer can declare that
 //! contract on their key (spec §9 Q2, slice 2); `none` never is.
 //!
 //! **Fail direction: CLOSED, everywhere.** No table, no control plane, a failed load,
@@ -36,7 +36,9 @@ pub enum Zdr {
     None,
     /// No retention, no training, for every account: eligible.
     Default,
-    /// Only under a contract the customer holds — not eligible in slice 1.
+    /// A ZDR mode exists but the customer's ACCOUNT must hold it (contract, approval or
+    /// self-serve setting — `decisions/ADR-079-zdr-provider-policy-data.md` §2). The
+    /// gateway cannot see a customer's account, so: not eligible in slice 1.
     Enterprise,
 }
 

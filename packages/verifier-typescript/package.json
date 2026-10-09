@@ -1,6 +1,6 @@
 {
 	"name": "@tracelanedev/audit-verifier",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Reference verifier for Tracelane tamper-evident audit ledgers",
 	"repository": {
 		"type": "git",
@@ -37,7 +37,7 @@
 		"@biomejs/biome": "^1.9.0",
 		"@types/node": "^22.0.0",
 		"typescript": "^5.5.0",
-		"vitest": "^2.0.0"
+		"vitest": "^3.2.6"
 	},
 	"files": ["dist"],
 	"engines": { "node": "^18.19.0 || >=20.6.0" },

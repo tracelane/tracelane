@@ -41,10 +41,52 @@ pub struct ProviderKeyRow {
     // The SELECT column list and its `r.get(N)` positions are unchanged —
     // only the struct field and its assignment were removed.
     pub provider_id: String,
+    /// `OG-11`: the key's name within its provider's pool; `default` for the one key
+    /// every workspace had before key pools.
+    pub label: String,
     pub ciphertext_b64: String,
     pub last4: String,
     pub saved_at: chrono::DateTime<chrono::Utc>,
     pub last_validation: Option<KeyValidation>,
+}
+
+/// `OG-11`: the label every pre-pool key carries, and the only label files, batches and
+/// passthrough ever use (provider objects are account-scoped).
+pub const DEFAULT_LABEL: &str = "default";
+
+/// Longest key label (the column CHECK says the same).
+pub const MAX_LABEL_LEN: usize = 64;
+
+/// Does `label` have the stored shape `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`? Pure — the
+/// same rule as the `provider_keys_label_chk` CHECK, so a label refused here is never
+/// SB (security re-review round 2, 2026-10-05): can these credential bytes be sent? A
+/// key goes into an HTTP header, so it must be visible ASCII (0x21..=0x7E) — an interior
+/// control byte made every dispatch fail at the header build, a tenant-made failure the
+/// breaker used to count against the provider. A structured credential (a JSON object,
+/// e.g. a Vertex service account) is parsed, never put in a header, so its interior
+/// whitespace is fine; it still may not carry a raw control byte outside JSON's own
+/// whitespace.
+#[must_use]
+pub fn credential_bytes_ok(plaintext: &str) -> bool {
+    if plaintext.starts_with('{') {
+        return serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(plaintext)
+            .is_ok()
+            && plaintext
+                .bytes()
+                .all(|b| !b.is_ascii_control() || matches!(b, b'\n' | b'\r' | b'\t'));
+    }
+    !plaintext.is_empty() && plaintext.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// sent to Postgres. No `:` — it is the AAD separator.
+#[must_use]
+pub fn valid_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    !b.is_empty()
+        && b.len() <= MAX_LABEL_LEN
+        && b[0].is_ascii_alphanumeric()
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,53 +108,121 @@ impl TryFrom<&Row> for ProviderKeyRow {
                 .get::<_, Option<String>>(5)
                 .map(|v| serde_json::from_str(&v))
                 .transpose()?,
+            label: r.get(6),
         })
     }
 }
 
-/// Insert / overwrite the per-(tenant, provider) ciphertext.
+/// Named labels remain disabled until the operator contracts the old key constraint.
+#[derive(Debug, thiserror::Error)]
+#[error("named provider keys require completion of the key-label rollout")]
+pub struct LabelsUnavailable;
+
+/// Insert / overwrite the per-(tenant, provider, label) ciphertext.
 ///
 /// Caller is responsible for calling `ByokMasterKey::encrypt_with_context`
-/// with `provider_key_aad(tenant_id, provider_id)` so the stored blob
+/// with `provider_key_aad_labeled(tenant_id, provider_id, label)` so the stored blob
 /// is bound to the row it's written to.
 pub async fn upsert(
     pool: &Pool,
     tenant_id: &TenantId,
     provider_id: &str,
+    label: &str,
     ciphertext_b64: &str,
     last4: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "INSERT INTO provider_keys (tenant_id, provider_id, ciphertext_b64, last4)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (tenant_id, provider_id) DO UPDATE
+    // OG-35: the upsert and its `provider_key.upsert` row commit together. The row
+    // carries the provider and the display fingerprint ONLY — never the ciphertext,
+    // never key material (`control_audit::redact` would scrub it anyway).
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    if label != DEFAULT_LABEL {
+        let enabled: bool = tx.query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'provider_keys'::regclass AND conname = 'provider_keys_tenant_provider_label_pk')",
+            &[],
+        ).await?.get(0);
+        if !enabled {
+            return Err(LabelsUnavailable.into());
+        }
+    }
+    let before = tx
+        .query_opt(
+            "SELECT last4, updated_at FROM provider_keys
+             WHERE tenant_id = $1 AND provider_id = $2 AND label = $3 FOR UPDATE",
+            &[tenant_id.as_uuid(), &provider_id, &label],
+        )
+        .await
+        .context("SELECT provider_keys")?
+        .map(|r| {
+            serde_json::json!({
+                "label": label,
+                "last4": r.get::<_, String>(0),
+                "saved_at": r.get::<_, chrono::DateTime<chrono::Utc>>(1),
+            })
+        });
+    tx.execute(
+        "INSERT INTO provider_keys (tenant_id, provider_id, label, ciphertext_b64, last4)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (tenant_id, provider_id, label) DO UPDATE
                 SET ciphertext_b64 = EXCLUDED.ciphertext_b64,
                     last4          = EXCLUDED.last4,
                     updated_at     = NOW()",
-            &[tenant_id.as_uuid(), &provider_id, &ciphertext_b64, &last4],
-        )
-        .await
-        .context("UPSERT provider_keys")?;
+        &[
+            tenant_id.as_uuid(),
+            &provider_id,
+            &label,
+            &ciphertext_b64,
+            &last4,
+        ],
+    )
+    .await
+    .context("UPSERT provider_keys")?;
+    crate::db::control_audit::record(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "provider_key.upsert",
+            target_type: "provider_key",
+            target_id: target_id(provider_id, label),
+            before,
+            after: Some(serde_json::json!({"label": label, "last4": last4})),
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// Fetch the ciphertext for one (tenant, provider) pair. Returns
+/// The audit row's `target_id` for one key: the provider id alone for the `default`
+/// label (byte-identical to the pre-pool rows, so a key's history stays one series),
+/// `provider:label` for any other.
+#[must_use]
+pub fn target_id(provider_id: &str, label: &str) -> String {
+    if label == DEFAULT_LABEL {
+        provider_id.to_owned()
+    } else {
+        format!("{provider_id}:{label}")
+    }
+}
+
+/// Fetch the ciphertext for one (tenant, provider, label). Returns
 /// `Ok(None)` when there is no row — the caller falls back to the
-/// legacy env-var path.
+/// legacy env-var path (the `default` label only).
 pub async fn get(
     pool: &Pool,
     tenant_id: &TenantId,
     provider_id: &str,
+    label: &str,
 ) -> Result<Option<ProviderKeyRow>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let row = client
         .query_opt(
-            "SELECT tenant_id, provider_id, ciphertext_b64, last4, updated_at, NULL::text
+            "SELECT tenant_id, provider_id, ciphertext_b64, last4, updated_at, NULL::text, label
              FROM provider_keys
-             WHERE tenant_id = $1 AND provider_id = $2",
-            &[tenant_id.as_uuid(), &provider_id],
+             WHERE tenant_id = $1 AND provider_id = $2 AND label = $3",
+            &[tenant_id.as_uuid(), &provider_id, &label],
         )
         .await
         .context("SELECT provider_keys")?;
@@ -127,18 +237,41 @@ pub async fn list(pool: &Pool, tenant_id: &TenantId) -> Result<Vec<ProviderKeyRo
         .query(
             "SELECT p.tenant_id, p.provider_id, p.ciphertext_b64, p.last4, p.updated_at,
                 (SELECT (a.after_json -> 'validation')::text FROM admin_audit_log a
-                 WHERE a.actor_workspace_id = p.tenant_id AND a.target_id = p.provider_id
+                 WHERE a.actor_workspace_id = p.tenant_id
+                   AND a.target_id = CASE WHEN p.label = 'default' THEN p.provider_id
+                                          ELSE p.provider_id || ':' || p.label END
                    AND a.target_type = 'provider_key' AND a.action = 'provider_key.validate'
                    AND (a.after_json ->> 'saved_at')::timestamptz = p.updated_at
-                 ORDER BY a.occurred_at DESC, a.id DESC LIMIT 1)
+                 ORDER BY a.occurred_at DESC, a.id DESC LIMIT 1),
+                p.label
              FROM provider_keys p
              WHERE p.tenant_id = $1
-             ORDER BY p.provider_id",
+             ORDER BY p.provider_id, p.label",
             &[tenant_id.as_uuid()],
         )
         .await
         .context("SELECT provider_keys (list)")?;
     rows.iter().map(ProviderKeyRow::try_from).collect()
+}
+
+/// The provider ids this tenant holds a key for — and NOTHING else. `OG-05`'s
+/// `GET /v1/models` reads this: it needs which providers are usable, never the
+/// ciphertext, so no secret material leaves this function. The statement is
+/// bound to the validated claim's tenant UUID; a request body never reaches it.
+///
+/// # Errors
+/// Fail-CLOSED on a pool or statement error — the caller answers 503 rather
+/// than listing a guessed set.
+pub async fn list_provider_ids(pool: &Pool, tenant_id: &TenantId) -> Result<Vec<String>> {
+    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let rows = client
+        .query(
+            "SELECT DISTINCT provider_id FROM provider_keys WHERE tenant_id = $1 ORDER BY provider_id",
+            &[tenant_id.as_uuid()],
+        )
+        .await
+        .context("SELECT provider_keys (provider ids)")?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 /// Record only a classified verdict for the exact version that was checked.
@@ -150,33 +283,176 @@ pub async fn record_validation(
     pool: &Pool,
     tenant: &TenantId,
     source: &ProviderKeyRow,
-    actor: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
     result: &KeyValidation,
 ) -> Result<bool> {
-    let json = serde_json::to_string(
-        &serde_json::json!({"saved_at": source.saved_at, "validation": result}),
-    )?;
-    let client = pool.get().await?;
-    let written = client.execute(
-        "INSERT INTO admin_audit_log (actor_user_id, actor_workspace_id, action, target_type, target_id, after_json)
-         SELECT $4, tenant_id, 'provider_key.validate', 'provider_key', provider_id, $5::text::jsonb
-         FROM provider_keys WHERE tenant_id = $1 AND provider_id = $2 AND updated_at = $3",
-        &[tenant.as_uuid(), &source.provider_id, &source.saved_at, &actor, &json],
-    ).await?;
-    Ok(written == 1)
+    // Recorded only while the validated key is still the stored one (the
+    // `updated_at` match), now through the ONE OG-35 writer so the row carries the
+    // request id, role and method like every other control change.
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let current = tx
+        .query_opt(
+            "SELECT 1 FROM provider_keys
+             WHERE tenant_id = $1 AND provider_id = $2 AND label = $3 AND updated_at = $4
+             FOR SHARE",
+            &[
+                tenant.as_uuid(),
+                &source.provider_id,
+                &source.label,
+                &source.saved_at,
+            ],
+        )
+        .await?;
+    if current.is_none() {
+        return Ok(false);
+    }
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "provider_key.validate",
+            target_type: "provider_key",
+            target_id: target_id(&source.provider_id, &source.label),
+            before: None,
+            after: Some(serde_json::json!({"saved_at": source.saved_at, "validation": result})),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
-/// Delete a single provider key.
-pub async fn delete(pool: &Pool, tenant_id: &TenantId, provider_id: &str) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "DELETE FROM provider_keys WHERE tenant_id = $1 AND provider_id = $2",
-            &[tenant_id.as_uuid(), &provider_id],
+/// Delete a single provider key (one label).
+///
+/// OG-35: a delete that removed a key commits together with its
+/// `provider_key.delete` row; deleting an absent key records nothing.
+///
+/// `OG-11`: refused with [`DeleteOutcome::InUseByRouting`] while the workspace routing
+/// document names `(provider_id, label)` in a key pool. The check reads the document
+/// under `FOR UPDATE` in the SAME transaction as the delete, and the routing writer locks
+/// the same row before it validates labels, so a concurrent `PUT /v1/routing` cannot
+/// slip a reference to the key in between.
+pub async fn delete(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<DeleteOutcome> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    // Lock a row that exists even before the first routing document is written.
+    tx.query_one(
+        "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
+        &[tenant_id.as_uuid()],
+    )
+    .await
+    .context("lock tenant for routing/key mutation")?;
+    let routing = tx
+        .query_opt(
+            "SELECT doc FROM workspace_routing WHERE tenant_id = $1 FOR UPDATE",
+            &[tenant_id.as_uuid()],
+        )
+        .await
+        .context("SELECT workspace_routing (key delete)")?
+        .map(|r| r.get::<_, serde_json::Value>(0));
+    if routing
+        .as_ref()
+        .is_some_and(|doc| doc_names_key(doc, provider_id, label))
+    {
+        return Ok(DeleteOutcome::InUseByRouting);
+    }
+    let removed = tx
+        .query_opt(
+            "DELETE FROM provider_keys WHERE tenant_id = $1 AND provider_id = $2 AND label = $3
+             RETURNING last4, updated_at",
+            &[tenant_id.as_uuid(), &provider_id, &label],
         )
         .await
         .context("DELETE provider_keys")?;
-    Ok(())
+    let outcome = if let Some(r) = removed {
+        crate::db::control_audit::record(
+            &tx,
+            tenant_id,
+            &actor.as_actor(),
+            crate::db::control_audit::Change {
+                action: "provider_key.delete",
+                target_type: "provider_key",
+                target_id: target_id(provider_id, label),
+                before: Some(serde_json::json!({
+                    "label": label,
+                    "last4": r.get::<_, String>(0),
+                    "saved_at": r.get::<_, chrono::DateTime<chrono::Utc>>(1),
+                })),
+                after: None,
+            },
+        )
+        .await?;
+        DeleteOutcome::Deleted
+    } else {
+        DeleteOutcome::Absent
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// `OG-11`: does a stored routing document name `(provider_id, label)` in a key pool?
+/// Reads the raw JSON (`key_pools[*].provider` / `.keys[*].label`) rather than the typed
+/// document so this module stays free of `crate::routing` (the real-Postgres harness
+/// mounts `db` on its own) — and so a document THIS gateway cannot parse still protects
+/// the keys it names (fail-CLOSED: an unreadable pool entry counts as naming nothing
+/// only when it has no recognisable provider/label at all).
+#[must_use]
+pub fn doc_names_key(doc: &serde_json::Value, provider_id: &str, label: &str) -> bool {
+    doc.get("key_pools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|pools| {
+            pools.iter().any(|p| {
+                p.get("provider").and_then(serde_json::Value::as_str) == Some(provider_id)
+                    && p.get("keys")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|ks| {
+                            ks.iter().any(|k| {
+                                k.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                            })
+                        })
+            })
+        })
+}
+
+/// What [`delete`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// No such key — nothing recorded.
+    Absent,
+    /// The routing document names this key in a pool — nothing deleted (`409`).
+    InUseByRouting,
+}
+
+/// `OG-11`: the labels this tenant holds for `provider_id`, for the routing writer's
+/// "every pool label exists" check. Bound to the validated claim's tenant UUID.
+///
+/// # Errors
+/// Fail-CLOSED: a statement error refuses the write.
+pub async fn labels_with(
+    client: &tokio_postgres::Client,
+    tenant_id: &TenantId,
+) -> Result<Vec<(String, String)>> {
+    let rows = client
+        .query(
+            "SELECT provider_id, label FROM provider_keys WHERE tenant_id = $1
+             ORDER BY provider_id, label",
+            &[tenant_id.as_uuid()],
+        )
+        .await
+        .context("SELECT provider_keys (labels)")?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
 }
 
 /// Extract the last 4 chars of the plaintext for display. Used to render
@@ -268,6 +544,7 @@ const KEY_CACHE_TTL: Duration = Duration::from_secs(900);
 struct CachedKey {
     secret: Arc<SecretString>,
     fetched_at: Instant,
+    expires_at: Option<Instant>,
     /// B-568 F2: set by the ONE stale reader that claims the background refresh,
     /// cleared when that refresh fails (so the next reader retries). A renewed
     /// entry is a new `CachedKey`, so it starts unclaimed.
@@ -279,16 +556,22 @@ impl CachedKey {
         Self {
             secret,
             fetched_at: Instant::now(),
+            expires_at: None,
             refreshing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn is_fresh(&self) -> bool {
-        self.fetched_at.elapsed() < KEY_CACHE_TTL
+        self.expires_at.map_or_else(
+            || self.fetched_at.elapsed() < KEY_CACHE_TTL,
+            |until| Instant::now() < until,
+        )
     }
 }
 
-type KeyCacheMap = DashMap<(Uuid, String), CachedKey>;
+/// `(tenant, provider, label)` — `OG-11`: one entry per pool key, so two labels of one
+/// provider never share a cached plaintext.
+type KeyCacheMap = DashMap<(Uuid, String, String), CachedKey>;
 
 static BYOK_KEY_CACHE: OnceLock<Arc<ArcSwap<KeyCacheMap>>> = OnceLock::new();
 
@@ -307,7 +590,111 @@ fn cache() -> &'static Arc<ArcSwap<KeyCacheMap>> {
 /// it that has nothing to do with memory.
 const MAX_CACHED_KEYS: usize = 50_000;
 
+#[cfg(test)]
 pub fn cache_decrypted(tenant_id: &TenantId, provider_id: &str, secret: Arc<SecretString>) {
+    cache_decrypted_labeled(tenant_id, provider_id, DEFAULT_LABEL, secret);
+}
+
+type CacheKey = (Uuid, String, String);
+type Fills = std::collections::HashMap<CacheKey, std::sync::Weak<()>>;
+static FILLS: OnceLock<parking_lot::Mutex<Fills>> = OnceLock::new();
+
+fn fills() -> &'static parking_lot::Mutex<Fills> {
+    FILLS.get_or_init(|| parking_lot::Mutex::new(Fills::new()))
+}
+
+/// Authority to publish one cold database read. Revocation removes the ticket
+/// before evicting the secret. No plaintext or lock crosses the database wait.
+pub struct ColdFill {
+    key: CacheKey,
+    ticket: Arc<()>,
+    map: Arc<KeyCacheMap>,
+}
+
+impl Drop for ColdFill {
+    fn drop(&mut self) {
+        let mut pending = fills().lock();
+        if pending
+            .get(&self.key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|active| Arc::ptr_eq(&active, &self.ticket))
+        {
+            pending.remove(&self.key);
+        }
+    }
+}
+
+/// Called BEFORE reading the row, so a delete during that read fences its result.
+#[must_use]
+pub fn begin_cold_fill(tenant: &TenantId, provider: &str, label: &str) -> Option<ColdFill> {
+    let key = (*tenant.as_uuid(), provider.to_owned(), label.to_owned());
+    let ticket = Arc::new(());
+    let mut pending = fills().lock();
+    if pending.len() >= MAX_CACHED_KEYS && !pending.contains_key(&key) {
+        return None;
+    }
+    pending.insert(key.clone(), Arc::downgrade(&ticket));
+    Some(ColdFill {
+        key,
+        ticket,
+        map: cache().load_full(),
+    })
+}
+
+impl ColdFill {
+    /// False means this read lost to revocation or a newer read. Its secret must
+    /// neither enter the cache NOR be dispatched by the caller.
+    ///
+    /// `expires_at` is the customer-managed DEK expiry (OG-37): that plaintext is never
+    /// served past it. `None` for a platform-sealed key (the normal TTL/stale rules).
+    pub fn publish(&self, secret: Arc<SecretString>, expires_at: Option<Instant>) -> bool {
+        let pending = fills().lock();
+        let current = pending
+            .get(&self.key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|active| Arc::ptr_eq(&active, &self.ticket));
+        if !current || !Arc::ptr_eq(&self.map, &cache().load_full()) {
+            return false;
+        }
+        cache_decrypted_locked(&self.key, secret, expires_at);
+        true
+    }
+}
+
+/// Test fixture insertion; production fills must carry a pre-read ticket.
+#[cfg(test)]
+pub fn cache_decrypted_labeled(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    secret: Arc<SecretString>,
+) {
+    cache_decrypted_until(tenant_id, provider_id, label, secret, None);
+}
+
+/// Test fixture insertion with a customer-managed DEK expiry (OG-37).
+#[cfg(test)]
+pub fn cache_decrypted_until(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    secret: Arc<SecretString>,
+    expires_at: Option<Instant>,
+) {
+    let _pending = fills().lock();
+    cache_decrypted_locked(
+        &(
+            *tenant_id.as_uuid(),
+            provider_id.to_owned(),
+            label.to_owned(),
+        ),
+        secret,
+        expires_at,
+    );
+}
+
+/// Customer-managed plaintext inherits the DEK expiry; it is NEVER served stale.
+fn cache_decrypted_locked(key: &CacheKey, secret: Arc<SecretString>, expires_at: Option<Instant>) {
     let map = cache().load();
     // BOUND THE MAP. Before this it grew without limit: entries left only via an
     // explicit `invalidate`, so every (tenant, provider) pair ever seen stayed
@@ -336,9 +723,24 @@ pub fn cache_decrypted(tenant_id: &TenantId, provider_id: &str, secret: Arc<Secr
         }
     }
     map.insert(
-        (*tenant_id.as_uuid(), provider_id.to_string()),
-        CachedKey::new(secret),
+        key.clone(),
+        CachedKey {
+            expires_at,
+            ..CachedKey::new(secret)
+        },
     );
+}
+
+/// A KMS refusal or a configuration write removes every provider plaintext.
+pub fn invalidate_tenant(tenant: &TenantId) {
+    // MED round 2 (2026-10-05): drop the tenant's in-flight fill tickets FIRST, under the
+    // same lock `publish` checks, so a fill that read the old (e.g. just-deleted KMS)
+    // configuration loses — exactly what the per-key `invalidate` does.
+    let mut pending = fills().lock();
+    pending.retain(|(id, _, _), _| id != tenant.as_uuid());
+    cache()
+        .load()
+        .retain(|(id, _, _), _| id != tenant.as_uuid());
 }
 
 // ---------------------------------------------------------------------
@@ -460,6 +862,7 @@ pub enum CachedLookup {
 pub enum RefreshOutcome {
     /// The row is there and decrypted — the re-read key.
     Renewed(Arc<SecretString>),
+    RenewedUntil(Arc<SecretString>, Option<Instant>),
     /// No row, or it no longer decrypts under its AAD. Evict (fail-CLOSED).
     Gone,
     /// The store could not be read. Keep serving inside the bound; re-arm.
@@ -471,11 +874,28 @@ pub enum RefreshOutcome {
 /// Supersedes `lookup_cached` (fresh-only; deleted 2026-09-27, B-568 F2) — its one
 /// caller, `server::dispatch::resolve_provider_key`, moved here. The warm path is
 /// unchanged: the same one `DashMap` probe, plus an `elapsed()` comparison.
+#[cfg(test)]
 pub fn lookup_swr(tenant_id: &TenantId, provider_id: &str) -> CachedLookup {
+    lookup_swr_labeled(tenant_id, provider_id, DEFAULT_LABEL)
+}
+
+/// [`lookup_swr`] for one pool `label` (`OG-11`).
+pub fn lookup_swr_labeled(tenant_id: &TenantId, provider_id: &str, label: &str) -> CachedLookup {
     let map = cache().load();
-    let Some(entry) = map.get(&(*tenant_id.as_uuid(), provider_id.to_string())) else {
+    let Some(entry) = map.get(&(
+        *tenant_id.as_uuid(),
+        provider_id.to_string(),
+        label.to_string(),
+    )) else {
         return CachedLookup::Miss;
     };
+    if let Some(until) = entry.expires_at {
+        return if Instant::now() < until {
+            CachedLookup::Fresh(Arc::clone(&entry.secret))
+        } else {
+            CachedLookup::Miss
+        };
+    }
     match classify(entry.fetched_at.elapsed(), key_stale_max()) {
         Freshness::Fresh => CachedLookup::Fresh(Arc::clone(&entry.secret)),
         Freshness::Stale => {
@@ -497,20 +917,46 @@ pub fn lookup_swr(tenant_id: &TenantId, provider_id: &str) -> CachedLookup {
 /// If the entry was invalidated (a customer replaced or deleted the key through
 /// the API) or replaced by a newer fill while the refresh was in flight, the
 /// result is dropped: a refresh that read the old row must never overwrite that.
+#[cfg(test)]
 pub fn complete_refresh(
     tenant_id: &TenantId,
     provider_id: &str,
     served: &Arc<SecretString>,
     outcome: RefreshOutcome,
 ) {
+    complete_refresh_labeled(tenant_id, provider_id, DEFAULT_LABEL, served, outcome);
+}
+
+/// [`complete_refresh`] for one pool `label` (`OG-11`).
+pub fn complete_refresh_labeled(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    served: &Arc<SecretString>,
+    outcome: RefreshOutcome,
+) {
     let map = cache().load();
-    let key = (*tenant_id.as_uuid(), provider_id.to_string());
+    let key = (
+        *tenant_id.as_uuid(),
+        provider_id.to_string(),
+        label.to_string(),
+    );
     match outcome {
         RefreshOutcome::Renewed(secret) => {
             if let Some(mut entry) = map.get_mut(&key)
                 && Arc::ptr_eq(&entry.secret, served)
             {
                 *entry = CachedKey::new(secret);
+            }
+        }
+        RefreshOutcome::RenewedUntil(secret, expires_at) => {
+            if let Some(mut entry) = map.get_mut(&key)
+                && Arc::ptr_eq(&entry.secret, served)
+            {
+                *entry = CachedKey {
+                    expires_at,
+                    ..CachedKey::new(secret)
+                };
             }
         }
         RefreshOutcome::Gone => {
@@ -539,7 +985,11 @@ fn cache_decrypted_at(
     fetched_at: Instant,
 ) {
     cache().load().insert(
-        (*tenant_id.as_uuid(), provider_id.to_string()),
+        (
+            *tenant_id.as_uuid(),
+            provider_id.to_string(),
+            DEFAULT_LABEL.to_string(),
+        ),
         CachedKey {
             fetched_at,
             ..CachedKey::new(secret)
@@ -550,10 +1000,15 @@ fn cache_decrypted_at(
 /// Invalidate one cache entry. Called after `upsert` / `delete` so a
 /// fresh API call sees the change immediately rather than waiting on
 /// TTL expiry.
-pub fn invalidate(tenant_id: &TenantId, provider_id: &str) {
-    cache()
-        .load()
-        .remove(&(*tenant_id.as_uuid(), provider_id.to_string()));
+pub fn invalidate(tenant_id: &TenantId, provider_id: &str, label: &str) {
+    let key = (
+        *tenant_id.as_uuid(),
+        provider_id.to_owned(),
+        label.to_owned(),
+    );
+    let mut pending = fills().lock();
+    pending.remove(&key);
+    cache().load().remove(&key);
 }
 
 // ---------------------------------------------------------------------
@@ -564,6 +1019,62 @@ pub fn invalidate(tenant_id: &TenantId, provider_id: &str) {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret as _;
+
+    /// MED round 2 (security re-review, 2026-10-05): a TENANT-wide invalidation (a KMS
+    /// configuration delete/rotate) must fence that tenant's in-flight cold fills the way
+    /// the per-key `invalidate` does — a fill that read the OLD configuration must not
+    /// publish after the delete committed. Other tenants' fills are untouched.
+    #[test]
+    fn r2_tenant_invalidation_fences_in_flight_cold_fills() {
+        let a = fresh_tenant();
+        let b = fresh_tenant();
+        let old = begin_cold_fill(&a, "openai", "default").unwrap();
+        let other = begin_cold_fill(&b, "openai", "default").unwrap();
+        invalidate_tenant(&a);
+        assert!(
+            !old.publish(secret("read-under-the-deleted-config"), None),
+            "a fill that read the revoked configuration must not publish"
+        );
+        assert!(matches!(
+            lookup_swr_labeled(&a, "openai", "default"),
+            CachedLookup::Miss
+        ));
+        assert!(
+            other.publish(secret("other"), None),
+            "tenant B is unaffected"
+        );
+        invalidate_tenant(&b);
+    }
+
+    #[test]
+    fn og11_revocation_fences_cold_fills_without_affecting_other_tenants() {
+        let a = fresh_tenant();
+        let b = fresh_tenant();
+        let old = begin_cold_fill(&a, "openai", "team-a").unwrap();
+        let other = begin_cold_fill(&b, "openai", "team-a").unwrap();
+        invalidate(&a, "openai", "team-a");
+        assert!(!old.publish(secret("revoked"), None));
+        assert!(other.publish(secret("other"), None));
+        assert!(matches!(
+            lookup_swr_labeled(&a, "openai", "team-a"),
+            CachedLookup::Miss
+        ));
+        let fresh = begin_cold_fill(&a, "openai", "team-a").unwrap();
+        assert!(fresh.publish(secret("rotated"), None));
+        assert!(!old.publish(secret("revoked"), None));
+        assert_eq!(
+            served(lookup_swr_labeled(&a, "openai", "team-a"))
+                .0
+                .as_deref(),
+            Some("rotated")
+        );
+        assert_eq!(
+            served(lookup_swr_labeled(&b, "openai", "team-a"))
+                .0
+                .as_deref(),
+            Some("other")
+        );
+    }
 
     // ── B-568 F2: stale-while-revalidate ────────────────────────────────
 
@@ -669,7 +1180,7 @@ mod tests {
         let old = secret("sk-raced");
         cache_decrypted_at(&t, "openai", Arc::clone(&old), just_expired());
         let _ = lookup_swr(&t, "openai");
-        invalidate(&t, "openai");
+        invalidate(&t, "openai", DEFAULT_LABEL);
         complete_refresh(
             &t,
             "openai",
@@ -688,6 +1199,37 @@ mod tests {
             served(lookup_swr(&t, "openai")),
             (Some("sk-new".into()), None)
         );
+    }
+
+    /// `OG-11`: two labels of one provider are two cache entries — a pool key is never
+    /// served for another label, and invalidating one leaves the other.
+    #[test]
+    fn og11_labels_are_separate_cache_entries() {
+        let t = fresh_tenant();
+        cache_decrypted_labeled(&t, "openai", "team-a", secret("sk-a"));
+        cache_decrypted_labeled(&t, "openai", "team-b", secret("sk-b"));
+        assert_eq!(
+            served(lookup_swr_labeled(&t, "openai", "team-a")),
+            (Some("sk-a".into()), None)
+        );
+        assert_eq!(
+            served(lookup_swr(&t, "openai")),
+            (None, None),
+            "default unset"
+        );
+        invalidate(&t, "openai", "team-a");
+        assert_eq!(
+            served(lookup_swr_labeled(&t, "openai", "team-a")),
+            (None, None)
+        );
+        assert_eq!(
+            served(lookup_swr_labeled(&t, "openai", "team-b")),
+            (Some("sk-b".into()), None)
+        );
+        assert!(valid_label("team-b") && valid_label("default"));
+        assert!(!valid_label("a:b") && !valid_label("-x") && !valid_label(""));
+        assert_eq!(target_id("openai", "default"), "openai");
+        assert_eq!(target_id("openai", "team-b"), "openai:team-b");
     }
 
     /// A fresh entry is served as fresh and claims no refresh; tenants never share.
@@ -809,5 +1351,29 @@ mod tests {
         // Valid JSON, no private_key_id → fall back rather than panic.
         let no_id = r#"{"type":"service_account","project_id":"abcd"}"#;
         assert_eq!(fingerprint_of("vertex", no_id), last4_of(no_id));
+    }
+
+    /// SB: a key with an interior control byte or whitespace is refused (it can only
+    /// fail at the header build); a structured JSON credential keeps its whitespace.
+    #[test]
+    fn sb_credential_bytes_must_be_sendable() {
+        for bad in [
+            "sk-ab\u{1}cd",
+            "sk-ab cd",
+            "sk-ab\ncd",
+            "sk-é",
+            "",
+            "{not json",
+            "{\"a\":\"\u{1}\"}",
+        ] {
+            assert!(!credential_bytes_ok(bad), "{bad:?} must be refused");
+        }
+        for good in [
+            "sk-proj-abc_DEF-123",
+            "AKIA:secret/with+chars=",
+            "{\n  \"type\": \"service_account\",\n\t\"private_key\": \"-----BEGIN-----\\nabc\\n\"\n}",
+        ] {
+            assert!(credential_bytes_ok(good), "{good:?} is sendable");
+        }
     }
 }

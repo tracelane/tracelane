@@ -24,36 +24,43 @@
 //! Run: `cargo bench -p gateway --bench gateway_throughput`.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use gateway::circuit_breaker::CircuitBreaker;
+use gateway::circuit_breaker::{CircuitBreaker, Cred, Outcome};
 use gateway::rate_limiter::RateLimiter;
 use tracelane_shared::TenantId;
 use uuid::Uuid;
 
 /// Warmed admission state for one tenant + one upstream (steady-state path,
 /// not first-insert allocation).
-fn warmed() -> (CircuitBreaker, RateLimiter, TenantId) {
+fn warmed() -> (CircuitBreaker, RateLimiter, TenantId, Cred) {
     let cb = CircuitBreaker::default();
     let limiter = RateLimiter::new();
     let tid = TenantId::from_jwt_claim(Uuid::new_v4());
+    // OG-13: a tenant's own BYOK credential — the hosted shape.
+    let cred = Cred::byok(tid.as_uuid(), "openai", "default");
     // Warm both maps.
-    let _ = cb.allow("openai", "default");
-    cb.record("openai", "default", true);
+    let _ = cb.allow("openai", "default", &cred);
+    cb.record("openai", "default", &cred, Outcome::Success);
     let _ = limiter.check(&tid, Some(600));
-    (cb, limiter, tid)
+    (cb, limiter, tid, cred)
 }
 
 /// The full admission overhead: breaker gate → rate-limit check → record outcome.
 /// This is what runs on every request before dispatch.
 fn bench_admission_overhead(c: &mut Criterion) {
-    let (cb, limiter, tid) = warmed();
+    let (cb, limiter, tid, cred) = warmed();
     c.bench_function("gateway_admission_overhead", |b| {
         b.iter(|| {
-            let allowed = black_box(cb.allow(black_box("openai"), black_box("default")));
+            let allowed = black_box(cb.allow(black_box("openai"), black_box("default"), &cred));
             let _ = black_box(limiter.check(black_box(&tid), black_box(Some(600))));
             cb.record(
                 black_box("openai"),
                 black_box("default"),
-                black_box(allowed),
+                &cred,
+                black_box(if allowed {
+                    Outcome::Success
+                } else {
+                    Outcome::UpstreamFault
+                }),
             );
         });
     });
@@ -61,10 +68,10 @@ fn bench_admission_overhead(c: &mut Criterion) {
 
 /// The breaker gate alone — the v2.0 hot-path addition (ADR-036).
 fn bench_breaker_allow(c: &mut Criterion) {
-    let (cb, _limiter, _tid) = warmed();
+    let (cb, _limiter, _tid, cred) = warmed();
     c.bench_function("circuit_breaker_allow", |b| {
         b.iter(|| {
-            let _ = black_box(cb.allow(black_box("openai"), black_box("default")));
+            let _ = black_box(cb.allow(black_box("openai"), black_box("default"), &cred));
         });
     });
 }

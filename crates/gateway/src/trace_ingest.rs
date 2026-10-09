@@ -207,6 +207,9 @@ fn backfill_span_costs(spans: &mut [tracelane_shared::TracelaneSpan]) {
             continue;
         };
         attrs.gen_ai_usage_cost = crate::pricing::cost_usd(&model, &usage);
+        if attrs.gen_ai_usage_cost.is_some() {
+            attrs.tracelane_usage_cost_origin = Some("computed".to_string());
+        }
     }
 }
 
@@ -220,6 +223,16 @@ fn capture_batch(
         max_field_bytes: capture.max_field_bytes,
     };
     for span in spans {
+        // Equality survives capture OFF; raw arguments never survive this gate.
+        // No key means no fingerprint, never a public/unkeyed hash fallback.
+        span.attributes.gen_ai_tool_call_arg_fp = span
+            .attributes
+            .gen_ai_tool_call_arguments
+            .as_deref()
+            .and_then(|raw| {
+                crate::tool_fingerprint::workspace_key(&span.tenant_id)
+                    .map(|key| crate::tool_fingerprint::with_key(&key, raw))
+            });
         tracelane_shared::otlp::content::apply_capture(span, &halves);
     }
 }
@@ -504,6 +517,16 @@ pub async fn ingest_traces_handler(
     // that retry land once.
     let n_total = payloads.len();
     let n_rejected = publish_batch(&nats, payloads).await;
+    // OG-50: the customer's own OTLP export (second tap site; the first is
+    // `otlp_emit::spawn_publish`). Only for a batch JetStream accepted WHOLE: a rejected batch
+    // is answered 503 and the SDK retries it, so offering now would export it twice. The spans
+    // were content-gated by `capture_batch` above, so the export carries what capture stored.
+    // Synchronous, no I/O, never fails the request.
+    if n_rejected == 0 {
+        for span in &batch.spans {
+            crate::otlp_emit::tap_span(span);
+        }
+    }
 
     if n_rejected > 0 {
         // OTLP's partial-success shape, matching what ingest's own receiver
@@ -704,6 +727,61 @@ mod tests {
     #[test]
     fn nats_payload_ceiling_matches_the_broker_default() {
         assert_eq!(MAX_NATS_PAYLOAD_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn otlp_argument_equality_precedes_capture_off() {
+        crate::tool_fingerprint::init_from_existing_pepper(&"07".repeat(32)).unwrap();
+        let mut original = bare_span();
+        original
+            .attributes
+            .extra
+            .insert("gen_ai.tool.name".into(), "search".into());
+        original.attributes.gen_ai_tool_call_arguments = Some(r#"{"city":"Paris"}"#.into());
+        let key = crate::tool_fingerprint::workspace_key(&original.tenant_id).unwrap();
+        let expected = crate::tool_fingerprint::with_key(&key, r#"{"city":"Paris"}"#);
+        let mut spans = vec![original];
+        capture_batch(&mut spans, crate::server::config::ContentCapture::OFF);
+        let stored = serde_json::to_value(&spans[0]).unwrap();
+        assert_eq!(
+            stored["attributes"]["gen_ai_tool_call_arg_fp"], expected,
+            "fingerprint must be computed before capture strips arguments"
+        );
+        assert!(spans[0].attributes.gen_ai_tool_call_arguments.is_none());
+        capture_batch(&mut spans, crate::server::config::ContentCapture::OFF);
+        assert!(
+            spans[0].attributes.gen_ai_tool_call_arg_fp.is_none(),
+            "no arguments must not fabricate equality"
+        );
+        let mut full = bare_span();
+        let raw = format!("private-{}", "x".repeat(200));
+        full.attributes.gen_ai_tool_call_arguments = Some(raw.clone());
+        let expected = crate::tool_fingerprint::with_key(
+            &crate::tool_fingerprint::workspace_key(&full.tenant_id).unwrap(),
+            &raw,
+        );
+        let mut spans = vec![full];
+        capture_batch(
+            &mut spans,
+            crate::server::config::ContentCapture {
+                input: true,
+                output: true,
+                max_field_bytes: 32,
+            },
+        );
+        assert_eq!(
+            spans[0].attributes.gen_ai_tool_call_arg_fp.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(
+            spans[0]
+                .attributes
+                .gen_ai_tool_call_arguments
+                .as_ref()
+                .unwrap()
+                .len()
+                < raw.len()
+        );
     }
 
     #[test]
@@ -950,7 +1028,13 @@ mod tests {
             include_str!("server/errors.rs"),
             include_str!("server/quota.rs"),
         ];
-        let server_count: usize = chat_path.iter().map(|s| s.matches(CALL).count()).sum();
+        // `c2301607` routed two of the five through the alias-aware wrapper;
+        // they are the same call sites, so both spellings count.
+        const ROUTED: &str = concat!("crate", "::pricing::cost_usd_for_routed_model(");
+        let server_count: usize = chat_path
+            .iter()
+            .map(|s| s.matches(CALL).count() + s.matches(ROUTED).count())
+            .sum();
         assert_eq!(
             server_count, 5,
             "the chat path's cost_usd call-site count changed ({server_count}, \

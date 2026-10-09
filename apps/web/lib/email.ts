@@ -24,7 +24,7 @@ function noteUnconfigured(): void {
 	if (warnedUnconfigured) return;
 	warnedUnconfigured = true;
 	console.warn(
-		"TRACELANE_DEGRADED email_unconfigured — RESEND_API_KEY is not set; billing emails are not being sent.",
+		"TRACELANE_DEGRADED email_unconfigured — RESEND_API_KEY is not set; billing and welcome emails are not being sent.",
 	);
 }
 
@@ -33,6 +33,12 @@ export interface SendEmailInput {
 	subject: string;
 	html: string;
 	text: string;
+	/** Sender override. Omitted → the billing sender (`FROM`). PLT-52 welcome mail passes `RESEND_FROM`. */
+	from?: string;
+	/** Resend `reply_to`. Omitted → the field is not sent at all. */
+	replyTo?: string;
+	/** Resend `Idempotency-Key` (max 256 chars, 24 h): a repeat with the same key is dropped provider-side. */
+	idempotencyKey?: string;
 }
 
 /**
@@ -50,16 +56,23 @@ export async function sendEmail(input: SendEmailInput): Promise<boolean> {
 	try {
 		const res = await fetch(RESEND_API, {
 			method: "POST",
+			// A hung Resend call would be cut at the Worker's waitUntil limit with no
+			// failure line logged; fail after 10 s instead (security review L1, 2026-09-30).
+			signal: AbortSignal.timeout(10_000),
 			headers: {
 				authorization: `Bearer ${key}`,
 				"content-type": "application/json",
+				...(input.idempotencyKey
+					? { "idempotency-key": input.idempotencyKey }
+					: {}),
 			},
 			body: JSON.stringify({
-				from: FROM,
+				from: input.from ?? FROM,
 				to: [input.to],
 				subject: input.subject,
 				html: input.html,
 				text: input.text,
+				...(input.replyTo ? { reply_to: input.replyTo } : {}),
 			}),
 		});
 		if (!res.ok) {

@@ -63,6 +63,14 @@ HOT_PATHS = [
     ("crates/gateway/src/anthropic_messages.rs", "messages_admitted"),
     ("crates/gateway/src/anthropic_messages.rs", "count_tokens_with_claims"),
     ("crates/gateway/src/anthropic_messages.rs", "finish_span"),
+    # OG-02 — the Gemini-native wire is a fourth per-request inference path; same reasoning
+    # as the Anthropic block above (the handler is a wrapper, `gemini_admitted` is the pipeline).
+    ("crates/gateway/src/gemini_native.rs", "model_action_handler"),
+    ("crates/gateway/src/gemini_native.rs", "generate_with_labels"),
+    ("crates/gateway/src/gemini_native.rs", "gemini_admitted"),
+    ("crates/gateway/src/gemini_native.rs", "count_tokens_with_claims"),
+    ("crates/gateway/src/gemini_native.rs", "stream_response"),
+    ("crates/gateway/src/gemini_native.rs", "buffered_response"),
     ("crates/ingest/src/clickhouse_writer.rs", "flush"),
 ]
 

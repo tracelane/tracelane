@@ -57,6 +57,7 @@ const REASON_LABEL: Record<string, string> = {
 	CONFIG_MISSING: "Rail configuration missing",
 	DEPENDENCY_UNAVAILABLE: "Rail dependency unavailable",
 	DETECTOR_ERROR: "Detector errored",
+	UNSCANNABLE_MEDIA: "Attachment could not be scanned",
 	FORMAT_INVALID_JSON: "Response was not valid JSON",
 	FORMAT_REASK_EXHAUSTED: "Re-ask attempts exhausted",
 	FORMAT_REGEX_FAIL: "Output failed the required pattern",

@@ -4,7 +4,7 @@ use crate::clickhouse_query::{PlanTier, TenantQuery};
 use crate::db::provider_keys::{KeyValidation, ProviderKeyRow};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -258,13 +258,26 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error":message}))).into_response()
 }
 
+/// `?label=` — `OG-11`: which pool key to validate; absent = `default`.
+#[derive(Debug, Deserialize)]
+struct LabelQuery {
+    label: Option<String>,
+}
+
 /// Owner-only, tenant-scoped and fail CLOSED on auth, decrypt and storage failures.
-#[tracing::instrument(skip(headers, state, id))]
+#[tracing::instrument(skip(headers, state, id, q))]
 async fn validate(
     headers: HeaderMap,
     State(state): State<ValidationState>,
     Path(id): Path<String>,
+    Query(q): Query<LabelQuery>,
 ) -> Response {
+    let label = q
+        .label
+        .unwrap_or_else(|| crate::db::provider_keys::DEFAULT_LABEL.to_owned());
+    if !crate::db::provider_keys::valid_label(&label) {
+        return error(StatusCode::BAD_REQUEST, "invalid label");
+    }
     let auth = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
@@ -279,22 +292,59 @@ async fn validate(
     if !claims.is_verified_owner() {
         return error(StatusCode::FORBIDDEN, "workspace owner required");
     }
-    let source = match crate::db::provider_keys::get(&state.pool, &claims.tenant_id, &id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "provider key not found"),
-        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "provider key unavailable"),
+    // OG-36 allowlist + SSO-required; the actor is the OG-35 audit row's.
+    let actor = match crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageProviderKeys,
+        &headers,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(r) => return r.into_response(),
     };
+    let source =
+        match crate::db::provider_keys::get(&state.pool, &claims.tenant_id, &id, &label).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return error(StatusCode::NOT_FOUND, "provider key not found"),
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "provider key unavailable"),
+        };
     let Some(master) = crate::byok::master_key() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "key encryption unavailable",
         );
     };
-    let aad = crate::byok::provider_key_aad(&claims.tenant_id, &id);
-    let secret = match master.decrypt_with_context(&source.ciphertext_b64, &aad) {
-        Ok(secret) => secret,
-        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "provider key unavailable"),
+    let vault = match crate::kms::KeyVault::global() {
+        Ok(v) => v,
+        Err(e) => return crate::kms::failure_response(e),
     };
+    // No KMS fence (H1): this only READS the key, and `record_validation` is a CAS on
+    // the row's `updated_at`, so a concurrent rotation cannot be overwritten. Holding a
+    // fence here spanned the provider `check` call.
+    // H1 round 2: the pooled connection is released before the KMS await in `open`.
+    let config = match state.pool.get().await {
+        Ok(client) => match crate::kms::vault::load(&**client, &claims.tenant_id, master).await {
+            Ok(c) => c,
+            Err(e) => return crate::kms::failure_response(e),
+        },
+        Err(_) => return crate::kms::failure_response(crate::kms::VaultError::Lookup),
+    };
+    let opened = match vault
+        .open(
+            config.as_ref(),
+            &claims.tenant_id,
+            // OG-11 + OG-37: the AAD subject carries the label (`provider` for `default`).
+            &crate::db::provider_keys::target_id(&id, &label),
+            &source.ciphertext_b64,
+            master,
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return crate::kms::failure_response(e),
+    };
+    let secret = opened.secret;
     let result = check(&id, &secret, &claims.tenant_id).await;
     let result = KeyValidation {
         status: result.status.into(),
@@ -305,7 +355,7 @@ async fn validate(
         &state.pool,
         &claims.tenant_id,
         &source,
-        &claims.sub,
+        &actor.audit,
         &result,
     )
     .await
@@ -633,6 +683,7 @@ mod rejection_tests {
         let now = chrono::Utc::now();
         let key = ProviderKeyRow {
             provider_id: "bedrock".into(),
+            label: "default".into(),
             ciphertext_b64: "unused-test-ciphertext".into(),
             last4: "test".into(),
             saved_at: now - chrono::Duration::hours(1),
@@ -690,6 +741,7 @@ mod rejection_tests {
         let saved = chrono::Utc::now() - chrono::Duration::hours(1);
         let source = ProviderKeyRow {
             provider_id: "anthropic".into(),
+            label: "default".into(),
             ciphertext_b64: "unit-test-ciphertext".into(),
             last4: "test".into(),
             saved_at: saved,

@@ -12,8 +12,12 @@
  * must drop `since`/`until`.
  */
 
-/** Params a range PRESET is mutually exclusive with — cleared when `range` is set. */
-const CUSTOM_WINDOW_PARAMS = ["since", "until"] as const;
+import { TRACE_FILTERS, type TraceParam } from "./filter-registry";
+
+/** Params a range preset supersedes, from the same URL grammar. */
+const CUSTOM_WINDOW_PARAMS = TRACE_FILTERS.filter(
+	(entry) => entry.kind === "window" && entry.param !== "range",
+).map((entry) => entry.param);
 
 /**
  * Compute the next query string after setting `key=value` (empty `value`
@@ -22,12 +26,13 @@ const CUSTOM_WINDOW_PARAMS = ["since", "until"] as const;
  */
 export function nextFilterParams(
 	current: URLSearchParams,
-	key: string,
+	key: TraceParam,
 	value: string,
 ): string {
 	const next = new URLSearchParams(current.toString());
 	if (value) next.set(key, value);
 	else next.delete(key);
+	if (key === "status") next.delete("has_error");
 	next.delete("cursor"); // any filter change resets pagination
 	if (key === "range") {
 		for (const p of CUSTOM_WINDOW_PARAMS) next.delete(p);

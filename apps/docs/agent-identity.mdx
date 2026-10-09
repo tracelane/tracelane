@@ -39,9 +39,9 @@ client classifier stores only a catalog name, such as `claude-code`, or nothing
 for an unknown client. It does not store the request's User-Agent in the span.
 A recognised client name describes the request; it does not establish who sent it.
 
-The currently observed Codex CLI uses the Responses API. This gateway does not
-serve `/v1/responses`; a catalog entry alone does not make that protocol work.
-Use a supported gateway route or SDK span capture for identity activity.
+The currently observed Codex CLI uses the Responses API. The gateway serves
+`POST /v1/responses`, so a Codex session routed through it records one gateway span
+per call; see [Codex CLI](/integrations/codex) for the setup.
 
 ## Read a card
 

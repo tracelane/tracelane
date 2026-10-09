@@ -98,6 +98,23 @@ async fn authorize(headers: &HeaderMap, need: Need) -> Result<Claims, Response> 
     Ok(claims)
 }
 
+/// A WRITE: [`authorize`] (the role answer, unchanged), then the admin-plane gate —
+/// OG-36's allowlist and SSO-required — which yields the actor the store's audit row
+/// carries (OG-35).
+async fn authorize_write(
+    headers: &HeaderMap,
+) -> Result<(Claims, crate::control_plane::ControlActor), Response> {
+    let claims = authorize(headers, Need::Write).await?;
+    let actor = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::EditPolicies,
+        headers,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    Ok((claims, actor))
+}
+
 fn routable(model: &str) -> bool {
     ProviderRegistry::provider_id_for_model(model).is_some()
 }
@@ -159,7 +176,7 @@ async fn put_alias(
     headers: HeaderMap,
     body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let claims = match authorize(&headers, Need::Write).await {
+    let (claims, actor) = match authorize_write(&headers).await {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -204,18 +221,40 @@ async fn put_alias(
     if let Err(e) = store::validate_write(alias, target, &existing, max, routable) {
         return refusal(&e, target);
     }
+    // OG-11: an alias must not shadow one of the workspace's virtual models (the routing
+    // writer refuses the converse). Read fresh — a failed read refuses (fail-CLOSED).
+    match crate::db::routing::get(pool, &claims.tenant_id).await {
+        Ok(row) => {
+            let routing = crate::routing::RoutingState::from_stored(row.as_ref().map(|r| &r.doc));
+            if crate::routing::is_virtual(&routing, alias) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "alias_is_virtual_model",
+                    "that name is one of your virtual models (PUT /v1/routing) — pick another alias",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, tenant_id = %claims.tenant_id, "routing read before alias write failed");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "write_failed",
+                "could not save alias",
+            );
+        }
+    }
     match store::put(
         pool,
         &claims.tenant_id,
         alias,
         target,
-        &claims.sub,
+        &actor.audit,
         max,
         body.create,
     )
     .await
     {
-        Ok(PutOutcome::Created | PutOutcome::Updated) => {
+        Ok(PutOutcome::Created | PutOutcome::Updated(_)) => {
             if let Some(cache) = state.entitlements.as_ref() {
                 cache.invalidate(*claims.tenant_id.as_uuid()).await;
             }
@@ -274,7 +313,7 @@ async fn delete_alias(
     headers: HeaderMap,
     query: Result<Query<DeleteQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    let claims = match authorize(&headers, Need::Write).await {
+    let (claims, actor) = match authorize_write(&headers).await {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -288,7 +327,7 @@ async fn delete_alias(
             "no control plane",
         );
     };
-    match store::delete(pool, &claims.tenant_id, &q.alias).await {
+    match store::delete(pool, &claims.tenant_id, &q.alias, &actor.audit).await {
         Ok(true) => {
             if let Some(cache) = state.entitlements.as_ref() {
                 cache.invalidate(*claims.tenant_id.as_uuid()).await;
@@ -363,7 +402,7 @@ async fn put_failover(
     body: Result<Json<FailoverBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     use crate::db::workspace_failover::{self as wf, FailoverError};
-    let claims = match authorize(&headers, Need::Write).await {
+    let (claims, actor) = match authorize_write(&headers).await {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -423,7 +462,7 @@ async fn put_failover(
         enabled: body.enabled,
         models,
     };
-    if let Err(e) = wf::put(pool, &claims.tenant_id, &settings, &claims.sub).await {
+    if let Err(e) = wf::put(pool, &claims.tenant_id, &settings, &actor.audit).await {
         tracing::error!(error = %e, tenant_id = %claims.tenant_id, "workspace failover write failed");
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,

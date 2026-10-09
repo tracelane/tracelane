@@ -136,10 +136,20 @@ pub(crate) fn substitution(
     served: Option<&str>,
     alias_applied: bool,
     failover: bool,
+    routed: bool,
 ) -> Option<&'static str> {
     let served = served?;
     if served == requested {
         return None;
+    }
+    // OG-11/OG-12: a virtual model or a routing rule chose the target — our doing,
+    // recorded as such, never mistaken for a provider's silent substitution.
+    if routed {
+        return Some(if failover {
+            "virtual+failover"
+        } else {
+            "virtual"
+        });
     }
     Some(match (alias_applied, failover) {
         (true, true) => "alias+failover",
@@ -202,6 +212,11 @@ pub(crate) struct CapturedInput {
     /// GWY-53: the OLDEST messages left out so the field fits its cap; recorded
     /// on the span as `tracelane_input_messages_omitted` when non-zero.
     omitted: usize,
+    /// `C1` (security review 2026-10-02): the allowlisted unmodelled fields that egressed
+    /// with the request — every string leaf redacted then capped like message text, the
+    /// whole value bounded by one field cap. `None` when there were none, or when it does
+    /// not fit (then only `extra_keys` names them).
+    extra: Option<serde_json::Value>,
 }
 
 impl CapturedInput {
@@ -252,10 +267,19 @@ impl CapturedInput {
             serde_json::Value::String(s)
         });
 
+        let extra = (!req.extra.is_empty())
+            .then(|| {
+                let mut v = serde_json::Value::Object(req.extra.clone());
+                store_safe_json(&mut v, cap);
+                v
+            })
+            .filter(|v| v.to_string().len() <= cap);
+
         Some(Self {
             messages: serde_json::Value::Array(kept),
             system,
             omitted,
+            extra,
         })
     }
 
@@ -272,6 +296,21 @@ impl CapturedInput {
                 serde_json::Value::from(self.omitted),
             );
         }
+        if let Some(extra) = self.extra {
+            attrs
+                .extra
+                .insert("tracelane_input_extra".to_string(), extra);
+        }
+    }
+}
+
+/// `C1`: [`store_safe`] over every string leaf of a structured value.
+fn store_safe_json(v: &mut serde_json::Value, cap: usize) {
+    match v {
+        serde_json::Value::String(s) => store_safe(s, cap),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| store_safe_json(x, cap)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|x| store_safe_json(x, cap)),
+        _ => {}
     }
 }
 
@@ -349,6 +388,30 @@ fn cap_message(m: &mut tracelane_shared::model::Message, cap: usize) {
                             image_url.url.push_str("…[omitted]");
                         }
                         store_safe(&mut image_url.url, cap);
+                    }
+                    // OG-03: audio bytes and a PDF are customer content the capture policy
+                    // never stored as bytes and must not start storing now — same rule as
+                    // the image above: keep the media type, drop the payload.
+                    ContentPart::InputAudio { input_audio } => {
+                        input_audio.data = "…[omitted]".to_owned();
+                    }
+                    ContentPart::File { file } => {
+                        if let Some(data) = file.file_data.as_mut()
+                            && data.starts_with("data:")
+                            && let Some(comma) = data.find(',')
+                        {
+                            data.truncate(comma + 1);
+                            data.push_str("…[omitted]");
+                        }
+                        if let Some(d) = file.file_data.as_mut() {
+                            store_safe(d, cap);
+                        }
+                        if let Some(n) = file.filename.as_mut() {
+                            store_safe(n, cap);
+                        }
+                        if let Some(i) = file.file_id.as_mut() {
+                            store_safe(i, cap);
+                        }
                     }
                 }
             }
@@ -513,7 +576,7 @@ fn truncate_utf8(s: &mut String, max: usize) {
 /// signal that the list was cut. Worst case added to a span is ~2.6 KB, which is
 /// what keeps this inside the NATS payload limit GWY-45 warns about — an
 /// oversized span is dropped WHOLE, losing the trace rather than the text.
-const MAX_TOOL_NAMES: usize = 32;
+pub(crate) const MAX_TOOL_NAMES: usize = 32;
 const MAX_TOOL_NAME_BYTES: usize = 64;
 
 /// RI-05 / M19: bound a tool-name list the SAME way `RequestConfig::build`
@@ -582,6 +645,7 @@ pub(crate) fn bounded_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> Op
 /// `.clone()` calls it replaces.
 #[derive(Clone, Default)]
 pub(crate) struct CallerIdentity {
+    pub(crate) hook_events: crate::guardrail::hooks::Events,
     pub(crate) labels: super::request_labels::BoundedLabels,
     pub(crate) agent_name: Option<String>,
     pub(crate) client_name: Option<String>,
@@ -619,6 +683,93 @@ pub(crate) struct CallerIdentity {
     /// from a header. Rides the span as `tracelane_gateway_cold_start = true`, and
     /// only when the span also carries a measured overhead.
     pub(crate) cold_start: bool,
+    /// `OG-23`: the API key's project (`api_keys.project_id`, resolved in the auth
+    /// SELECT). Set by admission from the claims, never from a header.
+    pub(crate) project_id: Option<String>,
+    /// `OG-23`: the API key's environment label. When set it is what the span records as
+    /// `deployment_environment`, over the caller's `x-tracelane-environment` header — a
+    /// staging key's spend is never labelled production.
+    pub(crate) key_environment: Option<String>,
+    /// `OG-11` / `OG-12`: how the routing document dispatched this request (virtual
+    /// model, strategy, target, key label, rule, arm). Default = not routed, nothing on
+    /// the span. Set by the handler, never from a header.
+    pub(crate) route: RouteMeta,
+}
+
+/// `OG-11` / `OG-12`: the routing facts a span records (`tracelane_route_*`,
+/// `tracelane_key_label`) — in the span's attribute bag, so no ingest change is needed.
+/// The raw sticky value of a split is never here, only its SOURCE.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RouteMeta {
+    pub(crate) virtual_model: Option<String>,
+    pub(crate) strategy: Option<&'static str>,
+    /// The served target's index in the virtual model's declared list.
+    pub(crate) target_index: Option<usize>,
+    /// The key-pool label that served (set only when a pool chose it).
+    pub(crate) key_label: Option<String>,
+    pub(crate) rule: Option<String>,
+    pub(crate) arm: Option<String>,
+    pub(crate) bucket: Option<u32>,
+    pub(crate) sticky_source: Option<&'static str>,
+    pub(crate) non_sticky: bool,
+}
+
+impl RouteMeta {
+    /// The plan's half (the served target and key are filled in by the handler).
+    pub(crate) fn from_plan(plan: Option<&crate::routing::RoutePlan>) -> Self {
+        let Some(p) = plan.filter(|p| p.dispatches()) else {
+            return Self::default();
+        };
+        Self {
+            virtual_model: p.virtual_model.clone(),
+            strategy: p.strategy.map(crate::routing::Strategy::as_str),
+            target_index: p.candidates.first().map(|c| c.target_index),
+            rule: p.assignment.as_ref().map(|a| a.rule.clone()),
+            arm: p.assignment.as_ref().and_then(|a| a.arm.clone()),
+            bucket: p.assignment.as_ref().and_then(|a| a.bucket),
+            sticky_source: p.assignment.as_ref().and_then(|a| a.sticky_source),
+            non_sticky: p.assignment.as_ref().is_some_and(|a| a.non_sticky),
+            ..Self::default()
+        }
+    }
+
+    /// A virtual model or a rule moved the request (the substitution is `virtual`).
+    pub(crate) fn routed(&self) -> bool {
+        self.virtual_model.is_some() || self.rule.is_some()
+    }
+
+    fn apply(&self, attrs: &mut tracelane_shared::span::SpanAttributes) {
+        let mut put = |k: &str, v: serde_json::Value| {
+            attrs.extra.insert(k.to_owned(), v);
+        };
+        if let Some(v) = &self.virtual_model {
+            put("tracelane_route_virtual_model", serde_json::json!(v));
+        }
+        if let Some(v) = self.strategy {
+            put("tracelane_route_strategy", serde_json::json!(v));
+        }
+        if let Some(v) = self.target_index {
+            put("tracelane_route_target_index", serde_json::json!(v));
+        }
+        if let Some(v) = &self.key_label {
+            put("tracelane_key_label", serde_json::json!(v));
+        }
+        if let Some(v) = &self.rule {
+            put("tracelane_route_rule", serde_json::json!(v));
+        }
+        if let Some(v) = &self.arm {
+            put("tracelane_route_arm", serde_json::json!(v));
+        }
+        if let Some(v) = self.bucket {
+            put("tracelane_route_bucket", serde_json::json!(v));
+        }
+        if let Some(v) = self.sticky_source {
+            put("tracelane_route_sticky_source", serde_json::json!(v));
+        }
+        if self.non_sticky {
+            put("tracelane_route_non_sticky", serde_json::json!(true));
+        }
+    }
 }
 
 /// `Debug` that prints PRESENCE, never VALUES.
@@ -682,6 +833,7 @@ impl CallerIdentity {
                 .and_then(tracelane_shared::span::bounded_end_user_id)
         };
         Self {
+            hook_events: Default::default(),
             labels: Default::default(),
             agent_name: headers
                 .get("x-tracelane-agent-name")
@@ -709,6 +861,11 @@ impl CallerIdentity {
                 .get("x-tracelane-step-index")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u32>().ok()),
+            // OG-23: set by admission from the CLAIMS, never from a header.
+            project_id: None,
+            key_environment: None,
+            // OG-11/OG-12: set by the handler from the routing plan, never here.
+            route: RouteMeta::default(),
         }
     }
 
@@ -780,6 +937,10 @@ pub(crate) struct RequestConfig {
     tool_names: Option<Vec<String>>,
     tool_definitions_hash: Option<String>,
     deployment_id: Option<String>,
+    /// OG-03. Names (never values) of the unmodelled top-level fields, sorted and bounded.
+    extra_keys: Option<Vec<String>>,
+    /// OG-03. Image / audio / file parts carried; rails R2–R8 scan text parts only.
+    non_text_parts: Option<u32>,
     /// OBS-52. Populated by [`RequestConfig::with_policy_flags`], never by
     /// `build` — a detector's verdict is not request configuration, and keeping
     /// them in one struct only because they travel together would let a future
@@ -789,6 +950,11 @@ pub(crate) struct RequestConfig {
     /// constraint — request configuration in the literal sense: the caller asked for it.
     zdr_required: Option<bool>,
     zdr_eligible_providers: Option<Vec<String>>,
+    /// `OG-05` §3.4: `Some("chat_to_responses")` when the PRIMARY dispatch of this
+    /// request is bridged to the OpenAI Responses API; recorded as the span
+    /// attribute `tracelane.bridge`. (A failover hop that happens to bridge is
+    /// not marked: the config is the request's, built before any hop.)
+    bridge: Option<&'static str>,
 }
 
 impl RequestConfig {
@@ -889,9 +1055,24 @@ impl RequestConfig {
             tool_names,
             tool_definitions_hash,
             deployment_id: deployment_identity(&req.model),
+            extra_keys: crate::request_support::extra_keys(req).map(|keys| {
+                // Bounded exactly like the tool-name list: a key is caller-chosen text.
+                keys.into_iter()
+                    .take(MAX_TOOL_NAMES)
+                    .map(|mut k| {
+                        truncate_utf8(&mut k, MAX_TOOL_NAME_BYTES);
+                        k
+                    })
+                    .collect()
+            }),
+            non_text_parts: Some(crate::request_support::non_text_part_count(req))
+                .filter(|n| *n > 0),
             misconfig_flags: None,
             zdr_required: None,
             zdr_eligible_providers: None,
+            bridge: crate::providers::ProviderRegistry::provider_id_for_model(&req.model)
+                .filter(|p| crate::providers::responses_bridge::applies(p, req))
+                .map(|_| crate::providers::responses_bridge::BRIDGE_NAME),
         }
     }
 
@@ -969,9 +1150,16 @@ impl RequestConfig {
         attrs.tracelane_request_tool_names = self.tool_names;
         attrs.tracelane_request_tool_definitions_hash = self.tool_definitions_hash;
         attrs.tracelane_request_deployment_id = self.deployment_id;
+        attrs.tracelane_request_extra_keys = self.extra_keys;
+        attrs.tracelane_request_non_text_parts = self.non_text_parts;
         attrs.tracelane_misconfig_flags = self.misconfig_flags;
         attrs.tracelane_zdr_required = self.zdr_required;
         attrs.tracelane_zdr_eligible_providers = self.zdr_eligible_providers;
+        if let Some(b) = self.bridge {
+            attrs
+                .extra
+                .insert("tracelane.bridge".into(), serde_json::json!(b));
+        }
     }
 }
 
@@ -1120,6 +1308,29 @@ pub(crate) fn build_gateway_span(
     let gateway_overhead_us = timing.and_then(|t| {
         gateway_overhead_us(start_time, t.dispatch_ts, t.provider_complete_ts, end_time)
     });
+    let computed_cost = usage_meta
+        .cost_usd
+        .is_none()
+        .then(|| {
+            crate::pricing::cost_usd_for_routed_model(
+                model,
+                super::config::alias(model),
+                &tracelane_shared::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens: usage_meta.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage_meta.cache_creation_input_tokens,
+                },
+            )
+        })
+        .flatten();
+    let cost_origin = if usage_meta.cost_usd.is_some() {
+        Some("provider_reported".to_string())
+    } else if computed_cost.is_some() {
+        Some("computed".to_string())
+    } else {
+        None
+    };
     let ttft_secs = timing
         .and_then(|t| t.ttft_us)
         .map(|us| f64::from(us) / 1_000_000.0);
@@ -1163,6 +1374,7 @@ pub(crate) fn build_gateway_span(
                 usage_meta.served.model.as_deref(),
                 alias_applied,
                 failover_from.is_some(),
+                identity.route.routed(),
             )
             .map(str::to_owned),
             tracelane_usage_input_includes_cache: (provider == "anthropic").then_some(false),
@@ -1176,17 +1388,8 @@ pub(crate) fn build_gateway_span(
             // Provider-reported cost when present; otherwise derive it from the
             // token counts + the model price catalog. `None` (unknown model) is
             // preserved — the gateway never fabricates a cost (ADR-055).
-            gen_ai_usage_cost: usage_meta.cost_usd.or_else(|| {
-                crate::pricing::cost_usd(
-                    model,
-                    &tracelane_shared::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_input_tokens: usage_meta.cache_read_input_tokens,
-                        cache_creation_input_tokens: usage_meta.cache_creation_input_tokens,
-                    },
-                )
-            }),
+            gen_ai_usage_cost: usage_meta.cost_usd.or(computed_cost),
+            tracelane_usage_cost_origin: cost_origin,
             gen_ai_request_stream: Some(usage_meta.stream),
             gen_ai_response_time_to_first_chunk: ttft_secs,
             tracelane_gateway_overhead_us: gateway_overhead_us,
@@ -1223,19 +1426,23 @@ pub(crate) fn build_gateway_span(
             },
             // GWY-43: which API key paid for this. `None` for a JWT session.
             tracelane_api_key_id: api_key_id.map(str::to_owned),
+            // OG-23: which project that key belongs to (absent = none).
+            tracelane_project_id: identity.project_id.clone(),
             // RI-05 M5: OpenAI's `system_fingerprint`, spelled as the OTLP passthrough
             // spells it (`decode.rs` maps `gen_ai.openai.*` → `openai.*` into `extra`).
-            extra: usage_meta
-                .served
-                .system_fingerprint
-                .as_ref()
-                .map(|fp| {
-                    std::collections::HashMap::from([(
-                        "openai.response.system_fingerprint".to_string(),
+            extra: {
+                let mut extra = std::collections::HashMap::new();
+                if let Some(fp) = &usage_meta.served.system_fingerprint {
+                    extra.insert(
+                        "openai.response.system_fingerprint".into(),
                         serde_json::Value::String(fp.clone()),
-                    )])
-                })
-                .unwrap_or_default(),
+                    );
+                }
+                if let Some(events) = identity.hook_events.value() {
+                    extra.insert("tracelane.guardrail.hooks".into(), events);
+                }
+                extra
+            },
             ..Default::default()
         },
         // A FAILED request (upstream 4xx/5xx/timeout, mid-stream provider error, or
@@ -1259,6 +1466,12 @@ pub(crate) fn build_gateway_span(
         .labels
         .0
         .write_to(&mut span.attributes, &identity.labels.1);
+    // OG-11/OG-12: the routing facts, on every span the request produces.
+    identity.route.apply(&mut span.attributes);
+    // OG-23: the KEY's environment wins over the caller's header.
+    if let Some(env) = &identity.key_environment {
+        span.attributes.deployment_environment = Some(env.clone());
+    }
     span
 }
 
@@ -1273,6 +1486,11 @@ pub(crate) fn build_gateway_span(
 /// `api_keys.id` it read from Postgres) but is ignored rather than unwrapped:
 /// this runs on the response path and must not be able to panic a stream.
 pub(crate) fn record_key_spend(api_key_id: Option<&str>, span: &TracelaneSpan) {
+    // OG-21: reconcile this request's TPM reservation against its recorded usage.
+    crate::limits::reconcile_span(api_key_id, span);
+    // OG-22 / OG-24: the policy budgets (workspace, project, key, end user) and the
+    // thresholds this request crossed — queued, never awaited.
+    crate::budgets::record_span(api_key_id, span);
     let cost = span.attributes.gen_ai_usage_cost;
     let tracker = crate::spend::tracker();
     // The workspace total counts EVERY request, keyed or not — a session-driven
@@ -1342,7 +1560,7 @@ pub(crate) struct LogprobAccumulator {
 /// was ACTUALLY summarised, so a capped summary is never presented as a
 /// whole-response one — the count is the disclosure, exactly as
 /// `tracelane_request_tool_count` is for a truncated tool-name list.
-const MAX_LOGPROB_TOKENS: u32 = 2_048;
+pub(crate) const MAX_LOGPROB_TOKENS: u32 = 2_048;
 
 impl LogprobAccumulator {
     pub(crate) fn absorb(&mut self, logprobs: &[f64]) {
@@ -1594,29 +1812,29 @@ mod tests {
     #[test]
     fn substitution_is_observed_never_inferred() {
         assert_eq!(
-            substitution("gpt-4o", None, false, false),
+            substitution("gpt-4o", None, false, false, false),
             None,
             "served unknown → none"
         );
         assert_eq!(
-            substitution("gpt-4o", Some("gpt-4o"), true, true),
+            substitution("gpt-4o", Some("gpt-4o"), true, true, false),
             None,
             "equal → none"
         );
         assert_eq!(
-            substitution("my-alias", Some("gpt-4o-2024-08-06"), true, false),
+            substitution("my-alias", Some("gpt-4o-2024-08-06"), true, false, false),
             Some("alias")
         );
         assert_eq!(
-            substitution("gpt-4o", Some("claude-sonnet-4-6"), false, true),
+            substitution("gpt-4o", Some("claude-sonnet-4-6"), false, true, false),
             Some("failover")
         );
         assert_eq!(
-            substitution("a", Some("b"), true, true),
+            substitution("a", Some("b"), true, true, false),
             Some("alias+failover")
         );
         assert_eq!(
-            substitution("gpt-4o", Some("gpt-4o-2024-08-06"), false, false),
+            substitution("gpt-4o", Some("gpt-4o-2024-08-06"), false, false, false),
             Some("provider"),
             "neither we nor a failover changed it: the silent-substitution signal"
         );
@@ -1749,6 +1967,66 @@ mod tests {
         assert_eq!(a.tracelane_api_key_id.as_deref(), Some("APIKEY"));
         assert_eq!(span.status.message.as_deref(), Some("ERRORREASON"));
     }
+
+    /// OG-23 proof 5: the key's project rides the span, and the KEY's environment wins
+    /// over a conflicting `x-tracelane-environment` header — a staging key's spend is
+    /// never labelled production. No key environment → the header, as before.
+    #[test]
+    fn og23_the_span_carries_the_keys_project_and_its_environment_wins() {
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(7));
+        let mut h = HeaderMap::new();
+        h.insert("x-tracelane-environment", "production".parse().unwrap());
+        let labels = super::super::request_labels::read(
+            &h,
+            &tracelane_shared::labels::LabelCaps::embedded(),
+        );
+        let build = |identity: &CallerIdentity| {
+            build_gateway_span(
+                &tenant,
+                uuid::Uuid::from_u128(1),
+                None,
+                "gpt-4o",
+                identity,
+                chrono::Utc::now(),
+                1,
+                1,
+                None,
+                SpanUsageMeta {
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    stream: false,
+                    cost_usd: None,
+                    served: ServedMeta::default(),
+                    finish_reason: None,
+                    dispatch_attempts: Vec::new(),
+                    reasoning_output_tokens: None,
+                },
+                None,
+                None,
+                None,
+                Some("APIKEY"),
+            )
+        };
+        let governed = CallerIdentity {
+            labels: labels.clone(),
+            project_id: Some("00000000-0000-0000-0000-0000000000aa".into()),
+            key_environment: Some("staging".into()),
+            ..CallerIdentity::default()
+        };
+        let a = build(&governed).attributes;
+        assert_eq!(
+            a.tracelane_project_id.as_deref(),
+            Some("00000000-0000-0000-0000-0000000000aa")
+        );
+        assert_eq!(a.deployment_environment.as_deref(), Some("staging"));
+        let plain = CallerIdentity {
+            labels,
+            ..CallerIdentity::default()
+        };
+        let a = build(&plain).attributes;
+        assert_eq!(a.tracelane_project_id, None);
+        assert_eq!(a.deployment_environment.as_deref(), Some("production"));
+    }
     /// GWY-45. `truncate_utf8` must cut on a CHARACTER boundary and say that it
     /// cut. A silent truncation produces eval cases that look complete and are
     /// not; a byte-boundary cut produces invalid UTF-8 and loses the whole span
@@ -1820,6 +2098,7 @@ mod tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         };
         // No operator block AND no control plane: the decision the OSS self-host makes.
         let capture = crate::server::config::capture_decision(None, None, &tenant);
@@ -1860,6 +2139,7 @@ mod tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -1907,6 +2187,30 @@ mod tests {
             !stored.contains(GWY53_SECRET),
             "a secret was stored: {stored}"
         );
+        assert!(stored.contains("[REDACTED:aws_key]"), "{stored}");
+    }
+
+    /// C1 (security review 2026-10-02): the allowlisted unmodelled fields egress with the
+    /// request, so capture stores them — redacted like every other captured string.
+    #[test]
+    fn c1_allowlisted_extra_fields_are_captured_redacted() {
+        use tracelane_shared::model::MessageContent;
+        let mut req = gwy53_req(vec![gwy53_msg(MessageContent::Text("hi".into()))]);
+        req.extra.insert(
+            "reasoning".into(),
+            serde_json::json!({"effort": "high", "note": format!("key {GWY53_SECRET}")}),
+        );
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(gwy53_on(4096), &req)
+            .expect("capture on")
+            .apply(&mut attrs);
+        let stored = attrs
+            .extra
+            .get("tracelane_input_extra")
+            .expect("extra captured")
+            .to_string();
+        assert!(stored.contains("\"effort\":\"high\""), "{stored}");
+        assert!(!stored.contains(GWY53_SECRET), "{stored}");
         assert!(stored.contains("[REDACTED:aws_key]"), "{stored}");
     }
 
@@ -2090,6 +2394,7 @@ mod tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -2537,6 +2842,32 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn og31_hook_fail_open_is_recorded_on_the_span_and_shared_with_abort_identity() {
+        let identity = CallerIdentity::default();
+        let abort_identity = identity.clone();
+        identity
+            .hook_events
+            .record(&[crate::guardrail::hooks::Event {
+                hook_id: Uuid::new_v4(),
+                phase: crate::guardrail::hooks::Phase::Pre,
+                fail_mode: crate::guardrail::hooks::FailMode::Open,
+                outcome: "fail_open",
+                reason: "HOOK_TIMEOUT",
+                latency_ms: 20,
+            }]);
+        let span = span_with(&abort_identity, None);
+        let event = &span.attributes.extra["tracelane.guardrail.hooks"][0];
+        assert_eq!(event["outcome"], "fail_open");
+        assert_eq!(event["reason"], "HOOK_TIMEOUT");
+        assert!(
+            !span_with(&CallerIdentity::default(), None)
+                .attributes
+                .extra
+                .contains_key("tracelane.guardrail.hooks")
+        );
     }
 
     fn now_timing() -> Option<GatewayTiming> {

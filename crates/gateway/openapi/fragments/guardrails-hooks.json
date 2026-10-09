@@ -1,0 +1,84 @@
+{
+  "module": "crates/gateway/src/guardrail/hooks_api.rs",
+  "operations": {
+    "PUT /v1/guardrails/hooks/{id}": {
+      "summary": "Create or replace one signed custom guardrail hook (specs/OG-31); the credential is sealed and the signing secret shown once.",
+      "tags": [
+        "guardrails"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "The hook (credential never returned).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_hook / invalid_hook_credential / invalid_hook_destination",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "hook_limit_reached",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_hook",
+        "invalid_hook_credential",
+        "invalid_hook_destination",
+        "hook_limit_reached",
+        "hooks_unavailable",
+        "hook_write_failed"
+      ]
+    },
+    "DELETE /v1/guardrails/hooks/{id}": {
+      "summary": "Delete one custom guardrail hook.",
+      "tags": [
+        "guardrails"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "204": {
+          "description": "Deleted."
+        },
+        "404": {
+          "description": "hook_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "hook_not_found",
+        "hooks_unavailable",
+        "hook_write_failed"
+      ]
+    }
+  }
+}

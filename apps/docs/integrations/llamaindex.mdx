@@ -51,8 +51,7 @@ each retrieved node, synthesizer, and the LLM call.
   **An OTel span and a gateway call are not the same unit, and they are not counted the
   same way.** A gateway request and an OTel span both count as ingest bytes against the
   SAME meter — there is no separate quota for one path or the other. On this OTel path
-  your app sends **spans**, and one agent run is many spans — the tree above is 11 for a
-  single `invoke()`. Size your ingest estimate against **spans per run**, not runs, and
+  your app sends **spans**, and one agent run can emit many spans. Size your ingest estimate against **spans per run**, not runs, and
   see [pricing](/pricing).
 </Warning>
 

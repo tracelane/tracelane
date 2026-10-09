@@ -131,7 +131,8 @@ CREATE TABLE IF NOT EXISTS tracelane.trace_summaries
     span_count       SimpleAggregateFunction(sum, UInt64),
     error_count      SimpleAggregateFunction(sum, UInt64),
     intervention     SimpleAggregateFunction(max, UInt8),
-    model            SimpleAggregateFunction(max, String),
+    model            SimpleAggregateFunction(max, String), -- Fallback when no successful model exists.
+    model_rank       SimpleAggregateFunction(min, String) DEFAULT '2:',
     -- Read-time from the MERGED bounds; a per-batch duration is not a component of the
     -- trace's duration, so it must never be stored.
     duration_us      Int64 ALIAS dateDiff('microsecond', start_time, end_time),
@@ -200,7 +201,29 @@ SELECT
             nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
             JSONExtractString(s.attributes, 'llm.model_name')
         )
-    )                                                        AS model
+    )                                                        AS model,
+    -- A success ranks before every error, then by span start time. Batches with no
+    -- successful model contribute '2:' so they cannot hide a later success.
+    min(if(
+        s.status_code != 2 AND coalesce(
+            nullIf(JSONExtractString(s.attributes, 'gen_ai_response_model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai_request_model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai.response.model'), ''),
+            nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
+            JSONExtractString(s.attributes, 'llm.model_name')
+        ) != '',
+        concat(
+            '0:', leftPad(toString(toUnixTimestamp64Micro(s.start_time)), 20, '0'), ':',
+            coalesce(
+                nullIf(JSONExtractString(s.attributes, 'gen_ai_response_model'), ''),
+                nullIf(JSONExtractString(s.attributes, 'gen_ai_request_model'), ''),
+                nullIf(JSONExtractString(s.attributes, 'gen_ai.response.model'), ''),
+                nullIf(JSONExtractString(s.attributes, 'gen_ai.request.model'), ''),
+                JSONExtractString(s.attributes, 'llm.model_name')
+            )
+        ),
+        '2:'
+    ))                                                       AS model_rank
 FROM tracelane.spans AS s
 GROUP BY s.tenant_id, s.trace_id;
 
@@ -487,3 +510,60 @@ ENGINE = MergeTree
 ORDER BY (detected_at)
 TTL toDateTime(detected_at) + INTERVAL 730 DAY
 SETTINGS index_granularity = 8192;
+-- Explicit task outcomes. Apply by hand before deploying the outcome routes.
+-- Reserved decision/label vocabulary is deliberately refused by the initial API.
+-- No time partition: a corrected outcome must replace the same key across months.
+CREATE TABLE IF NOT EXISTS tracelane.outcomes
+(
+    tenant_id String,
+    subject_kind Enum8('trace' = 1, 'session' = 2, 'decision' = 3),
+    subject_id String,
+    question_id String DEFAULT '',
+    result Enum8('success' = 1, 'failure' = 2, 'label' = 3),
+    actual String DEFAULT '',
+    reason String DEFAULT '',
+    source String,
+    version UInt64,
+    recorded_at DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (tenant_id, subject_kind, subject_id, question_id)
+PARTITION BY tuple()
+TTL toDate(recorded_at) + INTERVAL 365 DAY;
+
+-- Spend aggregate: matching migration 32 DDL; historical backfill is operator-only.
+CREATE TABLE IF NOT EXISTS tracelane.spend_hourly
+(
+    tenant_id String,
+    bucket_hour DateTime('UTC'),
+    model LowCardinality(String),
+    api_key_id String,
+    environment LowCardinality(String),
+    service LowCardinality(String),
+    cost_usd SimpleAggregateFunction(sum, Float64),
+    priced_requests SimpleAggregateFunction(sum, UInt64),
+    unpriced_requests SimpleAggregateFunction(sum, UInt64),
+    requests SimpleAggregateFunction(sum, UInt64)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(bucket_hour)
+ORDER BY (tenant_id, bucket_hour, model, api_key_id, environment, service)
+-- Same retention as slo_hourly_stats; no independent retention policy.
+TTL toDate(bucket_hour) + INTERVAL 365 DAY
+-- Source-table dedup alone does not protect additive MV targets. Ingest retries
+-- the same token with deduplicate_blocks_in_dependent_materialized_views = 1;
+-- retain 1000 target blocks, matching the other span MV targets' retry window.
+SETTINGS non_replicated_deduplication_window = 1000;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS tracelane.mv_spend_hourly
+TO tracelane.spend_hourly AS
+SELECT tenant_id, toStartOfHour(start_time) AS bucket_hour,
+    coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.request.model'), ''), JSONExtractString(attributes, 'llm.model_name')) AS model,
+    api_key_id, environment, service,
+    sumIf(source.cost_usd, source.cost_usd_present = 1 AND isFinite(source.cost_usd)) AS cost_usd,
+    countIf(source.cost_usd_present = 1 AND isFinite(source.cost_usd)) AS priced_requests,
+    countIf(NOT (source.cost_usd_present = 1 AND isFinite(source.cost_usd))) AS unpriced_requests,
+    count() AS requests
+FROM tracelane.spans AS source
+WHERE coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider')) <> ''
+GROUP BY tenant_id, bucket_hour, model, api_key_id, environment, service;

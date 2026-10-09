@@ -101,6 +101,17 @@ describe("disposable test workspace (Gate 4) — never a real tenant", () => {
 		expect(s.email).toBe(mod.E2E_TEST_EMAIL);
 	});
 
+	it("OG-60: the role is owner unless a known lesser slug is asked for; junk stays owner", async () => {
+		vi.stubEnv("NODE_ENV", "development");
+		vi.stubEnv("TRACELANE_E2E_AUTH", "1");
+		const mod = await import("./e2e-auth");
+		expect(mod.e2eTestSession().role).toBe("owner");
+		vi.stubEnv("TRACELANE_E2E_ROLE", "viewer");
+		expect(mod.e2eTestSession().role).toBe("viewer");
+		vi.stubEnv("TRACELANE_E2E_ROLE", "superuser");
+		expect(mod.e2eTestSession().role).toBe("owner");
+	});
+
 	it("the gateway-token bypass returns a fake token bound to the disposable tenant", async () => {
 		vi.stubEnv("NODE_ENV", "development");
 		vi.stubEnv("TRACELANE_E2E_AUTH", "1");

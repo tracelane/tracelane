@@ -25,27 +25,29 @@
 
 use std::sync::Arc;
 
-use tracelane_policy::pii::{
-    RedactionEntry, redact as redact_secrets, redact_reversible_from, reinsert,
-};
+use tracelane_policy::pii::{RedactionEntry, reinsert};
 use tracelane_shared::{ChatRequest, ContentPart, MessageContent, Usage};
 
 use crate::guardrail::context::{ResponseBuffer, ResponseInputs};
 use crate::guardrail::engine::GuardrailEngine;
 use crate::guardrail::outcome::Outcome;
-use crate::guardrail::rails::r6_sysprompt_leak::scan_sysprompt_leak;
+use crate::guardrail::rails::r6_sysprompt_leak::{MIN_LEAK_TOKENS, scan_sysprompt_leak_with_min};
 
 /// R2 request-side egress-apply: redact secrets/structured-PII out of the
-/// OUTGOING request (system prompt + message text + tool results) in place,
+/// OUTGOING request (system prompt + message text + tool results + every other
+/// rewritable text R2 reads — `guardrail::egress::redact_side_in_place`) in place,
 /// returning the reversible map so the streamed response can re-insert the
 /// user's originals (the seam's [`ResponseGuard`] holds this map). Indices are
 /// globally unique across every field (each field offsets by the running map
 /// length) so re-insertion never collides. Call this only when the request-side
 /// R2 verdict was `redact`; an empty map means nothing was redacted.
-pub fn redact_request_in_place(req: &mut ChatRequest) -> Vec<RedactionEntry> {
+pub fn redact_request_in_place(
+    req: &mut ChatRequest,
+    policy: Option<&super::pii_policy::PiiPolicy>,
+) -> Vec<RedactionEntry> {
     let mut map: Vec<RedactionEntry> = Vec::new();
     let redact_field = |s: &mut String, map: &mut Vec<RedactionEntry>| {
-        let r = redact_reversible_from(s, map.len());
+        let r = super::pii_policy::redact(s, map.len(), policy);
         if !r.is_clean() {
             *s = r.redacted;
             map.extend(r.entries);
@@ -68,7 +70,89 @@ pub fn redact_request_in_place(req: &mut ChatRequest) -> Vec<RedactionEntry> {
             }
         }
     }
+    // M-1 (and C1 before it): everything else R2 reads egresses with the request — tool
+    // descriptions and schemas, tool-call arguments, `response_format`, `user`, `metadata`,
+    // `stop`, the allowlisted extras — so it is redacted with it. ONE definition of that set,
+    // shared with the scan (`guardrail::egress`). Callers then run the residual check
+    // (`egress::redact_request`), which blocks on what could not be rewritten.
+    crate::guardrail::egress::redact_side_in_place(req, &mut map, policy);
     map
+}
+
+/// Native carriers outside the text seam are refused under an explicit output
+/// enforcement policy. Recurse through aggregate and SSE envelopes alike.
+pub(crate) fn has_unscanned_output(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(a) => a.iter().any(has_unscanned_output),
+        serde_json::Value::Object(o) => {
+            let kind = o
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            !matches!(
+                kind,
+                "" | "text" | "output_text" | "message" | "response" | "text_delta"
+                | "message_start" | "message_delta" | "message_stop" | "content_block_start" | "content_block_delta" | "content_block_stop" | "ping"
+                | "response.created" | "response.in_progress" | "response.output_item.added" | "response.output_item.done"
+                | "response.content_part.added" | "response.content_part.done" | "response.output_text.delta" | "response.output_text.done"
+                | "response.completed" | "response.incomplete" | "response.failed"
+                // Output-format metadata echoes a JSON Schema.
+                | "json_object" | "json_schema" | "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+            ) || o.get("thought").and_then(serde_json::Value::as_bool) == Some(true)
+                || [
+                    "functionCall",
+                    "function_call",
+                    "executableCode",
+                    "codeExecutionResult",
+                    "inlineData",
+                    "fileData",
+                    "function_call_arguments",
+                    "refusal",
+                ]
+                .iter()
+                .any(|k| o.get(*k).is_some_and(|v| !v.is_null()))
+                || o.get("annotations")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+                || o.get("candidates")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|a| a.len() > 1)
+                || o.iter().any(|(k, v)| {
+                    !matches!(
+                        k.as_str(),
+                        "tools"
+                            | "tool_choice"
+                            | "instructions"
+                            | "input"
+                            | "metadata"
+                            | "format"
+                            | "schema"
+                            | "output_config"
+                    ) && has_unscanned_output(v)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Initial/aggregate native text must be included in the stream's scanned text.
+/// Exact correspondence prevents an aggregate from substituting a schema-invalid
+/// substring for the validated document. Multiple text parts are refused when
+/// their individual text cannot be matched to this seam.
+pub(crate) fn has_unseen_text(value: &serde_json::Value, scanned: &str) -> bool {
+    match value {
+        serde_json::Value::Array(a) => a.iter().any(|v| has_unseen_text(v, scanned)),
+        serde_json::Value::Object(o) => o.iter().any(|(k, v)| {
+            if k == "text"
+                && let Some(t) = v.as_str()
+            {
+                return scanned != t;
+            }
+            // Provider response configuration is not model output.
+            !matches!(k.as_str(), "metadata" | "format" | "schema") && has_unseen_text(v, scanned)
+        }),
+        _ => false,
+    }
 }
 
 /// Trailing chars of the accumulated output held back before emission so a
@@ -104,6 +188,8 @@ pub struct ResponseGuard {
     /// char boundary; prefix-stable because only finalized content is emitted.
     emitted: usize,
     blocked: bool,
+    post_done: bool,
+    snapshot: Option<(super::rail::RailGate, super::policy::Policy)>,
 }
 
 impl ResponseGuard {
@@ -134,7 +220,66 @@ impl ResponseGuard {
             holdback,
             emitted: 0,
             blocked: false,
+            post_done: false,
+            snapshot: None,
         }
+    }
+
+    async fn snapshot(&mut self) -> &(super::rail::RailGate, super::policy::Policy) {
+        if self.snapshot.is_none() {
+            let mut snapshot = self.engine.response_snapshot(&self.inputs).await;
+            if let Some(hooks) = &self.inputs.hooks {
+                snapshot.1.hooks = hooks.clone();
+            }
+            self.snapshot = Some(snapshot);
+        }
+        // get_or_insert supplies a closed default without a panic; the async read above
+        // always populates the slot. One snapshot makes transformed byte offsets stable.
+        self.snapshot.get_or_insert_with(|| {
+            (
+                super::rail::RailGate::free_defaults_only(),
+                super::policy::Policy::default(),
+            )
+        })
+    }
+
+    fn enforces(snapshot: &(super::rail::RailGate, super::policy::Policy), rail: &str) -> bool {
+        super::policy_api::eligible(&snapshot.0, rail) && snapshot.1.enforces(rail)
+    }
+
+    /// Content outside the text seam cannot silently bypass an explicitly configured
+    /// output policy. Refuse it before any of its bytes are emitted.
+    pub(crate) async fn refuse_unscanned_output(&mut self) -> Option<&'static str> {
+        let snapshot = self.snapshot().await;
+        if !snapshot.1.hooks.iter().any(|h| h.config.post)
+            && ![
+                "R2_secrets_pii",
+                "R5_format",
+                "R6_sysprompt_leak",
+                "R7_topic_competitor",
+            ]
+            .iter()
+            .any(|r| Self::enforces(snapshot, r))
+        {
+            return None;
+        }
+        self.blocked = true;
+        let reason = "OUTPUT_POLICY_UNSCANNABLE";
+        let outcome = super::dispatcher::SideOutcome {
+            side: super::outcome::Side::Response,
+            decision: super::outcome::Decision::Block,
+            total_latency_micros: 0,
+            records: vec![super::dispatcher::RailRecord {
+                rail: "output_policy",
+                policy_version: "scoped@1",
+                latency_micros: 0,
+                outcome: super::outcome::RailOutcome::block(reason),
+            }],
+        };
+        self.engine
+            .record_response(&outcome, &self.inputs, &self.buf, None)
+            .await;
+        Some(reason)
     }
 
     /// Whether a block already terminated this stream.
@@ -160,13 +305,24 @@ impl ResponseGuard {
         let mut t = std::borrow::Cow::Borrowed(raw);
         if rail_redacted(outcome, "R6_sysprompt_leak") {
             let sys = self.inputs.system_prompt.as_deref().unwrap_or("");
-            t = std::borrow::Cow::Owned(scan_sysprompt_leak(&t, sys).redacted);
+            let min_tokens = outcome
+                .records
+                .iter()
+                .find(|r| r.rail == "R6_sysprompt_leak")
+                .and_then(|r| r.outcome.details.get("min_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(MIN_LEAK_TOKENS);
+            t = std::borrow::Cow::Owned(scan_sysprompt_leak_with_min(&t, sys, min_tokens).redacted);
         }
         if rail_redacted(outcome, "R7_topic_competitor") {
             t = std::borrow::Cow::Owned(self.engine.redact_competitors(&t));
         }
         if rail_redacted(outcome, "R2_secrets_pii") {
-            t = std::borrow::Cow::Owned(redact_secrets(&t));
+            t = std::borrow::Cow::Owned(super::pii_policy::output(
+                &t,
+                self.snapshot.as_ref().and_then(|s| s.1.pii()),
+            ));
         }
         if self.request_map.is_empty() {
             t.into_owned()
@@ -191,13 +347,39 @@ impl ResponseGuard {
     /// at the terminal step), and returns the newly-stable safe text to emit, or
     /// a [`GuardStep::Block`].
     pub async fn on_delta(&mut self, delta: &str, usage: Option<&Usage>) -> GuardStep {
-        if self.blocked {
+        if self.blocked || self.post_done {
             return GuardStep::Emit(String::new());
         }
         self.buf.push_chunk(delta);
+        let snapshot = self.snapshot().await.clone();
+        let hold_format =
+            self.inputs.expected_format.is_some() && Self::enforces(&snapshot, "R5_format");
+        let hold_post = snapshot.1.hooks.iter().any(|h| h.config.post);
+        if hold_post
+            && super::hooks::limits().is_none_or(|l| self.buf.accumulated().len() > l.input_bytes)
+        {
+            self.blocked = true;
+            let mut outcome = super::dispatcher::SideOutcome {
+                side: super::outcome::Side::Response,
+                decision: super::outcome::Decision::Allow,
+                records: Vec::new(),
+                total_latency_micros: 0,
+            };
+            super::hooks::block(&mut outcome, "HOOK_INPUT_TOO_LARGE");
+            self.engine
+                .record_response(&outcome, &self.inputs, &self.buf, usage)
+                .await;
+            return GuardStep::Block {
+                reason_code: "HOOK_INPUT_TOO_LARGE",
+            };
+        }
+        let mut inputs = self.inputs.clone();
+        // JSON can only be judged once complete. A block policy holds every byte
+        // until on_end validates the complete document.
+        inputs.expected_format = None;
         let outcome = self
             .engine
-            .evaluate_response_outcome(&self.inputs, &self.buf, usage)
+            .evaluate_response_snapshot(&inputs, &self.buf, usage, &snapshot)
             .await;
         if outcome.is_block() {
             // The offending content is within the held-back tail — terminate
@@ -210,6 +392,9 @@ impl ResponseGuard {
             return GuardStep::Block {
                 reason_code: reason,
             };
+        }
+        if hold_format || hold_post {
+            return GuardStep::Emit(String::new());
         }
         let transformed = self.transform(self.buf.accumulated(), &outcome);
         let safe = self.holdback_boundary(&transformed);
@@ -225,13 +410,58 @@ impl ResponseGuard {
     /// verdict once, and flushes the remaining held-back tail (now finalized,
     /// redacted + re-inserted). On a terminal block, drops the tail.
     pub async fn on_end(&mut self, usage: Option<&Usage>) -> GuardStep {
-        if self.blocked {
+        if self.blocked || self.post_done {
             return GuardStep::Emit(String::new());
         }
-        let outcome = self
+        let snapshot = self.snapshot().await.clone();
+        let mut outcome = self
             .engine
-            .evaluate_response_outcome(&self.inputs, &self.buf, usage)
+            .evaluate_response_snapshot(&self.inputs, &self.buf, usage, &snapshot)
             .await;
+        let mut transformed = self.transform(self.buf.accumulated(), &outcome);
+        if !outcome.is_block() && snapshot.1.hooks.iter().any(|h| h.config.post) {
+            self.post_done = true;
+            for hook in snapshot.1.hooks.iter().filter(|h| h.config.post) {
+                let evaluation = super::hooks::evaluate(
+                    *self.inputs.tenant_id.as_uuid(),
+                    hook,
+                    super::hooks::Phase::Post,
+                    &transformed,
+                )
+                .await;
+                super::hooks::append(&mut outcome, &evaluation);
+                self.inputs
+                    .hook_events
+                    .record(std::slice::from_ref(&evaluation.event));
+                if !evaluation.redactions.is_empty() {
+                    match super::hooks::replace(&transformed, &evaluation.redactions) {
+                        Ok(text) => transformed = text,
+                        Err(_) => super::hooks::block(&mut outcome, "HOOK_REDACTION_UNSUPPORTED"),
+                    }
+                }
+                if outcome.is_block() {
+                    break;
+                }
+            }
+        }
+        // R2/R6 may change the document. R5 must validate the bytes the caller
+        // receives, including any request-side PII re-insertion.
+        if !outcome.is_block() && Self::enforces(&snapshot, "R5_format") {
+            let mut safe_buf = ResponseBuffer::new();
+            safe_buf.push_chunk(&transformed);
+            let ctx =
+                super::context::GuardrailContext::from_response(&self.inputs, &safe_buf, usage);
+            let checked = snapshot.1.apply(
+                "R5_format",
+                super::rails::r5_format::R5Format::new().evaluate_sync(&ctx),
+            );
+            if checked.outcome == Outcome::Block {
+                outcome.decision = super::outcome::Decision::Block;
+                if let Some(record) = outcome.records.iter_mut().find(|r| r.rail == "R5_format") {
+                    record.outcome = checked;
+                }
+            }
+        }
         self.engine
             .record_response(&outcome, &self.inputs, &self.buf, usage)
             .await;
@@ -241,7 +471,6 @@ impl ResponseGuard {
                 reason_code: block_reason(&outcome),
             };
         }
-        let transformed = self.transform(self.buf.accumulated(), &outcome);
         if transformed.len() <= self.emitted {
             return GuardStep::Emit(String::new());
         }
@@ -300,8 +529,11 @@ mod tests {
 
     fn inputs(system_prompt: Option<&str>) -> ResponseInputs {
         ResponseInputs {
+            hooks: None,
+            hook_events: Default::default(),
             tenant_id: TenantId::from_jwt_claim(Uuid::from_u128(7)),
             api_key_id: None,
+            project_id: None,
             correlation_id: Ulid::from_parts(9, 9),
             system_prompt: system_prompt.map(str::to_owned),
             model: "claude-sonnet-4-6".to_string(),

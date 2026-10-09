@@ -103,6 +103,14 @@ fn openinference_aliases_land_and_canonical_values_win_both_orders() {
             value,
             "{alias}"
         );
+        if stored == "gen_ai_usage_cost" {
+            assert_eq!(
+                build_attributes(std::slice::from_ref(&a))
+                    .tracelane_usage_cost_origin
+                    .as_deref(),
+                Some("provider_reported")
+            );
+        }
         for attrs in [vec![a.clone(), c.clone()], vec![c, a]] {
             let result = serde_json::to_value(build_attributes(&attrs)).unwrap();
             assert_eq!(result[stored], preferred, "{alias} precedence");

@@ -1,0 +1,132 @@
+{
+  "module": "crates/gateway/src/cache_routes.rs",
+  "operations": {
+    "GET /v1/cache": {
+      "summary": "The effective response-cache settings with the SOURCE of each value, the invalidation epochs, the operator on/off and 24 h hit statistics.",
+      "tags": [
+        "cache"
+      ],
+      "responses": {
+        "200": {
+          "description": "Settings, effective state, epochs and stats (`stats_unavailable: true` when ClickHouse cannot answer \u2014 never a zero).",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "no_control_plane"
+      ]
+    },
+    "PUT /v1/cache/settings": {
+      "summary": "Replace the workspace cache settings (a full document: an absent field is its default).",
+      "tags": [
+        "cache"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "inherit",
+              "on",
+              "off"
+            ]
+          },
+          "ttl_hours": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace_by": {
+            "type": "string",
+            "enum": [
+              "workspace",
+              "project",
+              "end_user",
+              "key"
+            ]
+          },
+          "semantic": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "`changed`, the `previous` and the saved `settings`.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_field (names `field`).",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "cache_control_not_entitled: `on` or a TTL needs the plan's cache control.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "cache_control_not_entitled",
+        "no_control_plane",
+        "unavailable"
+      ]
+    },
+    "POST /v1/cache/invalidate": {
+      "summary": "Stop serving cached answers for a scope (a generation counter \u2014 stored rows are not erased and age out by TTL).",
+      "tags": [
+        "cache"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "workspace | project:<uuid> | key:<uuid> | model:<name>"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "`scope`, the new `epoch` and `effect: stop_serving`.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_field (names `scope`).",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "epoch_limit: the workspace has its maximum of invalidation scopes.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "epoch_limit",
+        "no_control_plane",
+        "unavailable"
+      ]
+    }
+  }
+}

@@ -120,6 +120,32 @@ pub(crate) fn test_state_with_chain(
     }
 }
 
+/// `state` with the R2 secrets/PII rail (a PAID rail) granted to every tenant. The
+/// guardrail engine reads entitlements through ITS OWN handle, so it is rebuilt over the
+/// same cache — as `server::run` wires both in production.
+pub(crate) fn grant_r2(mut state: AppState) -> AppState {
+    use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
+    type Resolved = std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<ResolvedEntitlements>> + Send>,
+    >;
+    let cache = Arc::new(EntitlementCache::new(Arc::new(move |_tenant| {
+        Box::pin(async move {
+            Ok(ResolvedEntitlements {
+                f_guardrail_r2: true,
+                ..ResolvedEntitlements::deny_all()
+            })
+        }) as Resolved
+    })));
+    state.guardrail = Arc::new(crate::guardrail::GuardrailEngine::new(
+        Arc::clone(&state.audit_chain),
+        None,
+        Some(Arc::clone(&cache)),
+        Arc::new(crate::guardrail::capability::CapabilityRegistry::new()),
+    ));
+    state.entitlements = Some(cache);
+    state
+}
+
 /// `Authorization: Bearer test-token` — resolved by the debug-build dev stub
 /// (`auth::dev_stub_claims`) to the fixed dev tenant with full scope.
 pub(crate) fn authed() -> HeaderMap {
@@ -778,12 +804,20 @@ mod tests {
             spans[0].status
         );
         assert_eq!(
-            state.circuit_breaker.outcomes("ollama", "default"),
+            state.circuit_breaker.outcomes(
+                "ollama",
+                "default",
+                &crate::circuit_breaker::Credential::Env
+            ),
             vec![true],
             "the breaker is fed once, with the FINAL outcome — not once per attempt"
         );
         assert_eq!(
-            state.circuit_breaker.state("ollama", "default"),
+            state.circuit_breaker.state(
+                "ollama",
+                "default",
+                &crate::circuit_breaker::Credential::Env
+            ),
             crate::circuit_breaker::State::Closed
         );
     }
@@ -944,7 +978,11 @@ mod tests {
             Some("provider_unavailable")
         );
         assert_eq!(
-            state.circuit_breaker.outcomes("ollama", "default"),
+            state.circuit_breaker.outcomes(
+                "ollama",
+                "default",
+                &crate::circuit_breaker::Credential::Env
+            ),
             vec![false]
         );
     }

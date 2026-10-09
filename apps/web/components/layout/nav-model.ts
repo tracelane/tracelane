@@ -20,6 +20,7 @@
  * a vitest node test, and a client component alike.
  */
 
+import { GATEWAY_TAB_HREFS } from "@/components/gateway/tabs-config";
 import { sections } from "./nav-config";
 
 /** Settings collapses to ONE sidebar-footer entry pointing at its first pane. */
@@ -77,5 +78,8 @@ export const ALL_CHROME_ROUTES: readonly string[] = [
 		// export above keeps meaning what it says, and the Set drops the duplicate.
 		ACCOUNT_HREF,
 		SUPPORT_HREF,
+		// OG-60: the Gateway settings tabs are separate routes under one nav entry — swept
+		// too, so a tab with a dead button cannot hide behind the single "Gateway" link.
+		...GATEWAY_TAB_HREFS,
 	]),
 ];

@@ -1,0 +1,19 @@
+---
+title: Regulated use boundaries
+description: Current data residency, BAA, content capture, and evidence boundaries for regulated workloads.
+classification: PUBLIC
+---
+
+Tracelane provides technical recording and verification controls. They are inputs to your assessment, not a certification or a statement that a deployment meets a law or industry framework. See the [EU AI Act Article 12 mapping](/compliance/eu-ai-act-article-12) for the scope and gaps of that evidence pack.
+
+## India DPDP and data location
+
+Tracelane Cloud's primary gateway, control-plane database, and hot trace store run in Germany. Its cold trace tier uses EU-jurisdiction object storage. The service does **not** offer tenant-selected regions or per-tenant region isolation. Backups have a separate lifecycle and include a secondary copy in Cloudflare's default jurisdiction; primary EU storage does not imply EU-only processing. The canonical audit ledger has no expiry clock and remains after workspace deletion. Read the [data residency and deletion details](/security#data-residency) before using the service for data with location or erasure requirements. Self-hosting gives you control of the deployment location.
+
+## HIPAA and protected health information
+
+Tracelane does **not** currently offer a signed Business Associate Agreement for the hosted gateway. Do not send protected health information through that service; [HHS requires a BAA for a cloud provider handling ePHI for a covered entity or business associate](https://www.hhs.gov/hipaa/for-professionals/faq/may-a-hipaa-covered-entity-or-business-associate-use-cloud-service-to-store-or-process-ephi/index.html). Gateway message capture is off by default and requires a workspace owner to enable it; other instrumentation and imports have their own capture path. Response caching can retain completion bodies under the conditions in [Prompt content](/security#prompt-content). Structured redaction is limited to supported identifier patterns and does not identify names, addresses, or free-text clinical details. Those controls do not replace a BAA or a data-handling assessment.
+
+## What the ledger establishes
+
+Gateway-admitted calls and recorded guardrail verdicts enter the hash chain. SDK and OTLP-only spans are captured separately. Ed25519 signatures attest batch contents under a Tracelane-held key; Rekor publication is best-effort and applies only to anchored batches. The [audit ledger guide](/audit-ledger) describes exactly what the offline verifier checks.

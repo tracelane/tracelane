@@ -23,16 +23,59 @@
 
 /// Build a ClickHouse client authenticated as the configured user, reading
 /// `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` / `CLICKHOUSE_DB` from the gateway
-/// process environment. **The single CH client constructor for the gateway** —
+/// process environment. **The request-path CH client constructor for the gateway** —
 /// connecting as the default user silently fails every query/insert against a
 /// credentialed ClickHouse (ADR-042: the same bug class that crash-looped
-/// ingest). Every gateway CH client MUST go through this.
+/// ingest). Deletion jobs use `sweeper_client`; all other gateway clients go through this.
 pub(crate) fn ch_client(url: impl Into<String>) -> clickhouse::Client {
     clickhouse::Client::default()
         .with_url(url)
         .with_user(std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))
         .with_password(std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default())
         .with_database(std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "tracelane".into()))
+}
+
+/// Deletion-only session for retention and blob GC. Fail-OPEN to the ordinary
+/// client if the secret is absent/empty (single-user self-host/dev). In hosted
+/// deployments that client cannot delete; callers count the refused mutation.
+///
+/// # Errors
+/// Construction is infallible. An absent/empty secret fails OPEN to `ch_client`;
+/// authentication and permission errors surface on execution, CLOSED to deletion.
+pub(crate) fn sweeper_client(url: impl Into<String>) -> clickhouse::Client {
+    use secrecy::{ExposeSecret, SecretString};
+    let password = std::env::var("CLICKHOUSE_SWEEPER_PASSWORD")
+        .ok()
+        .map(SecretString::from);
+    match password.filter(|pw| !pw.expose_secret().is_empty()) {
+        Some(password) => clickhouse::Client::default()
+            .with_url(url)
+            .with_user(
+                std::env::var("CLICKHOUSE_SWEEPER_USER").unwrap_or_else(|_| "tl_sweeper".into()),
+            )
+            .with_password(password.expose_secret())
+            .with_database(std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "tracelane".into())),
+        None => ch_client(url),
+    }
+}
+
+/// Read the authenticated session identity (not the configured name).
+///
+/// # Errors
+/// Returns authentication, network or decode errors without inventing an identity
+/// (fail-CLOSED to the identity claim). The caller counts the failure and retries.
+pub(crate) async fn current_user(
+    ch: &clickhouse::Client,
+) -> Result<String, clickhouse::error::Error> {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct User {
+        name: String,
+    }
+    Ok(ch
+        .query(&ceiling("SELECT currentUser() AS name"))
+        .fetch_one::<User>()
+        .await?
+        .name)
 }
 
 /// "Now", in the units a ClickHouse `DateTime64(3)` column actually stores.
@@ -78,13 +121,19 @@ impl PlanTier {
     /// strings fall back to `Builder` so the cap layer is fail-safe
     /// against an unrecognised tier label.
     pub fn from_plan_key(key: &str) -> Self {
+        Self::from_known_plan_key(key).unwrap_or(Self::Builder)
+    }
+
+    /// The tier for a KNOWN plan key, `None` otherwise — for a caller where an unknown key must
+    /// fail CLOSED rather than borrow `from_plan_key`'s cap-layer default (LAST review Low 2).
+    pub fn from_known_plan_key(key: &str) -> Option<Self> {
         match key {
-            "free_v1" => Self::Free,
-            "builder_v1" => Self::Builder,
-            "team_v1" => Self::Team,
-            "business_v1" => Self::Business,
-            "enterprise_v1" => Self::Enterprise,
-            _ => Self::Builder,
+            "free_v1" => Some(Self::Free),
+            "builder_v1" => Some(Self::Builder),
+            "team_v1" => Some(Self::Team),
+            "business_v1" => Some(Self::Business),
+            "enterprise_v1" => Some(Self::Enterprise),
+            _ => None,
         }
     }
 }
@@ -181,15 +230,13 @@ impl TenantQuery {
         self
     }
 
-    /// Return SQL with the SETTINGS block appended. Idempotent — if
-    /// the caller already attached settings, this still works because
-    /// later `SETTINGS` clauses override earlier ones in ClickHouse.
+    /// Return SQL with one SETTINGS block appended. The input must NOT already
+    /// contain SETTINGS: ClickHouse 24.12 rejects a second clause (retention
+    /// hardening real-server test). Put other settings in query.with_option().
     /// We separate the original body from the suffix with a newline
     /// for log-readability.
     pub fn sql_with_settings(&self) -> String {
-        // ClickHouse allows multiple SETTINGS sections; later wins.
-        // We always append our wrapper's caps last so they cannot be
-        // overridden by a query author who attached looser settings.
+        // One SETTINGS clause only; callers supply an undecorated SQL body.
         let mut settings = self.caps.settings_fragment();
         if let Some(tag) = &self.log_comment {
             // Single-quoted ClickHouse string literal; a literal `'` in a
@@ -248,6 +295,55 @@ pub fn ceiling(sql: &str) -> String {
     TenantQuery::new(sql, PlanTier::Business).sql_with_settings()
 }
 
+/// A tenant-filtered `count()` lookup, capped per the tenant's tier (ADR-031): `sql` must
+/// take exactly two binds — the tenant id, then `id` — and select one `n: UInt64` column.
+/// Lives in this wrapper so callers (the OG-06 batch provenance + spend-dedup lookups) never
+/// touch the ClickHouse client directly (`no-raw-ch-query.sh`).
+///
+/// # Errors
+/// Returns the ClickHouse error; the CALLER decides fail-closed vs fail-open (§10).
+pub(crate) async fn tenant_count_by_id(
+    url: String,
+    tier: PlanTier,
+    sql: &str,
+    tenant_id: &tracelane_shared::TenantId,
+    id: &str,
+) -> Result<u64, clickhouse::error::Error> {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct CountRow {
+        n: u64,
+    }
+    let sql = TenantQuery::new(sql, tier).sql_with_settings();
+    ch_client(url)
+        .query(&sql)
+        .bind(tenant_id.to_string())
+        .bind(id)
+        .fetch_one::<CountRow>()
+        .await
+        .map(|r| r.n)
+}
+
+/// [`tenant_count_by_id`] with several bound values after the tenant (`OG-20`'s batch
+/// provenance binds the file id, the key id and the policy fingerprint).
+pub(crate) async fn tenant_count_by_ids(
+    url: String,
+    tier: PlanTier,
+    sql: &str,
+    tenant_id: &tracelane_shared::TenantId,
+    ids: &[&str],
+) -> Result<u64, clickhouse::error::Error> {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct CountRow {
+        n: u64,
+    }
+    let sql = TenantQuery::new(sql, tier).sql_with_settings();
+    let mut q = ch_client(url).query(&sql).bind(tenant_id.to_string());
+    for id in ids {
+        q = q.bind(*id);
+    }
+    q.fetch_one::<CountRow>().await.map(|r| r.n)
+}
+
 #[cfg(test)]
 pub(crate) fn split_migration_statements(sql: &str) -> Vec<String> {
     let stripped: String = sql
@@ -268,6 +364,34 @@ pub(crate) fn split_migration_statements(sql: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL; integration runner or isolated credential proof"]
+    async fn sweeper_identity_against_a_real_clickhouse() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("throwaway URL required");
+        let expected =
+            std::env::var("SWEEPER_TEST_EXPECTED_USER").unwrap_or_else(|_| "default".into());
+        // The client's default database is `tracelane`; create it first so this test does
+        // not depend on another test having run (it failed whenever it ran first, 2026-09-30).
+        // As the admin the environment names (the users proof's prod-shaped container has
+        // no anonymous `default` user); the integration runner sets none and uses default.
+        let mut admin = clickhouse::Client::default().with_url(url.clone());
+        if let (Ok(user), Ok(password)) = (
+            std::env::var("CLICKHOUSE_USER"),
+            std::env::var("CLICKHOUSE_PASSWORD"),
+        ) {
+            admin = admin.with_user(user).with_password(password);
+        }
+        admin
+            .query("CREATE DATABASE IF NOT EXISTS tracelane")
+            .execute()
+            .await
+            .expect("create tracelane database");
+        let actual = current_user(&sweeper_client(url))
+            .await
+            .expect("authenticated identity");
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn plan_tier_from_plan_key_known_strings() {

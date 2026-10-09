@@ -10,7 +10,12 @@
 //! `{{TL_REDACT:<category>:<idx>}}` placeholder with a per-request map for
 //! response re-insertion.
 //!
-//! **V1 scope (deliberate, not a gap).** This rail performs request- and
+//! **2026-10-05 supersession:** request mutation is now enforced by `egress`,
+//! and response mutation by `ResponseGuard`. Explicit PII class policies select
+//! detectors/actions and literal exceptions on both sides. The historical V1
+//! staging description below no longer describes the current apply seam.
+//!
+//! **Historical V1 scope (deliberate, not a gap).** This rail performs request- and
 //! response-side **detection** and emits the redact/secret verdict to the
 //! ledger. The actual outgoing-payload mutation + the per-request reversible
 //! map lifecycle + response re-insertion are **one coherent seam** (the map
@@ -29,9 +34,14 @@
 //! redaction lands when that detector does. Documented, not silently dropped.
 
 use crate::guardrail::context::GuardrailContext;
+use crate::guardrail::egress::{Leaf, egress_leaves};
 use crate::guardrail::outcome::{FailMode, RailError, RailOutcome, Sides, reason_codes};
+use crate::guardrail::pii_policy::PiiPolicy;
+use crate::guardrail::policy::Mode;
 use crate::guardrail::rail::{GuardrailFeature, Rail, RailFuture};
-use tracelane_policy::pii::{ReversibleRedaction, is_secret_category, redact_reversible};
+use tracelane_policy::pii::{
+    ReversibleRedaction, contains_redactable, is_secret_category, redact_reversible,
+};
 use tracelane_shared::{ContentPart, MessageContent};
 
 /// The detector seam — `redact_reversible` in prod; swappable in tests to
@@ -70,26 +80,60 @@ impl R2SecretsPii {
     pub fn evaluate_sync(&self, ctx: &GuardrailContext<'_>) -> RailOutcome {
         if let Some(buf) = ctx.response_buf {
             let mut findings = Findings::default();
-            findings.absorb(&(self.scan)(buf.accumulated()));
+            findings.absorb(&(self.scan)(buf.accumulated()), ctx.policy.pii());
             return findings.into_outcome();
         }
         self.scan_request(ctx)
     }
 
+    /// R2 over a request body that egresses as-is (a relay wire, a batch line, a count-tokens
+    /// companion): every text leaf the egress walker hands over — keys and decoded text media
+    /// included. A text payload too large to decode cannot be cleared, so it BLOCKS
+    /// (`UNSCANNABLE_MEDIA`, fail-CLOSED), like a detector that could not run.
+    pub(crate) fn scan_egress_json(
+        &self,
+        body: &serde_json::Value,
+        policy: Option<&PiiPolicy>,
+    ) -> RailOutcome {
+        let mut findings = Findings::default();
+        let unscannable = egress_leaves(body, &mut |leaf, _| match leaf {
+            Leaf::Text(t) => {
+                if contains_redactable(t) {
+                    findings.absorb(&(self.scan)(t), policy);
+                }
+                false
+            }
+            Leaf::Unscannable => true,
+        });
+        if unscannable {
+            return RailOutcome::block(reason_codes::UNSCANNABLE_MEDIA);
+        }
+        findings.into_outcome()
+    }
+
     fn scan_request(&self, ctx: &GuardrailContext<'_>) -> RailOutcome {
         let mut findings = Findings::default();
+        // M-1: on a relay wire the caller's own JSON is what egresses, so THAT is what is
+        // scanned — every text leaf minus the opaque allowlist, by the same walk that later
+        // rewrites it (`egress::redact_relay_body`). The read model is lossy by design and
+        // must not decide what R2 sees.
+        if let Some(body) = ctx.egress_json {
+            return self.scan_egress_json(body, ctx.policy.pii());
+        }
         if let Some(sys) = ctx.system_prompt {
-            findings.absorb(&(self.scan)(sys));
+            findings.absorb(&(self.scan)(sys), ctx.policy.pii());
         }
         for m in ctx.messages {
             match &m.content {
-                MessageContent::Text(s) => findings.absorb(&(self.scan)(s)),
+                MessageContent::Text(s) => findings.absorb(&(self.scan)(s), ctx.policy.pii()),
                 MessageContent::Parts(parts) => {
                     for p in parts {
                         match p {
-                            ContentPart::Text { text, .. } => findings.absorb(&(self.scan)(text)),
+                            ContentPart::Text { text, .. } => {
+                                findings.absorb(&(self.scan)(text), ctx.policy.pii())
+                            }
                             ContentPart::ToolResult { content, .. } => {
-                                findings.absorb(&(self.scan)(content));
+                                findings.absorb(&(self.scan)(content), ctx.policy.pii());
                             }
                             _ => {}
                         }
@@ -97,15 +141,24 @@ impl R2SecretsPii {
                 }
             }
         }
+        // M-1 (C1 before it): the tool definitions and every other forwarded text — tool-call
+        // arguments, `response_format`, `user`, `metadata`, extras — egress too. Many small
+        // leaves (schema keywords), so the allocation-free check runs first.
+        for t in ctx.tool_def_text.iter().chain(&ctx.extra_text) {
+            if contains_redactable(t) {
+                findings.absorb(&(self.scan)(t), ctx.policy.pii());
+            }
+        }
         findings.into_outcome()
     }
 }
 
-/// Per-category hit counts over the scanned text. Only R2-scope categories are
-/// tallied — `ipv4`/`ipv6` are detected by the policy core but out of R2 scope
-/// (no R2 reason code), so they do not drive the verdict.
+/// Per-category hit counts over scanned text. The legacy default excludes IP
+/// detections from the verdict; an explicit class policy can select them.
 #[derive(Debug, Default)]
 struct Findings {
+    action: Option<Mode>,
+    ip: usize,
     secret: usize,
     card: usize,
     ssn: usize,
@@ -115,8 +168,19 @@ struct Findings {
 }
 
 impl Findings {
-    fn absorb(&mut self, r: &ReversibleRedaction) {
+    fn absorb(&mut self, r: &ReversibleRedaction, policy: Option<&PiiPolicy>) {
         for e in &r.entries {
+            if let Some(policy) = policy {
+                let Some(action) = policy.action(e) else {
+                    continue;
+                };
+                self.action = Some(match (self.action, action) {
+                    (Some(Mode::Block), _) | (_, Mode::Block) => Mode::Block,
+                    (Some(Mode::Redact), _) | (_, Mode::Redact) => Mode::Redact,
+                    _ => Mode::Observe,
+                });
+            }
+
             if is_secret_category(e.category) {
                 self.secret += 1;
                 continue;
@@ -127,13 +191,14 @@ impl Findings {
                 "email" => self.email += 1,
                 "phone" => self.phone += 1,
                 "iban" => self.iban += 1,
+                "ipv4" | "ipv6" if policy.is_some() => self.ip += 1,
                 _ => {} // ipv4 / ipv6 — out of R2 scope
             }
         }
     }
 
     fn total(&self) -> usize {
-        self.secret + self.card + self.ssn + self.email + self.phone + self.iban
+        self.secret + self.card + self.ssn + self.email + self.phone + self.iban + self.ip
     }
 
     /// Aggregate to a verdict. Reason code is the most-severe class present
@@ -153,10 +218,17 @@ impl Findings {
             reason_codes::PII_IBAN
         } else if self.email > 0 {
             reason_codes::PII_EMAIL
+        } else if self.ip > 0 {
+            "PII_IP"
         } else {
             reason_codes::PII_PHONE
         };
-        RailOutcome::redact(reason).with_details(serde_json::json!({
+        let outcome = match self.action {
+            Some(Mode::Block) => RailOutcome::block(reason),
+            Some(Mode::Observe) => RailOutcome::warn(reason),
+            _ => RailOutcome::redact(reason),
+        };
+        outcome.with_details(serde_json::json!({
             "has_secret": self.secret > 0,
             "counts": {
                 "secret": self.secret,
@@ -165,6 +237,7 @@ impl Findings {
                 "email": self.email,
                 "phone": self.phone,
                 "iban": self.iban,
+                "ip": self.ip,
             },
             "total": self.total(),
         }))
@@ -217,6 +290,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -275,6 +349,22 @@ mod tests {
         assert_eq!(out.reason_code, Some(reason_codes::PII_CARD));
         assert_eq!(out.details["has_secret"], false);
         assert!(!out.details.to_string().contains("4111"));
+    }
+
+    /// C1 (security review 2026-10-02): a secret inside an ALLOWLISTED unmodelled field
+    /// (`reasoning`, `provider`, …) is forwarded upstream, so R2 must see it too.
+    #[test]
+    fn c1_secret_in_an_extra_field_string_leaf_is_detected() {
+        let tenant = TenantId::from_jwt_claim(Uuid::from_u128(9));
+        let mut req = request(vec![user("hi")], None);
+        req.extra.insert(
+            "reasoning".into(),
+            serde_json::json!({"effort": "high", "note": ["deploy with sk-abcdefghijklmnopqrstuvwxyz012345"]}),
+        );
+        let reg = CapabilityRegistry::new();
+        let out = R2SecretsPii::new().evaluate_sync(&ctx(&tenant, &req, &reg));
+        assert_eq!(out.outcome, Outcome::Redact);
+        assert_eq!(out.reason_code, Some(reason_codes::SECRET_DETECTED));
     }
 
     /// Secret in the SYSTEM prompt is caught too.

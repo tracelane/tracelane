@@ -113,7 +113,187 @@ ALIASES = {
 
 # The TSV header row. Written literally rather than joined, so the file's column
 # order is visible in one glance — `catalog.rs` reads these positionally.
-HEADER = "id\tlabel\tbase_url\tbase_url_env\tapi_key_env\tprefixes"
+HEADER = "id\tlabel\tbase_url\tbase_url_env\tapi_key_env\tprefixes\tresponses_wire\tcapabilities"
+
+# OG-01: the providers whose OWN documentation confirms an OpenAI-Responses-
+# compatible endpoint at `{base_url}/v1/responses`. The `responses_wire` column
+# is DERIVED from this table and nothing else: `true` for an id listed here,
+# `false` for every other row. So a row flips only with a doc URL in review, and
+# a hand edit of the TSV column is a staleness failure under `--check`, never a
+# silent capability grant. `true` makes the gateway RELAY the caller's bytes to
+# that host; a wrong `true` is a 404 that reads as a provider outage.
+RESPONSES_WIRE = {
+    "openai": "https://platform.openai.com/docs/api-reference/responses",
+    "xai": "https://docs.x.ai/docs/api-reference#create-new-response",
+    "openrouter": "https://openrouter.ai/docs/api-reference/responses-api/overview",
+}
+
+
+def responses_wire_value(pid: str) -> str:
+    return "true" if pid in RESPONSES_WIRE else "false"
+
+
+# OG-06: the NON-CHAT endpoints a provider's OWN documentation shows at the OpenAI-shaped
+# path `{base_url}/v1/<path>`. The `capabilities` column (a comma-separated subset of
+# CAPABILITY_IDS, `` for none) is DERIVED from this table and nothing else, exactly as
+# `responses_wire` is from RESPONSES_WIRE: a capability flips on only with a doc URL in
+# review, and a hand edit of the TSV column is a staleness failure under `--check`, never
+# a silent grant. A wrong grant sends a tenant's BYOK key and body to a path the host does
+# not serve (a 404 that reads as an outage), so the default for every row is NONE.
+#
+#   images              POST /v1/images/generations (JSON)
+#   images_edits        POST /v1/images/edits (OpenAI's MULTIPART shape — xAI's edit
+#                       endpoint takes JSON, so xAI does NOT get this one)
+#   audio_speech        POST /v1/audio/speech (JSON in, audio bytes out)
+#   audio_transcription POST /v1/audio/transcriptions and /v1/audio/translations (multipart)
+#   moderation          POST /v1/moderations
+#   rerank              POST /v1/rerank (query, documents, top_n)
+#   files               POST/GET/DELETE /v1/files, GET /v1/files/{id}/content
+#   batch               POST/GET /v1/batches, POST /v1/batches/{id}/cancel
+# Cohere is a native adapter (not a row): its rerank is `POST {v2 base}/rerank`, in Rust.
+CAPABILITY_IDS = (
+    "images",
+    "images_edits",
+    "audio_speech",
+    "audio_transcription",
+    "moderation",
+    "rerank",
+    "files",
+    "batch",
+)
+CAPABILITIES: dict[str, dict[str, str]] = {
+    "openai": {
+        "images": "https://platform.openai.com/docs/api-reference/images/create",
+        "images_edits": "https://platform.openai.com/docs/api-reference/images/createEdit",
+        "audio_speech": "https://platform.openai.com/docs/api-reference/audio/createSpeech",
+        "audio_transcription": "https://platform.openai.com/docs/api-reference/audio/createTranscription",
+        "moderation": "https://platform.openai.com/docs/api-reference/moderations/create",
+        "files": "https://platform.openai.com/docs/api-reference/files",
+        "batch": "https://platform.openai.com/docs/api-reference/batch",
+    },
+    "groq": {
+        "audio_speech": "https://console.groq.com/docs/text-to-speech",
+        "audio_transcription": "https://console.groq.com/docs/speech-to-text",
+        "files": "https://console.groq.com/docs/batch",
+        "batch": "https://console.groq.com/docs/batch",
+    },
+    "xai": {
+        "images": "https://docs.x.ai/docs/guides/image-generations",
+    },
+    "together": {
+        "images": "https://docs.together.ai/reference/post-images-generations",
+        "rerank": "https://docs.together.ai/reference/rerank-1",
+    },
+    "mistral": {
+        "moderation": "https://docs.mistral.ai/api/endpoint/classifiers",
+    },
+}
+
+
+def capabilities_value(pid: str) -> str:
+    have = CAPABILITIES.get(pid, {})
+    return ",".join(c for c in CAPABILITY_IDS if c in have)
+
+
+# OG-05: FIRST-PARTY PREFIX TABLE. A developer types the model id exactly as the
+# vendor's docs print it (`kimi-k3`, `glm-5.3`, `qwen3.8-max`, `muse-*`); the
+# catalog's namespaced-only prefixes made those unroutable, and groq's bare `qwen`
+# MISROUTED `qwen3.8-max` to Groq with Groq's key. This table adds bare prefixes
+# to the vendor's OWN row. It is applied inside `parse_existing`, so `--local`,
+# `--check` and a full regeneration all agree, and it only ever edits the
+# `prefixes` column: a live `base_url` is never touched (a re-pointed base_url
+# would send a tenant's BYOK key to a host they never chose).
+#
+# provider id -> (prefixes to ADD, the vendor documentation that names them).
+FIRST_PARTY_PREFIXES: dict[str, tuple[list[str], str]] = {
+    # DashScope international compatible-mode (the `alibaba` row's host).
+    "alibaba": (
+        ["qwen3.", "qwen-max", "qwen-plus", "qwen-flash"],
+        "https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope",
+    ),
+    # International Moonshot host https://api.moonshot.ai (new row, below); the
+    # existing `moonshot` row is the China host api.moonshot.cn and stays as is.
+    "moonshot-intl": (
+        ["moonshot-intl/", "kimi-"],
+        "https://platform.moonshot.ai/docs/api/chat",
+    ),
+    "zai": (["glm-"], "https://docs.z.ai/api-reference/introduction"),
+    "mistral": (
+        ["magistral-", "codestral-", "devstral-"],
+        "https://docs.mistral.ai/getting-started/models/models_overview/",
+    ),
+    # Meta Model API moved to https://api.meta.ai/v1; concrete model ids sit
+    # behind SSO and were NOT FOUND (specs/OG-05 §2), so only the family
+    # prefix `muse-` is claimed.
+    "meta": (["meta/", "muse-"], "https://api.meta.ai/v1"),
+    # Groq keeps its own namespaced ids (`qwen/qwen3-32b`). OG-06: its Whisper models
+    # (`whisper-large-v3`, `whisper-large-v3-turbo`) and Orpheus speech models
+    # (`canopylabs/orpheus-v1-english`) route to Groq — `whisper-large` is LONGER than
+    # OpenAI's `whisper-1`, so the two never collide.
+    "groq": (
+        ["qwen/", "whisper-large", "canopylabs/"],
+        "https://console.groq.com/docs/models",
+    ),
+    # OG-06: OpenAI's non-chat model ids, as its docs print them. They are bare names with
+    # no `gpt` in them, so without these the media routes could not route them at all
+    # (`gpt-image-*`, `gpt-4o-transcribe`, `gpt-4o-mini-tts` already match `gpt`).
+    "openai": (
+        ["tts-1", "whisper-1", "dall-e", "omni-moderation", "text-moderation"],
+        "https://platform.openai.com/docs/models",
+    ),
+}
+
+# Bare prefixes REMOVED from an existing row. Groq loses bare `qwen`: it is what
+# captured `qwen3.8-max` (a first-party Alibaba id). Namespaced `qwen/` replaces it.
+PREFIX_REMOVALS: dict[str, set[str]] = {"groq": {"qwen"}}
+
+# New provider rows OG-05 adds (id, label, base_url, base_url_env, api_key_env).
+# `prefixes` come from FIRST_PARTY_PREFIXES; `responses_wire` is derived.
+NEW_ROWS: list[list[str]] = [
+    [
+        "moonshot-intl",
+        "Moonshot AI (International)",
+        "https://api.moonshot.ai",
+        "MOONSHOT_INTL_BASE_URL",
+        "MOONSHOT_API_KEY",
+    ],
+    ["meta", "Meta Model API", "https://api.meta.ai", "META_BASE_URL", "META_API_KEY"],
+]
+
+
+def apply_first_party(rows: dict[str, list[str]]) -> None:
+    """Add the OG-05 rows and prefixes to `rows` in place. Idempotent.
+
+    Never touches `base_url` of a row that already exists. Raises SystemExit if a
+    first-party claim names a provider that is not in the catalog, because
+    silently skipping it would leave the model unroutable with the generator
+    reporting success.
+    """
+    for new in NEW_ROWS:
+        if new[0] not in rows:
+            pid = new[0]
+            prefixes = ",".join(FIRST_PARTY_PREFIXES[pid][0])
+            rows[pid] = [
+                *new,
+                prefixes,
+                responses_wire_value(pid),
+                capabilities_value(pid),
+            ]
+    for pid, (add, doc) in FIRST_PARTY_PREFIXES.items():
+        if not doc.startswith("https://"):
+            sys.exit(f"FAIL — first-party prefixes for `{pid}` carry no https doc URL")
+        if pid not in rows:
+            sys.exit(f"FAIL — first-party prefixes name `{pid}`, which is not a row")
+        cur = [
+            p
+            for p in rows[pid][5].split(",")
+            if p and p not in PREFIX_REMOVALS.get(pid, ())
+        ]
+        for p in add:
+            if p not in cur:
+                cur.append(p)
+        rows[pid][5] = ",".join(cur)
+
 
 # Display names for the ids the catalog does not carry a label for. `openai` is
 # here because it IS a catalog row whose upstream label reads worse than this
@@ -165,9 +345,13 @@ def parse_existing() -> dict[str, list[str]]:
         if not line or line.startswith(("#", "id\t")):
             continue
         f = line.split("\t")
-        if len(f) != 6:
+        # Six columns is a row written before OG-01's `responses_wire`; seven is
+        # current. The seventh is DERIVED (`RESPONSES_WIRE`), never read back as
+        # truth — what the file says is compared against it by `--check`.
+        if len(f) not in (6, 7, 8):
             sys.exit(f"FAIL — malformed row in {CATALOG.name}: {line!r}")
-        rows[f[0]] = f
+        rows[f[0]] = f[:6] + [responses_wire_value(f[0]), capabilities_value(f[0])]
+    apply_first_party(rows)  # OG-05: first-party prefixes + the two new rows
     if len(rows) < 29:
         sys.exit(
             f"FAIL — parsed only {len(rows)} rows from {CATALOG.name}; expected >= 29 "
@@ -229,6 +413,8 @@ def build_rows(existing: dict[str, list[str]], md: dict) -> list[list[str]]:
                 re.sub(r"[^A-Z0-9]", "_", pid.upper()) + "_BASE_URL",
                 v["env"][0],
                 f"{pid}/",  # namespaced ONLY — see the module docstring
+                responses_wire_value(pid),
+                capabilities_value(pid),
             ]
         )
     return rows
@@ -243,7 +429,28 @@ def check_rows(rows: list[list[str]]) -> list[str]:
     bare: dict[str, str] = {}
     namespaced: dict[str, str] = {}
 
-    for pid, label, base, base_env, key_env, prefixes in rows:
+    for row in rows:
+        pid, label, base, base_env, key_env, prefixes, responses_wire, *rest = row
+        caps = rest[0] if rest else capabilities_value(pid)  # 7-column rows predate it
+        for cap in [c for c in caps.split(",") if c]:
+            if cap not in CAPABILITY_IDS:
+                errs.append(f"`{pid}` claims unknown capability `{cap}`")
+            elif not CAPABILITIES.get(pid, {}).get(cap, "").startswith("https://"):
+                errs.append(
+                    f"`{pid}` claims capability `{cap}` with no doc URL in CAPABILITIES"
+                )
+        if caps != capabilities_value(pid):
+            errs.append(
+                f"`{pid}` capabilities `{caps}` differ from the derived `{capabilities_value(pid)}`"
+            )
+        if responses_wire not in ("true", "false"):
+            errs.append(f"`{pid}` responses_wire `{responses_wire}` is not true/false")
+        if responses_wire == "true" and not RESPONSES_WIRE.get(pid, "").startswith(
+            "https://"
+        ):
+            errs.append(
+                f"`{pid}` claims responses_wire=true with no doc URL in RESPONSES_WIRE"
+            )
         if pid in seen_id:
             errs.append(f"duplicate provider id `{pid}`")
         seen_id.add(pid)
@@ -290,6 +497,10 @@ def render(rows: list[list[str]], src_sha: str) -> str:
         "# One OpenAI-compatible provider per row. Native adapters (anthropic, google,",
         "# vertex, bedrock, azure, cohere) are NOT here: their wire format differs and",
         "# they stay as typed Rust adapters.",
+        "#",
+        "# `capabilities` (OG-06) is a comma-separated subset of CAPABILITY_IDS in the",
+        "# generator — the non-chat endpoints the provider's OWN docs show at the",
+        "# OpenAI path; empty = none. DERIVED from CAPABILITIES (doc URL per entry).",
         "#",
         "# `prefixes` is comma-separated. A prefix containing `/` (or starting `@`) is",
         "# NAMESPACED and is matched first; a bare prefix is matched afterwards,",
@@ -595,7 +806,7 @@ def render_doc_body(
         "| Provider | ID | Default base URL | Base-URL override | API key env var | Model prefixes |",
         "|---|---|---|---|---|---|",
     ]
-    for pid, label, base, base_env, key_env, prefixes in sorted(
+    for pid, label, base, base_env, key_env, prefixes, *_wire in sorted(
         rows, key=lambda r: (r[1].lower(), r[0])
     ):
         # An empty `api_key_env` is Ollama, which is local and has no key to
@@ -652,11 +863,20 @@ def render_doc_pages(body: str) -> dict[Path, str]:
 
 def selftest() -> int:
     bad = [
-        (["a", "A", "https://x.dev/v1", "A_BASE_URL", "A_KEY", "a/"], "/v1"),
-        (["b", "B", "https://x.dev", "B_BASE_URL", "B_KEY", "llama"], None),
-        (["c", "C", "https://x.dev", "C_BASE_URL", "C_KEY", "llama"], "bare prefix"),
-        (["A!", "X", "https://x.dev", "X_BASE_URL", "X_KEY", "x/"], "not [a-z0-9"),
-        (["d", "D", "ftp://x.dev", "D_BASE_URL", "D_KEY", "d/"], "neither https"),
+        (["a", "A", "https://x.dev/v1", "A_BASE_URL", "A_KEY", "a/", "false"], "/v1"),
+        (["b", "B", "https://x.dev", "B_BASE_URL", "B_KEY", "llama", "false"], None),
+        (
+            ["c", "C", "https://x.dev", "C_BASE_URL", "C_KEY", "llama", "false"],
+            "bare prefix",
+        ),
+        (
+            ["A!", "X", "https://x.dev", "X_BASE_URL", "X_KEY", "x/", "false"],
+            "not [a-z0-9",
+        ),
+        (
+            ["d", "D", "ftp://x.dev", "D_BASE_URL", "D_KEY", "d/", "false"],
+            "neither https",
+        ),
     ]
     ok = True
     e = check_rows([bad[0][0]])
@@ -679,9 +899,23 @@ def selftest() -> int:
         f"  {'✓' if any('neither https' in x for x in e) else '✗'} a non-https base_url is REFUSED"
     )
     ok &= any("neither https" in x for x in e)
-    e = check_rows([["e", "E", "https://x.dev", "E_BASE_URL", "E_KEY", "e/"]])
+    e = check_rows([["e", "E", "https://x.dev", "E_BASE_URL", "E_KEY", "e/", "false"]])
     print(
         f"  {'✓' if not e else '✗'} a WELL-FORMED row passes (the check is not vacuous)"
+    )
+    ok &= not e
+
+    # OG-01: a row that claims the Responses wire without a doc URL is refused —
+    # `true` relays the caller's bytes to that host.
+    e = check_rows([["zz", "Z", "https://x.dev", "Z_BASE_URL", "Z_KEY", "zz/", "true"]])
+    hit = any("responses_wire=true" in x for x in e)
+    print(f"  {'✓' if hit else '✗'} responses_wire=true WITHOUT a doc URL is REFUSED")
+    ok &= hit
+    e = check_rows(
+        [["openai", "O", "https://x.dev", "O_BASE_URL", "O_KEY", "oo/", "true"]]
+    )
+    print(
+        f"  {'✓' if not e else '✗'} responses_wire=true WITH a doc URL passes (not vacuous)"
     )
     ok &= not e
 
@@ -741,6 +975,154 @@ def selftest() -> int:
     )
     ok &= hit
 
+    # ── OG-05: the first-party prefix table.
+    fake = {
+        "groq": [
+            "groq",
+            "Groq",
+            "https://g.example",
+            "G_URL",
+            "G_KEY",
+            "llama,qwen",
+            "false",
+        ],
+        "alibaba": [
+            "alibaba",
+            "A",
+            "https://a.example",
+            "A_URL",
+            "A_KEY",
+            "alibaba/",
+            "false",
+        ],
+        "zai": ["zai", "Z", "https://z.example", "Z_URL", "Z_KEY", "zai/", "false"],
+        "openai": [
+            "openai",
+            "O",
+            "https://o.example",
+            "O_URL",
+            "O_KEY",
+            "gpt,openai/",
+            "false",
+        ],
+        "mistral": [
+            "mistral",
+            "M",
+            "https://m.example",
+            "M_URL",
+            "M_KEY",
+            "mistral",
+            "false",
+        ],
+    }
+    before = {k: v[2] for k, v in fake.items()}
+    apply_first_party(fake)
+    hit = "qwen" not in fake["groq"][5].split(",") and "qwen/" in fake["groq"][5].split(
+        ","
+    )
+    print(
+        f"  {'✓' if hit else '✗'} groq LOSES bare `qwen` and keeps namespaced `qwen/`"
+    )
+    ok &= hit
+    hit = (
+        "qwen3." in fake["alibaba"][5].split(",")
+        and "kimi-" in fake["moonshot-intl"][5]
+    )
+    print(
+        f"  {'✓' if hit else '✗'} first-party bare prefixes land on the vendor's own row"
+    )
+    ok &= hit
+    hit = all(fake[k][2] == before[k] for k in before)
+    print(f"  {'✓' if hit else '✗'} an EXISTING row's base_url is never edited")
+    ok &= hit
+    snap = {k: list(v) for k, v in fake.items()}
+    apply_first_party(fake)
+    hit = snap == fake
+    print(f"  {'✓' if hit else '✗'} applying the table twice is a no-op (idempotent)")
+    ok &= hit
+    try:
+        apply_first_party({"groq": fake["groq"]})  # alibaba/zai/mistral rows missing
+        hit = False
+    except SystemExit:
+        hit = True
+    print(
+        f"  {'✓' if hit else '✗'} a first-party claim on a MISSING provider row is REFUSED"
+    )
+    ok &= hit
+    hit = all(u.startswith("https://") for _, u in FIRST_PARTY_PREFIXES.values())
+    print(f"  {'✓' if hit else '✗'} every first-party entry carries an https doc URL")
+    ok &= hit
+    # The merged result must still pass the row guards (no bare prefix claimed twice).
+    e = check_rows([r for r in fake.values()])
+    hit = not e
+    print(
+        f"  {'✓' if hit else '✗'} the merged rows pass check_rows (no duplicate bare prefix)"
+    )
+    ok &= hit
+    e = check_rows(
+        [
+            ["x1", "X", "https://x.dev", "X1_BASE_URL", "X1_KEY", "qwen3.", "false"],
+            list(fake["alibaba"]),
+        ]
+    )
+    hit = any("bare prefix" in x for x in e)
+    print(
+        f"  {'✓' if hit else '✗'} two rows claiming `qwen3.` are REFUSED (the guard BLOCKS)"
+    )
+    ok &= hit
+
+    # ── OG-06: the capability column is derived and doc-backed.
+    base = ["zq", "Z", "https://x.dev", "ZQ_BASE_URL", "ZQ_KEY", "zq/", "false"]
+    e = check_rows([[*base, "files"]])
+    hit = any("no doc URL" in x for x in e)
+    print(
+        f"  {'✓' if hit else '✗'} a capability WITHOUT a doc URL is REFUSED (the guard BLOCKS)"
+    )
+    ok &= hit
+    e = check_rows([[*base, "teleport"]])
+    hit = any("unknown capability" in x for x in e)
+    print(f"  {'✓' if hit else '✗'} an unknown capability id is REFUSED")
+    ok &= hit
+    e = check_rows(
+        [["openai", "O", "https://x.dev", "O_BASE_URL", "O_KEY", "oo/", "true", ""]]
+    )
+    hit = any("differ from the derived" in x for x in e)
+    print(
+        f"  {'✓' if hit else '✗'} a hand-DROPPED capability is a staleness failure (column is derived)"
+    )
+    ok &= hit
+    e = check_rows(
+        [
+            [
+                "openai",
+                "O",
+                "https://x.dev",
+                "O_BASE_URL",
+                "O_KEY",
+                "oo/",
+                "true",
+                capabilities_value("openai"),
+            ]
+        ]
+    )
+    hit = not e
+    print(
+        f"  {'✓' if hit else '✗'} the derived capabilities WITH doc URLs pass (not vacuous)"
+    )
+    ok &= hit
+    hit = capabilities_value("zq") == "" and capabilities_value("xai") == "images"
+    print(
+        f"  {'✓' if hit else '✗'} the default is NONE; xAI gets images but NOT the multipart edit shape"
+    )
+    ok &= hit
+    hit = all(
+        u.startswith("https://")
+        for caps in CAPABILITIES.values()
+        for u in caps.values()
+    )
+    print(f"  {'✓' if hit else '✗'} every CAPABILITIES entry carries an https doc URL")
+    ok &= hit
+
     print("selftest OK" if ok else "selftest FAILED")
     return 0 if ok else 1
 
@@ -784,6 +1166,16 @@ def check_local() -> int:
         return 1
 
     stale = []
+    # OG-01: the TSV's own data rows must equal what the generator would write —
+    # in particular the DERIVED `responses_wire` column, so a hand-flipped
+    # `true` is caught here rather than shipped as a relay to the wrong host.
+    have_rows = [
+        line
+        for line in CATALOG.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    if have_rows != [HEADER] + ["\t".join(r) for r in rows]:
+        stale.append(CATALOG.relative_to(ROOT))
     for path, want in [(DROPDOWN, render_dropdown(rows)), *pages.items()]:
         have = path.read_text(encoding="utf-8") if path.exists() else ""
         if have != want:
@@ -804,6 +1196,40 @@ def check_local() -> int:
     return 0
 
 
+def regenerate_local() -> int:
+    """Rewrite the catalog-derived artifacts from the checked-in rows alone.
+
+    No network, no price refresh: the rows are `parse_existing()` (which never
+    re-points a provider) and the `source sha256` line is carried over verbatim,
+    so the only change this can make is a derived column or a generated table.
+    """
+    existing = parse_existing()
+    rows = [existing[k] for k in sorted(existing)]
+    errs = check_rows(rows)
+    if errs:
+        for e in errs:
+            print(f"FAIL — {e}", file=sys.stderr)
+        return 1
+    m = re.search(
+        r"^# source sha256: (\S+)$", CATALOG.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    if not m:
+        print("FAIL — providers.tsv has no `# source sha256:` line", file=sys.stderr)
+        return 1
+    try:
+        native = parse_native_adapters(MOD_RS.read_text(encoding="utf-8"))
+        pages = render_doc_pages(render_doc_body(rows, native))
+    except (SpliceError, OSError) as exc:
+        print(f"FAIL — {exc}", file=sys.stderr)
+        return 1
+    CATALOG.write_text(render(rows, m.group(1)), encoding="utf-8")
+    DROPDOWN.write_text(render_dropdown(rows), encoding="utf-8")
+    for path, text in pages.items():
+        path.write_text(text, encoding="utf-8")
+    print(f"wrote {CATALOG.relative_to(ROOT)}: {len(rows)} rows (local, no network)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -812,11 +1238,19 @@ def main() -> int:
         help="LOCAL consistency only, no network. What the gate runs.",
     )
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument(
+        "--local",
+        action="store_true",
+        help="Regenerate providers.tsv + dropdown + doc tables from the checked-in "
+        "catalog, NO network and no price refresh (OG-01: a derived-column change).",
+    )
     a = ap.parse_args()
     if a.selftest:
         return selftest()
     if a.check:
         return check_local()
+    if a.local:
+        return regenerate_local()
 
     existing = parse_existing()
     md, sha = fetch(SOURCE_URL)

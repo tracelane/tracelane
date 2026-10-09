@@ -9,7 +9,7 @@
  * pass through (the toggle shows `audit_unavailable` by name); everything else is masked.
  */
 import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
 const PASS_THROUGH = new Set([400, 503]);
@@ -47,17 +47,13 @@ async function relay(upstream: Response): Promise<NextResponse> {
 }
 
 export async function GET(): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
-	return relay(
-		await fetch(`${gatewayBaseUrl()}/v1/workspace/capture`, {
-			headers: { authorization: `Bearer ${token}` },
-			cache: "no-store",
-		}),
-	);
+	return relay(await gatewayResponse("/v1/workspace/capture"));
 }
 
 export async function PUT(req: NextRequest): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
+	// Auth first (unchanged order): an unauthenticated caller is redirected
+	// before any body validation. `gatewayResponse` reuses the memoized token.
+	await requireGatewayToken();
 	let body: { input?: unknown; output?: unknown };
 	try {
 		body = (await req.json()) as typeof body;
@@ -68,14 +64,10 @@ export async function PUT(req: NextRequest): Promise<NextResponse> {
 		return NextResponse.json({ error: "invalid_body" }, { status: 400 });
 	}
 	return relay(
-		await fetch(`${gatewayBaseUrl()}/v1/workspace/capture`, {
+		await gatewayResponse("/v1/workspace/capture", {
 			method: "PUT",
-			headers: {
-				authorization: `Bearer ${token}`,
-				"content-type": "application/json",
-			},
+			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ input: body.input, output: body.output }),
-			cache: "no-store",
 		}),
 	);
 }

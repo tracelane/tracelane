@@ -25,14 +25,14 @@ is right and this page is the bug.
   │   → entitlements → rate limit → budgets → predictive layer (observe-first)   │
   │   → audit publish (acked JetStream write; fail-closed 503)                   │
   │ then (crates/gateway/src/server/chat.rs): BYOK key → guardrail rails R1–R8   │
-  │   → circuit breaker → dispatch (191 routable providers, prefix-routed,       │
+  │   → circuit breaker → dispatch (205 routable providers, prefix-routed,       │
   │   no default provider; one same-provider retry; cross-provider failover is   │
   │   a per-request opt-in) → span publish                                       │
   └───────┬──────────────────────────┬───────────────────────────┬───────────────┘
           │ HTTPS                    │ NATS JetStream            │ Postgres — through
           ▼                          │ tracelane.spans.>         │ caches, never per
   ┌───────────────────┐              │ tracelane.audit.>         │ request
-  │ 191 routable      │              ▼                           ▼
+  │ 205 routable      │              ▼                           ▼
   │ providers:        │   ┌────────────────────────┐   ┌────────────────────────────┐
   │ 6 native adapters │   │ ② Rust ingest          │   │ Postgres (Neon-compatible) │
   │ + 185 OpenAI-     │   │ consumes               │   │ • control plane: tenants,  │
@@ -90,9 +90,9 @@ Where each line of the diagram comes from:
   (`crates/gateway/src/providers/failover.rs:104-118`) and per-request
   cross-provider failover behind `X-Tracelane-Failover: cross-provider`
   (`server/chat.rs:917-925`).
-- Provider count: 185 OpenAI-compatible rows in `crates/gateway/providers.tsv`
+- Provider count: 199 OpenAI-compatible rows in `crates/gateway/providers.tsv`
   plus the 6 native adapters on `ProviderRegistry`
-  (`crates/gateway/src/providers/mod.rs:553-568`) — 191 routable. The count is
+  (`crates/gateway/src/providers/mod.rs:579-594`) — 205 routable. The count is
   derived, not typed: `scripts/ci/check-provider-count.py` fails the gate when a
   written number disagrees. An unknown model is refused with `unroutable_model`;
   there is no default provider (`providers/mod.rs:636-641,676-681`).

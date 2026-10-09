@@ -118,15 +118,29 @@ impl RetryPolicy {
         backoff_ms: DEFAULT_BACKOFF_MS,
     };
 
-    /// Total time this policy can spend sleeping between attempts.
+    /// The WORST-CASE time this policy can spend sleeping between attempts:
+    /// `Σ backoff_ms × 2^i` for `i in 0..retries` — OG-10's full-jitter backoff
+    /// draws each pause from `uniform(0, backoff_ms × 2^attempt)`, so the sum of the
+    /// caps is the most a run of retries could ask for. (Before OG-10 the pause was a
+    /// fixed `backoff_ms` and this was `retries × backoff_ms`.)
     ///
-    /// [`crate::server::config`] refuses a `failover:` block whose plan does
-    /// not fit inside [`FAILOVER_BUDGET_MS`] — a backoff longer than the budget
-    /// is a retry that can never fire, which reads as "retries configured" and
-    /// behaves as "no retries".
+    /// [`crate::server::config`] refuses a `failover:` block whose plan does not fit
+    /// inside [`FAILOVER_BUDGET_MS`] — a plan longer than the budget is retries that
+    /// can never all fire, which reads as "retries configured" and behaves as fewer.
+    /// Saturates rather than overflowing for an absurd `retries`.
     #[must_use]
     pub const fn planned_backoff_ms(&self) -> u64 {
-        self.retries as u64 * self.backoff_ms
+        if self.retries >= 64 {
+            return if self.backoff_ms == 0 { 0 } else { u64::MAX };
+        }
+        // Σ 2^i for i in 0..retries = 2^retries − 1 (computed in u128: no overflow).
+        let factor = (1u128 << self.retries) - 1;
+        let total = self.backoff_ms as u128 * factor;
+        if total > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            total as u64
+        }
     }
 }
 
@@ -232,7 +246,7 @@ pub fn is_failover_eligible(status_code: u16) -> bool {
 
 /// The built-in model for a provider in [`DEFAULT_CHAIN`], or `None`.
 ///
-/// `None` is a real answer, and the common one: only three of the 191 routable
+/// `None` is a real answer, and the common one: only three of the 205 routable
 /// providers have a built-in entry. A `failover:` chain that names any other
 /// provider must spell the model out (`chain: groq:llama-3.3-70b-versatile`),
 /// and [`crate::server::config`] refuses the block if it does not — rather than
@@ -574,5 +588,33 @@ mod tests {
     #[test]
     fn retry_policy_is_the_builtin_when_no_failover_block_is_installed() {
         assert_eq!(retry_policy(None), RetryPolicy::BUILTIN);
+    }
+}
+
+#[cfg(test)]
+mod og10_plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_planned_backoff_is_the_geometric_worst_case() {
+        let plan = |retries, backoff_ms| {
+            RetryPolicy {
+                retries,
+                backoff_ms,
+            }
+            .planned_backoff_ms()
+        };
+        assert_eq!(plan(0, 100), 0, "no retries, no sleep");
+        assert_eq!(plan(1, 100), 100);
+        assert_eq!(plan(2, 50), 150, "50 + 100");
+        assert_eq!(plan(3, 80), 560, "80 + 160 + 320");
+        assert_eq!(plan(5, 0), 0);
+        assert_eq!(
+            plan(200, 1),
+            u64::MAX,
+            "saturates, never wraps to a small number"
+        );
+        assert_eq!(plan(200, 0), 0);
+        assert_eq!(plan(63, u64::MAX), u64::MAX);
     }
 }

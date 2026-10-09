@@ -16,6 +16,33 @@ const h = vi.hoisted(() => ({
 	db: null as DbMock | null,
 }));
 
+const ctl = vi.hoisted(() => ({
+	record: vi.fn(
+		async (
+			..._a: unknown[]
+		): Promise<{ ok: true } | { ok: false; response: Response }> => ({
+			ok: true,
+		}),
+	),
+	failed: vi.fn(async (..._a: unknown[]) => undefined),
+}));
+const refused = (status: number, error: string) => ({
+	ok: false as const,
+	response: Response.json({ error }, { status }),
+});
+
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: ctl.record,
+	recordControlChangeFailed: ctl.failed,
+	redactEmail: (e: string) => `${e[0]}***${e.slice(e.indexOf("@"))}`,
+}));
+
+beforeEach(() => {
+	ctl.record.mockReset();
+	ctl.record.mockResolvedValue({ ok: true });
+	ctl.failed.mockReset();
+});
+
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -248,3 +275,91 @@ vi.mock("../owner-lock", () => ({
 	withOwnerMutation: async (_org: string, work: () => Promise<unknown>) =>
 		work(),
 }));
+
+describe("control-change recording (gateway audit precedes the WorkOS write)", () => {
+	beforeEach(() => {
+		h.session = {
+			tenantId: "org_SESSION",
+			userId: "user_ADMIN",
+			email: "a@b.co",
+		};
+		h.db = makeDbMock([[]]);
+		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+	});
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		process.env.WORKOS_API_KEY = undefined;
+	});
+
+	it("PATCH REJECT: recording refused -> gateway 403 returned and WorkOS is NOT written", async () => {
+		ctl.record.mockResolvedValue(refused(403, "role_forbidden"));
+		const spy = stub([admin, member]);
+		const res = await patch("mem_member", { role: "viewer" });
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as { error: string }).error).toBe(
+			"role_forbidden",
+		);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "PUT")).toBe(true);
+		expect(ctl.failed).not.toHaveBeenCalled();
+	});
+
+	it("PATCH REJECT: audit unavailable -> 503 and no WorkOS write", async () => {
+		ctl.record.mockResolvedValue(refused(503, "control_audit_unavailable"));
+		const spy = stub([admin, member]);
+		expect((await patch("mem_member", { role: "viewer" })).status).toBe(503);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "PUT")).toBe(true);
+	});
+
+	it("PATCH records member.role_change with before/after, then writes", async () => {
+		const spy = stub([admin, member]);
+		const res = await patch("mem_member", { role: "developer" });
+		expect(res.status).toBe(200);
+		expect(ctl.record).toHaveBeenCalledWith(
+			"member.role_change",
+			"mem_member",
+			{ role: "member" },
+			{ role: "developer" },
+		);
+		expect(spy.mock.calls.some((c) => methodOf(c) === "PUT")).toBe(true);
+		expect(ctl.failed).not.toHaveBeenCalled();
+	});
+
+	it("PATCH records .failed when WorkOS fails", async () => {
+		stub([admin, member], { putOk: false });
+		const res = await patch("mem_member", { role: "viewer" });
+		expect(res.status).toBe(502);
+		expect(ctl.failed).toHaveBeenCalledWith(
+			"member.role_change",
+			"mem_member",
+			{ role: "member" },
+			{ role: "viewer" },
+		);
+	});
+
+	it("PATCH accepts developer and billing as assignable roles", async () => {
+		stub([admin, member]);
+		expect((await patch("mem_member", { role: "billing" })).status).toBe(200);
+		expect((await patch("mem_member", { role: "developer" })).status).toBe(200);
+	});
+
+	it("DELETE REJECT: recording refused -> 403 and WorkOS is NOT called to delete", async () => {
+		ctl.record.mockResolvedValue(refused(403, "role_forbidden"));
+		const spy = stub([admin, member]);
+		const res = await del("mem_member");
+		expect(res.status).toBe(403);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "DELETE")).toBe(true);
+	});
+
+	it("DELETE records member.remove before and .failed when WorkOS fails", async () => {
+		stub([admin, member], { delOk: false });
+		expect((await del("mem_member")).status).toBe(502);
+		expect(ctl.record).toHaveBeenCalledWith("member.remove", "mem_member", {
+			user_id: "user_MEMBER",
+			role: "member",
+		});
+		expect(ctl.failed).toHaveBeenCalledWith("member.remove", "mem_member", {
+			user_id: "user_MEMBER",
+			role: "member",
+		});
+	});
+});

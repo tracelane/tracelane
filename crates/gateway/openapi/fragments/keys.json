@@ -1,0 +1,507 @@
+{
+  "module": "crates/gateway/src/key_routes.rs",
+  "operations": {
+    "POST /v1/keys": {
+      "summary": "Mint an API key. rawKey is returned once.",
+      "tags": [
+        "keys"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "budget_usd_monthly": {
+            "type": "number"
+          },
+          "rate_limit_rpm": {
+            "type": "integer"
+          },
+          "budget_reset": {
+            "enum": [
+              "daily",
+              "weekly",
+              "monthly"
+            ]
+          },
+          "velocity_breaker": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PolicyDocument"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "responses": {
+        "201": {
+          "description": "The key, with rawKey.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "role_forbidden",
+        "unavailable"
+      ]
+    },
+    "GET /v1/keys/{id}": {
+      "summary": "One key's metadata and window spend (never key material).",
+      "tags": [
+        "keys"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The key (camelCase) plus spend.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "keyPrefix": {
+                "type": "string"
+              },
+              "lastUsedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "createdAt": {
+                "type": "string"
+              },
+              "mintedBy": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "expiresAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "budgetUsdMonthly": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "rateLimitRpm": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "budgetReset": {
+                "enum": [
+                  "daily",
+                  "weekly",
+                  "monthly"
+                ]
+              },
+              "velocityBreaker": {
+                "type": "boolean"
+              },
+              "revokedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "projectId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "environment": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PolicyDocument"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "not_found",
+        "insufficient_scope",
+        "unavailable"
+      ]
+    },
+    "PATCH /v1/keys/{id}": {
+      "summary": "Edit a key in place (RFC 7396). policy, project_id and environment are the OG-20/OG-23 fields; null clears.",
+      "tags": [
+        "keys"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_usd_monthly": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rate_limit_rpm": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "budget_reset": {
+            "type": "string"
+          },
+          "velocity_breaker": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The key.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "keyPrefix": {
+                "type": "string"
+              },
+              "lastUsedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "createdAt": {
+                "type": "string"
+              },
+              "mintedBy": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "expiresAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "budgetUsdMonthly": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "rateLimitRpm": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "budgetReset": {
+                "enum": [
+                  "daily",
+                  "weekly",
+                  "monthly"
+                ]
+              },
+              "velocityBreaker": {
+                "type": "boolean"
+              },
+              "revokedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "projectId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "environment": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PolicyDocument"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "key_retiring",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "not_found",
+        "key_retiring",
+        "environment_not_in_project",
+        "role_forbidden",
+        "unavailable"
+      ]
+    },
+    "DELETE /v1/keys/{id}": {
+      "summary": "Revoke a key (owner only); takes effect in the gateway's auth cache at once.",
+      "tags": [
+        "keys"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "204": {
+          "description": "Revoked."
+        },
+        "404": {
+          "description": "not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "not_found",
+        "role_forbidden",
+        "unavailable"
+      ]
+    },
+    "POST /v1/keys/{id}/rotate": {
+      "summary": "Rotate a key: mint a successor, keep the old one for grace_hours.",
+      "tags": [
+        "keys"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "grace_hours": {
+            "type": "integer"
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "The successor (rawKey once).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "key_retiring",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "not_found",
+        "key_retiring",
+        "invalid_field",
+        "role_forbidden",
+        "unavailable"
+      ]
+    },
+    "GET /v1/keys/rotation-policy": {
+      "summary": "The default rotation grace window.",
+      "tags": [
+        "keys"
+      ],
+      "responses": {
+        "200": {
+          "description": "Policy.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "graceHours": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

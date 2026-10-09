@@ -56,12 +56,9 @@ describe("PUT /api/billing/ceiling", () => {
 	});
 
 	it("ACCEPT: usd: null (turning the ceiling off) is valid", async () => {
-		const spy = vi.fn(
-			async () =>
-				({
-					ok: true,
-					json: async () => ({ usd: null, overflow_mode: "auto_age" }),
-				}) as unknown as Response,
+		// A REAL Response: `gatewayResponse` re-wraps the upstream body.
+		const spy = vi.fn(async () =>
+			Response.json({ usd: null, overflow_mode: "auto_age" }),
 		);
 		vi.stubGlobal("fetch", spy);
 		const res = await PUT(req({ usd: null, overflow_mode: "auto_age" }));
@@ -86,12 +83,8 @@ describe("PUT /api/billing/ceiling", () => {
 	});
 
 	it("HAPPY: forwards the body + minted JWT, returns the gateway's response", async () => {
-		const spy = vi.fn(
-			async (..._args: unknown[]) =>
-				({
-					ok: true,
-					json: async () => ({ usd: 500, overflow_mode: "auto_overage" }),
-				}) as unknown as Response,
+		const spy = vi.fn(async (..._args: unknown[]) =>
+			Response.json({ usd: 500, overflow_mode: "auto_overage" }),
 		);
 		vi.stubGlobal("fetch", spy);
 		const res = await PUT(req({ usd: 500, overflow_mode: "auto_overage" }));
@@ -102,9 +95,11 @@ describe("PUT /api/billing/ceiling", () => {
 		});
 		const init = spy.mock.calls[0]?.[1] as {
 			method?: string;
-			headers?: Record<string, string>;
+			headers?: HeadersInit;
 		};
 		expect(init.method).toBe("PUT");
-		expect(init.headers?.authorization).toBe("Bearer minted-jwt");
+		expect(new Headers(init.headers).get("authorization")).toBe(
+			"Bearer minted-jwt",
+		);
 	});
 });

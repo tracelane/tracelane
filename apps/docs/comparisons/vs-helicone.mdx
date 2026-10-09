@@ -50,11 +50,11 @@ You do not have to take that on trust. Our `deny.toml` sets a license allowlist 
 </Accordion>
 
 <Accordion title="Is Tracelane feature-equivalent to Helicone?">
-Tracelane covers 191 providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline (**self-host writes and hashes the chain to ClickHouse; chain resumption ACROSS a gateway restart needs the Postgres control plane, so continuous multi-restart chains are Cloud today**), inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
+Tracelane covers 205 providers, BYOK with envelope encryption, usage/token tracking, OTel GenAI semconv, and a full Apache 2.0 self-host. On top of that it ships a tamper-evident audit ledger you can verify offline (**self-host writes and hashes the chain to ClickHouse; chain resumption ACROSS a gateway restart needs the Postgres control plane, so continuous multi-restart chains are Cloud today**), inline heuristic guardrails, and a Prompt Promotion workflow. Compare that surface against your current tool's own documentation — feature parity is a moving target and we would rather you check than trust our summary of someone else's product.
 </Accordion>
 
 <Accordion title="What happens to my historical Helicone data?">
-Your historical traces stay where they are — `tlane migrate helicone` is a config + environment migration, not a trace-data importer, so it does not pull your past Helicone traces across. New traces flow into Tracelane from the moment you redeploy. A historical-trace importer (Helicone JSON dump → OTel GenAI semconv) is on the roadmap; until it ships, export from Helicone for archival and start fresh in Tracelane.
+`tlane import-helicone --traces <path>` imports historical requests from a saved Helicone JSON file. It reads a local file and does not fetch or paginate your Helicone account. See [Import Helicone history](/integrations/helicone-history) for the accepted format and limits. New traces flow into Tracelane after you route traffic through the gateway.
 </Accordion>
 
 </AccordionGroup>

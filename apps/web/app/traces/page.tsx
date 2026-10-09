@@ -9,11 +9,18 @@ import { PageHeader } from "@tracelanedev/ui";
  */
 
 import { classifyTraceFetchError, noMatchCopy } from "@/app/traces/empty-state";
+import {
+	TRACE_EXPORT_PARAMS,
+	TRACE_PAGE_PARAMS,
+	type TraceParam,
+	copyGatewayTraceFilters,
+} from "@/app/traces/filter-registry";
 import { EmptyTraces } from "@/components/empty-states/EmptyTraces";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { FilterBar } from "@/components/trace-viewer/FilterBar";
 import { LiveTraces } from "@/components/trace-viewer/LiveTraces";
+import { TraceExportControls } from "@/components/trace-viewer/TraceExportControls";
 import {
 	type TraceGroup,
 	TraceGroupTable,
@@ -100,30 +107,16 @@ function parseSize(sp: SP): PageSize {
 	return (VALID_SIZES as readonly number[]).includes(v) ? (v as PageSize) : 25;
 }
 
-/** The page-facing filter params (not the gateway-derived ones). */
-const PAGE_PARAMS = [
-	"issue",
-	"status",
+const VALID_GROUPS = [
 	"model",
-	"range",
-	"since",
-	"until",
-	"min_latency_ms",
-	"signature_id",
-	"q",
-	"failover",
-	// OBS-20 — "show me this person's traces".
-	"end_user",
-	"agent",
-	"model_family",
-	"sort",
-	"order",
-	"group",
-	"size",
-	"cursor",
+	"operation",
+	"status",
+	"environment",
+	"release",
+	"service",
+	"user",
+	"tag",
 ] as const;
-
-const VALID_GROUPS = ["model", "operation", "status"] as const;
 
 /**
  * Build a `/traces` URL that preserves the active filters and applies the
@@ -132,11 +125,11 @@ const VALID_GROUPS = ["model", "operation", "status"] as const;
  */
 function pageHref(
 	sp: SP,
-	overrides: Partial<Record<(typeof PAGE_PARAMS)[number], string | undefined>>,
+	overrides: Partial<Record<TraceParam, string | undefined>>,
 ): string {
 	const merged: SP = { ...sp, ...overrides };
 	const q = new URLSearchParams();
-	for (const k of PAGE_PARAMS) {
+	for (const k of TRACE_PAGE_PARAMS) {
 		const v = merged[k];
 		if (v) q.set(k, v);
 	}
@@ -171,27 +164,8 @@ function setWindow(q: URLSearchParams, w: TimeRange | null): void {
 function buildQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	q.set("limit", String(parseSize(sp)));
-	if (sp.model) q.set("model", sp.model);
-	if (sp.issue) q.set("issue", sp.issue);
-	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
-	if (sp.signature_id) q.set("signature_id", sp.signature_id);
-	if (sp.end_user) q.set("end_user", sp.end_user);
-	if (sp.agent) q.set("agent", sp.agent);
-	if (sp.model_family) q.set("model_family", sp.model_family);
-	// OBS-01. Forwarded verbatim — the gateway is the ONE place the 4-char
-	// minimum is enforced (`trace_reads.rs::validate_search_term`); a term the
-	// FilterBar wouldn't have submitted itself (a hand-typed `?q=abc`) still
-	// reaches the gateway and comes back as its real 400, not a silent drop.
-	if (sp.q) q.set("q", sp.q);
-	if (sp.failover === "true") q.set("failover", "true");
-	if (sp.status === "error") q.set("has_error", "true");
-	else if (sp.status === "ok") q.set("has_error", "false");
-	// A raw since/until window (e.g. a dashboard chart-click) wins over the range
-	// preset; the gateway validates both as RFC3339 and rejects malformed input.
+	copyGatewayTraceFilters(q, sp, "list");
 	setWindow(q, w);
-	if (sp.sort) q.set("sort", sp.sort);
-	if (sp.order) q.set("order", sp.order);
-	if (sp.cursor) q.set("cursor", sp.cursor);
 	return q.toString();
 }
 
@@ -199,7 +173,10 @@ function buildQuery(sp: SP, w: TimeRange | null): string {
  * A /traces href that sets the sort column and toggles direction (clicking the
  * active column flips desc↔asc; a new column starts desc). Resets the cursor.
  */
-function sortHref(sp: SP, col: "start_time" | "duration" | "spans"): string {
+function sortHref(
+	sp: SP,
+	col: "start_time" | "duration" | "spans" | "cost" | "errors",
+): string {
 	const curSort = sp.sort ?? "start_time";
 	const curOrder = sp.order ?? "desc";
 	const order = curSort === col && curOrder === "desc" ? "asc" : "desc";
@@ -213,22 +190,11 @@ function sortHref(sp: SP, col: "start_time" | "duration" | "spans"): string {
  */
 function buildExportBase(sp: SP): string {
 	const q = new URLSearchParams();
-	if (sp.status) q.set("status", sp.status);
-	if (sp.model) q.set("model", sp.model);
-	if (sp.issue) q.set("issue", sp.issue);
-	if (sp.range) q.set("range", sp.range);
-	// A custom window survives into the export (it used to be dropped, so the CSV
-	// covered a different period than the list it was exported from).
-	if (sp.since) q.set("since", sp.since);
-	if (sp.until) q.set("until", sp.until);
-	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
-	if (sp.signature_id) q.set("signature_id", sp.signature_id);
-	if (sp.end_user) q.set("end_user", sp.end_user);
-	if (sp.agent) q.set("agent", sp.agent);
-	if (sp.model_family) q.set("model_family", sp.model_family);
-	if (sp.failover === "true") q.set("failover", "true");
-	if (sp.sort) q.set("sort", sp.sort);
-	if (sp.order) q.set("order", sp.order);
+	for (const { param } of TRACE_EXPORT_PARAMS) {
+		if (param === "cursor") continue; // first download starts at the first row
+		const value = sp[param];
+		if (value) q.set(param, value);
+	}
 	return q.toString();
 }
 
@@ -236,16 +202,7 @@ function buildExportBase(sp: SP): string {
 function buildGroupQuery(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
 	if (sp.group) q.set("by", sp.group);
-	if (sp.model) q.set("model", sp.model);
-	if (sp.issue) q.set("issue", sp.issue);
-	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
-	if (sp.signature_id) q.set("signature_id", sp.signature_id);
-	if (sp.end_user) q.set("end_user", sp.end_user);
-	if (sp.agent) q.set("agent", sp.agent);
-	if (sp.model_family) q.set("model_family", sp.model_family);
-	if (sp.failover === "true") q.set("failover", "true");
-	if (sp.status === "error") q.set("has_error", "true");
-	else if (sp.status === "ok") q.set("has_error", "false");
+	copyGatewayTraceFilters(q, sp, "group");
 	setWindow(q, w);
 	return q.toString();
 }
@@ -258,16 +215,7 @@ function buildGroupQuery(sp: SP, w: TimeRange | null): string {
  */
 function buildStreamParams(sp: SP, w: TimeRange | null): string {
 	const q = new URLSearchParams();
-	if (sp.model) q.set("model", sp.model);
-	if (sp.issue) q.set("issue", sp.issue);
-	if (sp.min_latency_ms) q.set("min_latency_ms", sp.min_latency_ms);
-	if (sp.signature_id) q.set("signature_id", sp.signature_id);
-	if (sp.end_user) q.set("end_user", sp.end_user);
-	if (sp.agent) q.set("agent", sp.agent);
-	if (sp.model_family) q.set("model_family", sp.model_family);
-	if (sp.failover === "true") q.set("failover", "true");
-	if (sp.status === "error") q.set("has_error", "true");
-	else if (sp.status === "ok") q.set("has_error", "false");
+	copyGatewayTraceFilters(q, sp, "stream");
 	setWindow(q, w);
 	// A live tail reads UP TO NOW. The page's resolved `until` is frozen at render, so
 	// sending it made every reconnect re-read the same window and no new trace could
@@ -383,6 +331,38 @@ async function TracesData({
 		nextCursor = data.next_cursor ?? null;
 	} catch (err) {
 		if (err instanceof GatewayError) {
+			if (err.status === 400 && err.body?.error === "sort_window_too_wide") {
+				const maxHours = Number(err.body.max_hours);
+				return (
+					<ErrorState
+						title="Cost sort needs a shorter window"
+						description={`Sort by cost needs a window of ≤ ${maxHours / 24} days. Select a shorter range to enable it.`}
+						action={
+							<div className="flex items-center gap-3">
+								<button
+									type="button"
+									disabled
+									title={`Cost sort needs a window of ≤ ${maxHours / 24} days`}
+									className="cursor-not-allowed text-sm text-ink-3"
+								>
+									Cost sort unavailable
+								</button>
+								<Link
+									href={pageHref(sp, {
+										range: "24h",
+										since: undefined,
+										until: undefined,
+										cursor: undefined,
+									})}
+									className="text-sm font-medium text-ink-2 underline underline-offset-2 hover:text-ink"
+								>
+									Use a 24-hour window
+								</Link>
+							</div>
+						}
+					/>
+				);
+			}
 			// OBS-01. Classification is a pure, unit-tested function
 			// (`empty-state.ts`) — a 4xx is a REJECTED request, not an
 			// unreachable gateway, most commonly `?q=` forced below the 4-char
@@ -542,6 +522,8 @@ async function TracesData({
 				durationHref={sortHref(sp, "duration")}
 				startedHref={sortHref(sp, "start_time")}
 				spansHref={sortHref(sp, "spans")}
+				costHref={sortHref(sp, "cost")}
+				errorsHref={sortHref(sp, "errors")}
 			/>
 
 			<PaginationBar
@@ -617,7 +599,10 @@ export default async function TracesPage({
 	});
 	const query = buildQuery(sp, w);
 	const exportBase = buildExportBase(sp);
-	const exportPrefix = exportBase ? `${exportBase}&` : "";
+	const exportWindow = new URLSearchParams();
+	setWindow(exportWindow, w);
+	if (!exportWindow.has("until"))
+		exportWindow.set("until", new Date().toISOString());
 	const groupBy =
 		sp.group && VALID_GROUPS.includes(sp.group as (typeof VALID_GROUPS)[number])
 			? sp.group
@@ -634,22 +619,10 @@ export default async function TracesPage({
 					</Suspense>
 				</div>
 				<div className="flex items-center gap-4">
-					<div className="flex items-center gap-2 text-xs">
-						<a
-							href={`/api/traces/export?${exportPrefix}format=csv`}
-							download
-							className="rounded-control border border-line px-2.5 py-1.5 font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						>
-							Export CSV
-						</a>
-						<a
-							href={`/api/traces/export?${exportPrefix}format=json`}
-							download
-							className="rounded-control border border-line px-2.5 py-1.5 font-medium text-ink-3 transition-colors hover:text-ink-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
-						>
-							JSON
-						</a>
-					</div>
+					<TraceExportControls
+						baseQuery={exportBase}
+						windowQuery={exportWindow.toString()}
+					/>
 				</div>
 			</div>
 

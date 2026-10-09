@@ -13,7 +13,7 @@ code-derived diagrams and request flows.
 | Gateway binary | Rust/Axum HTTP gateway. `main.rs` loads environment configuration and starts the server; `server.rs` assembles the routes. | [`crates/gateway/src/main.rs`](crates/gateway/src/main.rs), [`crates/gateway/src/server.rs`](crates/gateway/src/server.rs) |
 | Ingest binary | Rust ingest process containing the OTLP HTTP receiver, NATS JetStream consumer, bounded span channel, and ClickHouse writer. | [`crates/ingest/src/main.rs`](crates/ingest/src/main.rs) |
 | Web application | Next application containing the dashboard, application API routes, and Drizzle-backed control-plane data access. | [`apps/web/app/`](apps/web/app/), [`apps/web/package.json`](apps/web/package.json) |
-| Marketing site | Astro application for tracelane.dev. Hosted separately and not included in the public repository, because it is mostly hosted-service deployment configuration. | `apps/site/` (canonical repository only) |
+| Marketing site | Hosted separately; its deployment source is outside this public repository. | Not included |
 | Documentation source | MDX documentation-site content and navigation metadata. | [`apps/docs/`](apps/docs/) |
 | MCP server | Node MCP server. It selects stdio by default or streamable HTTP by environment; its reader selects gateway HTTP or direct ClickHouse access. | [`apps/mcp/src/index.ts`](apps/mcp/src/index.ts), [`apps/mcp/src/reader.ts`](apps/mcp/src/reader.ts) |
 | Audit CLI | Rust `tracelane-audit` command for fetching and verifying audit-ledger exports. | [`crates/tracelane-audit-cli/src/main.rs`](crates/tracelane-audit-cli/src/main.rs) |
@@ -51,7 +51,6 @@ and the package roles are summarized in [`packages/README.md`](packages/README.m
 | Development PostgreSQL migrations | [`infra/dev/postgres/migrations/`](infra/dev/postgres/migrations/) |
 | Development ClickHouse base schema and migrations | [`infra/dev/clickhouse/schema.sql`](infra/dev/clickhouse/schema.sql), [`infra/dev/clickhouse/migrations/`](infra/dev/clickhouse/migrations/) |
 | Self-host ClickHouse schema | [`infra/self-host/clickhouse/schema.sql`](infra/self-host/clickhouse/schema.sql), [`infra/self-host/clickhouse/02_slo_alerting.sql`](infra/self-host/clickhouse/02_slo_alerting.sql) |
-| Marketing-site SQL migration (canonical repository only) | `apps/site/migrations/` |
 
 This index does not designate an authority among the four application/development
 PostgreSQL and ClickHouse schema/migration locations. No single top-level document in

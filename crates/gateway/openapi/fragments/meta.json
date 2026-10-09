@@ -1,0 +1,21 @@
+{
+  "operations": {
+    "GET /v1/openapi.json": {
+      "module": "crates/gateway/src/openapi_route.rs",
+      "summary": "This document. Public, rate-limited; the bytes are the checked-in control.v1.json.",
+      "tags": ["meta"],
+      "x-error-envelope": "control",
+      "responses": {
+        "200": {
+          "description": "The OpenAPI 3.1 document.",
+          "schema": { "type": "object" }
+        },
+        "429": {
+          "description": "rate_limited (Retry-After header).",
+          "schema": { "$ref": "#/components/schemas/ControlError" }
+        }
+      },
+      "x-error-codes": ["rate_limited"]
+    }
+  }
+}

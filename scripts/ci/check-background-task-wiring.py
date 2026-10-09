@@ -57,7 +57,12 @@ CRATE_DIRS = [
     Path("crates/shared/src"),
 ]
 
-RE_DEF = re.compile(r"^\s*pub(?:\s+async)?\s+fn\s+(spawn_\w+)\s*[(<]", re.MULTILINE)
+# `[ \t]`, never `\s`, before the name (2026-09-30): `^\s*` under MULTILINE rescanned every
+# blanked comment/test run from each line start — 14 s of this guard's 17 s. Anchoring on
+# group 1 below is unchanged, so the recorded line numbers are too.
+RE_DEF = re.compile(
+    r"^[ \t]*pub(?:[ \t]+async)?[ \t]+fn[ \t]+(spawn_\w+)\s*[(<]", re.MULTILINE
+)
 
 # A file-level `#![cfg(test)]` INNER attribute makes the whole module test-only, so its
 # `spawn_*` need no production wiring and its call sites must not count as one. This is

@@ -38,6 +38,7 @@ import {
 	cn,
 } from "@tracelanedev/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { LoopEvidence } from "./LoopEvidence";
 import { SpanInspector } from "./SpanInspector";
 import { SwimlaneView } from "./SwimlaneView";
 import { TraceSummaryHeader } from "./TraceSummaryHeader";
@@ -113,6 +114,9 @@ export function TraceDetailView({
 	traceId,
 	spans,
 	hitCounts,
+	toolPreviewLimit,
+	conversationLimit,
+	minGenerationMs,
 }: {
 	spans: Span[];
 	traceId?: string;
@@ -122,9 +126,15 @@ export function TraceDetailView({
 	 * then renders without a count rather than substituting a wrong one.
 	 */
 	hitCounts?: Record<string, number>;
+	toolPreviewLimit?: number;
+	conversationLimit?: number;
+	minGenerationMs?: number;
 }) {
 	const [selectedId, setSelectedId] = useState<string | null>(
-		spans[0]?.span_id ?? null,
+		[...spans].reverse().find((s) => inferSpanKind(s.attributes) === "llm")
+			?.span_id ??
+			spans[0]?.span_id ??
+			null,
 	);
 	useEffect(() => {
 		const requested = new URLSearchParams(window.location.search).get("span");
@@ -180,6 +190,31 @@ export function TraceDetailView({
 		() => spans.find((s) => s.span_id === selectedId) ?? null,
 		[spans, selectedId],
 	);
+	const llmSpans = useMemo(
+		() => spans.filter((s) => inferSpanKind(s.attributes) === "llm"),
+		[spans],
+	);
+	const previousToolHash = useMemo(() => {
+		const index = spans.findIndex((s) => s.span_id === selectedId);
+		for (let i = index - 1; i >= 0; i--) {
+			const candidate = spans[i];
+			if (!candidate) continue;
+			try {
+				const a = JSON.parse(candidate.attributes) as Record<string, unknown>;
+				if (
+					a.gen_ai_request_model === undefined &&
+					a.gen_ai_response_model === undefined
+				)
+					continue;
+				return typeof a.tracelane_request_tool_definitions_hash === "string"
+					? a.tracelane_request_tool_definitions_hash
+					: undefined;
+			} catch {
+				// Skip unreadable attributes and inspect the prior span.
+			}
+		}
+		return undefined;
+	}, [spans, selectedId]);
 
 	// OBS-49 — the agent-lane projection of the same spans. Computed once from
 	// ALL spans regardless of the active filters; Failures-only then narrows
@@ -267,6 +302,13 @@ export function TraceDetailView({
 	return (
 		<div className="space-y-4">
 			<TraceSummaryHeader spans={spans} />
+			{traceId && (
+				<LoopEvidence
+					traceId={traceId}
+					spans={spans}
+					onSelectSpan={setSelectedId}
+				/>
+			)}
 			<div className="flex flex-col gap-4 md:h-[calc(100vh-320px)] md:min-h-[400px] md:flex-row">
 				{/* The span-view panel is a card, so it takes `--radius-card` from
 				    `.surface-card` rather than the 12px `rounded-card` it used to hardcode —
@@ -482,6 +524,12 @@ export function TraceDetailView({
 						key={selectedId}
 						traceId={traceId}
 						span={selectedSpan}
+						previousToolHash={previousToolHash}
+						toolPreviewLimit={toolPreviewLimit}
+						conversationLimit={conversationLimit}
+						minGenerationMs={minGenerationMs}
+						llmSpans={llmSpans}
+						onSelectSpan={setSelectedId}
 					/>
 				</div>
 			</div>

@@ -337,6 +337,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

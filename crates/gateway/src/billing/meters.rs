@@ -233,7 +233,12 @@ impl MeterSink {
         }
 
         match last_err {
-            None => Ok(accepted),
+            None => {
+                tracelane_shared::degradation::resolve(
+                    tracelane_shared::degradation::Degradation::MeterFlushFailed,
+                );
+                Ok(accepted)
+            }
             Some(e) => {
                 tracing::warn!(error = %e, "meter sink flush failed; batch held for an unchanged retry");
                 tracelane_shared::degradation::note(
@@ -358,6 +363,7 @@ pub fn global() -> Option<Arc<MeterSink>> {
 
 #[cfg(test)]
 mod tests {
+    static METER_EPISODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use super::*;
 
     fn t() -> TenantId {
@@ -422,6 +428,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_flush_holds_the_batch_unchanged_and_notes_degradation() {
         use tracelane_shared::degradation::{Degradation, count};
+        let _episode_guard = METER_EPISODE_TEST_LOCK.lock().await;
         // Port 1 / an address nothing listens on: the insert will fail to
         // connect, exercising the failure path without a real ClickHouse.
         let sink = MeterSink::new("http://127.0.0.1:1".to_string());
@@ -560,8 +567,41 @@ mod tests {
 
     #[tokio::test]
     async fn empty_buffer_flushes_as_a_noop() {
+        let _episode_guard = METER_EPISODE_TEST_LOCK.lock().await;
         let sink = MeterSink::new("http://127.0.0.1:1".to_string());
         assert_eq!(sink.flush().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_meter_flush_closes_episode_after_pending_batch_lands() {
+        use tracelane_shared::degradation::{Degradation, is_open, note, resolve};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let _episode_guard = METER_EPISODE_TEST_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let sink = MeterSink::new(server.uri());
+        sink.pending.lock().await.push_back(MeterBatch {
+            token: "b602-retry".into(),
+            day: 1,
+            rows: vec![(
+                (t().to_string(), UsageMeter::IngestBytes, String::new()),
+                42.0,
+            )],
+        });
+        let kind = Degradation::MeterFlushFailed;
+        resolve(kind);
+        note(kind);
+        assert_eq!(sink.flush().await.unwrap(), 1);
+        assert!(sink.pending.lock().await.is_empty());
+        assert!(
+            !is_open(kind),
+            "accepted pending batch closes the meter episode"
+        );
     }
 
     /// **B-469 proof, both directions, on a real server.** The same immutable

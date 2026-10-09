@@ -3,7 +3,7 @@ export const ISSUE_LABELS = {
 	model_swapped: "Model swapped",
 	alias: "Alias",
 	fallback: "Served by fallback",
-	truncated: "Truncated",
+	truncated: "Hit token limit",
 	filtered: "Filtered",
 	empty: "Empty output",
 	cancelled: "Stream cancelled",
@@ -36,4 +36,18 @@ export type SignalsRecorded = {
 export type GenerationDetails = {
 	issues?: IssueChip[];
 	signals_recorded?: SignalsRecorded;
+};
+
+export type IssueSummary = {
+	total_traces: number;
+	llm_calls: number;
+	no_served_model_calls: number;
+	no_finish_reason_calls: number;
+	gateway_signal_calls: number;
+	counts: { kind: IssueKind; trace_count: number }[];
+	window_days: number;
+	since: string;
+	until: string;
+	as_of: string;
+	content_capture: boolean;
 };

@@ -16,10 +16,15 @@
  * failure → a clean message, no redirect loop.
  */
 
+import { recordSignIn } from "@/lib/signups";
 import { handleAuth } from "@workos-inc/authkit-nextjs";
 import { NextResponse } from "next/server";
 
 export const GET = handleAuth({
+	// SET-60: record the completed sign-in (name, email, method) in `signups`.
+	// `recordSignIn` never throws, so a DB fault cannot turn a good sign-in into
+	// /auth/error. Not tenant data; nothing authorizes on it (specs/SET-60 §2).
+	onSuccess: recordSignIn,
 	onError: async ({ error, request }) => {
 		const msg = error instanceof Error ? error.message : String(error);
 		console.error("[auth/callback]", msg);

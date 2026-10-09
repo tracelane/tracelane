@@ -48,6 +48,8 @@ it("reads changed policy values only when the existing cadence expires", async (
 		experiment_datasets: 13,
 		session_turns: 15,
 		dataset_items: 33,
+		trace_conversation_messages: 44,
+		span_tool_names_preview: 7,
 	};
 	h.rows.mockResolvedValue([{ value: first }]);
 	expect(await getListPageSettings()).toEqual({
@@ -65,6 +67,8 @@ it("reads changed policy values only when the existing cadence expires", async (
 		experiment_datasets: 7,
 		session_turns: 5,
 		dataset_items: 6,
+		trace_conversation_messages: 4,
+		span_tool_names_preview: 3,
 	};
 	h.rows.mockResolvedValue([{ value: next }]);
 	vi.advanceTimersByTime(h.cadence + 1);

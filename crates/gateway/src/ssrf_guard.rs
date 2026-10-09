@@ -62,6 +62,13 @@ impl PinnedTarget {
         }
     }
 
+    /// The addresses that passed the blocked-range check, for a caller that opens its
+    /// OWN socket (the Realtime WebSocket, `OG-07`, which reqwest cannot carry). Empty for
+    /// an IP-literal host: connect to the literal.
+    pub(crate) fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
     /// Test-only constructor: a pinned target for a host that need not resolve.
     #[cfg(test)]
     pub(crate) fn for_test(host: &str, addrs: Vec<SocketAddr>) -> Self {

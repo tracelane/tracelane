@@ -1,0 +1,55 @@
+{
+  "max_age_days": 30,
+  "artifacts": {
+    "CLAUDE.md": {
+      "provider_count": true
+    },
+    "AGENTS.md": {},
+    "docs/runbook/ROADMAP.md": {},
+    "docs/inventory/README.md": {
+      "generated": "inventory"
+    },
+    "docs/reference/OPERATING-MANUAL.md": {},
+    "docs/reference/CONTRACT.md": {},
+    "docs/reference/TRAPS.md": {},
+    "docs/internal/ENG-SIGNALS.html": {
+      "generated": "signals",
+      "max_age_days": 1
+    },
+    "apps/docs/providers.mdx": {
+      "provider_count": true,
+      "checks": [
+        [
+          "scripts/ci/build-provider-catalog.py",
+          "--check"
+        ]
+      ]
+    },
+    "docs/guides/providers.md": {
+      "provider_count": true,
+      "checks": [
+        [
+          "scripts/ci/build-provider-catalog.py",
+          "--check"
+        ]
+      ]
+    },
+    "apps/web/db/plans.v3.json": {
+      "checks": [
+        [
+          "scripts/ci/check-pricing-copy-vs-seed.py"
+        ],
+        [
+          "scripts/ci/check-schema-ts-vs-migrations.py"
+        ]
+      ]
+    },
+    "apps/docs/pricing.mdx": {
+      "checks": [
+        [
+          "scripts/ci/check-pricing-copy-vs-seed.py"
+        ]
+      ]
+    }
+  }
+}

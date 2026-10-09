@@ -1,5 +1,7 @@
 {
   "_comment": "BILL-01 / ADR-076 — the founder's 2026-09-12 pricing ruling, verbatim (specs/BILL-01-metering-and-tiers.md §0). THE single source for every public price, allowance, window and seat figure: seed.mjs upserts these into plan_entitlements, and scripts/ci/check-pricing-copy-vs-seed.py refuses any docs/site/README figure that disagrees. Rates are market-anchored and never adjusted for cost; null = custom/contract (Enterprise). AMENDMENT A5 (founder, 2026-09-14): ingest allowances re-derived as 4x the hot window's steady-state fill (hot_gb x 30 / indexed_window_days) — Builder 20, Team 100, Business 200 GB; every paid tier gets cold_gb_included = 24x its monthly ingest (two years of included ingest), meter 5 bills only beyond it, mean-daily basis like meter 2; backfill is billed, no exemption. Applied to ALL workspaces immediately (no real customers).",
+  "plan_version": "v3",
+  "_plan_version_comment": "B-409: the version the `plans` allowances below ARE. seed.mjs inserts plan_allowances rows under it and marks it current; a version's rows are immutable (migration 0055 trigger), so a ruling that changes ANY allowance or window (hot/ingest/cold GB, series, scan units, eval runs, indexed/queryable/ledger days) MUST bump this string — the seed refuses otherwise. Tenants pinned to an older version (tenants.plan_version, set by the Polar webhook on first paid activation) keep it while price_protected_until is in the future.",
   "meters": {
     "ingest_usd_per_gb": 0.2,
     "hot_window_usd_per_gb_month_ladder": [
@@ -37,12 +39,76 @@
     ]
   },
   "policy": {
+    "guardrail_hooks": { "max_hooks": 8, "concurrency": 4, "timeout_ms": 5000, "response_bytes": 65536, "max_matches": 16, "match_bytes": 256, "input_bytes": 1048576, "secret_bytes": 4096, "min_secret_bytes": 32 },
+    "guardrail_pii": { "allowlist_count": 64, "allowlist_value_bytes": 256 },
+    "retention_sweep": {
+      "delete_wait_secs": 300,
+      "max_mutations_per_run": 400,
+      "max_run_secs": 3000,
+      "tombstone_live_grace_hours": 36
+    },
+    "workspace_glance": {
+      "volume_window_days": 30,
+      "activity_window_days": 7,
+      "cache_ttl_seconds": 300,
+      "storage_cache_ttl_seconds": 900,
+      "providers_top": 8,
+      "storage_tables_top": 8
+    },
+    "trace_reads": {
+      "export_max_rows": 10000,
+      "list_max_page": 200,
+      "cost_sort_max_window_hours": 168
+    },
+    "spend_spikes": {
+      "hour": {
+        "baseline_buckets": 168,
+        "ratio": 3.0,
+        "min_usd": 1.0,
+        "min_history_buckets": 24,
+        "max_window_buckets": 720,
+        "max_spikes_returned": 10,
+        "drill_top_n": 10
+      },
+      "day": {
+        "baseline_buckets": 14,
+        "ratio": 2.5,
+        "min_usd": 5.0,
+        "min_history_buckets": 7,
+        "max_window_buckets": 90,
+        "max_spikes_returned": 10,
+        "drill_top_n": 10
+      },
+      "backfill_days": 30,
+      "backfill_max_memory_bytes": 536870912,
+      "backfill_max_execution_seconds": 60
+    },
+    "attempt_records_since": "2026-09-19",
+    "trace_reads_tenant_key_multiplier": 3,
+    "trace_live_tail_retry_ms": 15000,
+    "agent_loop": {
+      "min_repeats": 3,
+      "window_secs": 300,
+      "max_instances": 200,
+      "max_span_ids_per_instance": 50
+    },
+    "incident_regression": {
+      "outcome_reason_max_bytes": 2000,
+      "outcomes_per_minute_per_tenant": 60,
+      "incident_reads_per_minute_per_tenant": 120,
+      "incident_last_good_lookback_hours": 168,
+      "outcome_session_window_hours": 8760,
+      "incident_max_candidates": 50,
+      "incident_max_sessions_per_candidate": 20,
+      "regression_max_cases_per_export": 100,
+      "outcome_tile_window_days": 30
+    },
     "generation_issues": {
       "dashboard_window_days": 7,
       "summary_cache_ttl_seconds": 60,
       "inline_chip_limit": 3
     },
-    "web_list_page_sizes": { "experiments": 25, "datasets": 100, "experiment_datasets": 100, "session_turns": 20, "dataset_items": 50 },
+    "web_list_page_sizes": { "experiments": 25, "datasets": 100, "experiment_datasets": 100, "session_turns": 20, "dataset_items": 50, "trace_conversation_messages": 50, "span_tool_names_preview": 10 },
     "playground_limits": {
       "max_columns": 4,
       "max_messages": 50,
@@ -141,8 +207,11 @@
       "cold_archive_days": 7,
       "unlimited_seats": false,
       "f_sso": false,
+      "f_customer_kms": false,
       "f_cache_control": false,
       "cache_ttl_hours": 0,
+      "f_otel_export": false,
+      "max_exports": 0,
       "overage_allowed": false,
       "rate_limit_rpm": 60,
       "cold_gb_included": null
@@ -163,8 +232,11 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": false,
+      "f_customer_kms": false,
       "f_cache_control": true,
       "cache_ttl_hours": 24,
+      "f_otel_export": false,
+      "max_exports": 0,
       "overage_allowed": true,
       "rate_limit_rpm": 600,
       "cold_gb_included": 480
@@ -185,8 +257,11 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_customer_kms": false,
       "f_cache_control": true,
       "cache_ttl_hours": 168,
+      "f_otel_export": false,
+      "max_exports": 0,
       "overage_allowed": true,
       "rate_limit_rpm": 6000,
       "cold_gb_included": 2400
@@ -207,8 +282,11 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_customer_kms": true,
       "f_cache_control": true,
       "cache_ttl_hours": 720,
+      "f_otel_export": false,
+      "max_exports": 0,
       "overage_allowed": true,
       "rate_limit_rpm": 60000,
       "cold_gb_included": 4800
@@ -229,8 +307,11 @@
       "cold_archive_days": null,
       "unlimited_seats": true,
       "f_sso": true,
+      "f_customer_kms": true,
       "f_cache_control": true,
       "cache_ttl_hours": 2160,
+      "f_otel_export": false,
+      "max_exports": 0,
       "overage_allowed": true,
       "rate_limit_rpm": null,
       "cold_gb_included": null

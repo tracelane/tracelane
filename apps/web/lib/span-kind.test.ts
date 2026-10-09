@@ -8,6 +8,13 @@ const J = (o: unknown) => JSON.stringify(o);
 // crates/ingest/src/otlp_decode.rs + the predictive detectors. ≥2 real trace
 // shapes, plus the edge cases that matter most for honesty.
 describe("inferSpanKind — conservative span-kind inference", () => {
+	it("prefers an explicit OpenInference kind over an LLM heuristic", () => {
+		expect(
+			inferSpanKind(
+				J({ openinference_span_kind: "AGENT", gen_ai_request_model: "gpt-4o" }),
+			),
+		).toBe("agent");
+	});
 	it("real shape #1 — an LLM chat call (gen_ai.*) → llm", () => {
 		expect(
 			inferSpanKind(

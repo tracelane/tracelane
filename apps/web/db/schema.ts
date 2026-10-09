@@ -212,6 +212,11 @@ export const tenants = pgTable(
 		// The `pricing_rates.price_version` this tenant is pinned to (12-month
 		// price protection). NULL = tracks the current version.
 		priceVersion: text("price_version"),
+		// B-409 (migration 0055): the `plan_allowances.plan_version` this tenant
+		// is pinned to — set beside `priceVersion`, by the Polar webhook ONLY, on
+		// the first paid activation. Honoured while `priceProtectedUntil` is in
+		// the future (NULL = no expiry known). NULL = tracks the current version.
+		planVersion: text("plan_version"),
 	},
 	(t) => [
 		uniqueIndex("tenants_workos_org_id_idx").on(t.workosOrgId),
@@ -337,8 +342,13 @@ export const planEntitlements = pgTable("plan_entitlements", {
 	coldGbIncluded: numeric("cold_gb_included", { precision: 12, scale: 3 }),
 	unlimitedSeats: boolean("unlimited_seats").notNull().default(false),
 	fSso: boolean("f_sso").notNull().default(false),
+	fCustomerKms: boolean("f_customer_kms").notNull().default(false),
 	fCacheControl: boolean("f_cache_control").notNull().default(false),
 	cacheTtlHours: integer("cache_ttl_hours").notNull().default(0),
+	// OG-50 (migration 0076): OTLP span export plan gate; seeded OFF for every plan until the
+	// founder rules (spec §9). Plan-only, read through the gateway entitlement cache.
+	fOtelExport: boolean("f_otel_export").notNull().default(false),
+	maxExports: integer("max_exports").notNull().default(0),
 	overageAllowed: boolean("overage_allowed").notNull().default(false), // Free: no overage, ages out
 	overflowMode: text("overflow_mode").notNull().default("auto_age"),
 	// The Polar product ids for this plan, written by scripts/ops/polar-sync.mjs
@@ -542,6 +552,295 @@ export const cmkKeys = pgTable(
 
 export type CmkKey = typeof cmkKeys.$inferSelect;
 
+// ── OG-23: projects (and the environments their keys may carry) ──────────────
+// Migration 0056 (un-journaled, hand-applied BEFORE the gateway — S2: the gateway's
+// API-key auth SELECT LEFT JOINs this table). Written ONLY by the gateway's
+// `/v1/projects` routes (`crates/gateway/src/project_routes.rs`); archived, never
+// deleted, so a key in an archived project stays governed by it. `policy` is OG-20
+// (migration 0057): evaluated IN ADDITION to each key's own; the vocabulary's one
+// authority is `crates/gateway/src/key_policy.rs`.
+
+export const projects = pgTable(
+	"projects",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		environments: text("environments")
+			.array()
+			.notNull()
+			.default(sql`'{production}'`),
+		policy: jsonb("policy"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		archivedAt: timestamp("archived_at", { withTimezone: true }),
+	},
+	(t) => [
+		index("projects_tenant_id_idx").on(t.tenantId),
+		uniqueIndex("projects_tenant_live_name_idx")
+			.on(t.tenantId, sql`lower(${t.name})`)
+			.where(sql`${t.archivedAt} IS NULL`),
+		check("projects_name_not_blank_chk", sql`length(btrim(${t.name})) > 0`),
+		check(
+			"projects_environments_not_empty_chk",
+			sql`cardinality(${t.environments}) > 0`,
+		),
+		check(
+			"projects_policy_object_chk",
+			sql`${t.policy} IS NULL OR jsonb_typeof(${t.policy}) = 'object'`,
+		),
+	],
+);
+
+export type Project = typeof projects.$inferSelect;
+
+// ── OG-25 / OG-21 / OG-22: workspace controls (migration 0060) ───────────────
+// One row per tenant (absent = nothing set): the pause, the block lists, and the
+// WORKSPACE layer of the OG-21/OG-22 policy (limits, budget, end_user_budget only).
+// Read by the gateway entitlement refresh; written ONLY by the gateway's owner-gated
+// /v1/controls routes (each write records one admin_audit_log row).
+export const workspaceControls = pgTable(
+	"workspace_controls",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		policy: jsonb("policy"),
+		pausedAt: timestamp("paused_at", { withTimezone: true }),
+		pausedBy: text("paused_by"),
+		pauseReason: text("pause_reason"),
+		blockedModels: text("blocked_models").array().notNull().default(sql`'{}'`),
+		blockedProviders: text("blocked_providers")
+			.array()
+			.notNull()
+			.default(sql`'{}'`),
+		blockedEndUsers: text("blocked_end_users")
+			.array()
+			.notNull()
+			.default(sql`'{}'`),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedBy: text("updated_by"),
+	},
+	(t) => [
+		check(
+			"workspace_controls_policy_object_chk",
+			sql`${t.policy} IS NULL OR jsonb_typeof(${t.policy}) = 'object'`,
+		),
+	],
+);
+
+export type WorkspaceControls = typeof workspaceControls.$inferSelect;
+
+// ── OG-51: response-cache controls (migration 0075) ───────────────────────────
+// Written ONLY by the gateway's owner-gated PUT /v1/cache/settings (one
+// admin_audit_log row per write); read by the entitlement refresh. `mode`
+// inherit = serve per the operator block AND the workspace's content capture.
+export const workspaceCacheSettings = pgTable(
+	"workspace_cache_settings",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		mode: text("mode").notNull().default("inherit"),
+		ttlHours: integer("ttl_hours"),
+		namespaceBy: text("namespace_by").notNull().default("workspace"),
+		semantic: boolean("semantic").notNull().default(true),
+		updatedBy: text("updated_by"),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		check(
+			"workspace_cache_settings_mode_chk",
+			sql`${t.mode} IN ('inherit', 'on', 'off')`,
+		),
+		check(
+			"workspace_cache_settings_ttl_chk",
+			sql`${t.ttlHours} IS NULL OR ${t.ttlHours} > 0`,
+		),
+		check(
+			"workspace_cache_settings_namespace_chk",
+			sql`${t.namespaceBy} IN ('workspace', 'project', 'key', 'end_user')`,
+		),
+	],
+);
+
+export type WorkspaceCacheSettings = typeof workspaceCacheSettings.$inferSelect;
+
+// The invalidation GENERATION COUNTER (the gateway has no ClickHouse delete grant):
+// a bump makes the old cache entries unreachable on both tiers.
+export const cacheEpochs = pgTable(
+	"cache_epochs",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		scope: text("scope").notNull(),
+		epoch: bigint("epoch", { mode: "number" }).notNull().default(0),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.scope] }),
+		check(
+			"cache_epochs_scope_len_chk",
+			sql`char_length(${t.scope}) BETWEEN 1 AND 200`,
+		),
+		check("cache_epochs_epoch_chk", sql`${t.epoch} >= 0`),
+	],
+);
+
+export type CacheEpoch = typeof cacheEpochs.$inferSelect;
+
+// ── OG-50: OTLP/HTTP span export destinations (migration 0076) ────────────────
+// `headers_enc` is the customer's header map SEALED (AES-256-GCM under the gateway's BYOK
+// master key, AAD `otel-export:<tenant>:<id>`) — never read here, never in clear. Written
+// ONLY by the gateway's owner-gated /v1/exports/otel routes (one admin_audit_log row per
+// write) and its status flusher; counters are "since gateway start".
+export const otelExports = pgTable(
+	"otel_exports",
+	{
+		id: uuid("id").primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		url: text("url").notNull(),
+		headersEnc: text("headers_enc"),
+		headerNames: text("header_names").array().notNull().default(sql`'{}'`),
+		enabled: boolean("enabled").notNull().default(true),
+		includeContent: boolean("include_content").notNull().default(false),
+		sampleRatio: doublePrecision("sample_ratio").notNull().default(1),
+		onlyErrors: boolean("only_errors").notNull().default(false),
+		status: text("status").notNull().default("never_delivered"),
+		lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+		lastErrorClass: text("last_error_class"),
+		delivered: bigint("delivered", { mode: "number" }).notNull().default(0),
+		dropped: bigint("dropped", { mode: "number" }).notNull().default(0),
+		failed: bigint("failed", { mode: "number" }).notNull().default(0),
+		createdBy: text("created_by"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		index("otel_exports_tenant_idx").on(t.tenantId),
+		index("otel_exports_enabled_idx").on(t.tenantId).where(sql`${t.enabled}`),
+		check(
+			"otel_exports_name_len_chk",
+			sql`char_length(${t.name}) BETWEEN 1 AND 128`,
+		),
+		check(
+			"otel_exports_url_len_chk",
+			sql`char_length(${t.url}) BETWEEN 1 AND 2048`,
+		),
+		check(
+			"otel_exports_sample_ratio_chk",
+			sql`${t.sampleRatio} >= 0 AND ${t.sampleRatio} <= 1`,
+		),
+		check(
+			"otel_exports_status_chk",
+			sql`${t.status} IN ('never_delivered', 'ok', 'degraded')`,
+		),
+		check("otel_exports_delivered_chk", sql`${t.delivered} >= 0`),
+		check("otel_exports_dropped_chk", sql`${t.dropped} >= 0`),
+		check("otel_exports_failed_chk", sql`${t.failed} >= 0`),
+	],
+);
+
+export type OtelExport = typeof otelExports.$inferSelect;
+
+// ── OG-24: spend alert channels + outbox (migration 0061) ─────────────────────
+// Secrets (a Slack URL, a webhook signing secret) live ONLY in secret_enc
+// (AES-256-GCM under the gateway's BYOK master key). Written only by the gateway.
+export const spendAlertChannels = pgTable(
+	"spend_alert_channels",
+	{
+		id: uuid("id").primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		name: text("name").notNull(),
+		target: text("target").notNull(),
+		secretEnc: text("secret_enc"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		createdBy: text("created_by"),
+	},
+	(t) => [
+		index("spend_alert_channels_tenant_idx").on(t.tenantId),
+		check(
+			"spend_alert_channels_kind_chk",
+			sql`${t.kind} IN ('email', 'slack', 'webhook')`,
+		),
+		check(
+			"spend_alert_channels_secret_chk",
+			sql`${t.kind} = 'email' OR ${t.secretEnc} IS NOT NULL`,
+		),
+	],
+);
+
+export type SpendAlertChannel = typeof spendAlertChannels.$inferSelect;
+
+// The outbox AND the dedup: UNIQUE (tenant_id, channel_id, dedup_key) fires a
+// threshold once per window per channel; 'delivered' only after a 2xx.
+export const spendAlertEvents = pgTable(
+	"spend_alert_events",
+	{
+		id: uuid("id").defaultRandom().primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		channelId: uuid("channel_id")
+			.notNull()
+			.references(() => spendAlertChannels.id, { onDelete: "cascade" }),
+		dedupKey: text("dedup_key").notNull(),
+		payload: jsonb("payload").notNull(),
+		status: text("status").notNull().default("pending"),
+		attempts: integer("attempts").notNull().default(0),
+		nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		lastError: text("last_error"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+	},
+	(t) => [
+		uniqueIndex("spend_alert_events_dedup_uq").on(
+			t.tenantId,
+			t.channelId,
+			t.dedupKey,
+		),
+		index("spend_alert_events_tenant_idx").on(t.tenantId, t.createdAt.desc()),
+		check(
+			"spend_alert_events_status_chk",
+			sql`${t.status} IN ('pending', 'delivered', 'failed')`,
+		),
+	],
+);
+
+export type SpendAlertEvent = typeof spendAlertEvents.$inferSelect;
+
 // ── API keys ─────────────────────────────────────────────────────────────────
 // Gateway keys for authenticating agent traffic. Auth is the peppered-HMAC
 // + Argon2id scheme (ADR-042), matching crates/gateway/src/db/api_keys.rs:
@@ -616,14 +915,55 @@ export const apiKeys = pgTable(
 		// velocity breaker on top of the existing monthly `budgetUsdMonthly`.
 		budgetReset: text("budget_reset").notNull().default("monthly"),
 		velocityBreaker: boolean("velocity_breaker").notNull().default(false),
+		// ── OG-23 (migration 0056): the key's project and environment label ──
+		// NULL = no project / no environment = the behaviour every key had before.
+		// RESTRICT: a project is archived, never deleted, so its policy can never be
+		// silently stripped from a live key. Read by the gateway's auth JOIN (S2).
+		projectId: uuid("project_id").references(() => projects.id, {
+			onDelete: "restrict",
+		}),
+		environment: text("environment"),
+		// ── OG-20 (migration 0057): this key's own policy (NULL = none) ──
+		// Validated strictly on write by the gateway's key routes; an unparseable
+		// stored document refuses every request on the key (fail-CLOSED).
+		policy: jsonb("policy"),
+		// ── OG-51 (migration 0075): this key's own cache NARROWING (NULL = none) ──
+		// {"mode":"off"?,"namespace_by"?}; a key can only narrow, never widen. Read by the
+		// gateway's entitlement refresh, written only by PATCH /v1/keys/{id}.
+		cache: jsonb("cache"),
 	},
 	(t) => [
 		index("api_keys_tenant_id_idx").on(t.tenantId),
+		check(
+			"api_keys_cache_object_chk",
+			sql`${t.cache} IS NULL OR jsonb_typeof(${t.cache}) = 'object'`,
+		),
+		index("api_keys_project_id_idx")
+			.on(t.projectId)
+			.where(sql`${t.projectId} IS NOT NULL`),
+		check(
+			"api_keys_environment_slug_chk",
+			sql`${t.environment} IS NULL OR ${t.environment} ~ '^[a-z0-9][a-z0-9_-]{0,31}$'`,
+		),
+		check(
+			"api_keys_environment_needs_project_chk",
+			sql`${t.environment} IS NULL OR ${t.projectId} IS NOT NULL`,
+		),
+		check(
+			"api_keys_policy_object_chk",
+			sql`${t.policy} IS NULL OR jsonb_typeof(${t.policy}) = 'object'`,
+		),
 		// Only keys that actually expire are of interest to the expiry sweep.
 		index("api_keys_expires_at_idx")
 			.on(t.expiresAt)
 			.where(sql`${t.expiresAt} IS NOT NULL AND ${t.revokedAt} IS NULL`),
 		uniqueIndex("api_keys_lookup_hash_idx").on(t.lookupHash),
+		// Migration 0062: serves the valid-key-set DELTA read in the gateway
+		// (`db/api_keys.rs` `fetch_known_keys`: `lookup_hash IS NOT NULL AND created_at >= $2`).
+		// No tenant_id predicate in that query, hence no tenant_id column here.
+		index("api_keys_created_at_idx")
+			.on(t.createdAt)
+			.where(sql`${t.lookupHash} IS NOT NULL`),
 		// PARTIAL unique index: `key_hash` is the LEGACY column, always
 		// NULL for keys minted by the current route. A plain unique index that
 		// treats NULLs as not-distinct rejects the 2nd NULL row → the "can't add a
@@ -689,6 +1029,13 @@ export const adminAuditLog = pgTable(
 		afterJson: jsonb("after_json"),
 		ipAddr: inet("ip_addr"),
 		userAgent: text("user_agent"),
+		// OG-35 (migration 0058): minted by the gateway per control request; the
+		// actor's role and auth method when the change was made. NULL on older rows
+		// and on the dashboard's best-effort `recordAdminAction` rows. The table is
+		// APPEND-ONLY (0058 trigger): never UPDATE or DELETE it from here.
+		requestId: text("request_id"),
+		actorRole: text("actor_role"),
+		actorAuthMethod: text("actor_auth_method"),
 	},
 	(t) => [
 		index("idx_admin_audit_workspace").on(
@@ -700,10 +1047,47 @@ export const adminAuditLog = pgTable(
 			t.targetId,
 			t.occurredAt.desc(),
 		),
+		index("idx_admin_audit_workspace_id").on(t.actorWorkspaceId, t.id.desc()),
 	],
 );
 
 export type AdminAuditLogRow = typeof adminAuditLog.$inferSelect;
+
+// ── Admin-plane access policy (OG-36, migration 0059) ─────────────────────────
+// Per-workspace admin IP allowlist + SSO-required. Read by the gateway on every
+// control route (`control_plane::require_control`), never on inference. No row =
+// no policy. Written only through the gateway's `PUT /v1/security/admin-access`
+// (audited) or the operator break-glass script — never from the dashboard directly.
+
+export const tenantAdminSecurity = pgTable(
+	"tenant_admin_security",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		adminIpAllowlist: text("admin_ip_allowlist")
+			.array()
+			.notNull()
+			.default(sql`'{}'`),
+		ssoRequired: boolean("sso_required").notNull().default(false),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		updatedBy: text("updated_by").notNull().default(""),
+	},
+	(t) => [
+		check(
+			"tenant_admin_security_cidrs_chk",
+			sql`(${t.adminIpAllowlist}::cidr[]) IS NOT NULL`,
+		),
+		check(
+			"tenant_admin_security_cidrs_max_chk",
+			sql`cardinality(${t.adminIpAllowlist}) <= 256`,
+		),
+	],
+);
+
+export type TenantAdminSecurityRow = typeof tenantAdminSecurity.$inferSelect;
 
 // ── Provider keys (BYOK) ──────────────────────────────────────────────────────
 // Per-tenant, per-provider upstream API keys (OpenAI sk-…, Anthropic sk-ant-…),
@@ -719,6 +1103,9 @@ export const providerKeys = pgTable(
 			.notNull()
 			.references(() => tenants.id, { onDelete: "cascade" }),
 		providerId: text("provider_id").notNull(),
+		// OG-11 (expand 0070, contract 0077): the key's name within its provider's pool; `default`
+		// is the one key every workspace had before. Part of the PK and of the AAD.
+		label: text("label").notNull().default("default"),
 		ciphertextB64: text("ciphertext_b64").notNull(),
 		last4: text("last4").notNull(),
 		createdAt: timestamp("created_at", { withTimezone: true })
@@ -729,8 +1116,15 @@ export const providerKeys = pgTable(
 			.notNull(),
 	},
 	(t) => [
-		primaryKey({ columns: [t.tenantId, t.providerId] }),
+		primaryKey({
+			name: "provider_keys_tenant_provider_label_pk",
+			columns: [t.tenantId, t.providerId, t.label],
+		}),
 		index("provider_keys_tenant_idx").on(t.tenantId),
+		check(
+			"provider_keys_label_chk",
+			sql`${t.label} ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'`,
+		),
 	],
 );
 
@@ -838,6 +1232,33 @@ export const workspaceFailover = pgTable(
 	],
 );
 
+// Migration 0070 (OG-11/OG-12/OG-13): one workspace's routing document — virtual
+// models, key pools, conditional rules + canary splits, per-route timeouts and breaker
+// overrides. Strict-parsed by the gateway (an unparseable document refuses routed
+// requests, 503 routing_invalid); written only by the owner-gated `PUT /v1/routing`
+// with an optimistic `version`, one admin_audit_log row per write.
+export const workspaceRouting = pgTable(
+	"workspace_routing",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		doc: jsonb("doc").notNull().default(sql`'{}'::jsonb`),
+		version: integer("version").notNull().default(1),
+		updatedBy: text("updated_by").notNull().default(""),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		check(
+			"workspace_routing_doc_object_chk",
+			sql`jsonb_typeof(${t.doc}) = 'object'`,
+		),
+		check("workspace_routing_version_chk", sql`${t.version} >= 1`),
+	],
+);
+
 // GWY-53: a workspace owner's opt-in to record prompt (input) and response (output)
 // text on gateway spans. No row = both off. Hand-written migration 0052; written only by
 // the owner-gated `PUT /v1/workspace/capture`, which ledgers every change.
@@ -851,6 +1272,18 @@ export const workspaceContentCapture = pgTable("workspace_content_capture", {
 	updatedAt: timestamp("updated_at", { withTimezone: true })
 		.defaultNow()
 		.notNull(),
+});
+
+// B-459 (2026-09-30): tombstones of purged tenants. Hand-written migration 0053. Written
+// by `scripts/ops/tenant-purge.sh` BEFORE the `tenants` row is deleted; read by the
+// gateway retention sweep, which deletes ClickHouse rows of exactly these ids. No
+// `.references(() => tenants.id)` — the row it names is deleted by design.
+export const purgedTenants = pgTable("purged_tenants", {
+	tenantId: uuid("tenant_id").primaryKey(),
+	purgedAt: timestamp("purged_at", { withTimezone: true })
+		.defaultNow()
+		.notNull(),
+	purgedBy: text("purged_by").notNull().default(""),
 });
 
 export const auditChainState = pgTable("audit_chain_state", {
@@ -1032,6 +1465,38 @@ export const users = pgTable(
 );
 
 export type User = typeof users.$inferSelect;
+
+// ── signups ──────────────────────────────────────────────────────────
+// SET-60: the operator's list of everyone who completed a sign-in (name, email,
+// first/last seen, count, method). Written ONLY by `lib/signups.ts` from the auth
+// callback's `onSuccess`. NOT tenant data: no `tenant_id`, nothing authorizes on it, no
+// API reads it (specs/SET-60-signup-capture.md §2). `organization_id` is the WorkOS org
+// id as text, informational — never joined to `tenants.id`. PII: the account-delete
+// route removes the row. Migration 0063 (hand-applied, un-journaled).
+export const signups = pgTable(
+	"signups",
+	{
+		workosUserId: text("workos_user_id").primaryKey(),
+		email: text("email").notNull(),
+		name: text("name"),
+		firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+		lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+		loginCount: integer("login_count").default(1).notNull(),
+		organizationId: text("organization_id"),
+		authMethod: text("auth_method"),
+	},
+	(t) => [index("signups_email_lower_idx").on(sql`lower(${t.email})`)],
+);
+
+export type Signup = typeof signups.$inferSelect;
+
+// Minimal durable erasure marker. Migration 0064 serializes PII writes against
+// erasure and checks this marker inside each users/signups write statement.
+export const accountDeletions = pgTable("account_deletions", {
+	workosUserId: text("workos_user_id").primaryKey(),
+});
 
 // ── Support requests (in-product "Reach out" widget) ─────────────────────────
 // A user's Question / Feedback / Bug message from the dashboard support widget.
@@ -1583,6 +2048,51 @@ export const pricingRates = pgTable(
 export type PricingRate = typeof pricingRates.$inferSelect;
 
 /**
+ * B-409 (migration 0055): the six included allowances + three windows a plan
+ * buys, per `plan_version` — the `pricing_rates` mechanism applied to WHAT the
+ * price buys. `seed.mjs` inserts the `plans.v3.json` `plan_version` rows and
+ * flips `is_current`; a version's numbers are immutable (a DB trigger refuses
+ * the UPDATE) and a version a tenant pins cannot be deleted. A tenant resolves
+ * `tenants.planVersion` while `price_protected_until` is in the future, else
+ * the `is_current` row; no row → the FREE allowances (fail-closed). At most one
+ * current row per plan (partial unique index).
+ */
+export const planAllowances = pgTable(
+	"plan_allowances",
+	{
+		planVersion: text("plan_version").notNull(),
+		planLookupKey: text("plan_lookup_key")
+			.notNull()
+			.references(() => planEntitlements.planLookupKey),
+		hotGbIncluded: numeric("hot_gb_included", { precision: 12, scale: 3 }), // NULL = custom
+		ingestGbIncluded: numeric("ingest_gb_included", {
+			precision: 12,
+			scale: 3,
+		}),
+		coldGbIncluded: numeric("cold_gb_included", { precision: 12, scale: 3 }),
+		seriesIncluded: bigint("series_included", { mode: "number" }),
+		scanUnitsIncluded: bigint("scan_units_included", { mode: "number" }),
+		evalRunsIncluded: bigint("eval_runs_included", { mode: "number" }),
+		indexedWindowDays: integer("indexed_window_days").notNull(),
+		queryableDays: integer("queryable_days").notNull(),
+		ledgerDays: integer("ledger_days").notNull(),
+		isCurrent: boolean("is_current").notNull().default(false),
+		effectiveFrom: date("effective_from").notNull().defaultNow(),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.planVersion, t.planLookupKey] }),
+		uniqueIndex("plan_allowances_one_current_per_plan")
+			.on(t.planLookupKey)
+			.where(sql`${t.isCurrent}`),
+	],
+);
+
+export type PlanAllowance = typeof planAllowances.$inferSelect;
+
+/**
  * One row per named policy knob: burst multiple, warning thresholds, dunning
  * schedule, refund window, etc. `value` is `jsonb` because the shapes vary
  * (a single number, a list of days, a list of tiers).
@@ -1602,10 +2112,11 @@ export type BillingPolicyRow = typeof billingPolicy.$inferSelect;
  * can route to — a reference table (CLAUDE.md §23), seeded from
  * `apps/web/db/provider_capabilities.v1.json`, read by the gateway through its refresher.
  * `zdr`: `none` (nothing promised) · `default` (no retention, no training, for every
- * account) · `enterprise` (only under a contract the customer holds). Every row ships as
- * `none` until someone has READ the provider's policy page and dated it — `policy_url` +
- * `verified_at` are what make a `default`/`enterprise` row admissible (the seed refuses one
- * without both). Migration 0046.
+ * account) · `enterprise` (a documented ZDR mode the customer's ACCOUNT must hold — a
+ * contract, an approval, or a self-serve setting; ADR-079 §2 widened the word, the CHECK is
+ * unchanged). A row is `none` until someone has READ the provider's policy page and dated it
+ * — `policy_url` + `verified_at` are what make a `default`/`enterprise` row admissible (the
+ * seed refuses one without both). First population: ADR-079 (2026-10-03). Migration 0046.
  */
 export const providerCapabilities = pgTable(
 	"provider_capabilities",
@@ -1653,3 +2164,92 @@ export const meterWarnings = pgTable(
 );
 
 export type MeterWarning = typeof meterWarnings.$inferSelect;
+
+/** Scoped rail overrides. Writes are atomic with the control-change audit. */
+export const guardrailPolicies = pgTable(
+	"guardrail_policies",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		scope: text("scope").notNull(),
+		scopeId: uuid("scope_id").notNull(),
+		policy: jsonb("policy").notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedBy: text("updated_by").notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.scope, t.scopeId] }),
+		check(
+			"guardrail_policies_scope_check",
+			sql`${t.scope} IN ('workspace', 'key', 'project')`,
+		),
+		check(
+			"guardrail_policies_policy_check",
+			sql`jsonb_typeof(${t.policy}) = 'object'`,
+		),
+		check(
+			"guardrail_policies_check",
+			sql`${t.scope} <> 'workspace' OR ${t.scopeId} = ${t.tenantId}`,
+		),
+	],
+);
+
+/** Tenant-owned custom guardrails; ciphertext is never returned by the read API. */
+export const guardrailHooks = pgTable(
+	"guardrail_hooks",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		id: uuid("id").notNull(),
+		config: jsonb("config").notNull(),
+		ciphertextB64: text("ciphertext_b64").notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedBy: text("updated_by").notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.id] }),
+		check(
+			"guardrail_hooks_config_check",
+			sql`jsonb_typeof(${t.config}) = 'object'`,
+		),
+	],
+);
+
+// Customer-managed provider-key data keys; platform secrets stay on the platform KEK.
+export const tenantKmsConfigs = pgTable("tenant_kms_configs", {
+	tenantId: uuid("tenant_id")
+		.primaryKey()
+		.references(() => tenants.id, { onDelete: "cascade" }),
+	backend: text("backend").notNull(),
+	keyRef: text("key_ref").notNull(),
+	params: jsonb("params").notNull(),
+	secretEnc: text("secret_enc"),
+	status: text("status").notNull().default("active"),
+	updatedAt: timestamp("updated_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+	updatedBy: text("updated_by").notNull(),
+});
+export const tenantDataKeys = pgTable(
+	"tenant_data_keys",
+	{
+		id: uuid("id").primaryKey(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		wrappedDek: bytea("wrapped_dek").notNull(),
+		keyRef: text("key_ref").notNull(),
+		retiredAt: timestamp("retired_at", { withTimezone: true }),
+	},
+	(t) => [
+		uniqueIndex("tenant_data_keys_active_tenant_idx")
+			.on(t.tenantId)
+			.where(sql`${t.retiredAt} IS NULL`),
+	],
+);

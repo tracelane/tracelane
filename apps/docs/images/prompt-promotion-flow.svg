@@ -51,9 +51,9 @@
   <!-- ③ Eval Gate -->
   <rect x="348" y="54" width="136" height="78" rx="8" fill="#FFFBEB" stroke="#FCD34D" stroke-width="2"/>
   <text x="416" y="80"  text-anchor="middle" font-size="11.5" font-weight="600" fill="#92400E" font-family="'Inter',system-ui,sans-serif">Eval Gate</text>
-  <text x="416" y="97"  text-anchor="middle" font-size="10"   fill="#B45309" font-family="'Inter',system-ui,sans-serif">all assertions green?</text>
-  <text x="416" y="114" text-anchor="middle" font-size="9.5"  fill="#D97706" font-family="'Inter',system-ui,sans-serif">100 % pass threshold</text>
-  <text x="416" y="126" text-anchor="middle" font-size="9"    fill="#FCD34D" font-family="'Inter',system-ui,sans-serif">streams results in UI</text>
+  <text x="416" y="97"  text-anchor="middle" font-size="10"   fill="#B45309" font-family="'Inter',system-ui,sans-serif">eval run passed?</text>
+  <text x="416" y="114" text-anchor="middle" font-size="9.5"  fill="#D97706" font-family="'Inter',system-ui,sans-serif">else promotion blocked</text>
+  <text x="416" y="126" text-anchor="middle" font-size="9"    fill="#FCD34D" font-family="'Inter',system-ui,sans-serif">run via the evals API</text>
 
   <!-- Arrow: Eval Gate ─pass─► Production (green, horizontal) -->
   <line x1="484" y1="93" x2="524" y2="93" stroke="#16A34A" stroke-width="2" marker-end="url(#ag)"/>
@@ -67,7 +67,7 @@
   <rect x="528" y="60" width="132" height="66" rx="8" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.5"/>
   <text x="594" y="88"  text-anchor="middle" font-size="11.5" font-weight="600" fill="#166534" font-family="'Inter',system-ui,sans-serif">Production</text>
   <text x="594" y="104" text-anchor="middle" font-size="10"   fill="#16A34A" font-family="'Inter',system-ui,sans-serif">atomic version swap</text>
-  <text x="594" y="119" text-anchor="middle" font-size="9"    fill="#4ADE80" font-family="'Inter',system-ui,sans-serif">&lt;1 ms p95 resolve</text>
+  <text x="594" y="119" text-anchor="middle" font-size="9"    fill="#4ADE80" font-family="'Inter',system-ui,sans-serif">pointer moves on pass</text>
 
   <!-- Arrow: Production → Monitor -->
   <line x1="660" y1="93" x2="700" y2="93" stroke="#6B7280" stroke-width="1.5" marker-end="url(#ab)"/>
@@ -76,12 +76,12 @@
   <!-- ⑤ Monitor -->
   <rect x="704" y="60" width="148" height="66" rx="8" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
   <text x="778" y="84"  text-anchor="middle" font-size="11.5" font-weight="600" fill="#3730A3" font-family="'Inter',system-ui,sans-serif">Monitor</text>
-  <text x="778" y="100" text-anchor="middle" font-size="10"   fill="#6366F1" font-family="'Inter',system-ui,sans-serif">eval score · error rate</text>
-  <text x="778" y="116" text-anchor="middle" font-size="9"    fill="#A5B4FC" font-family="'Inter',system-ui,sans-serif">latency · token spend</text>
+  <text x="778" y="100" text-anchor="middle" font-size="10"   fill="#6366F1" font-family="'Inter',system-ui,sans-serif">metrics you post</text>
+  <text x="778" y="116" text-anchor="middle" font-size="9"    fill="#A5B4FC" font-family="'Inter',system-ui,sans-serif">vs drift baseline</text>
 
   <!-- Arrow: Monitor ─drift─► Auto-rollback (amber, down) -->
   <line x1="778" y1="126" x2="778" y2="196" stroke="#D97706" stroke-width="2" marker-end="url(#aa)"/>
-  <text x="784" y="163" font-size="9" font-weight="600" fill="#D97706" font-family="'Inter',system-ui,sans-serif">&gt;2σ drift</text>
+  <text x="784" y="163" font-size="9" font-weight="600" fill="#D97706" font-family="'Inter',system-ui,sans-serif">drift &gt; σ threshold</text>
 
   <!-- Blocked box -->
   <rect x="348" y="200" width="136" height="68" rx="8" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>

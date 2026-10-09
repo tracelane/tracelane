@@ -12,10 +12,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use super::AppState;
-use super::dispatch::{
-    DispatchGuard, ProviderKey, breaker_outcome, provider_name_from_model,
-    resolve_provider_key_traced,
-};
+use super::dispatch::{DispatchGuard, ProviderKey, breaker_outcome, provider_name_from_model};
 use super::errors::{
     classify_dispatch_error, dispatch_failure_response, provider_error_response,
     unroutable_model_response,
@@ -126,6 +123,16 @@ fn build_embeddings_span(
 /// (`400 unroutable_model`), provider-key resolution, input validation.
 /// Fail-OPEN: span publish and byte metering are off the response path — a
 /// NATS or ClickHouse problem never fails a request that the provider served.
+/// `POST /v1/embeddings` as mounted: the strict parse (`M-A`, security re-review
+/// 2026-10-03 — a repeated key is a 400 `duplicate_json_key`), then [`embeddings_handler`].
+pub(crate) async fn embeddings_route(
+    state: State<AppState>,
+    headers: HeaderMap,
+    crate::strict_json::StrictJson(body): crate::strict_json::StrictJson,
+) -> axum::response::Response {
+    embeddings_handler(state, headers, Json(body)).await
+}
+
 #[instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
 pub(crate) async fn embeddings_handler(
     State(state): State<AppState>,
@@ -164,6 +171,7 @@ async fn embeddings_handler_with_labels(
         admitted.entitlements.as_deref(),
         state.semantic_cache.as_deref(),
         false,
+        &crate::cache_controls::CacheCaller::default(),
     ) {
         Ok(policy) => policy,
         Err(err) => {
@@ -173,6 +181,7 @@ async fn embeddings_handler_with_labels(
         }
     };
     let crate::admission::Admitted {
+        attempt_security,
         claims,
         mut identity,
         request_start,
@@ -180,6 +189,7 @@ async fn embeddings_handler_with_labels(
         inbound_parent,
         parsed,
         entitlements,
+        route_plan,
         mut dispatch_guard,
         // B-568 I1: the route label is `embeddings`; the timer is emitted at this
         // route's dispatch boundary too, rather than discarded.
@@ -188,18 +198,48 @@ async fn embeddings_handler_with_labels(
     } = admitted;
     let mut request = parsed.request;
     let tenant_id = &claims.tenant_id;
+    if state
+        .guardrail
+        .policy_for(
+            *tenant_id.as_uuid(),
+            claims.api_key_id(),
+            claims.governance.as_ref().and_then(|g| g.project_id),
+        )
+        .await
+        .has_hooks()
+    {
+        dispatch_guard.abort("guardrail_policy_unenforceable", None);
+        return crate::openai_responses::coded(
+            StatusCode::FORBIDDEN,
+            "guardrail_policy_unenforceable",
+            "custom guardrails require synchronous text inference on this gateway",
+        );
+    }
+
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
     // GWY-27: a WORKSPACE alias resolves to its target at entry, as on the chat route
     // (see `chat.rs` for why entry and not beside the operator rewrite). The caller's
     // string survives on `identity.requested_model`; an unroutable target fails
     // CLOSED below.
-    if let Some(target) = entitlements
+    //
+    // OG-11: a VIRTUAL model (exactly one concrete target on this wire — vector
+    // dimensions must not change mid-index; the plan refused any other) resolves to its
+    // target instead.
+    if let Some(c) = route_plan.as_deref().and_then(|p| p.candidates.first()) {
+        request.model.clone_from(&c.model);
+    } else if let Some(target) = entitlements
         .as_deref()
         .and_then(|e| crate::db::model_aliases::resolve(&e.model_aliases, &request.model))
     {
         request.model = target.to_owned();
         identity.tenant_alias_applied = true;
     }
+    identity.route = super::RouteMeta::from_plan(route_plan.as_deref());
+    dispatch_guard.record_route(identity.route.clone());
+    let routing_state: std::sync::Arc<crate::routing::RoutingState> = entitlements
+        .as_deref()
+        .map(|e| std::sync::Arc::clone(&e.routing))
+        .unwrap_or_default();
     // The model string routing uses — the caller's own, or its workspace alias's
     // target — kept verbatim through the span and the ledger even when a
     // `tracelane.yaml` alias rewrites what goes upstream.
@@ -305,17 +345,27 @@ async fn embeddings_handler_with_labels(
     // --- Step 3: BYOK key. Fail-CLOSED, and the two failures need OPPOSITE
     // user actions (add a key vs rotate one) — never collapsed into one. ---
     let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id);
-    let (resolved_key, byok_round_trip) =
-        resolve_provider_key_traced(tenant_id, provider_id, key_env).await;
+    // OG-11: from the provider's key POOL (`default` alone when the document gives none).
+    let mut route_rng = crate::routing::thread_rng;
+    let pool = crate::routing::pool_labels(
+        &crate::admission::Embeddings::ROUTING,
+        &routing_state,
+        provider_id,
+        &mut route_rng,
+    );
+    let pooled = pool.pooled;
+    let mut key_cursor = super::KeyCursor::new(pool.labels);
+    let first = key_cursor.next_key(tenant_id, provider_id, key_env).await;
     // B-568 I5: a BYOK cache miss read the control plane on the request path.
     // `identity` is borrowed by `refuse_with_span` above, so the flag rides the
     // timer and is applied to the success span below.
-    if byok_round_trip {
+    if key_cursor.cold {
         timer.note_cold();
     }
-    let provider_key = match resolved_key {
-        ProviderKey::Found(k) => k,
-        outcome => {
+    let (mut key_label, provider_key) = match first {
+        Some(found) => found,
+        None => {
+            let outcome = key_cursor.into_failure();
             let (status, code, message) = match outcome {
                 ProviderKey::NotConfigured => (
                     StatusCode::BAD_REQUEST,
@@ -327,7 +377,17 @@ async fn embeddings_handler_with_labels(
                     "provider_key_unavailable",
                     "the key store could not be reached — nothing was sent to the provider; retry shortly",
                 ),
-                _ => (
+                ProviderKey::KmsUnavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "kms_unavailable",
+                    "customer key service unavailable",
+                ),
+                ProviderKey::KmsDenied => (
+                    StatusCode::FORBIDDEN,
+                    "kms_access_denied",
+                    "customer key service refused access",
+                ),
+                ProviderKey::Unusable | ProviderKey::Found(_) => (
                     StatusCode::BAD_GATEWAY,
                     "provider_key_unusable",
                     "a stored key for this provider could not be decrypted — rotate it in Settings → LLM Providers",
@@ -341,9 +401,12 @@ async fn embeddings_handler_with_labels(
 
     // --- Step 4: Breaker + kill switch (ADR-036/038) ---
     let upstream = provider_name_from_model(&model);
-    let region = "default";
+    // OG-13: the adapter's region and THIS tenant's credential.
+    let region = state.providers.upstream_region(provider_id);
+    let breaker_cred =
+        super::dispatch::breaker_cred(tenant_id, provider_id, &key_label, Some(&routing_state));
     let upstream_killed = state.kill_switch.upstream_killed(upstream);
-    if upstream_killed || !state.circuit_breaker.allow(upstream, region) {
+    if upstream_killed || !state.circuit_breaker.allow(upstream, region, &breaker_cred) {
         tracing::warn!(
             provider = upstream,
             killed = upstream_killed,
@@ -397,19 +460,87 @@ async fn embeddings_handler_with_labels(
         )
         .unwrap_or(0),
     );
-    let result = adapter
-        .embeddings(&upstream_request, provider_key.expose_secret(), tenant_id)
+    let mut result = crate::routing::deadlines::Budget::for_request(
+        entitlements.as_deref(),
+        provider_id,
+        &model,
+        request_start,
+    )
+    .with_breaker(&state.circuit_breaker, upstream, region, &breaker_cred)
+    .with_attempt(
+        &attempt_security,
+        provider_id,
+        &model,
+        &key_label,
+        &provider_key,
+    )
+    .scope(adapter.embeddings(&upstream_request, provider_key.expose_secret(), tenant_id))
+    .await;
+    if let Some(ok) = breaker_outcome(&result) {
+        crate::routing::deadlines::record_legacy(
+            &state.circuit_breaker,
+            upstream,
+            region,
+            &breaker_cred,
+            ok,
+            entitlements.as_deref(),
+            &model,
+        );
+    }
+    // OG-11: a KEY failure (401 / 403 / 429) moves to the NEXT pool key — same model,
+    // never another (no fallthrough on this wire), within `routing.max_attempts`.
+    let mut budget = if pooled {
+        crate::routing::limits().max_attempts.saturating_sub(1)
+    } else {
+        0
+    };
+    while budget > 0 && matches!(&result, Err(e) if crate::routing::is_key_failure(e)) {
+        let Some((label, key)) = key_cursor.next_key(tenant_id, provider_id, key_env).await else {
+            break;
+        };
+        let cred =
+            super::dispatch::breaker_cred(tenant_id, provider_id, &label, Some(&routing_state));
+        if !state.circuit_breaker.allow(upstream, region, &cred) {
+            continue;
+        }
+        budget -= 1;
+        result = crate::routing::deadlines::Budget::for_request(
+            entitlements.as_deref(),
+            provider_id,
+            &model,
+            request_start,
+        )
+        .with_breaker(&state.circuit_breaker, upstream, region, &cred)
+        .with_attempt(&attempt_security, provider_id, &model, &label, &key)
+        .scope(adapter.embeddings(&upstream_request, key.expose_secret(), tenant_id))
         .await;
+        if let Some(ok) = breaker_outcome(&result) {
+            crate::routing::deadlines::record_legacy(
+                &state.circuit_breaker,
+                upstream,
+                region,
+                &cred,
+                ok,
+                entitlements.as_deref(),
+                &model,
+            );
+        }
+        key_label = label;
+    }
+    if pooled {
+        identity.route.key_label = Some(key_label.clone());
+    }
     // The provider answered (or failed): every path below records its own span.
     dispatch_guard.disarm();
     let provider_complete_ts = chrono::Utc::now();
-    if let Some(ok) = breaker_outcome(&result) {
-        state.circuit_breaker.record(upstream, region, ok);
-    }
 
     let mut response = match result {
         Ok(r) => r,
         Err(err) => {
+            if let Some(denied) = err.downcast_ref::<crate::routing::attempt::Denied>() {
+                dispatch_guard.abort(denied.code(), None);
+                return Embeddings::refuse(denied.0.clone());
+            }
             let failure = classify_dispatch_error(&err);
             let status_code = err
                 .downcast_ref::<crate::providers::ProviderHttpError>()
@@ -423,31 +554,37 @@ async fn embeddings_handler_with_labels(
             );
             //  #3: a failure MUST be countable (status_code = 2), or the
             // error-rate metric is structurally pinned at 0% for this route.
-            spawn_span_publish(
-                &state,
-                with_zdr(
-                    build_embeddings_span(
-                        tenant_id,
-                        trace_id,
-                        inbound_parent,
-                        &model,
-                        &identity,
-                        request_start,
-                        0,
-                        None,
-                        Some(failure.reason()),
-                        claims.api_key_id(),
-                    ),
-                    zdr_eligible.clone(),
+            let mut error_span = with_zdr(
+                build_embeddings_span(
+                    tenant_id,
+                    trace_id,
+                    inbound_parent,
+                    &model,
+                    &identity,
+                    request_start,
+                    0,
+                    None,
+                    Some(failure.reason()),
+                    claims.api_key_id(),
                 ),
+                zdr_eligible.clone(),
             );
+            if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+                error_span.attributes.tracelane_dispatch_attempts =
+                    Some(vec![timeout.attempt(provider_id, &model)]);
+            }
+            spawn_span_publish(&state, error_span);
             tracing::warn!(
                 provider = upstream,
                 reason = failure.reason(),
                 status = ?status_code,
                 "embeddings dispatch failed"
             );
-            return dispatch_failure_response(failure, upstream);
+            return dispatch_failure_response(
+                failure,
+                upstream,
+                super::errors::upstream_retry_after_secs(&err),
+            );
         }
     };
 
@@ -689,7 +826,7 @@ mod route_tests {
         assert!(
             non_test.contains(concat!(
                 r#".route("/v1/embeddings", "#,
-                "post(embeddings_handler))"
+                "post(embeddings_route))"
             )),
             "the /v1/embeddings route must be mounted in the unconditional router"
         );

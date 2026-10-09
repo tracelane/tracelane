@@ -1,0 +1,23 @@
+---
+title: Inspect failures, loops, and spend spikes
+description: How Tracelane reads recorded traces to investigate incidents, repeated tool calls, and spend changes.
+classification: PUBLIC
+---
+
+Tracelane's diagnostics read recorded gateway and trace data. They do not run an analysis model on the request path. The trace, dashboard, and gateway views provide different starting points for an investigation.
+
+## Investigate a failed run
+
+The incident panel on a trace identifies a recorded failing signal: an error status, a bad annotation, or a failure outcome you explicitly recorded. It compares that run with the last comparable good run of the same agent when one exists in the lookback window. Requested and served model, tool definitions, environment, and release can appear in the comparison when captured. An explanation is labelled **supported** or **uncertain** with its evidence; missing fields are not guessed.
+
+You can record success or failure on the trace or with `POST /v1/outcomes`. HTTP 200 alone does not establish task success. With content capture enabled and the required dataset access, the panel can export recorded input as a dataset file or Promptfoo configuration. Expected output is left empty for you to define; export does not execute a model or tool.
+
+## Find repeated tool calls
+
+The trace view can show repeated tool calls by argument fingerprint. The dashboard and gateway views summarize loop and rescued-request signals. These are detection and investigation aids, not a claim that the gateway prevents every loop. A fingerprint requires the necessary request attributes; older calls without them cannot be retroactively classified.
+
+## Explain a spend spike
+
+Spend views show the largest recorded contributors to an hourly or daily increase. Open the contributing traces to inspect the requests behind the change. The baseline and trigger thresholds come from workspace policy; a spike is a comparison of recorded spend, not proof of its cause.
+
+For the underlying request path, see [architecture](/architecture). For capture settings and limits, see [concepts](/concepts) and [security](/security). For guardrail decisions, see [agent-tool safety guardrails](/predictive-guardrails).

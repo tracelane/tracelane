@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * `OBS-50` proof 2 — the Tool calls section renders for a span that called a tool
- * and does NOT render for one that did not; the content-off row says so in words
+ * and does NOT render for one that did not; missing arguments are described
  * and shows the byte size; a captured argument renders pretty-printed.
  */
 import "@testing-library/jest-dom/vitest";
@@ -29,7 +29,7 @@ function span(attributes: Record<string, unknown>): Span {
 afterEach(cleanup);
 
 describe("SpanInspector — Tool calls (OBS-50)", () => {
-	it("content OFF: one row per called tool with its byte size and the not-captured line", () => {
+	it("missing arguments: shows byte size without claiming capture is off", () => {
 		render(
 			<SpanInspector
 				span={span({
@@ -44,7 +44,8 @@ describe("SpanInspector — Tool calls (OBS-50)", () => {
 		expect(section).toHaveTextContent("Tool calls (1)");
 		expect(section).toHaveTextContent("get_weather");
 		expect(section).toHaveTextContent("0.2 KiB");
-		expect(section).toHaveTextContent("arguments not captured");
+		expect(section).toHaveTextContent("arguments not recorded");
+		expect(section).not.toHaveTextContent("content capture is off");
 		expect(section).toHaveTextContent("turn ended on the tool call");
 	});
 

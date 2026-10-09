@@ -108,14 +108,17 @@ async fn handler(
         }
     };
 
-    // IDENTITY_TEAM_SPEC §1: billing is owner-only (authoritative gateway gate).
-    if !claims.can_admin() {
-        return (
-            StatusCode::FORBIDDEN,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            crate::auth::role_forbidden_json("owner"),
-        )
-            .into_response();
+    // IDENTITY_TEAM_SPEC §1 + OG-34: the `manage_billing` capability (admin and the
+    // billing role), then OG-36's allowlist and SSO-required. Opening the portal
+    // changes no Tracelane state, so no audit row (`CONTROL_ROUTES`).
+    if let Err(r) = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageBilling,
+        &headers,
+    )
+    .await
+    {
+        return r.into_response();
     }
 
     // 2. Look up the tenant's Polar customer id.

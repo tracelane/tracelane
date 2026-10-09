@@ -81,6 +81,55 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<Value>,
     },
+    /// `OG-03`. OpenAI's `input_audio` part. Serialises back to exactly the wire
+    /// shape OpenAI-compatible providers take, so the compat adapter forwards it
+    /// verbatim; every native adapter translates or refuses it.
+    InputAudio {
+        input_audio: InputAudio,
+    },
+    /// `OG-03`. OpenAI's `file` part (a PDF as a data URI, or a provider file id).
+    File {
+        file: FilePart,
+    },
+}
+
+/// `OG-03`. `data` is base64 (no `data:` prefix); `format` is `wav` or `mp3`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+/// `OG-03`. At least one of `file_data` (a `data:application/pdf;base64,…` URI) or
+/// `file_id` must be present — enforced by the gateway's request validation, not by
+/// serde, so the 400 can name the part.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilePart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+/// `OG-03`. OpenAI's `stop`: one string or an array of strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Stop {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Stop {
+    /// The sequences, whichever shape arrived.
+    #[must_use]
+    pub fn sequences(&self) -> Vec<&str> {
+        match self {
+            Self::One(s) => vec![s.as_str()],
+            Self::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,7 +430,7 @@ impl Serialize for ToolChoice {
 
 /// Universal chat request shape used throughout the gateway.
 /// Provider adapters translate from this to provider-native format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -428,6 +477,39 @@ pub struct ChatRequest {
     pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<RequestMetadata>,
+    /// `OG-03`. OpenAI `stop` (≤4 entries of ≤256 bytes, validated by the gateway).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Stop>,
+    /// `OG-03`. `{"type":"text|json_object|json_schema", …}`, validated by the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
+    /// `OG-03`. One of the efforts in the gateway's reasoning reference table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// `OG-03`. Takes precedence over `max_tokens` wherever both could apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// `OG-03`. End-user identifier (≤256 bytes). Not answer-changing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// `OG-03`. Forwarded only to OpenAI-compatible providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// `OG-03`. Only `1` (or absent) is served: guardrails, cost, cache and capture
+    /// are all defined over ONE choice. Never forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// `OG-03`. Every OTHER top-level field the caller sent. Flatten only receives
+    /// keys no typed field claimed, so it can never override one. Forwarded only to
+    /// OpenAI-compatible providers; a non-empty map on a native adapter is a 400.
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -856,11 +938,103 @@ mod b355_tool_choice_tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(&req).expect("serialize");
         assert!(
             v.get("tool_choice").is_none(),
             "an absent tool_choice must not reach the wire: {v}"
+        );
+    }
+}
+
+/// `OG-03`: the new typed fields, the `extra` bag, and the OpenAI-shaped audio / file parts.
+#[cfg(test)]
+mod og03_wire_tests {
+    use super::*;
+
+    #[test]
+    fn typed_fields_are_claimed_and_only_unmodelled_keys_land_in_extra() {
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["a", "b"],
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "max",
+            "max_completion_tokens": 9,
+            "presence_penalty": 0.5,
+            "frequency_penalty": -0.5,
+            "parallel_tool_calls": false,
+            "user": "u",
+            "service_tier": "auto",
+            "n": 1,
+            "seed": 7,
+            "temperature": 0.2,
+            "logit_bias": {"1": 2},
+            "store": true
+        }))
+        .expect("decodes");
+        assert_eq!(req.stop, Some(Stop::Many(vec!["a".into(), "b".into()])));
+        assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(req.max_completion_tokens, Some(9));
+        assert_eq!(req.n, Some(1));
+        assert_eq!(req.seed, Some(7));
+        let mut keys: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["logit_bias", "store"],
+            "typed fields must not leak into extra"
+        );
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_an_array() {
+        let one: ChatRequest = serde_json::from_value(
+            serde_json::json!({"model": "m", "messages": [], "stop": "END"}),
+        )
+        .unwrap();
+        assert_eq!(one.stop.as_ref().map(Stop::sequences), Some(vec!["END"]));
+    }
+
+    #[test]
+    fn a_request_with_none_of_the_new_fields_serialises_byte_identically() {
+        let req = ChatRequest {
+            model: "m".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["messages", "model"], "{v}");
+    }
+
+    #[test]
+    fn input_audio_and_file_parts_round_trip_in_openai_wire_shape() {
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                {"type": "file", "file": {"file_data": "data:application/pdf;base64,AAAA", "filename": "a.pdf"}},
+                {"type": "file", "file": {"file_id": "file-1"}}
+            ]
+        }))
+        .expect("decodes");
+        let MessageContent::Parts(parts) = &msg.content else {
+            panic!("parts expected");
+        };
+        assert!(matches!(parts[0], ContentPart::InputAudio { .. }));
+        assert!(matches!(parts[1], ContentPart::File { .. }));
+        // Back out: exactly the keys OpenAI-compatible providers take, nothing added.
+        let out = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            out["content"][0]["input_audio"],
+            serde_json::json!({"data": "AAAA", "format": "wav"})
+        );
+        assert_eq!(
+            out["content"][2]["file"],
+            serde_json::json!({"file_id": "file-1"})
         );
     }
 }

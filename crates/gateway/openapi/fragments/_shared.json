@@ -1,0 +1,489 @@
+{
+  "control_responses": {
+    "401": {
+      "description": "unauthorized \u2014 no or invalid credential.",
+      "schema": {
+        "$ref": "#/components/schemas/ControlError"
+      }
+    },
+    "403": {
+      "description": "role_forbidden (names required_role + capability), admin_ip_not_allowed, or sso_required.",
+      "schema": {
+        "$ref": "#/components/schemas/ControlError"
+      }
+    },
+    "429": {
+      "description": "control_rate_limited; Retry-After header and retry_after_secs.",
+      "schema": {
+        "$ref": "#/components/schemas/ControlError"
+      }
+    },
+    "503": {
+      "description": "control_change_unavailable / control_audit_unavailable \u2014 the change was not applied.",
+      "schema": {
+        "$ref": "#/components/schemas/ControlError"
+      }
+    }
+  },
+  "schemas": {
+    "ControlError": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string"
+        },
+        "required_role": {
+          "type": "string"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "retry_after_secs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    "PolicyList": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PolicyRate": {
+      "type": "object",
+      "properties": {
+        "rpm": {
+          "type": "integer"
+        },
+        "tpm": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PolicyBudget": {
+      "type": "object",
+      "properties": {
+        "usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "window": {
+          "enum": [
+            "daily",
+            "weekly",
+            "monthly",
+            "rolling_1h",
+            "rolling_24h",
+            "rolling_7d",
+            "rolling_30d"
+          ],
+          "default": "monthly"
+        },
+        "mode": {
+          "enum": [
+            "hard",
+            "soft"
+          ],
+          "default": "hard"
+        },
+        "alert_at_percent": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "alert_at_usd": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      },
+      "required": [
+        "usd"
+      ],
+      "additionalProperties": false
+    },
+    "PolicyDocument": {
+      "type": "object",
+      "properties": {
+        "models": {
+          "$ref": "#/components/schemas/PolicyList"
+        },
+        "providers": {
+          "$ref": "#/components/schemas/PolicyList"
+        },
+        "source_ips": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_input_tokens": {
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "type": "integer"
+        },
+        "max_body_bytes": {
+          "type": "integer"
+        },
+        "required_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_metadata_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "rpm": {
+              "type": "integer"
+            },
+            "tpm": {
+              "type": "integer"
+            },
+            "per_end_user": {
+              "$ref": "#/components/schemas/PolicyRate"
+            },
+            "per_model": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "rpm": {
+                    "type": "integer"
+                  },
+                  "tpm": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "model"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "budget": {
+          "$ref": "#/components/schemas/PolicyBudget"
+        },
+        "end_user_budget": {
+          "$ref": "#/components/schemas/PolicyBudget"
+        }
+      },
+      "additionalProperties": false,
+      "description": "crates/shared/src/key_policy.rs is the one vocabulary. A WORKSPACE policy (PUT /v1/controls/policy) may carry only models, providers, source_ips, limits, budget, end_user_budget; token / body / label caps are refused 400."
+    },
+    "ControlsState": {
+      "type": "object",
+      "properties": {
+        "paused": {
+          "type": "boolean"
+        },
+        "pausedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pausedBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pauseReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blocks": {
+          "type": "object",
+          "properties": {
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "endUsers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "policy": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/PolicyDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "BudgetCounter": {
+      "type": "object",
+      "properties": {
+        "policy": {
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "workspace",
+            "project",
+            "key"
+          ]
+        },
+        "subjectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endUser": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "hard",
+            "soft"
+          ]
+        },
+        "budgetUsd": {
+          "type": "number"
+        },
+        "spentUsd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "null = unknown (known:false), never 0"
+        },
+        "known": {
+          "type": "boolean"
+        },
+        "resetsAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Project": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "environments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "policy": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/PolicyDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        }
+      }
+    },
+    "AlertChannel": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "email",
+            "slack",
+            "webhook"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "signingSecret": {
+          "type": "string",
+          "description": "webhook only, in the create response only, shown once"
+        }
+      }
+    },
+    "AdminAccess": {
+      "type": "object",
+      "properties": {
+        "admin_ip_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sso_required": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "your_ip": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "your_ip_attested": {
+          "type": "boolean"
+        },
+        "max_ip_allowlist_entries": {
+          "type": "integer"
+        }
+      }
+    },
+    "ControlChange": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "occurred_at": {
+          "type": "string"
+        },
+        "actor": {
+          "type": "string"
+        },
+        "actor_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor_auth_method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "action": {
+          "type": "string"
+        },
+        "target_type": {
+          "type": "string"
+        },
+        "target_id": {
+          "type": "string"
+        },
+        "before": {},
+        "after": {},
+        "ip": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

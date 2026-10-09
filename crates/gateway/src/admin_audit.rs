@@ -1,5 +1,11 @@
 //! Admin-action audit log helper (ADR-031).
 //!
+//! **SUPERSEDED for writing (OG-35, 2026-10-04): the gateway's ONE writer into
+//! `admin_audit_log` is `crate::db::control_audit::record`**, called inside each
+//! control change's own transaction (fail-CLOSED), with redaction, request id, role
+//! and auth method. What follows describes the V1 builder this file still keeps for
+//! its test; it is not on any request path.
+//!
 //! Inserts one row into `admin_audit_log` (Postgres) per mutating
 //! admin action. The helper is intentionally low-ceremony — every
 //! field is `Option`-able where the prompt allows; callers fill in

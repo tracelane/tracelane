@@ -298,7 +298,7 @@ fn authorize_read(claims: &Claims) -> Result<(), ApiError> {
 /// `Admin` is the right scope for the same reason it is right there: these
 /// routes mutate durable workspace state, and `KeyScope::allows` deliberately
 /// has no implication hierarchy, so a key that needs two capabilities lists two.
-fn authorize_write(claims: &Claims) -> Result<(), ApiError> {
+pub(crate) fn authorize_write(claims: &Claims) -> Result<(), ApiError> {
     if !claims.can_write_prompts() {
         return Err(api_err(
             StatusCode::FORBIDDEN,
@@ -331,7 +331,7 @@ fn authorize_write(claims: &Claims) -> Result<(), ApiError> {
 /// shipped inverted. The refusal is a `503` rather than a `403` because the
 /// honest fact is "we could not verify", not "you are not entitled" — the same
 /// posture as the audit-export gate and `prompt_routes`.
-async fn require_datasets(
+pub(crate) async fn require_datasets(
     entitlements: &Option<Arc<EntitlementCache>>,
     tenant: &TenantId,
 ) -> Result<(), ApiError> {
@@ -577,7 +577,7 @@ pub struct SpanContentRow {
 /// answers for MANY traces at once and the caller must know which row is
 /// which — [`SpanContentRow`] is the single-item shape and deliberately does
 /// not carry ids, because a single-item read already knows them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, clickhouse::Row)]
 pub struct TraceSpanContent {
     pub trace_id: String,
     pub span_id: String,
@@ -684,6 +684,16 @@ pub trait DatasetStore: Send + Sync {
     ) -> Result<bool>;
     async fn delete_item(&self, tenant: &TenantId, dataset_id: Uuid, item_id: Uuid)
     -> Result<bool>;
+
+    /// Read the content-bearing spans of one trace with a cap+1 sentinel.
+    /// # Errors
+    /// Fails CLOSED on either the span read or batch blob resolution failure.
+    async fn trace_content(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TraceSpanContent>>;
 
     /// Re-read ONE span's recorded content under the tenant claim.
     async fn span_content(
@@ -1591,6 +1601,35 @@ impl DatasetStore for ClickHouseDatasetStore {
         Ok(true)
     }
 
+    async fn trace_content(
+        &self,
+        tenant: &TenantId,
+        trace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TraceSpanContent>> {
+        // Exclude absent/null/empty arrays before the cap+1 sentinel. Keep malformed
+        // values and blob references so decoding/rehydration still fails honestly.
+        let sql = self.capped(
+            "SELECT trace_id, span_id, JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, JSONExtractRaw(attributes, 'gen_ai_system_instructions') AS system_instructions FROM tracelane.spans FINAL WHERE tenant_id = ? AND trace_id = ? AND JSONHas(attributes, 'gen_ai_input_messages') AND trimBoth(input_messages) NOT IN ('', 'null') AND NOT (JSONType(input_messages) = 'Array' AND JSONLength(input_messages) = 0) ORDER BY start_time, span_id LIMIT ?",
+            tenant,
+        ).await;
+        let mut rows: Vec<TraceSpanContent> = self
+            .ch
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(trace_id)
+            .bind(limit as u64)
+            .fetch_all()
+            .await?;
+        // Resolve every referenced input/system blob in one batch, never per span.
+        let mut fields: Vec<&mut String> = rows
+            .iter_mut()
+            .flat_map(|r| [&mut r.input_messages, &mut r.system_instructions])
+            .collect();
+        crate::billing::blobs::rehydrate(&self.ch, tenant, &mut fields).await?;
+        Ok(rows)
+    }
+
     async fn span_content(
         &self,
         tenant: &TenantId,
@@ -2393,6 +2432,69 @@ struct AddItemBody {
     span_id: Option<String>,
 }
 
+/// The shared trace-to-dataset conversion. Captured input is copied; an expected answer is never inferred.
+pub(crate) fn trace_item(
+    messages: &[Message],
+    system: String,
+    trace_uuid: Option<Uuid>,
+    span_id: String,
+    actor: String,
+    now: i64,
+) -> Result<DatasetItem, ApiError> {
+    // Re-serialized through `Vec<Message>` rather than stored as the raw span
+    // bytes: the item's `input` is then EXACTLY the shape `prompt_eval` will
+    // deserialize, so producer and consumer agree by construction.
+    let input = serde_json::to_string(&messages).map_err(|e| {
+        tracing::error!(error = %e, "dataset add: re-serializing copied messages failed");
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not serialize the copied span content".to_string(),
+        )
+    })?;
+    let size = input.len() + system.len();
+    if size > limits::ITEM_INPUT_BYTES {
+        return Err(coded_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "item_too_large",
+            "This span's recorded content is larger than one dataset item may hold. It is \
+             refused rather than truncated — a truncated prompt is a test case that \
+             quietly tests something else.",
+            serde_json::json!({ "max_bytes": limits::ITEM_INPUT_BYTES, "got_bytes": size }),
+        ));
+    }
+
+    let hash = input_hash(messages, &system).map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "dataset add: hashing failed");
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not compute the dedupe hash".to_string(),
+        )
+    })?;
+    let item = DatasetItem {
+        item_id: Uuid::new_v4(),
+        // UNNAMED. The provenance lives in `source_trace_id`; manufacturing a
+        // `trace:<id>` label here would put the same fact in two columns that
+        // can then disagree, and the surface renders the ordinal for an unnamed
+        // item.
+        name: String::new(),
+        input,
+        system,
+        // ALWAYS NULL on a trace-derived item, and that is expected rather than
+        // an error: production captures INPUT ONLY, because the span is
+        // published before the response-side guardrail seam so a BLOCKED request
+        // still produces a span. An empty string here would be a test case that
+        // passes nothing and fails nothing.
+        expected_output: None,
+        metadata: "{}".to_string(),
+        source_trace_id: trace_uuid,
+        source_span_id: span_id.to_string(),
+        input_hash: hash,
+        created_at_ms: now,
+        created_by: actor,
+    };
+    Ok(item)
+}
+
 /// `POST /v1/datasets/{id}/items` — **the one-click conversion**.
 #[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn add_item(
@@ -2546,35 +2648,15 @@ async fn add_item(
         SpanVerdict::Content(m, s) => (m, s),
     };
 
-    // Re-serialized through `Vec<Message>` rather than stored as the raw span
-    // bytes: the item's `input` is then EXACTLY the shape `prompt_eval` will
-    // deserialize, so producer and consumer agree by construction.
-    let input = serde_json::to_string(&messages).map_err(|e| {
-        tracing::error!(error = %e, "dataset add: re-serializing copied messages failed");
-        api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not serialize the copied span content".to_string(),
-        )
-    })?;
-    let size = input.len() + system.len();
-    if size > limits::ITEM_INPUT_BYTES {
-        return Err(coded_err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "item_too_large",
-            "This span's recorded content is larger than one dataset item may hold. It is \
-             refused rather than truncated — a truncated prompt is a test case that \
-             quietly tests something else.",
-            serde_json::json!({ "max_bytes": limits::ITEM_INPUT_BYTES, "got_bytes": size }),
-        ));
-    }
-
-    let hash = input_hash(&messages, &system).map_err(|e| {
-        tracing::error!(error = %format!("{e:#}"), "dataset add: hashing failed");
-        api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not compute the dedupe hash".to_string(),
-        )
-    })?;
+    let item = trace_item(
+        &messages,
+        system,
+        Some(trace_uuid),
+        span_id.to_owned(),
+        actor,
+        datetime64_millis_now(),
+    )?;
+    let hash = item.input_hash.clone();
     // A duplicate is NOT an error, and the existing item is NOT overwritten —
     // `expected_output` is deliberately outside the hash, so overwriting would
     // discard a reference someone reviewed.
@@ -2595,29 +2677,6 @@ async fn add_item(
         ));
     }
 
-    let now = datetime64_millis_now();
-    let item = DatasetItem {
-        item_id: Uuid::new_v4(),
-        // UNNAMED. The provenance lives in `source_trace_id`; manufacturing a
-        // `trace:<id>` label here would put the same fact in two columns that
-        // can then disagree, and the surface renders the ordinal for an unnamed
-        // item.
-        name: String::new(),
-        input,
-        system,
-        // ALWAYS NULL on a trace-derived item, and that is expected rather than
-        // an error: production captures INPUT ONLY, because the span is
-        // published before the response-side guardrail seam so a BLOCKED request
-        // still produces a span. An empty string here would be a test case that
-        // passes nothing and fails nothing.
-        expected_output: None,
-        metadata: "{}".to_string(),
-        source_trace_id: Some(trace_uuid),
-        source_span_id: span_id.to_string(),
-        input_hash: hash,
-        created_at_ms: now,
-        created_by: actor,
-    };
     let item_id = item.item_id;
     state
         .store
@@ -3564,6 +3623,26 @@ async fn import_dataset(
     })))
 }
 
+/// One canonical JSONL record, shared by dataset and incident exports.
+pub(crate) fn export_line(i: &DatasetItem) -> serde_json::Value {
+    serde_json::json!({
+        // Emitted even when empty, so a re-import is byte-for-byte the same
+        // shape. An omitted key and an empty one are the same to the
+        // importer, but only one of them survives a diff of two exports.
+        "name": i.name,
+        "input": serde_json::from_str::<serde_json::Value>(&i.input)
+            .unwrap_or(serde_json::Value::Null),
+        "system": if i.system.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&i.system).unwrap_or(serde_json::Value::Null)
+        },
+        "expected_output": i.expected_output,
+        "metadata": serde_json::from_str::<serde_json::Value>(&i.metadata)
+            .unwrap_or_else(|_| serde_json::json!({})),
+    })
+}
+
 /// `GET /v1/datasets/{id}/export?format=jsonl`.
 #[tracing::instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn export_dataset(
@@ -3596,22 +3675,7 @@ async fn export_dataset(
 
     let mut out = String::new();
     for i in items {
-        let line = serde_json::json!({
-            // Emitted even when empty, so a re-import is byte-for-byte the same
-            // shape. An omitted key and an empty one are the same to the
-            // importer, but only one of them survives a diff of two exports.
-            "name": i.name,
-            "input": serde_json::from_str::<serde_json::Value>(&i.input)
-                .unwrap_or(serde_json::Value::Null),
-            "system": if i.system.trim().is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::from_str(&i.system).unwrap_or(serde_json::Value::Null)
-            },
-            "expected_output": i.expected_output,
-            "metadata": serde_json::from_str::<serde_json::Value>(&i.metadata)
-                .unwrap_or_else(|_| serde_json::json!({})),
-        });
+        let line = export_line(&i);
         out.push_str(&line.to_string());
         out.push('\n');
     }
@@ -4241,6 +4305,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
 
@@ -4251,6 +4316,40 @@ mod tests {
 
     // ── The refusals must stay DISTINGUISHABLE ───────────────────────────────
 
+    #[tokio::test]
+    async fn regression_content_query_filters_empty_inputs_before_limit() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let store =
+            ClickHouseDatasetStore::new(clickhouse::Client::default().with_url(server.uri()));
+        let tenant = TenantId::from_jwt_claim(Uuid::from_u128(7));
+        assert!(store.trace_content(&tenant, "trace", 3).await.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let sql = requests[0]
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "query")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(sql.contains(&format!("FINAL WHERE tenant_id = '{}'", tenant)));
+        let before_limit = sql.split("LIMIT 3").next().unwrap();
+        assert!(
+            before_limit.contains("trimBoth(input_messages) NOT IN ('', 'null')"),
+            "empty and null content must be filtered before LIMIT: {sql}"
+        );
+        assert!(
+            before_limit.contains(
+                "NOT (JSONType(input_messages) = 'Array' AND JSONLength(input_messages) = 0)"
+            ),
+            "empty arrays must be filtered without hiding malformed content or blob refs: {sql}"
+        );
+        assert!(sql.contains("LIMIT 3"));
+    }
     /// The property the whole surface is built to hold. Every code this module
     /// can emit for "there is no content here" is listed, and any two being
     /// equal fails HERE, loudly, rather than being discovered by a user who
@@ -5089,6 +5188,15 @@ mod tests {
             let before = items.len();
             items.retain(|(d, i)| !(*d == id && i.item_id == item_id));
             Ok(before != items.len())
+        }
+        async fn trace_content(
+            &self,
+            t: &TenantId,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<TraceSpanContent>> {
+            self.note(t);
+            Ok(vec![])
         }
         async fn span_content(
             &self,

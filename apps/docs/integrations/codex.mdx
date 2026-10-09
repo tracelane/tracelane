@@ -1,0 +1,83 @@
+---
+title: "Codex CLI"
+description: "Route Codex CLI through the Tracelane gateway so every model call is admitted, guarded and recorded."
+classification: PUBLIC
+---
+
+Codex CLI talks to models over the OpenAI **Responses API**. The gateway serves
+`POST /v1/responses`, so pointing Codex at it is a provider entry in Codex's
+`config.toml`. No Tracelane SDK is involved.
+
+## Setup
+
+Mint a key with the **`chat`** scope in **Settings → API keys**. Add the key for the
+model's provider under **Settings → LLM providers**, because the gateway calls that
+provider with your own key. Then add this to `~/.codex/config.toml`:
+
+```toml
+model_provider = "tracelane"
+model = "gpt-6.1-sol"
+
+[model_providers.tracelane]
+name = "Tracelane"
+base_url = "https://gateway.tracelane.dev/v1"
+env_key = "TRACELANE_API_KEY"
+wire_api = "responses"
+```
+
+```bash
+export TRACELANE_API_KEY=tlane_...
+codex
+```
+
+Codex sends `Authorization: Bearer $TRACELANE_API_KEY` to `{base_url}/responses`.
+Each call becomes one gateway span, with the same keys, budgets, rate limits and
+guardrails as every other route.
+
+## Using a model that is not OpenAI's
+
+Set `model` to any model the gateway routes, for example a `claude-*` or `gemini-*`
+model:
+
+```toml
+model = "claude-sonnet-5-5"
+```
+
+How the call reaches the provider depends on the provider:
+
+| Provider | What the gateway does |
+|---|---|
+| OpenAI, xAI, OpenRouter | Relays Codex's request to the provider's own Responses endpoint, and relays the reply unchanged unless a guardrail rewrites it. Stored responses, `previous_response_id` and built-in tools work, because the state lives in your provider account. |
+| Every other provider | Translates the request into that provider's format and the reply back into Responses events. |
+
+Translated calls have these limits:
+
+- **No stored state.** `previous_response_id`, `background` and `conversation`
+  return `400 unsupported_parameter`. Codex with `store = false`, its default,
+  sends the full conversation on every turn and is not affected.
+- **Hosted search is dropped, not run.** Codex's `web_search` and `tool_search`
+  tools are removed before the call, and the response header
+  `x-tracelane-dropped-tools` lists them. Other hosted tools, such as
+  `code_interpreter`, `file_search` and `computer_use`, return `400`.
+- **Reasoning items are not returned.** Encrypted reasoning from an earlier OpenAI
+  turn means nothing to another provider, so the gateway drops it and counts it on
+  the span.
+- **Reasoning effort, structured output and file inputs are translated** into the
+  provider's own controls where it has them, for example adaptive thinking on Claude
+  or `thinkingLevel` on Gemini. A value the provider cannot honour returns
+  `400 unsupported_parameter` naming the field.
+- **Two hints are dropped, and the drop is reported.** `text.verbosity` has no
+  equivalent outside OpenAI. `parallel_tool_calls: false` is dropped on providers
+  that have no such switch, so the model may return more than one call in a turn. Both
+  appear in `x-tracelane-dropped-tools`. Nothing is ignored silently.
+
+Codex's freeform `apply_patch` tool is passed to the provider as a tool that takes a
+single string. The call comes back to Codex as a `custom_tool_call`, the shape Codex
+expects.
+
+## Errors
+
+Gateway errors use the OpenAI shape, `{"error": {"message", "type", "code", "param"}}`.
+For a relayed provider, an upstream error keeps its status and body, with credentials
+scrubbed. A rejected provider key is reported as `provider_key_rejected` and the
+upstream body is not returned.

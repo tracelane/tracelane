@@ -22,6 +22,33 @@ const h = vi.hoisted(() => ({
 	unlimitedSeats: true,
 }));
 
+const ctl = vi.hoisted(() => ({
+	record: vi.fn(
+		async (
+			..._a: unknown[]
+		): Promise<{ ok: true } | { ok: false; response: Response }> => ({
+			ok: true,
+		}),
+	),
+	failed: vi.fn(async (..._a: unknown[]) => undefined),
+}));
+const refused = (status: number, error: string) => ({
+	ok: false as const,
+	response: Response.json({ error }, { status }),
+});
+
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: ctl.record,
+	recordControlChangeFailed: ctl.failed,
+	redactEmail: (e: string) => `${e[0]}***${e.slice(e.indexOf("@"))}`,
+}));
+
+beforeEach(() => {
+	ctl.record.mockReset();
+	ctl.record.mockResolvedValue({ ok: true });
+	ctl.failed.mockReset();
+});
+
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");

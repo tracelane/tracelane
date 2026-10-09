@@ -63,7 +63,13 @@ impl OpenAiProvider {
         api_key: &str,
         tenant_id: &TenantId,
     ) -> Result<ProviderStream> {
-        let oai_request = OpenAiRequest::from_universal(request);
+        // OG-05 §3.4: a model chat completions cannot serve goes through the
+        // Responses API. Decided HERE, inside the one adapter, so breaker,
+        // failover, guardrails and spans see the same `ProviderStream` as ever.
+        if super::responses_bridge::applies(self.provider_id, &request) {
+            return self.chat_via_responses(request, api_key).await;
+        }
+        let oai_request = OpenAiRequest::from_universal_for(request, self.provider_id);
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         // SSRF: validate before the POST (reviewer).
@@ -71,15 +77,15 @@ impl OpenAiProvider {
             .await
             .context("SSRF guard rejected OpenAI base URL")?;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .json(&oai_request)
-            .send()
-            .await
-            .context("failed to send request to OpenAI API")?;
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .header("authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(&oai_request),
+        )
+        .await
+        .context("failed to send request to OpenAI API")?;
 
         let status = response.status();
         if !status.is_success() {
@@ -88,26 +94,113 @@ impl OpenAiProvider {
             // offending Authorization header and would leak the customer's
             // BYOK key into our logs / error records / tenant-visible error JSON.
             // Body is consumed to free the connection but never logged.
-            let _body = response.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(response.headers());
+            let body = crate::routing::deadlines::error_text(response).await?;
             tracing::warn!(status = %status, "OpenAI API error");
             // Typed so the gateway can tell an auth rejection (401/403 → the
             // tenant's key was rejected) from an outage (5xx → 502). Status only,
             // never the body (credential-echo risk above).
-            return Err(crate::providers::ProviderHttpError {
-                provider: self.provider_id,
-                status: status.as_u16(),
+            //
+            // OG-03 §3.4: a relayable 4xx also carries the upstream's own message —
+            // scrubbed, truncated, key-stripped — built ONLY by `from_response`,
+            // which refuses 401/403/407, every 5xx and any auth rejection.
+            return Err(crate::providers::ProviderHttpError::from_response(
+                self.provider_id,
+                status.as_u16(),
                 // OpenAI-shape bodies use a lowercase `error.code`, which
                 // `safe_reason` deliberately rejects (the guard is SHOUTY_SNAKE
                 // only). Status-level mapping (429/404) still applies to all 28
                 // OpenAI-compatible providers; extracting their codes is a
                 // separate, additive step.
-                reason: None,
-            }
+                None,
+                &body,
+                api_key,
+            )
+            .with_retry_after(retry_after)
             .into());
         }
 
         let stream = build_openai_stream(response);
         Ok(Box::pin(stream))
+    }
+}
+
+impl OpenAiProvider {
+    /// `OG-05` §3.4: serve a chat request through `POST {base}/v1/responses`.
+    /// The request body and the frame parser are `responses_bridge`'s; this
+    /// method owns only the HTTP call, so its failure handling is the chat
+    /// path's, line for line.
+    ///
+    /// # Errors
+    /// Fail-CLOSED: SSRF refusal, transport failure, a non-2xx (typed
+    /// `ProviderHttpError`, status only plus a scrubbed relayable message), or
+    /// a request the Responses wire cannot carry. Upstream bodies never reach
+    /// an error string.
+    async fn chat_via_responses(
+        &self,
+        request: ChatRequest,
+        api_key: &str,
+    ) -> Result<ProviderStream> {
+        let body = super::responses_bridge::build_body(&request)?;
+        let url = format!("{}/v1/responses", self.base_url);
+
+        crate::ssrf_guard::validate_url(&url)
+            .await
+            .context("SSRF guard rejected OpenAI base URL")?;
+
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .header("authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await
+        .context("failed to send request to OpenAI Responses API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // SECURITY: as in `chat` — the upstream body never enters an error string.
+            let text = crate::routing::deadlines::error_text(response).await?;
+            tracing::warn!(status = %status, "OpenAI Responses API error");
+            return Err(crate::providers::ProviderHttpError::from_response(
+                self.provider_id,
+                status.as_u16(),
+                None,
+                &text,
+                api_key,
+            )
+            .into());
+        }
+
+        Ok(Box::pin(build_responses_stream(response)))
+    }
+}
+
+/// Responses SSE -> provider events, via `responses_bridge`'s pure parser.
+fn build_responses_stream(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<ProviderEvent>> + Send {
+    try_stream! {
+        use futures::StreamExt as _;
+        let mut byte_stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut st = super::responses_bridge::FrameState::default();
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk: Bytes = chunk
+                .map_err(reqwest::Error::without_url)
+                .context("error reading Responses stream chunk")?;
+            buf.extend_from_slice(&chunk);
+            for event in super::responses_bridge::drain_frames(&mut buf, &mut st)? {
+                yield event;
+            }
+        }
+        // A stream that ends before a terminal frame is a truncated answer.
+        if !st.finished {
+            Err(anyhow::anyhow!(
+                "the Responses stream ended before response.completed"
+            ))?;
+        }
     }
 }
 
@@ -121,7 +214,7 @@ fn build_openai_stream(
 
         use futures::StreamExt as _;
         while let Some(chunk) = byte_stream.next().await {
-            let chunk: Bytes = chunk.context("error reading response chunk")?;
+            let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("error reading response chunk")?;
             lines.push(&chunk);
 
             while let Some(line) = lines.next_line() {
@@ -178,8 +271,11 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     // carries at least one of them; consumers keep the first and ignore the rest.
     let mut events: Vec<ProviderEvent> = response_meta(&v).into_iter().collect();
 
-    // Usage chunk (stream_options.include_usage = true)
-    if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
+    // Usage chunk (stream_options.include_usage = true). Pushed LAST, after whatever
+    // else this frame carries — F3 (2026-10-03): Mistral bundles the whole tool call,
+    // `finish_reason` AND `usage` onto ONE terminal chunk, and an early return here
+    // dropped the call and the reason with no error.
+    let usage_event = v.get("usage").filter(|u| !u.is_null()).map(|usage| {
         let input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
         let output = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
         // Wire-reported cost: OpenRouter (and some OpenAI-compatible
@@ -194,16 +290,15 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64)
             .map(|n| n as u32);
-        events.push(ProviderEvent::UsageUpdate {
+        ProviderEvent::UsageUpdate {
             input_tokens: input,
             output_tokens: output,
             cache_read: None,
             cache_creation: None,
             cost_usd,
             reasoning,
-        });
-        return Ok(events);
-    }
+        }
+    });
 
     // OBS-53. Collected BEFORE the content/tool/finish decision below and
     // carried alongside whichever of those wins, because this frame can
@@ -225,10 +320,11 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
         }
     }
 
+    // Every fact on the frame, in wire order: content, tool calls, stop reason, usage.
+    // F3: this used to return after the FIRST of these it found, so a compatible host
+    // that bundles them (Mistral's terminal chunk; a last token carrying its reason)
+    // lost the rest silently.
     let delta = &v["choices"][0]["delta"];
-    if delta.is_null() {
-        return Ok(events);
-    }
 
     // Text delta
     if let Some(text) = delta["content"].as_str()
@@ -237,46 +333,39 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
         events.push(ProviderEvent::StreamChunk {
             delta: text.to_owned(),
         });
-        return Ok(events);
     }
 
     // Tool call delta
-    if let Some(tool_calls) = delta["tool_calls"].as_array()
-        && let Some(tc) = tool_calls.first()
-    {
-        let index = tc["index"].as_u64().unwrap_or(0) as usize;
-        let id = tc["id"].as_str().map(str::to_owned);
-        let name = tc["function"]["name"].as_str().map(str::to_owned);
-        let input_delta = tc["function"]["arguments"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        events.push(ProviderEvent::ToolCallDelta {
-            index,
-            id,
-            name,
-            input_delta,
-        });
-        return Ok(events);
+    // OG-90: EVERY entry, not `.first()`. OpenAI sends one call per chunk, but several
+    // OpenAI-compatible providers batch parallel calls into one delta, and the second call used
+    // to vanish with no error.
+    if let Some(tool_calls) = delta["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+            let id = tc["id"].as_str().map(str::to_owned);
+            let name = tc["function"]["name"].as_str().map(str::to_owned);
+            let input_delta = tc["function"]["arguments"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            events.push(ProviderEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                input_delta,
+            });
+        }
     }
 
     // B-354: the provider's own stop reason, passed through.
-    //
-    // Checked LAST, and that is the honest limit of this parser's single-event
-    // return: OpenAI itself sends `finish_reason` on its own chunk with an
-    // EMPTY delta, so this is reached for every real OpenAI stream. A
-    // compatible host that bundles the reason onto the last CONTENT chunk
-    // loses it here — the content event wins, because dropping a token is
-    // worse than dropping a reason the buffered path can still derive from the
-    // presence of tool calls.
     if let Some(reason) = v["choices"][0]["finish_reason"]
         .as_str()
         .and_then(FinishReason::from_openai_finish_reason)
     {
         events.push(ProviderEvent::Finish { reason });
-        return Ok(events);
     }
 
+    events.extend(usage_event);
     Ok(events)
 }
 
@@ -341,6 +430,31 @@ pub(super) struct OpenAiRequest {
     logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs: Option<u8>,
+    /// OG-03. Every field below is forwarded exactly as the caller sent it and is absent
+    /// from the wire when they sent none, so an older request serialises byte-identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<tracelane_shared::Stop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
+    /// OG-03. The caller's unmodelled top-level fields, forwarded to an OpenAI-compatible
+    /// provider so a new provider feature works without a gateway release. Keys this
+    /// struct writes itself are removed first — never emitted twice.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,8 +487,26 @@ struct OpenAiFunctionDef {
 }
 
 impl OpenAiRequest {
+    /// Provider-agnostic form (Azure, and every test written before OG-03): `max_tokens`
+    /// stays `max_tokens`.
     pub(super) fn from_universal(req: ChatRequest) -> Self {
-        let messages: Vec<OpenAiMessage> =
+        Self::from_universal_for(req, "")
+    }
+
+    /// `provider_id` is the catalog id of the adapter sending this. **For `openai` the
+    /// output-token cap is sent as `max_completion_tokens` even when the caller sent
+    /// `max_tokens`**: OpenAI accepts it on every chat model and its reasoning models accept
+    /// ONLY it. Every other OpenAI-compatible provider gets the cap under the name the
+    /// caller used — they implement the older name, and several reject the newer one.
+    pub(super) fn from_universal_for(mut req: ChatRequest, provider_id: &str) -> Self {
+        let (max_tokens, max_completion_tokens) = if provider_id == "openai" {
+            (None, req.max_completion_tokens.or(req.max_tokens))
+        } else {
+            (req.max_tokens, req.max_completion_tokens)
+        };
+        let mut extra = std::mem::take(&mut req.extra);
+        extra.retain(|k, _| !crate::request_support::ADAPTER_OWNED_KEYS.contains(&k.as_str()));
+        let mut messages: Vec<OpenAiMessage> =
             req.messages
                 .into_iter()
                 .map(|m| {
@@ -419,6 +551,22 @@ impl OpenAiRequest {
                 })
                 .collect();
 
+        // OG-90: `ChatRequest.system` is how the Responses-translate and Anthropic-shaped entries
+        // carry a system prompt (Codex's `instructions`, the A5 untrusted-data instruction). The
+        // OpenAI wire has no top-level `system`, so it is the FIRST message — it used to be dropped
+        // here without an error.
+        if let Some(system) = req.system.take().filter(|s| !s.is_empty()) {
+            messages.insert(
+                0,
+                OpenAiMessage {
+                    role: "system".into(),
+                    content: Value::String(system),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            );
+        }
+
         let tools = req.tools.map(|ts| {
             ts.into_iter()
                 .map(|t| OpenAiTool {
@@ -441,12 +589,22 @@ impl OpenAiRequest {
             stream_options: StreamOptions {
                 include_usage: true,
             },
-            max_tokens: req.max_tokens,
+            max_tokens,
             temperature: req.temperature,
             top_p: req.top_p,
             seed: req.seed,
             logprobs: req.logprobs,
             top_logprobs: req.top_logprobs,
+            max_completion_tokens,
+            stop: req.stop,
+            response_format: req.response_format,
+            reasoning_effort: req.reasoning_effort,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+            parallel_tool_calls: req.parallel_tool_calls,
+            user: req.user,
+            service_tier: req.service_tier,
+            extra,
         }
     }
 }
@@ -476,6 +634,74 @@ mod tests {
             stream: Some(true),
             system: None,
             metadata: None,
+            ..Default::default()
+        }
+    }
+
+    // ── OG-03 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn og03_openai_gets_max_completion_tokens_even_when_the_caller_sent_max_tokens() {
+        let mut req = simple_request();
+        req.max_tokens = Some(100);
+        let wire = serde_json::to_value(OpenAiRequest::from_universal_for(req, "openai")).unwrap();
+        assert_eq!(wire["max_completion_tokens"], 100);
+        assert!(
+            wire.get("max_tokens").is_none(),
+            "reasoning models reject max_tokens"
+        );
+        // max_completion_tokens from the caller wins over max_tokens.
+        let mut req = simple_request();
+        req.max_tokens = Some(100);
+        req.max_completion_tokens = Some(7);
+        let wire = serde_json::to_value(OpenAiRequest::from_universal_for(req, "openai")).unwrap();
+        assert_eq!(wire["max_completion_tokens"], 7);
+        // Every other compatible provider keeps the name the caller used.
+        let mut req = simple_request();
+        req.max_tokens = Some(100);
+        let wire = serde_json::to_value(OpenAiRequest::from_universal_for(req, "groq")).unwrap();
+        assert_eq!(wire["max_tokens"], 100);
+        assert!(wire.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn og03_extra_is_forwarded_and_never_overrides_what_the_adapter_writes() {
+        let mut req = simple_request();
+        req.extra
+            .insert("logit_bias".into(), serde_json::json!({"1": 2}));
+        req.extra.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": false}),
+        );
+        req.extra
+            .insert("model".into(), serde_json::json!("attacker-model"));
+        let json = serde_json::to_string(&OpenAiRequest::from_universal(req)).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire["logit_bias"], serde_json::json!({"1": 2}));
+        assert_eq!(
+            wire["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+        assert_eq!(wire["model"], "gpt-5.5");
+        assert_eq!(json.matches("\"model\"").count(), 1, "{json}");
+        assert_eq!(json.matches("stream_options").count(), 1, "{json}");
+    }
+
+    #[test]
+    fn og03_a_request_with_none_of_the_new_fields_serialises_as_before() {
+        let wire = serde_json::to_value(OpenAiRequest::from_universal(simple_request())).unwrap();
+        for k in [
+            "stop",
+            "response_format",
+            "reasoning_effort",
+            "max_completion_tokens",
+            "presence_penalty",
+            "frequency_penalty",
+            "parallel_tool_calls",
+            "user",
+            "service_tier",
+        ] {
+            assert!(wire.get(k).is_none(), "{k} must be absent: {wire}");
         }
     }
 
@@ -716,8 +942,55 @@ mod tests {
         assert!(json.contains(r#""top_logprobs":3"#), "{json}");
     }
 
-    /// The control: a content chunk still parses as content, unchanged. The
-    /// finish_reason check is LAST for exactly this reason.
+    /// Live defect F3 (2026-10-03, founder Mistral key): Mistral sends the WHOLE tool
+    /// call, `finish_reason` and `usage` on ONE terminal chunk (verbatim shape below,
+    /// `id`/`model` dropped). The `usage` arm returned early, so the call and the reason
+    /// vanished: the client got `finish_reason: stop` and no `tool_calls`, with no error.
+    #[test]
+    fn a_bundled_terminal_chunk_keeps_its_tool_call_reason_and_usage() {
+        let data = r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"ovsMU69C5","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"},"index":0}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":71,"total_tokens":83,"completion_tokens":12}}"#;
+        match parse_openai_sse(data).expect("parses").as_slice() {
+            [
+                ProviderEvent::ToolCallDelta {
+                    index: 0,
+                    id,
+                    name,
+                    input_delta,
+                },
+                ProviderEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                },
+                ProviderEvent::UsageUpdate {
+                    input_tokens: 71,
+                    output_tokens: 12,
+                    ..
+                },
+            ] => {
+                assert_eq!(id.as_deref(), Some("ovsMU69C5"));
+                assert_eq!(name.as_deref(), Some("get_weather"));
+                assert_eq!(input_delta, r#"{"city": "Paris"}"#);
+            }
+            other => panic!("expected tool call + finish + usage, got {other:?}"),
+        }
+    }
+
+    /// Same class, content side: a host that bundles the last token with its stop
+    /// reason keeps BOTH.
+    #[test]
+    fn a_content_chunk_carrying_its_finish_reason_keeps_both() {
+        let data = r#"{"choices":[{"index":0,"delta":{"content":"5"},"finish_reason":"length"}]}"#;
+        match parse_openai_sse(data).expect("parses").as_slice() {
+            [
+                ProviderEvent::StreamChunk { delta },
+                ProviderEvent::Finish {
+                    reason: FinishReason::Length,
+                },
+            ] => assert_eq!(delta, "5"),
+            other => panic!("expected content + finish, got {other:?}"),
+        }
+    }
+
+    /// The control: a content chunk still parses as content, unchanged.
     #[test]
     fn a_content_chunk_is_still_a_content_chunk() {
         let data = r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
@@ -938,26 +1211,29 @@ impl OpenAiProvider {
             .await
             .context("SSRF guard rejected the embeddings base URL")?;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .json(request)
-            .send()
-            .await
-            .context("failed to send embeddings request upstream")?;
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .header("authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(request),
+        )
+        .await
+        .context("failed to send embeddings request upstream")?;
 
         let status = response.status();
         if !status.is_success() {
             // Body consumed to free the connection, never logged or propagated
             // (credential-echo risk — see the `# Errors` note above).
-            let _body = response.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(response.headers());
+            let _body = crate::routing::deadlines::error_text(response).await?;
             tracing::warn!(status = %status, provider = self.provider_id, "embeddings upstream error");
             return Err(crate::providers::ProviderHttpError {
                 provider: self.provider_id,
                 status: status.as_u16(),
                 reason: None,
+                message: None,
+                retry_after,
             }
             .into());
         }
@@ -965,6 +1241,7 @@ impl OpenAiProvider {
         response
             .json::<EmbeddingsResponse>()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("upstream returned a body that is not an embeddings response")
     }
 }

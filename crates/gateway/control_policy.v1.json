@@ -1,0 +1,28 @@
+{
+  "_comment": "OG-35 / OG-36 reference table (CLAUDE.md §23): the admin-plane caps and windows. Embedded with include_str! and parsed by crates/gateway/src/control_plane.rs `policy()`; a block that does not parse falls back to `ControlPolicy::fallback()`, which a unit test holds equal to this file. Specs: specs/OG-35-control-change-audit.md §5, specs/OG-36-admin-ip-allowlist-sso.md §5.",
+  "version": 1,
+  "admin_access": {
+    "max_ip_allowlist_entries": 64,
+    "client_ip_attestation_max_skew_secs": 60,
+    "sso_session_cache_ttl_secs": 900,
+    "sso_session_cache_max_entries": 10000,
+    "sso_lookup_timeout_ms": 5000,
+    "sso_lookup_max_pages": 5
+  },
+  "control_audit": {
+    "page_default": 100,
+    "page_max": 500,
+    "change_json_max_bytes": 16384,
+    "_web_change_max_bytes_what": "rev5 M7 (2026-10-04): POST /v1/audit/control-changes writes to admin_audit_log, which nothing deletes. Each of before/after was capped at change_json_max_bytes, so one call could still write ~2x that; this caps the WHOLE change (before + after serialised) — 413 change_too_large past it.",
+    "web_change_max_bytes": 16384
+  },
+  "rate_limit": {
+    "_what": "rev5 M7 (2026-10-04, ADR-039 §23.11) + rev6 N1 (2026-10-04): token buckets on the admin control plane, per minute, per (WORKSPACE, PRINCIPAL) — the principal is the session's user id or the API key's id, so one caller draining their bucket never 429s another. Charged only AFTER the admin IP allowlist and SSO-required admitted the call. control_routes_per_minute binds every route that runs require_control (key mint/edit, controls, projects, policies, budgets, security, the audit trail); web_control_changes_per_minute additionally binds POST /v1/audit/control-changes, whose rows are undeletable. Past either: 429 control_rate_limited with Retry-After. Per-process (one gateway per control plane, B-386).",
+    "control_routes_per_minute": 120,
+    "web_control_changes_per_minute": 30,
+    "_channel_tests_what": "rev5 L5: POST /v1/controls/alert-channels/{id}/test makes one real outbound delivery (email, Slack post, signed webhook) per call; its own per-WORKSPACE bucket (it bounds deliveries, not a principal).",
+    "channel_tests_per_minute": 6,
+    "_incident_controls_what": "rev6 N1: the incident controls — pause, resume, blocks, revoke-all, single-key revoke, member removal (its POST /v1/audit/control-changes record) — draw on THIS per-(workspace, principal) bucket INSTEAD of the shared ones, so an owner mid-incident is never refused because the shared bucket was spent. Generous; it still bounds the undeletable audit rows these write.",
+    "incident_controls_per_minute": 60
+  }
+}

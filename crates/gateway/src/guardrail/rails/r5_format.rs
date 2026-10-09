@@ -39,7 +39,13 @@ impl R5Format {
             return RailOutcome::not_applicable();
         }
         let text = buf.accumulated().trim();
-        if text.is_empty() {
+        if text.is_empty()
+            && !ctx
+                .policy
+                .rails
+                .get("R5_format")
+                .is_some_and(|r| r.enabled && r.mode == crate::guardrail::policy::Mode::Block)
+        {
             // Nothing to validate yet (stream just started) — not a failure.
             return RailOutcome::not_applicable();
         }
@@ -90,8 +96,11 @@ mod tests {
 
     fn inputs(fmt: Option<ExpectedFormat>) -> ResponseInputs {
         ResponseInputs {
+            hooks: None,
+            hook_events: Default::default(),
             tenant_id: TenantId::from_jwt_claim(Uuid::from_u128(5)),
             api_key_id: None,
+            project_id: None,
             correlation_id: Ulid::from_parts(1, 1),
             system_prompt: None,
             model: "claude-sonnet-4-6".to_string(),

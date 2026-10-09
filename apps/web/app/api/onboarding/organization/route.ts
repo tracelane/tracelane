@@ -16,6 +16,7 @@
 
 import { rateLimit } from "@/lib/rate-limit";
 import { upsertTenantId, upsertUserMirror } from "@/lib/tenant";
+import { scheduleWelcomeEmail } from "@/lib/welcome-email";
 import { switchToOrganization, withAuth } from "@workos-inc/authkit-nextjs";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -168,6 +169,19 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		email: user.email,
 		name: displayName(user),
 	});
+	// PLT-52: the ONLY place a welcome email is sent — a brand-new org, so once
+	// per workspace (branches 1 and 2 above return `created: false` and never
+	// reach here). Recipient is the WorkOS session user, never the request body.
+	// Runs after the response; fail-OPEN — it never throws or delays sign-up.
+	// Security review 2026-09-30 (C1): ONLY a WorkOS-verified address. Otherwise anyone
+	// could register someone else's address and have founder@tracelane.dev mail it.
+	if (user.emailVerified === true) {
+		scheduleWelcomeEmail({
+			workspaceId: org.id,
+			workspaceName: name,
+			to: user.email,
+		});
+	}
 	return NextResponse.json(
 		{ organizationId: org.id, tenantId, created: true },
 		{ status: 201 },

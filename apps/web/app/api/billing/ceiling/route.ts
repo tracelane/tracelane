@@ -8,8 +8,8 @@
  * re-checks the `admin` scope — a UI-only gate is not a gate.
  */
 
-import { canAdmin, requireGatewayToken, requireSession } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { canAdmin, requireSession } from "@/lib/auth";
+import { gatewayResponse } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
 interface CeilingBody {
@@ -48,16 +48,10 @@ export async function PUT(req: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	const { token } = await requireGatewayToken();
-	const base = gatewayBaseUrl();
-
 	try {
-		const upstream = await fetch(`${base}/v1/billing/ceiling`, {
+		const upstream = await gatewayResponse("/v1/billing/ceiling", {
 			method: "PUT",
-			headers: {
-				"content-type": "application/json",
-				authorization: `Bearer ${token}`,
-			},
+			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 		});
 		if (!upstream.ok) {

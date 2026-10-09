@@ -186,10 +186,10 @@ export default async function PlaygroundPage({
 				value: defaultModelFor(k.provider_id),
 				label: `${PROVIDER_LABEL.get(k.provider_id) ?? k.provider_id} (${defaultModelFor(k.provider_id)})`,
 			}))
-			// A tenant can hold more than one key per provider is not possible
-			// (BYOK is one key per provider id), but two provider ids can share a
-			// mapped default (rare) — de-dupe on the model value so the <select>
-			// never repeats an option.
+			// A tenant may hold several keys for one provider (OG-11 key pools —
+			// one row per label), and two provider ids can share a mapped default
+			// (rare) — de-dupe on the model value so the <select> never repeats an
+			// option.
 			.filter((m, i, arr) => arr.findIndex((o) => o.value === m.value) === i);
 
 		let prefill: PrefillResult | undefined;

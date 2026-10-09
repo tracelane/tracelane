@@ -35,17 +35,16 @@
 //!   * the ClickHouse seed only covers spans written since migration 16, since
 //!     that is when `api_key_id` began being recorded. Spend before the cutover
 //!     is not attributable to a key and is not counted.
-//!   * a ClickHouse read failure seeds **0**, which fails OPEN — the same choice
-//!     `quota_baseline_from_clickhouse` makes, and for the same reason: a
-//!     control-plane outage must not stop a customer's production traffic. It is
-//!     stated here because a fail-open budget is a thing an operator must know
-//!     about rather than discover.
-//!
-//! Fail-open is correct here and is NOT in tension with
-//! `.claude/rules/tenancy.md`: that rule governs *entitlement* reads, where the
-//! absent-cache state must resolve to the unprivileged tier. A budget is a
-//! customer's own self-imposed ceiling, not a paid capability, so the
-//! fault-tolerance direction applies (`CLAUDE.md` §10).
+//!   * **a ClickHouse read failure is UNKNOWN spend, and a hard cap REFUSES**
+//!     (`OG-22`, 2026-10-04 — `503 budget_spend_unknown`, `admission::run`). It
+//!     used to seed **0** and fail OPEN, so a restart during a ClickHouse outage
+//!     forgave accrued spend and the hard cap let traffic through; a customer who
+//!     set a HARD ceiling asked for exactly that not to happen. The read is retried
+//!     after a backoff, never per request. No ClickHouse configured at all is not
+//!     "unknown": this in-process counter is then the whole accounting (it restarts
+//!     at zero — the stated limit of a deployment without durable spans).
+//!   * the background pre-flight (`seed_workspace`, eval / experiment runs) still
+//!     seeds 0 on a failed read — named in `specs/OG-22-budgets-every-level.md` §6.
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -113,6 +112,11 @@ pub struct SpendTracker {
     /// map expresses both — the trick the retired `QuotaTracker` used, and the reason
     /// there is no separate month-boundary reset job to forget to run.
     seeded: Arc<DashMap<Subject, u32>>,
+    /// `OG-22`: when a subject's durable baseline read last FAILED. While younger than
+    /// `budget_seed_retry_backoff_ms` the spend is still UNKNOWN and the read is not
+    /// retried — an outage costs one ClickHouse read per subject per backoff, not one per
+    /// request.
+    failed: Arc<DashMap<Subject, std::time::Instant>>,
 }
 
 impl Default for SpendTracker {
@@ -127,6 +131,7 @@ impl SpendTracker {
         Self {
             spend: Arc::new(DashMap::new()),
             seeded: Arc::new(DashMap::new()),
+            failed: Arc::new(DashMap::new()),
         }
     }
 
@@ -137,6 +142,20 @@ impl SpendTracker {
     #[must_use]
     pub fn needs_seed(&self, who: Subject, year_month: u32) -> bool {
         self.seeded.get(&who).is_none_or(|m| *m != year_month)
+    }
+
+    /// `OG-22`: did this subject's baseline read fail within the backoff?
+    #[must_use]
+    pub fn seed_backing_off(&self, who: Subject) -> bool {
+        let backoff = std::time::Duration::from_millis(
+            crate::controls::config().budget_seed_retry_backoff_ms,
+        );
+        self.failed.get(&who).is_some_and(|t| t.elapsed() < backoff)
+    }
+
+    /// `OG-22`: record a failed baseline read (the spend stays unknown).
+    pub fn note_seed_failed(&self, who: Subject) {
+        self.failed.insert(who, std::time::Instant::now());
     }
 
     /// Seed the counter from a durable baseline. Idempotent and race-safe: the
@@ -150,6 +169,7 @@ impl SpendTracker {
         use dashmap::mapref::entry::Entry;
         match self.seeded.entry(who) {
             Entry::Occupied(mut e) if *e.get() != year_month => {
+                self.failed.remove(&who);
                 // Month rolled: the previous month's total must not carry over.
                 self.spend
                     .entry(who)
@@ -160,6 +180,7 @@ impl SpendTracker {
             }
             Entry::Occupied(_) => false,
             Entry::Vacant(e) => {
+                self.failed.remove(&who);
                 self.spend
                     .entry(who)
                     .or_insert_with(|| AtomicU64::new(0))

@@ -1,3 +1,4 @@
+import { ResilienceTiles } from "@/components/gateway/ResilienceTiles";
 import { PageHeader } from "@tracelanedev/ui";
 import { StatusBadge } from "@tracelanedev/ui";
 import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
@@ -28,6 +29,7 @@ import {
 } from "@/app/slo/budget";
 import { RangeControl } from "@/components/RangeControl";
 import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
+import { WorkspaceGlance } from "@/components/dashboard/WorkspaceGlance";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { MetricChart } from "@/components/metrics/MetricChart";
 import { OverheadContext } from "@/components/metrics/OverheadContext";
@@ -36,6 +38,7 @@ import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
 import { PLAN_TO_LOOKUP_KEY, type Plan } from "@/lib/entitlements";
+import { GatewayError } from "@/lib/gateway";
 import {
 	fetchGatewayStatsFor,
 	fetchGuardrailStatsFor,
@@ -45,6 +48,7 @@ import {
 	fetchSloSummary,
 	fetchSloTimeseries,
 	fetchToolAnalyticsFor,
+	fetchWorkspaceGlance,
 } from "@/lib/metrics/fetch";
 import {
 	fmtCompact,
@@ -69,6 +73,7 @@ import {
 	type TimeRange,
 	bucketLabel,
 	parseTimeRange,
+	windowParams,
 	withWindow,
 } from "@/lib/metrics/time-range";
 import {
@@ -76,11 +81,13 @@ import {
 	Card,
 	ConcentricRings,
 	EmptyState,
+	ErrorState,
 	Gauge,
 	MetricIcon,
 	type MetricIconName,
 	ModelDonut,
 	RequestFlow,
+	Skeleton,
 	SparkBars,
 } from "@tracelanedev/ui";
 import { and, count, eq, gt, isNull, or, sql } from "drizzle-orm";
@@ -688,6 +695,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 		 * the layout underneath them.
 		 */
 		<div className="space-y-5">
+			<ResilienceTiles initial={gw} query={windowParams(range).toString()} />
 			{/* The page header used to sit here. It moved OUT of this component and
 			    above the Suspense boundary in `DashboardPage` — it depends on no
 			    gateway read, so rendering it here made the page title wait for the
@@ -1589,6 +1597,24 @@ async function NoApiKeysBanner() {
 	}
 }
 
+import { GenerationIssues } from "@/components/dashboard/GenerationIssues";
+
+async function WorkspaceGlanceData() {
+	try {
+		const data = await fetchWorkspaceGlance();
+		return data ? <WorkspaceGlance data={data} /> : <WarmingBanner />;
+	} catch (error) {
+		if (error instanceof GatewayError && error.status === 403)
+			return (
+				<ErrorState
+					title="You don't have access to workspace usage"
+					description="Ask a workspace administrator for access."
+				/>
+			);
+		throw error;
+	}
+}
+
 export default async function DashboardPage({
 	searchParams,
 }: {
@@ -1610,9 +1636,9 @@ export default async function DashboardPage({
 		 */
 		<div className="space-y-5 px-1 py-2 sm:px-2 sm:py-3 lg:px-3">
 			{/* Page header — OUTSIDE the Suspense boundary on purpose. The range
-			    control sits alone on the right: it is a CONTROL, and it used to be
-			    the fifth item in a row of four metrics, which is what made that row
-			    read as a toolbar rather than as a readout.
+			    control is NOT here (2026-10-01): it sits directly above
+			    `DashboardData`, the only section it drives — in the header it read as
+			    controlling the fixed-window workspace glance below it.
 			    Nothing here reads the gateway, so it streams with the shell instead
 			    of behind `DashboardData`'s eight-read fan-out. That is the whole
 			    point: the page identifies itself and becomes interactive (the range
@@ -1628,9 +1654,28 @@ export default async function DashboardPage({
 						Your agent fleet, at a glance.
 					</p>
 				</div>
-				<RangeControl />
 			</header>
-			<WindowNotice range={range} />
+			<Suspense
+				fallback={
+					<div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+						{[
+							"volume",
+							"spans",
+							"ingest",
+							"period",
+							"stored",
+							"agents",
+							"spend",
+							"providers",
+						].map((name) => (
+							<Skeleton key={name} className="h-28" />
+						))}
+					</div>
+				}
+			>
+				<WorkspaceGlanceData />
+			</Suspense>
+			<GenerationIssues />
 			{/* Outside `DashboardData` on purpose — see NoApiKeysBanner. `null`
 			    fallback: a banner must never render a placeholder. */}
 			<Suspense fallback={null}>
@@ -1641,6 +1686,17 @@ export default async function DashboardPage({
 			    Without it, the RangeControl's useTransition keeps the current view
 			    on screen and swaps in the new window's data when it arrives. The
 			    fallback now shows only on the true first load. */}
+			{/* The range control sits HERE, directly above the only section it drives.
+			    In the header it read as controlling "Workspace at a glance" too, whose
+			    windows are fixed (OBS-60) — founder 2026-10-01: "the numbers are same for
+			    1 hr, 24 hr etc. Why". */}
+			<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+				<div className="min-w-0 sm:flex-1">
+					<SectionLabel>Activity in the selected range</SectionLabel>
+				</div>
+				<RangeControl />
+			</div>
+			<WindowNotice range={range} />
 			<Suspense
 				fallback={
 					<p className="py-10 text-sm text-ink-3">Loading dashboard…</p>

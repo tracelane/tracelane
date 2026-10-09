@@ -40,19 +40,30 @@ import {
 	Table,
 } from "@tracelanedev/ui";
 import Link from "next/link";
+import { MetadataSpendLink } from "./MetadataSpendLink";
 import { SectionLabel } from "./SectionLabel";
 
 const DIMENSIONS = [
 	{ by: "key", label: "API key" },
 	{ by: "model", label: "Model" },
 	{ by: "provider", label: "Provider" },
+	{ by: "user", label: "User" },
+	{ by: "tag", label: "Tag" },
+	{ by: "environment", label: "Environment" },
+	{ by: "release", label: "Release" },
+	{ by: "service", label: "Service" },
 ] as const;
 
 /** Plural noun for the truncation badge: "keys" / "models" / "providers". */
-const PLURAL: Record<CostBreakdown["by"], string> = {
+const PLURAL: Record<string, string> = {
 	key: "keys",
 	model: "models",
 	provider: "providers",
+	user: "users",
+	tag: "tags",
+	environment: "environments",
+	release: "releases",
+	service: "services",
 };
 
 /** USD with enough precision to be useful at agent scale, where a request can
@@ -136,13 +147,16 @@ export function SpendAttribution({
 	 * review cannot see the difference.
 	 */
 	const tabs = (
-		<SegmentedControl
-			linkAs={Link}
-			label="Attribute spend by"
-			value={by}
-			options={DIMENSIONS.map((d) => ({ value: d.by, label: d.label }))}
-			hrefFor={hrefFor}
-		/>
+		<div className="flex flex-wrap items-center gap-2">
+			<SegmentedControl
+				linkAs={Link}
+				label="Attribute spend by"
+				value={by}
+				options={DIMENSIONS.map((d) => ({ value: d.by, label: d.label }))}
+				hrefFor={hrefFor}
+			/>
+			<MetadataSpendLink hrefTemplate={hrefFor("meta:__KEY__")} />
+		</div>
 	);
 
 	/* The section head: the same eyebrow + hairline + right-hand control the rest
@@ -218,8 +232,8 @@ export function SpendAttribution({
 				{data.truncated && (
 					<Badge tone="info">
 						Showing the {fmtCount(data.rows.length)} costliest of{" "}
-						{fmtCount(data.group_count)} {PLURAL[by]} — totals cover all{" "}
-						{fmtCount(data.group_count)}
+						{fmtCount(data.group_count)} {PLURAL[by] ?? "metadata values"} —
+						totals cover all {fmtCount(data.group_count)}
 					</Badge>
 				)}
 				{/* R94. An experiment is DELIBERATELY expensive, so leaving its spend
@@ -240,6 +254,17 @@ export function SpendAttribution({
 			{data.attribution_begins_note && (
 				<p className="text-2xs text-ink-3">{data.attribution_begins_note}</p>
 			)}
+			{by === "tag" && (
+				<p className="text-xs text-ink-2">
+					Requests with multiple tags appear in each tag group, so row counts
+					can exceed the total requests.
+				</p>
+			)}
+			{by.startsWith("meta:") && (
+				<p className="text-xs text-ink-2">
+					Grouped by metadata key {by.slice(5)}.
+				</p>
+			)}
 
 			<Card quiet className="overflow-hidden">
 				{/* `-mt-px` pulls the header band's top hairline under the card border,
@@ -249,7 +274,10 @@ export function SpendAttribution({
 					<Table>
 						<THead>
 							<TR>
-								<TH>{DIMENSIONS.find((d) => d.by === by)?.label}</TH>
+								<TH>
+									{DIMENSIONS.find((d) => d.by === by)?.label ??
+										"Metadata value"}
+								</TH>
 								<TH numeric>Requests</TH>
 								<TH numeric>Unpriced</TH>
 								<TH numeric>Input tokens</TH>

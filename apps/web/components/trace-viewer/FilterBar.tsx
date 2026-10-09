@@ -4,6 +4,10 @@ import {
 	nextFilterParams,
 	nextIssueFilterParams,
 } from "@/app/traces/filter-params";
+import {
+	type TraceParam,
+	traceFilterLabel,
+} from "@/app/traces/filter-registry";
 import { ISSUE_LABELS, issueLabel } from "@/lib/generation-issues";
 import { Button, SegmentedControl, cn } from "@tracelanedev/ui";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -40,6 +44,18 @@ const GROUPS = [
 	{ value: "model", label: "Model" },
 	{ value: "operation", label: "Operation" },
 	{ value: "status", label: "Status" },
+	{ value: "environment", label: "Environment" },
+	{ value: "release", label: "Release" },
+	{ value: "service", label: "Service" },
+	{ value: "user", label: "User" },
+	{ value: "tag", label: "Tag" },
+] as const;
+const LABEL_FILTERS = [
+	{ key: "environment", label: "Environment" },
+	{ key: "release", label: "Release" },
+	{ key: "service", label: "Service" },
+	{ key: "tag", label: "Tag" },
+	{ key: "meta", label: "Metadata key:value" },
 ] as const;
 
 /**
@@ -96,7 +112,13 @@ export function FilterBar() {
 	const router = useRouter();
 	const pathname = usePathname();
 	const sp = useSearchParams();
-	const status = sp.get("status") ?? "";
+	const status =
+		sp.get("status") ??
+		(sp.get("has_error") === "true"
+			? "error"
+			: sp.get("has_error") === "false"
+				? "ok"
+				: "");
 	// No range param defaults to 1h (fast) — the page's rangeSince mirrors this;
 	// "All time" is the explicit opt-out (range=all).
 	const range = sp.get("range") ?? "1h";
@@ -115,7 +137,7 @@ export function FilterBar() {
 	const searchRef = useRef<HTMLInputElement>(null);
 
 	const setParam = useCallback(
-		(key: string, value: string) => {
+		(key: TraceParam, value: string) => {
 			// nextFilterParams also clears a stale since/until window when a range
 			// PRESET is picked — otherwise the server's `sp.since ?? rangeSince(range)`
 			// keeps the old window and the preset shows rows outside the picked range.
@@ -215,7 +237,10 @@ export function FilterBar() {
 	// The default 1h range isn't a "custom" filter — only a non-default range
 	// counts toward showing "Clear all".
 	const active = Boolean(
-		issues.length ||
+		sp.get("key") ||
+			sp.get("loop") ||
+			sp.get("rescued") ||
+			issues.length ||
 			status ||
 			(range && range !== "1h") ||
 			model ||
@@ -225,6 +250,7 @@ export function FilterBar() {
 			endUser ||
 			agent ||
 			modelFamily ||
+			LABEL_FILTERS.some(({ key }) => sp.has(key)) ||
 			group,
 	);
 
@@ -233,6 +259,48 @@ export function FilterBar() {
 
 	return (
 		<div className="mb-4 flex flex-wrap items-center gap-2">
+			{sp.get("key") && (
+				<FilterChip
+					label={`API key: ${sp.get("key")}`}
+					onRemove={() => setParam("key", "")}
+				/>
+			)}
+			{sp.get("loop") === "true" ? (
+				<FilterChip
+					label="Repeated tool calls"
+					onRemove={() => setParam("loop", "")}
+				/>
+			) : (
+				<Button
+					variant="secondary"
+					size="sm"
+					onClick={() => setParam("loop", "true")}
+				>
+					Repeated tool calls
+				</Button>
+			)}
+			{sp.get("rescued") ? (
+				<FilterChip
+					label={`Rescued: ${sp.get("rescued")}`}
+					onRemove={() => setParam("rescued", "")}
+				/>
+			) : (
+				<label className="text-xs text-ink-3">
+					Rescued{" "}
+					<select
+						aria-label="Rescued requests"
+						className={inputCls}
+						value=""
+						onChange={(e) => setParam("rescued", e.target.value)}
+					>
+						<option value="">All requests</option>
+						<option value="any">Any rescue</option>
+						<option value="failover">By failover</option>
+						<option value="retry">By retry</option>
+					</select>
+				</label>
+			)}
+
 			{/* OBS-01 full-text search — span name + attributes, ngram-indexed on the
 			    gateway (`crates/gateway/src/trace_reads.rs:1849`). Submits on Enter,
 			    not on every keystroke (see the `q` effect above); Esc clears. */}
@@ -299,6 +367,31 @@ export function FilterBar() {
 			/>
 
 			{/* Model — chip when active, input when clear */}
+			{LABEL_FILTERS.map(({ key, label }) => {
+				const value = sp.get(key);
+				return value ? (
+					<FilterChip
+						key={key}
+						label={`${label}: ${value}`}
+						onRemove={() => setParam(key, "")}
+					/>
+				) : (
+					<input
+						key={key}
+						aria-label={`Filter by ${label.toLowerCase()}`}
+						placeholder={`${label}…`}
+						className={cn(inputCls, "w-40")}
+						onKeyDown={(e) => {
+							if (e.key === "Enter") {
+								e.preventDefault();
+								const input = e.currentTarget.value.trim();
+								if (key !== "meta" || /^[A-Za-z0-9_.:-]{1,64}:.+/.test(input))
+									setParam(key, input);
+							}
+						}}
+					/>
+				);
+			})}
 			{model ? (
 				<FilterChip
 					label={`model: ${model}`}
@@ -371,13 +464,13 @@ export function FilterBar() {
 
 			{agent && (
 				<FilterChip
-					label={`agent: ${agent}`}
+					label={`${traceFilterLabel("agent").toLowerCase()}: ${agent}`}
 					onRemove={() => setParam("agent", "")}
 				/>
 			)}
 			{modelFamily && (
 				<FilterChip
-					label={`model family: ${modelFamily}`}
+					label={`${traceFilterLabel("model_family").toLowerCase()}: ${modelFamily}`}
 					onRemove={() => setParam("model_family", "")}
 				/>
 			)}

@@ -57,18 +57,9 @@ use tracelane_shared::{Message, TenantId};
 
 /// Default trace-list page size when `limit` is absent.
 const DEFAULT_TRACE_LIMIT: u32 = 50;
-/// Hard cap on trace-list page size (keeps a single page bounded).
-const MAX_TRACE_LIMIT: u32 = 200;
-/// Row cap for a trace export (CSV/JSON download). Bounded so a big tenant's
-/// export can't scan the full TTL; filter first for a tighter set.
-// ponytail: a single 10k-row cap. NO LONGER SILENT (OBS-23, 2026-08-08): the cap
-// is unchanged, but a truncated export now SAYS SO — `X-Tracelane-Truncated: true`
-// plus `X-Tracelane-Row-Count`, and a terminal row in the CSV body so the signal
-// survives a download that drops headers. The CEILING IS STILL LIVE, so this marker
-// stays: a guaranteed-complete export still needs the streamed/paginated path, and
-// removing this marker would let a later pass raise the cap with nothing recording
-// that 10k was ever a deliberate accepted limit. Disclosed debt, not a silent gap.
-const MAX_TRACE_EXPORT: u32 = 10_000;
+// ponytail: exports remain bounded by the cached `policy.trace_reads.export_max_rows`.
+// The ceiling is disclosed by headers and a CSV terminal row. Continuation is
+// implemented separately; keep this marker until a complete export is proven.
 
 /// OBS-23 truncation signal. `true` when the export stopped at the row cap.
 const X_TRUNCATED: axum::http::HeaderName =
@@ -133,7 +124,7 @@ const MAX_GATEWAY_HOURS: u32 = 720;
 /// (`CostRow::group_count` and the `all_*` columns) and the response says
 /// `truncated` when its rows are a subset — a row cap, never a silent cap on the
 /// figures above the table.
-const GATEWAY_PROVIDER_CAP: u32 = 256;
+pub(crate) const GATEWAY_PROVIDER_CAP: u32 = 256;
 const DEFAULT_GUARDRAIL_HOURS: u32 = 24;
 const MAX_GUARDRAIL_HOURS: u32 = 720;
 
@@ -300,7 +291,7 @@ fn cap_bucket_secs(bucket_secs: i64, width_secs: i64) -> i64 {
 /// broken the parity that matters (5-minute bar == hourly bar) to buy one that
 /// cannot be observed. `mv_exprs_match_migration_06_and_trace_summaries_only_adds_the_dead_arm`
 /// pins BOTH facts from the checked-in SQL, never from a hand copy.
-const MV_PROVIDER_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider'))";
+pub(crate) const MV_PROVIDER_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider'))";
 const MV_MODEL_EXPR: &str = "coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_response_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_request_model'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.response.model'), ''), JSONExtractString(attributes, 'llm.model_name'))";
 /// Default / max verdict-list page size (the decision-mix click-through).
 const DEFAULT_VERDICT_LIMIT: u32 = 100;
@@ -326,6 +317,10 @@ const END_USER_ID_ATTR: &str = "user_id";
 /// `/api/traces` response so the UI consumes it unchanged.
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceSummary {
+    pub rescued: Option<String>,
+    pub rescues_available: bool,
+    pub loop_calls: u32,
+    pub loops_available: bool,
     pub trace_id: String,
     pub root_name: String,
     /// Human-readable ClickHouse `toString(start_time)` (e.g.
@@ -343,6 +338,8 @@ pub struct TraceSummary {
     /// rollup (`trace_cost_rollup`), bounded to the page's trace ids. `0.0` when
     /// no priced spans (unpriced models / the rollup failing → fail-open).
     pub cost_usd: f64,
+    /// Whether a span recorded a finite cost. An absent price is unknown, not $0.
+    pub cost_usd_present: bool,
     /// Summed `input + output` tokens over this trace's spans (read-time rollup).
     /// `0` when the spans carry no usage or the rollup fails.
     pub total_tokens: i64,
@@ -384,6 +381,10 @@ pub struct TraceSummaryRow {
     pub error_count: u64,
     pub intervention: u8,
     pub model: String,
+    /// Sort key from the cost join; zero for other sort modes.
+    pub cost_micro_usd: i64,
+    /// Priced spans inside the selected window; zero for other sort modes.
+    pub priced_spans_in_window: u64,
 }
 
 /// One group of traces from the /v1/traces/groups aggregation. Serialize + Row
@@ -395,12 +396,19 @@ pub struct TraceGroupRow {
     /// Traces in the group with ≥1 error span.
     pub error_traces: u64,
     pub avg_duration_us: f64,
+    pub p50_duration_us: f64,
+    pub p90_duration_us: f64,
     pub p95_duration_us: f64,
+    pub p99_duration_us: f64,
 }
 
 impl From<TraceSummaryRow> for TraceSummary {
     fn from(r: TraceSummaryRow) -> Self {
         Self {
+            rescued: None,
+            rescues_available: false,
+            loop_calls: 0,
+            loops_available: false,
             trace_id: r.trace_id,
             root_name: r.root_name,
             start_time: r.start_time,
@@ -412,6 +420,7 @@ impl From<TraceSummaryRow> for TraceSummary {
             // Populated by the handler from `trace_cost_rollup`; the CH list row
             // carries no cost/token columns, so From defaults to zero.
             cost_usd: 0.0,
+            cost_usd_present: false,
             total_tokens: 0,
             issues: None,
         }
@@ -434,6 +443,7 @@ pub struct SpanRow {
     pub status_code: u8,
     pub status_message: String,
     /// Raw OTel/OpenInference attribute JSON string (parsed client-side).
+    #[serde(serialize_with = "crate::tool_fingerprint::public_attributes")]
     pub attributes: String,
     pub aft_ids: Vec<String>,
     pub intervention: u8,
@@ -447,6 +457,16 @@ struct SpanResponse {
     span: SpanRow,
     #[serde(flatten)]
     generation: crate::generation_issues::GenerationDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<crate::usage_breakdown::UsageView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caps: Option<SpanCaps>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpanCaps {
+    tool_names: usize,
+    logprob_tokens: u32,
 }
 
 impl From<SpanRow> for SpanResponse {
@@ -457,7 +477,23 @@ impl From<SpanRow> for SpanResponse {
                 attributes: &attrs,
                 status_code: span.status_code,
             });
-        Self { span, generation }
+        let usage_attrs =
+            serde_json::from_str::<tracelane_shared::SpanAttributes>(&span.attributes).ok();
+        let usage = usage_attrs.as_ref().and_then(|a| {
+            (a.gen_ai_usage_input_tokens.is_some() || a.gen_ai_usage_output_tokens.is_some()).then(
+                || crate::usage_breakdown::breakdown(a, a.tracelane_usage_cost_origin.as_deref()),
+            )
+        });
+        let caps = usage.as_ref().map(|_| SpanCaps {
+            tool_names: crate::server::MAX_TOOL_NAMES,
+            logprob_tokens: crate::server::MAX_LOGPROB_TOKENS,
+        });
+        Self {
+            span,
+            generation,
+            usage,
+            caps,
+        }
     }
 }
 
@@ -941,6 +977,7 @@ pub struct GatewayProviderRow {
 /// so a zero-request provider never divides by zero / yields NaN).
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayProviderHealth {
+    pub rescued_by_failover: Option<u64>,
     pub provider: String,
     pub requests: u64,
     pub errors: u64,
@@ -977,6 +1014,13 @@ pub struct GatewayProviderHealth {
 /// are recorded); the UI keys off it to disclose any future gap.
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayStatsResponse {
+    pub requests_with_failed_attempt: Option<u64>,
+    pub rescued_by_failover: Option<u64>,
+    pub rescued_by_retry: Option<u64>,
+    pub rescue_rate_pct: Option<f64>,
+    pub rescue_added_ms_p50: Option<f64>,
+    pub attempt_records_since: Option<String>,
+    pub agent_loops: Option<crate::agent_loops::LoopTotals>,
     pub window_hours: u32,
     pub total_requests: u64,
     pub total_errors: u64,
@@ -1017,6 +1061,12 @@ pub enum CostDimension {
     Key,
     Model,
     Provider,
+    User,
+    Tag,
+    Environment,
+    Release,
+    Service,
+    Meta,
 }
 
 impl CostDimension {
@@ -1025,6 +1075,12 @@ impl CostDimension {
             "key" => Some(Self::Key),
             "model" => Some(Self::Model),
             "provider" => Some(Self::Provider),
+            "user" => Some(Self::User),
+            "tag" => Some(Self::Tag),
+            "environment" => Some(Self::Environment),
+            "release" => Some(Self::Release),
+            "service" => Some(Self::Service),
+            s if s.strip_prefix("meta:").is_some_and(valid_meta_key) => Some(Self::Meta),
             _ => None,
         }
     }
@@ -1037,6 +1093,12 @@ impl CostDimension {
             Self::Key => "api_key_id",
             Self::Model => "JSONExtractString(attributes, 'gen_ai_request_model')",
             Self::Provider => "JSONExtractString(attributes, 'gen_ai_provider_name')",
+            Self::User => "JSONExtractString(attributes, 'user_id')",
+            Self::Tag => "arrayJoin(if(empty(tags), [''], tags))",
+            Self::Environment => "environment",
+            Self::Release => "release",
+            Self::Service => "service",
+            Self::Meta => "JSONExtractString(attributes, 'tracelane_metadata', ?)",
         }
     }
 
@@ -1045,6 +1107,12 @@ impl CostDimension {
             Self::Key => "key",
             Self::Model => "model",
             Self::Provider => "provider",
+            Self::User => "user",
+            Self::Tag => "tag",
+            Self::Environment => "environment",
+            Self::Release => "release",
+            Self::Service => "service",
+            Self::Meta => "meta",
         }
     }
 }
@@ -1129,8 +1197,9 @@ impl CostScope {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CostFilters {
+    pub meta_key: Option<String>,
     /// Inclusive lower bound on `start_time`, seconds since epoch. When set it
     /// overrides `hours` (CX-26 / B-525 — `/v1/costs` used to drop the pair the
     /// client sends and serve a rolling `now() − hours` under an absolute label).
@@ -1222,8 +1291,8 @@ pub struct CostBreakdownRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct CostBreakdownResponse {
     pub window_hours: u32,
-    /// `"key"` | `"model"` | `"provider"`.
-    pub by: &'static str,
+    /// The requested attribution dimension, including `meta:<key>` when used.
+    pub by: String,
     pub total_cost_usd: f64,
     pub total_requests: u64,
     /// Requests in the window we could price. `total_requests - priced_requests`
@@ -1295,25 +1364,31 @@ pub enum BreakdownMetric {
     Errors,
     ErrorRate,
     P50Ms,
+    P90Ms,
     P95Ms,
+    P99Ms,
     InputTokens,
     OutputTokens,
     CostUsd,
+    OutputTpsP50,
 }
 
 impl BreakdownMetric {
     // No production caller today — used only by a test enumerating every
     // metric/dimension combination. Gated (B-390, 2026-09-12).
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         Self::Requests,
         Self::Errors,
         Self::ErrorRate,
         Self::P50Ms,
+        Self::P90Ms,
         Self::P95Ms,
+        Self::P99Ms,
         Self::InputTokens,
         Self::OutputTokens,
         Self::CostUsd,
+        Self::OutputTpsP50,
     ];
 
     pub fn parse(s: Option<&str>) -> Option<Self> {
@@ -1322,10 +1397,13 @@ impl BreakdownMetric {
             "errors" => Self::Errors,
             "error_rate" => Self::ErrorRate,
             "p50_ms" => Self::P50Ms,
+            "p90_ms" => Self::P90Ms,
             "p95_ms" => Self::P95Ms,
+            "p99_ms" => Self::P99Ms,
             "input_tokens" => Self::InputTokens,
             "output_tokens" => Self::OutputTokens,
             "cost_usd" => Self::CostUsd,
+            "output_tps_p50" => Self::OutputTpsP50,
             _ => return None,
         })
     }
@@ -1336,17 +1414,20 @@ impl BreakdownMetric {
             Self::Errors => "errors",
             Self::ErrorRate => "error_rate",
             Self::P50Ms => "p50_ms",
+            Self::P90Ms => "p90_ms",
             Self::P95Ms => "p95_ms",
+            Self::P99Ms => "p99_ms",
             Self::InputTokens => "input_tokens",
             Self::OutputTokens => "output_tokens",
             Self::CostUsd => "cost_usd",
+            Self::OutputTpsP50 => "output_tps_p50",
         }
     }
 
     /// The SAME definitions the built-in pages use (cost via `cost_usd_present`,
     /// errors via `status_code = 2`, latency from `duration_us`), so a custom tile can
     /// never disagree with the page it mirrors.
-    fn expr(self) -> &'static str {
+    fn expr(self, min_generation_ms: u64) -> String {
         match self {
             Self::Requests => "toFloat64(count())",
             Self::Errors => "toFloat64(countIf(status_code = 2))",
@@ -1354,7 +1435,9 @@ impl BreakdownMetric {
                 "if(count() = 0, 0.0, round(countIf(status_code = 2) / count() * 100.0, 2))"
             }
             Self::P50Ms => "quantileExact(0.5)(duration_us) / 1000.0",
+            Self::P90Ms => "quantileExact(0.9)(duration_us) / 1000.0",
             Self::P95Ms => "quantileExact(0.95)(duration_us) / 1000.0",
+            Self::P99Ms => "quantileExact(0.99)(duration_us) / 1000.0",
             Self::InputTokens => {
                 "toFloat64(sum(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens')))"
             }
@@ -1364,8 +1447,26 @@ impl BreakdownMetric {
             Self::CostUsd => {
                 "round(sumIf(cost_usd, cost_usd_present = 1 AND isFinite(cost_usd)), 6)"
             }
+            Self::OutputTpsP50 => return format!(
+                "if(countIf({valid}) = 0, 0.0, quantileExactIf(0.5)(toFloat64(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens')) * 1000000.0 / ({generation}), {valid}))",
+                generation = output_generation_us(),
+                valid = output_speed_condition(min_generation_ms),
+            ),
         }
+        .to_owned()
     }
+}
+
+fn output_generation_us() -> &'static str {
+    "(duration_us - JSONExtractUInt(attributes, 'tracelane_gateway_overhead_us') - JSONExtractFloat(attributes, 'gen_ai_response_time_to_first_chunk') * 1000000.0)"
+}
+
+fn output_speed_condition(min_generation_ms: u64) -> String {
+    format!(
+        "JSONExtractBool(attributes, 'gen_ai_request_stream') AND JSONExtractFloat(attributes, 'gen_ai_response_time_to_first_chunk') > 0 AND JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens') > 0 AND {} >= {}",
+        output_generation_us(),
+        min_generation_ms.saturating_mul(1000),
+    )
 }
 
 /// The dimension a breakdown tile groups by — the ones the gateway already groups by
@@ -1377,18 +1478,30 @@ pub enum BreakdownBy {
     Key,
     Status,
     Operation,
+    User,
+    Tag,
+    Environment,
+    Release,
+    Service,
+    Meta,
 }
 
 impl BreakdownBy {
     // No production caller today — same reasoning as `BreakdownMetric::ALL`
     // above. Gated (B-390, 2026-09-12).
     #[cfg(test)]
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 11] = [
         Self::Model,
         Self::Provider,
         Self::Key,
         Self::Status,
         Self::Operation,
+        Self::User,
+        Self::Tag,
+        Self::Environment,
+        Self::Release,
+        Self::Service,
+        Self::Meta,
     ];
 
     pub fn parse(s: Option<&str>) -> Option<Self> {
@@ -1398,6 +1511,12 @@ impl BreakdownBy {
             "key" => Self::Key,
             "status" => Self::Status,
             "operation" => Self::Operation,
+            "user" => Self::User,
+            "tag" => Self::Tag,
+            "environment" => Self::Environment,
+            "release" => Self::Release,
+            "service" => Self::Service,
+            s if s.strip_prefix("meta:").is_some_and(valid_meta_key) => Self::Meta,
             _ => return None,
         })
     }
@@ -1409,6 +1528,12 @@ impl BreakdownBy {
             Self::Key => "key",
             Self::Status => "status",
             Self::Operation => "operation",
+            Self::User => "user",
+            Self::Tag => "tag",
+            Self::Environment => "environment",
+            Self::Release => "release",
+            Self::Service => "service",
+            Self::Meta => "meta",
         }
     }
 
@@ -1419,12 +1544,20 @@ impl BreakdownBy {
             Self::Key => "api_key_id",
             Self::Status => "if(status_code = 2, 'error', 'ok')",
             Self::Operation => "JSONExtractString(attributes, 'gen_ai_operation_name')",
+            Self::User => "JSONExtractString(attributes, 'user_id')",
+            Self::Tag => "arrayJoin(if(empty(tags), [''], tags))",
+            Self::Environment => "environment",
+            Self::Release => "release",
+            Self::Service => "service",
+            Self::Meta => "JSONExtractString(attributes, 'tracelane_metadata', ?)",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BreakdownFilters {
+    pub meta_key: Option<String>,
+    pub min_generation_ms: u64,
     pub metric: BreakdownMetric,
     pub by: BreakdownBy,
     pub since_us: i64,
@@ -1441,18 +1574,27 @@ pub struct BreakdownRow {
     pub n: u64,
 }
 
-/// Bind order: tenant, since_us, until_us, limit. Exactly four `?`; nothing else in
-/// the text varies with the caller.
-fn build_metric_breakdown_sql(metric: BreakdownMetric, by: BreakdownBy) -> String {
+/// Bind order: optional bound metadata key, tenant, since_us, until_us, limit.
+/// The generation floor is a loaded policy integer, never caller text.
+fn build_metric_breakdown_sql(
+    metric: BreakdownMetric,
+    by: BreakdownBy,
+    min_generation_ms: u64,
+) -> String {
+    let n = if metric == BreakdownMetric::OutputTpsP50 {
+        format!("countIf({})", output_speed_condition(min_generation_ms))
+    } else {
+        "count()".to_owned()
+    };
     format!(
-        "SELECT {dim} AS key, {expr} AS value, toUInt64(count()) AS n \
+        "SELECT {dim} AS key, {expr} AS value, toUInt64({n}) AS n \
 FROM spans FINAL \
 WHERE tenant_id = ? \
   AND start_time >= fromUnixTimestamp64Micro(?) \
   AND start_time < fromUnixTimestamp64Micro(?) \
 GROUP BY key ORDER BY value DESC, key ASC LIMIT ?",
         dim = by.column(),
-        expr = metric.expr(),
+        expr = metric.expr(min_generation_ms),
     )
 }
 
@@ -1574,6 +1716,7 @@ impl GatewayStatsResponse {
                     .map_or("closed", crate::circuit_breaker::State::as_str)
                     .to_string();
                 GatewayProviderHealth {
+                    rescued_by_failover: None,
                     error_rate_pct: pct(r.errors, r.requests),
                     cache_hit_rate_pct: pct(r.cache_hits, r.requests),
                     provider: r.provider,
@@ -1615,6 +1758,13 @@ impl GatewayStatsResponse {
             open_breakers,
             // Both former gaps (failover + rate-limit) are now recorded; nothing
             // is faked. Kept for forward-compat so a future gap can be disclosed.
+            requests_with_failed_attempt: None,
+            rescued_by_failover: None,
+            rescued_by_retry: None,
+            rescue_rate_pct: None,
+            rescue_added_ms_p50: None,
+            attempt_records_since: None,
+            agent_loops: None,
             uninstrumented: vec![],
         }
     }
@@ -1837,6 +1987,8 @@ pub struct SignaturesResponse {
 /// the wire populate `gen_ai.usage.cost`).
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
+    pub loop_calls: u32,
+    pub loops_available: bool,
     /// `gen_ai.conversation.id` — the thread key.
     pub session_id: String,
     /// Distinct traces (turns) in the conversation.
@@ -1907,6 +2059,8 @@ impl From<SessionSummaryRow> for SessionSummary {
     fn from(r: SessionSummaryRow) -> Self {
         let status = if r.error_count > 0 { "error" } else { "ok" };
         Self {
+            loop_calls: 0,
+            loops_available: false,
             session_id: r.session_id,
             turns: r.turns,
             started_at: r.started_at,
@@ -2113,6 +2267,9 @@ pub struct SessionTurn {
     pub exchange: Option<SessionExchange>,
 }
 
+const X_NEXT_CURSOR: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-tracelane-next-cursor");
+
 // ── Filters (parsed, validated) ──────────────────────────────────────────────
 
 /// Sortable trace-list column. Keyset pagination generalizes over this: the
@@ -2126,6 +2283,10 @@ pub enum TraceSort {
     Duration,
     /// `span_count` (biggest/smallest traces) — a real trace_summaries column.
     SpanCount,
+    /// Stored per-trace error count from merged summaries.
+    Errors,
+    /// Window-bounded sum of priced span costs, rounded to micro-USD.
+    Cost,
 }
 
 /// Sort direction. Drives both the `ORDER BY` and the keyset comparison operator.
@@ -2143,6 +2304,17 @@ pub enum TraceGroupBy {
     Model,
     Operation,
     Status,
+    Environment,
+    Release,
+    Service,
+    User,
+    Tag,
+}
+
+impl TraceGroupBy {
+    fn needs_span_join(self) -> bool {
+        !matches!(self, Self::Model | Self::Operation | Self::Status)
+    }
 }
 
 /// Sortable session-list column. Allowlisted — the `ORDER BY` expression is
@@ -2181,6 +2353,13 @@ impl SessionSort {
 /// Validated trace-list filters. All optional except `limit`.
 #[derive(Debug, Clone, Default)]
 pub struct TraceListFilters {
+    pub environment: Option<String>,
+    pub release: Option<String>,
+    pub service: Option<String>,
+    pub tag: Option<String>,
+    pub meta: Option<(String, String)>,
+    pub rescued: Option<crate::rescue::RescueFilter>,
+    pub loop_policy: Option<crate::billing::rating::AgentLoopPolicy>,
     pub issues: Vec<Issue>,
     pub agent: Option<String>,
     pub model_family: Option<String>,
@@ -2212,6 +2391,7 @@ pub struct TraceListFilters {
     /// `u_1`'s traces when asked for `u_10`, which for an identity filter is a
     /// wrong answer rather than a loose one.
     pub end_user: Option<String>,
+    pub api_key: Option<String>,
     /// Inclusive lower bound on `start_time`, microseconds since epoch.
     pub since_us: Option<i64>,
     /// Inclusive upper bound on `start_time`, microseconds since epoch.
@@ -2397,7 +2577,7 @@ dateDiff('microsecond', min(start_time), max(end_time)) AS duration_us, \
 sum(span_count) AS span_count, \
 sum(error_count) AS error_count, \
 max(intervention) AS intervention, \
-max(model) AS model \
+if(startsWith(min(model_rank), '0:'), substring(min(model_rank), 24), max(model)) AS model \
 FROM trace_summaries \
 WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
 GROUP BY tenant_id, trace_id)";
@@ -2411,8 +2591,36 @@ GROUP BY tenant_id, trace_id)";
 /// (`w_since`/`w_until`) so it prunes on the time-first key of migration 22
 /// instead of scanning the tenant's history.
 fn push_trace_filters(sql: &mut String, f: &TraceListFilters) {
+    if let Some(policy) = f.loop_policy {
+        sql.push_str(&format!(
+            " AND trace_id IN (SELECT arrayJoin(arrayMap(r -> r.3, records)) FROM ({}))",
+            crate::agent_loops::grouped_sql(policy, &crate::agent_loops::LoopScope::default())
+        ));
+    }
+    if let Some(rescued) = f.rescued {
+        sql.push_str(&format!(
+            " AND trace_id IN (SELECT trace_id FROM ({}) WHERE {})",
+            crate::rescue::evidence_sql(),
+            rescued.predicate()
+        ));
+    }
     if f.model.is_some() {
         sql.push_str(" AND model = ?");
+    }
+    for (value, column) in [
+        (&f.environment, "environment"),
+        (&f.release, "release"),
+        (&f.service, "service"),
+    ] {
+        if value.is_some() {
+            sql.push_str(&format!(" AND trace_id IN (SELECT trace_id FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND {column} = ?)"));
+        }
+    }
+    if f.tag.is_some() {
+        sql.push_str(" AND trace_id IN (SELECT trace_id FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND has(tags, ?))");
+    }
+    if f.meta.is_some() {
+        sql.push_str(" AND trace_id IN (SELECT trace_id FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND JSONExtractString(attributes, 'tracelane_metadata', ?) = ?)");
     }
     if f.min_duration_us.is_some() {
         sql.push_str(" AND duration_us >= ?");
@@ -2433,11 +2641,13 @@ WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND has(
         // serves it and prunes; the `attributes` ngram index was deleted in
         // migration 22 on measurement (it pruned nothing on the JSON blob) — the
         // window is what bounds that half now.
-        sql.push_str(
+        // Project away server-only evidence before searching; keep every other JSON key/value.
+        sql.push_str(&format!(
             " AND trace_id IN (SELECT trace_id FROM spans \
 WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
-AND (multiSearchAny(name, [?, ?]) OR multiSearchAny(attributes, [?, ?])))",
-        );
+AND (multiSearchAny(name, [?, ?]) OR multiSearchAny({}, [?, ?])))",
+            crate::tool_fingerprint::SEARCHABLE_ATTRIBUTES_SQL,
+        ));
     }
     if f.failover == Some(true) {
         // Failover is a per-span JSON attribute (no column on trace_summaries);
@@ -2461,6 +2671,9 @@ AND JSONExtractBool(attributes, 'tracelane_failover_activated'))",
             " AND trace_id IN (SELECT trace_id FROM spans FINAL \
 WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND ({predicates}))"
         ));
+    }
+    if f.api_key.is_some() {
+        sql.push_str(" AND trace_id IN (SELECT trace_id FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND api_key_id = ?)");
     }
     if f.end_user.is_some() {
         // OBS-20. Same tenant-scoped-subquery shape as the failover filter above,
@@ -2501,10 +2714,21 @@ fn build_trace_list_sql(f: &TraceListFilters) -> String {
         "SELECT trace_id, root_name, \
 toString(st_min) AS start_time_iso, \
 toInt64(toUnixTimestamp64Micro(st_min)) AS start_time_us, \
-duration_us, span_count, error_count, intervention, model \
-FROM ",
+duration_us, span_count, error_count, intervention, model, ",
     );
+    if f.sort == TraceSort::Cost {
+        sql.push_str("ifNull(cost_by_trace.cost_micro_usd, toInt64(0)) AS cost_micro_usd, ifNull(cost_by_trace.priced_spans, toUInt64(0)) AS priced_spans_in_window FROM ");
+    } else {
+        sql.push_str("toInt64(0) AS cost_micro_usd, toUInt64(0) AS priced_spans_in_window FROM ");
+    }
     sql.push_str(MERGED_SUMMARIES);
+    if f.sort == TraceSort::Cost {
+        sql.push_str(" LEFT JOIN (SELECT trace_id, \
+toInt64(round(sum(if(isFinite(JSONExtractFloat(attributes, 'gen_ai_usage_cost')) AND JSONExtractFloat(attributes, 'gen_ai_usage_cost') > 0, JSONExtractFloat(attributes, 'gen_ai_usage_cost'), 0)) * 1000000)) AS cost_micro_usd, \
+toUInt64(countIf(JSONHas(attributes, 'gen_ai_usage_cost') AND isFinite(JSONExtractFloat(attributes, 'gen_ai_usage_cost')))) AS priced_spans \
+FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until \
+GROUP BY trace_id) AS cost_by_trace USING (trace_id)");
+    }
     sql.push_str(" WHERE tenant_id = ?");
     push_trace_filters(&mut sql, f);
     // Sort column + direction from a fixed allowlist (never user input → safe to
@@ -2516,6 +2740,11 @@ FROM ",
         TraceSort::StartTime => ("st_min", "toUnixTimestamp64Micro(st_min)"),
         TraceSort::Duration => ("duration_us", "duration_us"),
         TraceSort::SpanCount => ("span_count", "span_count"),
+        TraceSort::Errors => ("error_count", "error_count"),
+        TraceSort::Cost => (
+            "cost_micro_usd",
+            "ifNull(cost_by_trace.cost_micro_usd, toInt64(0))",
+        ),
     };
     let (dir, op) = match f.order {
         SortOrder::Desc => ("DESC", "<"),
@@ -2554,6 +2783,8 @@ fn parse_sort(s: Option<&str>) -> TraceSort {
     match s {
         Some("duration") => TraceSort::Duration,
         Some("spans") => TraceSort::SpanCount,
+        Some("errors") => TraceSort::Errors,
+        Some("cost") => TraceSort::Cost,
         _ => TraceSort::StartTime,
     }
 }
@@ -2601,6 +2832,11 @@ fn parse_group_by(s: &str) -> Option<TraceGroupBy> {
         "model" => Some(TraceGroupBy::Model),
         "operation" => Some(TraceGroupBy::Operation),
         "status" => Some(TraceGroupBy::Status),
+        "environment" => Some(TraceGroupBy::Environment),
+        "release" => Some(TraceGroupBy::Release),
+        "service" => Some(TraceGroupBy::Service),
+        "user" => Some(TraceGroupBy::User),
+        "tag" => Some(TraceGroupBy::Tag),
         _ => None,
     }
 }
@@ -2614,6 +2850,7 @@ fn build_trace_groups_sql(by: TraceGroupBy, f: &TraceListFilters) -> String {
         TraceGroupBy::Model => "model",
         TraceGroupBy::Operation => "root_name",
         TraceGroupBy::Status => "if(error_count > 0, 'error', 'ok')",
+        _ => "arrayJoin(if(empty(labels.keys), [''], labels.keys))",
     };
     // `count()` / `countIf` over the merged subquery (one row per trace after the
     // GROUP BY, so no `uniqExact` is needed). `quantileExact` (not the approximate
@@ -2626,10 +2863,28 @@ fn build_trace_groups_sql(by: TraceGroupBy, f: &TraceListFilters) -> String {
 toUInt64(count()) AS trace_count, \
 toUInt64(countIf(error_count > 0)) AS error_traces, \
 avg(duration_us) AS avg_duration_us, \
-quantileExact(0.95)(duration_us) AS p95_duration_us \
+quantileExact(0.5)(duration_us) AS p50_duration_us, \
+quantileExact(0.9)(duration_us) AS p90_duration_us, \
+quantileExact(0.95)(duration_us) AS p95_duration_us, \
+quantileExact(0.99)(duration_us) AS p99_duration_us \
 FROM "
     ));
     sql.push_str(MERGED_SUMMARIES);
+    if by.needs_span_join() {
+        sql.push_str(" AS summaries");
+        if by == TraceGroupBy::Tag {
+            sql.push_str(" LEFT JOIN (SELECT trace_id, groupUniqArray(label) AS keys FROM (SELECT trace_id, arrayJoin(tags) AS label FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND notEmpty(tags)) GROUP BY trace_id) AS labels USING (trace_id)");
+        } else {
+            let column = match by {
+                TraceGroupBy::Environment => "environment",
+                TraceGroupBy::Release => "release",
+                TraceGroupBy::Service => "service",
+                TraceGroupBy::User => "JSONExtractString(attributes, 'user_id')",
+                _ => unreachable!("span join required only for label dimensions"),
+            };
+            sql.push_str(&format!(" LEFT JOIN (SELECT trace_id, [argMinIf({column}, start_time, {column} != '')] AS keys FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until GROUP BY trace_id) AS labels USING (trace_id)"));
+        }
+    }
     sql.push_str(" WHERE tenant_id = ?");
     push_trace_filters(&mut sql, f);
     sql.push_str(" GROUP BY group_key ORDER BY trace_count DESC LIMIT ?");
@@ -2677,6 +2932,7 @@ pub struct TraceCostRow {
     pub trace_id: String,
     pub cost_usd: f64,
     pub total_tokens: i64,
+    pub priced_spans: u64,
 }
 
 /// Build the per-trace cost/token rollup SELECT for a page of `n_ids` traces.
@@ -2684,7 +2940,7 @@ pub struct TraceCostRow {
 /// gateway-stats rollup) plus `input + output` usage tokens over each trace's
 /// spans. `tenant_id = ?` is the first predicate and bound; the `trace_id IN
 /// (?, …)` list is bound per id — index-served on the `(tenant_id, trace_id)`
-/// order, so the spans scan is bounded to the page (≤ `MAX_TRACE_LIMIT` ids),
+/// order, so the spans scan is bounded to the policy-capped page ids,
 /// never a full-tenant scan. Callers must never invoke this with `n_ids == 0`
 /// (an empty `IN ()` is invalid SQL) — the reader short-circuits that.
 fn build_trace_cost_rollup_sql(n_ids: usize) -> String {
@@ -2695,7 +2951,8 @@ round(sum(if(isFinite(JSONExtractFloat(attributes, 'gen_ai_usage_cost')) \
 AND JSONExtractFloat(attributes, 'gen_ai_usage_cost') > 0, \
 JSONExtractFloat(attributes, 'gen_ai_usage_cost'), 0)), 6) AS cost_usd, \
 toInt64(sum(toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_input_tokens')) \
-+ toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens')))) AS total_tokens \
++ toInt64(JSONExtractUInt(attributes, 'gen_ai_usage_output_tokens')))) AS total_tokens, \
+toUInt64(countIf(JSONHas(attributes, 'gen_ai_usage_cost') AND isFinite(JSONExtractFloat(attributes, 'gen_ai_usage_cost')))) AS priced_spans \
 FROM spans FINAL \
 WHERE tenant_id = ? AND trace_id IN ({placeholders}) \
 GROUP BY trace_id"
@@ -3138,9 +3395,8 @@ AND JSONExtractString(attributes, 'gen_ai_provider_name') != ''",
 /// a top-level column), latency percentiles (`duration_us`, materialized), and
 /// prompt-cache hits (`gen_ai_usage_cache_read_input_tokens > 0`). Provider is
 /// the ingest-normalized `gen_ai_provider_name` attribute; the non-empty filter
-/// isolates gateway LLM spans. Failover + rate-limit are deliberately absent —
-/// they are logged only, never written to `spans`, so surfacing them here would
-/// be fabrication. `tenant_id = ?` is the first WHERE predicate and bound. `?`
+/// isolates gateway LLM spans. The recorded failover flag is separate from
+/// dispatch-ledger rescues; pre-dispatch rate limits use live process counters. `tenant_id = ?` is the first WHERE predicate and bound. `?`
 /// order: tenant, (since_secs | hours), limit.
 fn build_gateway_stats_sql(f: &GatewayStatsFilters) -> String {
     let mut sql = String::from(
@@ -3540,8 +3796,119 @@ LIMIT 1 BY trace_id"
 /// [`ClickHouseTraceReader`]; tests use the in-module `MockTraceReader`.
 #[async_trait::async_trait]
 pub trait TraceReader: Send + Sync {
+    /// Recording cutover from the cached policy; absent is unknown.
+    /// # Errors
+    /// Infallible; missing/invalid data fails OPEN to an absent caption.
+    fn attempt_records_since(&self) -> Option<String> {
+        crate::billing::rating::Policy::default().attempt_records_since
+    }
+
+    /// Cached per-tenant read cap; None is an explicitly unlimited limit.
+    /// # Errors
+    /// Fails CLOSED on entitlement errors; the default is the restrictive tier.
+    async fn trace_read_rpm(&self, _tenant: &TenantId) -> Result<Option<u32>> {
+        Ok(crate::entitlement_cache::ResolvedEntitlements::deny_all().rate_limit_rpm)
+    }
+
+    /// Cached multiplier bounding the combined read allowance of a tenant's API keys.
+    fn trace_read_tenant_key_multiplier(&self) -> Option<u32> {
+        crate::billing::rating::Policy::default().trace_reads_tenant_key_multiplier
+    }
+
+    /// # Errors
+    /// Fails CLOSED on storage errors; stats keep provider health and return null evidence (OPEN).
+    async fn rescue_summary(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<crate::rescue::RescueRow>>;
+    /// # Errors
+    /// Fails CLOSED on storage errors; list rows mark evidence unavailable (OPEN).
+    async fn trace_rescues(
+        &self,
+        tenant: &TenantId,
+        ids: &[String],
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<crate::rescue::TraceRescueRow>>;
+    /// # Errors
+    /// Fails CLOSED on unavailable storage or invalid evidence; callers return 502.
+    async fn spend_causes(
+        &self,
+        _tenant: &TenantId,
+        _by: crate::spend_causes::Dimension,
+        _start: i64,
+        _granularity: crate::spend_spikes::Granularity,
+        _params: crate::billing::rating::SpendSpikeParams,
+    ) -> Result<crate::spend_causes::Causes> {
+        anyhow::bail!("spend attribution unavailable")
+    }
+    /// # Errors
+    /// Infallible. Cached policy falls OPEN to validated packaged display defaults;
+    /// absent valid defaults return None and evidence endpoints fail CLOSED.
+    fn spend_policy(&self) -> Option<crate::billing::rating::SpendSpikePolicy> {
+        crate::billing::rating::SpendSpikePolicy::embedded()
+    }
+    /// # Errors
+    /// Fails CLOSED on unavailable storage; callers return 502 instead of fabricated totals.
+    async fn spend_series(
+        &self,
+        _tenant: &TenantId,
+        _since: i64,
+        _until: i64,
+        _granularity: crate::spend_spikes::Granularity,
+    ) -> Result<Vec<crate::spend_spikes::BucketRow>> {
+        anyhow::bail!("spend aggregate unavailable")
+    }
+    /// # Errors
+    /// Infallible; absent policy makes evidence reads fail CLOSED.
+    fn agent_loop_policy(&self) -> Option<crate::billing::rating::AgentLoopPolicy> {
+        crate::billing::rating::AgentLoopPolicy::embedded()
+    }
+    /// # Errors
+    /// Fails CLOSED on invalid policy or storage errors; evidence endpoint returns 502.
+    async fn agent_loop_data(
+        &self,
+        _tenant: &TenantId,
+        _since: Option<i64>,
+        _until: Option<i64>,
+        _scope: &crate::agent_loops::LoopScope,
+    ) -> Result<crate::agent_loops::LoopData> {
+        anyhow::bail!("loop evidence unavailable")
+    }
+    /// Scalar totals only; never loads instance records.
+    /// # Errors
+    /// Fails CLOSED on unavailable evidence; optional stats render null (OPEN).
+    async fn agent_loop_totals(
+        &self,
+        _tenant: &TenantId,
+        _since: i64,
+        _until: i64,
+        _scope: &crate::agent_loops::LoopScope,
+    ) -> Result<crate::agent_loops::LoopTotals> {
+        anyhow::bail!("loop totals unavailable")
+    }
+    /// Full-group call counts, bounded to the requested page ids.
+    /// # Errors
+    /// Fails CLOSED on read error; lists remain available with unknown evidence (OPEN).
+    async fn agent_loop_calls(
+        &self,
+        _tenant: &TenantId,
+        _since: i64,
+        _until: i64,
+        _scope: &crate::agent_loops::LoopScope,
+    ) -> Result<Vec<(String, u64)>> {
+        anyhow::bail!("loop rollup unavailable")
+    }
     fn generation_issue_policy(&self) -> crate::generation_issues::SummaryPolicy {
         crate::generation_issues::SummaryPolicy::embedded()
+    }
+    fn trace_read_policy(&self) -> crate::billing::rating::TraceReadPolicy {
+        crate::billing::rating::Policy::default().trace_reads
+    }
+    fn output_speed_min_generation_ms(&self) -> u64 {
+        tracelane_shared::labels::OutputSpeedPolicy::embedded().min_generation_ms
     }
     async fn generation_issue_summary(&self, tenant_id: &TenantId) -> Result<Arc<IssueSummary>>;
     async fn list_traces(
@@ -3709,6 +4076,8 @@ pub struct ClickHouseTraceReader {
     /// where `AuditChain::append_in_memory` writes ClickHouse directly and it is
     /// the only ledger that exists — the fallback below.
     pg_pool: Option<crate::db::DbPool>,
+    /// Boot-resolved read limit when the control plane is unavailable.
+    no_cp_rpm: Option<u32>,
 }
 
 impl ClickHouseTraceReader {
@@ -3723,6 +4092,7 @@ impl ClickHouseTraceReader {
             client,
             entitlements: None,
             pg_pool: None,
+            no_cp_rpm: crate::rate_limiter::resolve_no_control_plane_rate_limit_rpm(false),
         }
     }
 
@@ -3730,8 +4100,10 @@ impl ClickHouseTraceReader {
     pub fn with_entitlements(
         mut self,
         entitlements: Option<Arc<crate::entitlement_cache::EntitlementCache>>,
+        no_cp_rpm: Option<u32>,
     ) -> Self {
         self.entitlements = entitlements;
+        self.no_cp_rpm = no_cp_rpm;
         self
     }
 
@@ -3808,6 +4180,34 @@ fn now_us() -> i64 {
     chrono::Utc::now().timestamp_micros()
 }
 
+fn cost_sort_window(
+    sort: TraceSort,
+    since: Option<i64>,
+    until: Option<i64>,
+    max_hours: u32,
+) -> Result<Option<i64>, u32> {
+    if sort != TraceSort::Cost {
+        return Ok(until);
+    }
+    let now = now_us();
+    // Keep the default at exactly seven days; the normal list's future-clock
+    // slack would otherwise make a default cost sort exceed its policy bound.
+    let end = until.unwrap_or(now);
+    let start = since.unwrap_or(now - DEFAULT_LIST_WINDOW_SECS * 1_000_000);
+    if end < start || end.saturating_sub(start) > i64::from(max_hours) * 3_600_000_000 {
+        return Err(max_hours);
+    }
+    Ok(Some(end))
+}
+
+fn cost_sort_error(max_hours: u32) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error":"sort_window_too_wide", "max_hours":max_hours})),
+    )
+        .into_response()
+}
+
 /// Bind the prefix every trace_summaries query shares: `w_since, w_until`
 /// ([`WINDOW_WITH`]), the inner tenant ([`MERGED_SUMMARIES`]) and the outer
 /// tenant, then the filters in [`push_trace_filters`]'s exact order. Cursor and
@@ -3816,15 +4216,37 @@ fn bind_trace_prefix_and_filters(
     mut q: clickhouse::query::Query,
     tenant_id: &TenantId,
     f: &TraceListFilters,
+    group_by: Option<TraceGroupBy>,
 ) -> clickhouse::query::Query {
     let (since, until) = f.window_bounds(now_us());
-    q = q
-        .bind(since)
-        .bind(until)
-        .bind(tenant_id.to_string())
-        .bind(tenant_id.to_string());
+    q = q.bind(since).bind(until).bind(tenant_id.to_string());
+    if group_by.is_some_and(TraceGroupBy::needs_span_join) {
+        q = q.bind(tenant_id.to_string());
+    }
+    if f.sort == TraceSort::Cost {
+        q = q.bind(tenant_id.to_string());
+    }
+    q = q.bind(tenant_id.to_string());
+    if f.loop_policy.is_some() {
+        q = q.bind(tenant_id.to_string());
+    }
+    if f.rescued.is_some() {
+        q = q.bind(tenant_id.to_string());
+    }
     if let Some(m) = &f.model {
         q = q.bind(m.clone());
+    }
+    for value in [&f.environment, &f.release, &f.service, &f.tag]
+        .into_iter()
+        .flatten()
+    {
+        q = q.bind(tenant_id.to_string()).bind(value.clone());
+    }
+    if let Some((key, value)) = &f.meta {
+        q = q
+            .bind(tenant_id.to_string())
+            .bind(key.clone())
+            .bind(value.clone());
     }
     if let Some(d) = f.min_duration_us {
         q = q.bind(d);
@@ -3852,6 +4274,9 @@ fn bind_trace_prefix_and_filters(
     if !f.issues.is_empty() {
         q = q.bind(tenant_id.to_string());
     }
+    if let Some(key) = &f.api_key {
+        q = q.bind(tenant_id.to_string()).bind(key);
+    }
     if let Some(u) = &f.end_user {
         // OBS-20 subquery binds tenant_id THEN the id — the two `?` in
         // `WHERE tenant_id = ? AND … = ?`, in that order (TRAPS §58).
@@ -3872,8 +4297,288 @@ fn bind_trace_prefix_and_filters(
 
 #[async_trait::async_trait]
 impl TraceReader for ClickHouseTraceReader {
+    fn trace_read_tenant_key_multiplier(&self) -> Option<u32> {
+        self.rate_card
+            .load()
+            .policy
+            .trace_reads_tenant_key_multiplier
+    }
+
+    fn attempt_records_since(&self) -> Option<String> {
+        self.rate_card.load().policy.attempt_records_since.clone()
+    }
+
+    async fn trace_read_rpm(&self, tenant: &TenantId) -> Result<Option<u32>> {
+        // No cache fails RESTRICTED to the boot-resolved limit: a hosted node
+        // with a failed pool still caps reads. Only confirmed self-host is
+        // unlimited; absence of a cache alone is never that confirmation.
+        let ent = match &self.entitlements {
+            Some(cache) => Some(cache.resolved(*tenant.as_uuid()).await),
+            None => None,
+        };
+        Ok(ent.as_ref().map_or(self.no_cp_rpm, |e| e.rate_limit_rpm))
+    }
+
+    async fn rescue_summary(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<crate::rescue::RescueRow>> {
+        let sql = TenantQuery::new(
+            format!("{WINDOW_WITH}{}", crate::rescue::summary_sql()),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        Ok(self
+            .client
+            .query(&sql)
+            .bind(since)
+            .bind(until)
+            .bind(tenant.to_string())
+            .fetch_all()
+            .await?)
+    }
+    async fn trace_rescues(
+        &self,
+        tenant: &TenantId,
+        ids: &[String],
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<crate::rescue::TraceRescueRow>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = TenantQuery::new(
+            format!("{WINDOW_WITH}{}", crate::rescue::trace_sql()),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        Ok(self
+            .client
+            .query(&sql)
+            .bind(since)
+            .bind(until)
+            .bind(tenant.to_string())
+            .bind(ids)
+            .fetch_all()
+            .await?)
+    }
+    async fn spend_causes(
+        &self,
+        tenant: &TenantId,
+        by: crate::spend_causes::Dimension,
+        start: i64,
+        granularity: crate::spend_spikes::Granularity,
+        params: crate::billing::rating::SpendSpikeParams,
+    ) -> Result<crate::spend_causes::Causes> {
+        let end = start + granularity.seconds();
+        let tier = self.tier_for(tenant).await;
+        let sql = TenantQuery::new(crate::spend_causes::summary_sql(by), tier).sql_with_settings();
+        let summary = self
+            .client
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(start)
+            .bind(end)
+            .fetch_one::<crate::spend_causes::Summary>()
+            .await?;
+        let sql = TenantQuery::new(crate::spend_causes::rows_sql(by, params.drill_top_n), tier)
+            .sql_with_settings();
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(start)
+            .bind(end)
+            .fetch_all::<crate::spend_causes::CauseRow>()
+            .await?;
+        let mut baseline = Vec::new();
+        if !rows.is_empty()
+            && let Some(sql) = crate::spend_causes::baseline_sql(by, granularity)
+        {
+            let sql = TenantQuery::new(sql, tier).sql_with_settings();
+            baseline = self
+                .client
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(start - i64::from(params.baseline_buckets) * granularity.seconds())
+                .bind(start)
+                .bind(rows.iter().map(|r| r.dimension.clone()).collect::<Vec<_>>())
+                .fetch_all()
+                .await?;
+        }
+        let series = self
+            .spend_series(tenant, start, end, granularity)
+            .await?
+            .iter()
+            .map(|r| r.cost_usd)
+            .sum();
+        crate::spend_causes::build(
+            by,
+            (start, granularity),
+            params,
+            series,
+            summary,
+            rows,
+            baseline,
+        )
+    }
+    fn spend_policy(&self) -> Option<crate::billing::rating::SpendSpikePolicy> {
+        self.rate_card.load().policy.spend_spikes
+    }
+    async fn spend_series(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+        granularity: crate::spend_spikes::Granularity,
+    ) -> Result<Vec<crate::spend_spikes::BucketRow>> {
+        let sql = TenantQuery::new(
+            crate::spend_spikes::series_sql(granularity),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        Ok(self
+            .client
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(since)
+            .bind(until)
+            .fetch_all()
+            .await?)
+    }
+    fn agent_loop_policy(&self) -> Option<crate::billing::rating::AgentLoopPolicy> {
+        self.rate_card.load().policy.agent_loop
+    }
+    async fn agent_loop_data(
+        &self,
+        tenant: &TenantId,
+        since: Option<i64>,
+        until: Option<i64>,
+        scope: &crate::agent_loops::LoopScope,
+    ) -> Result<crate::agent_loops::LoopData> {
+        use crate::agent_loops::{LoopData, LoopRow, scoped_instances_sql};
+        let policy = self
+            .agent_loop_policy()
+            .context("loop policy unavailable")?;
+        anyhow::ensure!(policy.valid(), "invalid loop policy");
+        let filters = TraceListFilters {
+            since_us: since,
+            until_us: until,
+            ..Default::default()
+        };
+        let (since, until) = filters.window_bounds(now_us());
+        let tier = self.tier_for(tenant).await;
+        let sql = TenantQuery::new(
+            format!("{WINDOW_WITH}{}", scoped_instances_sql(policy, scope)),
+            tier,
+        )
+        .sql_with_settings();
+        let query = self
+            .client
+            .query(&sql)
+            .bind(since)
+            .bind(until)
+            .bind(tenant.to_string());
+        let rows = scope
+            .bind_instances(scope.bind(query, tenant))
+            .fetch_all::<LoopRow>()
+            .await?;
+        let totals = self.agent_loop_totals(tenant, since, until, scope).await?;
+        Ok(LoopData {
+            policy,
+            rows,
+            total_instances: totals.instances,
+            groups: totals.groups,
+            tool_calls: totals.tool_calls,
+            unfingerprinted: totals.unfingerprinted_tool_calls,
+        })
+    }
+    async fn agent_loop_totals(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+        scope: &crate::agent_loops::LoopScope,
+    ) -> Result<crate::agent_loops::LoopTotals> {
+        let policy = self
+            .agent_loop_policy()
+            .context("loop policy unavailable")?;
+        anyhow::ensure!(policy.valid(), "invalid loop policy");
+        let sql = TenantQuery::new(
+            format!(
+                "{WINDOW_WITH}SELECT * FROM ({})",
+                crate::agent_loops::totals_sql(policy, scope)
+            ),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        let query = self
+            .client
+            .query(&sql)
+            .bind(since)
+            .bind(until)
+            .bind(tenant.to_string());
+        let (instances, groups, tool_calls, unfingerprinted_tool_calls) = scope
+            .bind_instances(scope.bind(query, tenant))
+            .fetch_one::<(u64, u64, u64, u64)>()
+            .await?;
+        Ok(crate::agent_loops::LoopTotals {
+            min_repeats: policy.min_repeats,
+            window_secs: policy.window_secs,
+            instances,
+            groups,
+            tool_calls,
+            unfingerprinted_tool_calls,
+        })
+    }
+    async fn agent_loop_calls(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+        scope: &crate::agent_loops::LoopScope,
+    ) -> Result<Vec<(String, u64)>> {
+        if scope.trace_ids.is_empty() && scope.session_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let policy = self
+            .agent_loop_policy()
+            .context("loop policy unavailable")?;
+        anyhow::ensure!(policy.valid(), "invalid loop policy");
+        let sql = TenantQuery::new(
+            format!(
+                "{WINDOW_WITH}{}",
+                crate::agent_loops::rollup_sql(policy, scope)
+            ),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        let mut query = self.client.query(&sql).bind(since).bind(until);
+        if !scope.trace_ids.is_empty() {
+            query = query.bind(&scope.trace_ids);
+        }
+        let query = query.bind(tenant.to_string());
+        let ids = if scope.trace_ids.is_empty() {
+            &scope.session_ids
+        } else {
+            &scope.trace_ids
+        };
+        let mut query = scope.bind(query, tenant);
+        if scope.trace_ids.is_empty() {
+            query = query.bind(ids);
+        }
+        Ok(query.fetch_all().await?)
+    }
     fn generation_issue_policy(&self) -> crate::generation_issues::SummaryPolicy {
         self.rate_card.load().policy.generation_issues
+    }
+    fn trace_read_policy(&self) -> crate::billing::rating::TraceReadPolicy {
+        self.rate_card.load().policy.trace_reads
+    }
+    fn output_speed_min_generation_ms(&self) -> u64 {
+        self.rate_card.load().policy.output_speed.min_generation_ms
     }
     async fn generation_issue_summary(&self, tenant_id: &TenantId) -> Result<Arc<IssueSummary>> {
         let policy = self.generation_issue_policy();
@@ -3959,7 +4664,7 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<TraceSummaryRow>> {
         let sql = TenantQuery::new(build_trace_list_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
+        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, None);
         if let Some((cts, cid)) = &f.cursor {
             q = q.bind(*cts).bind(*cts).bind(cid.clone());
         }
@@ -3981,7 +4686,7 @@ impl TraceReader for ClickHouseTraceReader {
         )
         .sql_with_settings();
         // Filter binds MIRROR list_traces (same order as build_trace_groups_sql).
-        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
+        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, Some(by));
         q = q.bind(f.limit);
         q.fetch_all::<TraceGroupRow>()
             .await
@@ -3990,9 +4695,10 @@ impl TraceReader for ClickHouseTraceReader {
 
     async fn count_traces(&self, tenant_id: &TenantId, f: &TraceListFilters) -> Result<u64> {
         let sql = TenantQuery::new(build_trace_count_sql(f), self.tier_for(tenant_id).await)
+            .with_log_comment(format!("tenant_id={tenant_id}"))
             .sql_with_settings();
         // Bind order MIRRORS build_trace_list_sql's filter binds, minus cursor/limit.
-        let q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f);
+        let q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, None);
         let row = q
             .fetch_one::<TraceTotalRow>()
             .await
@@ -4243,13 +4949,15 @@ impl TraceReader for ClickHouseTraceReader {
         f: &BreakdownFilters,
     ) -> Result<Vec<BreakdownRow>> {
         let sql = TenantQuery::new(
-            build_metric_breakdown_sql(f.metric, f.by),
+            build_metric_breakdown_sql(f.metric, f.by, f.min_generation_ms),
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        self.client
-            .query(&sql)
-            .bind(tenant_id.to_string())
+        let mut q = self.client.query(&sql);
+        if let Some(key) = &f.meta_key {
+            q = q.bind(key.clone());
+        }
+        q.bind(tenant_id.to_string())
             .bind(f.since_us)
             .bind(f.until_us)
             .bind(f.limit)
@@ -4260,8 +4968,13 @@ impl TraceReader for ClickHouseTraceReader {
 
     async fn cost_breakdown(&self, tenant_id: &TenantId, f: &CostFilters) -> Result<Vec<CostRow>> {
         let sql = TenantQuery::new(build_cost_breakdown_sql(f), self.tier_for(tenant_id).await)
+            .with_log_comment(format!("tenant_id={tenant_id}"))
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = self.client.query(&sql);
+        if let Some(key) = &f.meta_key {
+            q = q.bind(key.clone());
+        }
+        q = q.bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4270,10 +4983,50 @@ impl TraceReader for ClickHouseTraceReader {
         if let Some(u) = f.until_secs {
             q = q.bind(u);
         }
-        q.bind(f.limit)
+        let mut rows = q
+            .bind(f.limit)
             .fetch_all::<CostRow>()
             .await
-            .context("cost breakdown SELECT failed")
+            .context("cost breakdown SELECT failed")?;
+        // A span with two tags appears in both groups, but the window totals
+        // describe unique requests. Read those totals from the unexpanded key
+        // grouping over the same tenant/window/scope.
+        if f.dimension == CostDimension::Tag && !rows.is_empty() {
+            let mut base = f.clone();
+            base.dimension = CostDimension::Key;
+            base.meta_key = None;
+            base.limit = 1;
+            let totals_sql = TenantQuery::new(
+                build_cost_breakdown_sql(&base),
+                self.tier_for(tenant_id).await,
+            )
+            .with_log_comment(format!("tenant_id={tenant_id}"))
+            .sql_with_settings();
+            let mut totals_q = self.client.query(&totals_sql).bind(tenant_id.to_string());
+            if let Some(s) = base.since_secs {
+                totals_q = totals_q.bind(s);
+            } else {
+                totals_q = totals_q.bind(base.hours);
+            }
+            if let Some(u) = base.until_secs {
+                totals_q = totals_q.bind(u);
+            }
+            let total = totals_q
+                .bind(base.limit)
+                .fetch_one::<CostRow>()
+                .await
+                .context("unique-request tag totals SELECT failed")?;
+            for row in &mut rows {
+                row.all_requests = total.all_requests;
+                row.all_priced_requests = total.all_priced_requests;
+                row.all_cost_usd = total.all_cost_usd;
+                row.all_eval_requests = total.all_eval_requests;
+                row.all_eval_cost_usd = total.all_eval_cost_usd;
+                row.all_judge_requests = total.all_judge_requests;
+                row.all_judge_cost_usd = total.all_judge_cost_usd;
+            }
+        }
+        Ok(rows)
     }
 
     async fn latency_breakdown(
@@ -4732,6 +5485,15 @@ pub struct TraceReadState {
 
 #[derive(Debug, Deserialize)]
 pub struct TraceListQuery {
+    environment: Option<String>,
+    release: Option<String>,
+    service: Option<String>,
+    tag: Option<String>,
+    meta: Option<String>,
+    key: Option<String>,
+    rescued: Option<crate::rescue::RescueFilter>,
+    #[serde(rename = "loop")]
+    repeated_tool: Option<bool>,
     include_issues: Option<bool>,
     issue: Option<String>,
     agent: Option<String>,
@@ -4766,15 +5528,26 @@ pub struct TraceListQuery {
     order: Option<String>,
 }
 
-/// Query for `GET /v1/traces/export` — the same filters as the list (no cursor,
-/// no page limit) plus the output `format`.
+/// Query for `GET /v1/traces/export` — the same filters and keyset cursor as
+/// the list, plus the output `format`; the cached policy supplies the page cap.
 #[derive(Debug, Deserialize)]
 pub struct TraceExportQuery {
+    environment: Option<String>,
+    release: Option<String>,
+    service: Option<String>,
+    tag: Option<String>,
+    meta: Option<String>,
+    key: Option<String>,
+    rescued: Option<crate::rescue::RescueFilter>,
+    #[serde(rename = "loop")]
+    repeated_tool: Option<bool>,
     issue: Option<String>,
     agent: Option<String>,
     model_family: Option<String>,
     /// `"csv"` (default) | `"json"`.
     format: Option<String>,
+    q: Option<String>,
+    cursor: Option<String>,
     model: Option<String>,
     has_error: Option<String>,
     min_latency_ms: Option<f64>,
@@ -4794,6 +5567,15 @@ pub struct TraceExportQuery {
 /// Query for `GET /v1/traces/groups` — the grouping dimension + the same filters.
 #[derive(Debug, Deserialize)]
 pub struct TraceGroupsQuery {
+    environment: Option<String>,
+    release: Option<String>,
+    service: Option<String>,
+    tag: Option<String>,
+    meta: Option<String>,
+    key: Option<String>,
+    rescued: Option<crate::rescue::RescueFilter>,
+    #[serde(rename = "loop")]
+    repeated_tool: Option<bool>,
     issue: Option<String>,
     agent: Option<String>,
     model_family: Option<String>,
@@ -4977,8 +5759,9 @@ pub struct SessionTranscriptQuery {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
-/// Mount the three read routes. Mounted only when `CLICKHOUSE_URL` is set.
-pub fn routes() -> Router<TraceReadState> {
+/// Mount read routes and related reads behind the same tenant/key allowance.
+/// Mounted only when `CLICKHOUSE_URL` is set.
+pub fn routes(state: TraceReadState, extra_routes: Router) -> Router {
     Router::new()
         .route(
             "/v1/traces/issues/summary",
@@ -5000,6 +5783,9 @@ pub fn routes() -> Router<TraceReadState> {
         .route("/v1/slo/models", get(slo_by_model_handler))
         .route("/v1/slo/timeseries", get(slo_timeseries_handler))
         .route("/v1/gateway/stats", get(gateway_stats_handler))
+        .route("/v1/agent-loops", get(agent_loops_handler))
+        .route("/v1/spend/series", get(spend_series_handler))
+        .route("/v1/spend/spike-causes", get(spend_causes_handler))
         .route("/v1/costs", get(cost_breakdown_handler))
         .route("/v1/metrics/breakdown", get(metric_breakdown_handler))
         .route(
@@ -5018,6 +5804,16 @@ pub fn routes() -> Router<TraceReadState> {
             "/v1/sessions/{session_id}/transcript",
             get(session_transcript_handler),
         )
+        .with_state(state.clone())
+        .merge(extra_routes)
+        .route_layer(axum::middleware::from_fn_with_state(
+            (
+                state.clone(),
+                Arc::new(crate::rate_limiter::RateLimiter::new()),
+                Arc::new(crate::rate_limiter::RateLimiter::new()),
+            ),
+            trace_read_limit,
+        ))
 }
 
 #[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
@@ -5043,6 +5839,129 @@ async fn generation_issue_summary_handler(
                 "generation issue summary unavailable",
             )
         }
+    }
+}
+
+/// Read-router resource boundary: separate session allowance, plus per-key AND aggregate key caps.
+/// # Errors
+/// Fails CLOSED on auth/policy errors and rate exhaustion (429 + Retry-After).
+async fn trace_read_limit(
+    State((state, session_limiter, key_limiter)): State<(
+        TraceReadState,
+        Arc<crate::rate_limiter::RateLimiter>,
+        Arc<crate::rate_limiter::RateLimiter>,
+    )>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let claims = match authenticate(request.headers()).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let rpm = match state.reader.trace_read_rpm(&claims.tenant_id).await {
+        Ok(Some(0)) | Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "trace read policy unavailable",
+            );
+        }
+        Ok(rpm) => rpm,
+    };
+    let decision = if claims.auth_method == crate::auth::AuthMethod::ApiKey {
+        let key_rpm = match (rpm, claims.rate_limit_rpm) {
+            (Some(plan), Some(key)) => Some(plan.min(key)),
+            (plan, key) => plan.or(key),
+        };
+        let tenant_rpm = match rpm {
+            Some(rpm) => match state.reader.trace_read_tenant_key_multiplier() {
+                Some(multiplier) if multiplier > 0 => Some(rpm.saturating_mul(multiplier)),
+                _ => {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "trace read policy unavailable",
+                    );
+                }
+            },
+            // Only an explicit unlimited entitlement (or confirmed self-host)
+            // bypasses the aggregate ceiling. A missing multiplier never does.
+            None => None,
+        };
+        // Every key spends the SAME tenant allowance as well as its own bucket.
+        // This limiter is separate from sessions so scripts cannot drain the dashboard.
+        key_limiter.check_scoped(
+            &claims.tenant_id,
+            tenant_rpm,
+            Some(claims.api_key_id().unwrap_or(&claims.sub)),
+            key_rpm,
+        )
+    } else {
+        session_limiter.check(&claims.tenant_id, rpm)
+    };
+    if let crate::rate_limiter::RateLimitDecision::Throttle { retry_after_secs } = decision {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            Json(serde_json::json!({"error":"trace_read_rate_limited"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentLoopQuery {
+    since: Option<String>,
+    until: Option<String>,
+    trace_id: Option<String>,
+    session_id: Option<String>,
+    limit: Option<u32>,
+}
+/// # Errors
+/// Fails CLOSED on auth, validation or storage errors; never returns guessed evidence.
+#[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn agent_loops_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<AgentLoopQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let since = match parse_rfc3339_micros(q.since.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
+    };
+    let until = match parse_rfc3339_micros(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let served = ServedWindow::resolve(
+        since.map(|v| v / 1_000_000),
+        until.map(|v| v / 1_000_000),
+        (DEFAULT_LIST_WINDOW_SECS / 3600) as u32,
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    if served.since_secs > served.until_secs {
+        return error_response(StatusCode::BAD_REQUEST, "since must precede until");
+    }
+    let since = Some(served.since_secs * 1_000_000);
+    let until = Some(served.until_secs * 1_000_000);
+    let scope = crate::agent_loops::LoopScope {
+        trace_ids: q.trace_id.iter().cloned().collect(),
+        session_ids: q.session_id.iter().cloned().collect(),
+    };
+    match state
+        .reader
+        .agent_loop_data(&claims.tenant_id, since, until, &scope)
+        .await
+    {
+        Ok(data) => served.stamp(Json(data.response(q.limit)).into_response()),
+        Err(_) => error_response(StatusCode::BAD_GATEWAY, "loop evidence unavailable"),
     }
 }
 
@@ -5075,6 +5994,7 @@ async fn trace_count_handler(
                 .into_response();
         }
     };
+
     let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
@@ -5093,8 +6013,25 @@ async fn trace_count_handler(
         .min_latency_ms
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
+    if q.repeated_tool == Some(true) && state.reader.agent_loop_policy().is_none() {
+        return error_response(StatusCode::BAD_GATEWAY, "loop policy unavailable");
+    }
     let filters = TraceListFilters {
+        rescued: q.rescued,
+        loop_policy: if q.repeated_tool == Some(true) {
+            state.reader.agent_loop_policy()
+        } else {
+            None
+        },
         issues,
+        environment: q.environment.filter(|s| !s.is_empty()),
+        release: q.release.filter(|s| !s.is_empty()),
+        service: q.service.filter(|s| !s.is_empty()),
+        tag: q.tag.filter(|s| !s.is_empty()),
+        meta: match parse_meta_filter(q.meta.as_deref()) {
+            Ok(meta) => meta,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_meta_filter"),
+        },
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: search,
@@ -5104,6 +6041,7 @@ async fn trace_count_handler(
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
         end_user: q.end_user.filter(|s| !s.is_empty()),
+        api_key: q.key.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor: None,
@@ -5160,6 +6098,25 @@ fn validate_search_term(raw: Option<&str>) -> Result<Option<String>, &'static st
     }
 }
 
+fn valid_meta_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+fn parse_meta_filter(raw: Option<&str>) -> Result<Option<(String, String)>, ()> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let (key, value) = raw.split_once(':').ok_or(())?;
+    if !valid_meta_key(key) {
+        return Err(());
+    }
+    Ok(Some((key.to_owned(), value.to_owned())))
+}
+
 /// GET /v1/traces — keyset-paginated trace list for the authenticated tenant.
 #[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn list_traces_handler(
@@ -5190,7 +6147,7 @@ async fn list_traces_handler(
     let limit = q
         .limit
         .unwrap_or(DEFAULT_TRACE_LIMIT)
-        .clamp(1, MAX_TRACE_LIMIT);
+        .clamp(1, state.reader.trace_read_policy().list_max_page);
     let cursor = match q.cursor.as_deref() {
         Some(c) => match decode_cursor(c) {
             Some(parsed) => Some(parsed),
@@ -5206,13 +6163,40 @@ async fn list_traces_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
+    let sort = parse_sort(q.sort.as_deref());
+    let until_us = match cost_sort_window(
+        sort,
+        since_us,
+        until_us,
+        state.reader.trace_read_policy().cost_sort_max_window_hours,
+    ) {
+        Ok(until) => until,
+        Err(max_hours) => return cost_sort_error(max_hours),
+    };
     // §2 latency floor: milliseconds → duration_us. Ignore NaN / negative.
     let min_duration_us = q
         .min_latency_ms
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
+    if q.repeated_tool == Some(true) && state.reader.agent_loop_policy().is_none() {
+        return error_response(StatusCode::BAD_GATEWAY, "loop policy unavailable");
+    }
     let filters = TraceListFilters {
+        rescued: q.rescued,
+        loop_policy: if q.repeated_tool == Some(true) {
+            state.reader.agent_loop_policy()
+        } else {
+            None
+        },
         issues,
+        environment: q.environment.filter(|s| !s.is_empty()),
+        release: q.release.filter(|s| !s.is_empty()),
+        service: q.service.filter(|s| !s.is_empty()),
+        tag: q.tag.filter(|s| !s.is_empty()),
+        meta: match parse_meta_filter(q.meta.as_deref()) {
+            Ok(meta) => meta,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_meta_filter"),
+        },
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: search.clone(),
@@ -5222,10 +6206,11 @@ async fn list_traces_handler(
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
         end_user: q.end_user.filter(|s| !s.is_empty()),
+        api_key: q.key.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor,
-        sort: parse_sort(q.sort.as_deref()),
+        sort,
         order: parse_order(q.order.as_deref()),
         limit,
     };
@@ -5247,6 +6232,8 @@ async fn list_traces_handler(
                 TraceSort::StartTime => r.start_time_us,
                 TraceSort::Duration => r.duration_us,
                 TraceSort::SpanCount => r.span_count as i64,
+                TraceSort::Errors => r.error_count as i64,
+                TraceSort::Cost => r.cost_micro_usd,
             };
             encode_cursor(sort_val, &r.trace_id)
         })
@@ -5257,12 +6244,12 @@ async fn list_traces_handler(
     let issues_deferred = q.include_issues == Some(false);
     let (traces, issues_available) = if issues_deferred {
         (
-            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows).await,
+            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows, &filters).await,
             false,
         )
     } else {
         let (mut traces, issue_rows) = tokio::join!(
-            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows),
+            enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows, &filters),
             state.reader.trace_issue_rollup(&claims.tenant_id, &ids),
         );
         let available = apply_trace_issues(&mut traces, issue_rows);
@@ -5343,7 +6330,9 @@ async fn trace_issue_rollup_handler(
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if ids.len() > MAX_TRACE_LIMIT as usize || ids.iter().any(|id| id.is_empty()) {
+    if ids.len() > state.reader.trace_read_policy().list_max_page as usize
+        || ids.iter().any(|id| id.is_empty())
+    {
         return error_response(
             StatusCode::BAD_REQUEST,
             "trace_ids must contain one page of nonempty ids",
@@ -5383,14 +6372,47 @@ async fn enrich_traces_with_cost(
     reader: &dyn TraceReader,
     tenant_id: &TenantId,
     rows: Vec<TraceSummaryRow>,
+    filters: &TraceListFilters,
 ) -> Vec<TraceSummary> {
     let ids: Vec<String> = rows.iter().map(|r| r.trace_id.clone()).collect();
-    let cost_map: std::collections::HashMap<String, (f64, i64)> = reader
+    let loop_data = if ids.is_empty() {
+        None
+    } else {
+        let (since, until) = filters.window_bounds(now_us());
+        reader
+            .agent_loop_calls(
+                tenant_id,
+                since,
+                until,
+                &crate::agent_loops::LoopScope {
+                    trace_ids: ids.clone(),
+                    session_ids: vec![],
+                },
+            )
+            .await
+            .inspect_err(|_| {
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::TraceIssueReadFailed,
+                );
+            })
+            .ok()
+    };
+    let (since, until) = filters.window_bounds(now_us());
+    let rescues = reader
+        .trace_rescues(tenant_id, &ids, since, until)
+        .await
+        .inspect_err(|_| {
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::RescueReadFailed,
+            );
+        })
+        .ok();
+    let cost_map: std::collections::HashMap<String, (f64, i64, bool)> = reader
         .trace_cost_rollup(tenant_id, &ids)
         .await
         .map(|v| {
             v.into_iter()
-                .map(|c| (c.trace_id, (c.cost_usd, c.total_tokens)))
+                .map(|c| (c.trace_id, (c.cost_usd, c.total_tokens, c.priced_spans > 0)))
                 .collect()
         })
         .unwrap_or_else(|err| {
@@ -5399,9 +6421,37 @@ async fn enrich_traces_with_cost(
         });
     rows.into_iter()
         .map(|r| {
-            let (cost_usd, total_tokens) = cost_map.get(&r.trace_id).copied().unwrap_or((0.0, 0));
+            let (cost_usd, total_tokens, cost_usd_present) = cost_map
+                .get(&r.trace_id)
+                .copied()
+                .unwrap_or((0.0, 0, false));
+            let sorted_cost_usd = r.cost_micro_usd as f64 / 1_000_000.0;
+            let priced_spans_in_window = r.priced_spans_in_window;
             let mut s = TraceSummary::from(r);
-            s.cost_usd = cost_usd;
+            s.rescued = rescues
+                .as_ref()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|r| r.trace_id == s.trace_id && !r.rescued.is_empty())
+                })
+                .map(|r| r.rescued.clone());
+            s.rescues_available = rescues.is_some();
+            s.loop_calls = loop_data.as_ref().map_or(0, |d| {
+                d.iter()
+                    .find(|(id, _)| id == &s.trace_id)
+                    .map_or(0, |(_, n)| u32::try_from(*n).unwrap_or(u32::MAX))
+            });
+            s.loops_available = loop_data.is_some();
+            s.cost_usd = if filters.sort == TraceSort::Cost {
+                sorted_cost_usd
+            } else {
+                cost_usd
+            };
+            s.cost_usd_present = if filters.sort == TraceSort::Cost {
+                priced_spans_in_window > 0
+            } else {
+                cost_usd_present
+            };
             s.total_tokens = total_tokens;
             s
         })
@@ -5409,9 +6459,9 @@ async fn enrich_traces_with_cost(
 }
 
 /// GET /v1/traces/export?format=csv|json — the current filtered trace list as a
-/// downloadable CSV (default) or JSON, up to `MAX_TRACE_EXPORT` rows. Reuses the
+/// downloadable CSV (default) or JSON, up to the seeded export cap. Reuses the
 /// exact `list_traces` filters (model / has_error / min_latency / signature / time
-/// window); no cursor — exports from the top of the filtered `start_time DESC` set.
+/// window); a cursor resumes the same keyset sort after a capped file.
 #[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn export_traces_handler(
     State(state): State<TraceReadState>,
@@ -5434,6 +6484,18 @@ async fn export_traces_handler(
         }
     };
 
+    let search = match validate_search_term(q.q.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+    let cursor = match q.cursor.as_deref() {
+        Some(raw) => match decode_cursor(raw) {
+            Some(value) => Some(value),
+            None => return error_response(StatusCode::BAD_REQUEST, "malformed cursor"),
+        },
+        None => None,
+    };
+
     let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
@@ -5442,27 +6504,55 @@ async fn export_traces_handler(
         Ok(v) => v,
         Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
     };
+    let sort = parse_sort(q.sort.as_deref());
+    let until_us = match cost_sort_window(
+        sort,
+        since_us,
+        until_us,
+        state.reader.trace_read_policy().cost_sort_max_window_hours,
+    ) {
+        Ok(until) => until,
+        Err(max_hours) => return cost_sort_error(max_hours),
+    };
     let min_duration_us = q
         .min_latency_ms
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
+    if q.repeated_tool == Some(true) && state.reader.agent_loop_policy().is_none() {
+        return error_response(StatusCode::BAD_GATEWAY, "loop policy unavailable");
+    }
     let filters = TraceListFilters {
+        rescued: q.rescued,
+        loop_policy: if q.repeated_tool == Some(true) {
+            state.reader.agent_loop_policy()
+        } else {
+            None
+        },
         issues,
+        environment: q.environment.filter(|s| !s.is_empty()),
+        release: q.release.filter(|s| !s.is_empty()),
+        service: q.service.filter(|s| !s.is_empty()),
+        tag: q.tag.filter(|s| !s.is_empty()),
+        meta: match parse_meta_filter(q.meta.as_deref()) {
+            Ok(meta) => meta,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_meta_filter"),
+        },
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
-        q: None,
+        q: search,
         model: q.model.filter(|s| !s.is_empty()),
         has_error: parse_bool(q.has_error.as_deref()),
         min_duration_us,
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
         end_user: q.end_user.filter(|s| !s.is_empty()),
+        api_key: q.key.filter(|s| !s.is_empty()),
         since_us,
         until_us,
-        cursor: None,
-        sort: parse_sort(q.sort.as_deref()),
+        cursor,
+        sort,
         order: parse_order(q.order.as_deref()),
-        limit: MAX_TRACE_EXPORT,
+        limit: state.reader.trace_read_policy().export_max_rows,
     };
 
     let rows = match state.reader.list_traces(&claims.tenant_id, &filters).await {
@@ -5472,9 +6562,26 @@ async fn export_traces_handler(
             return error_response(StatusCode::BAD_GATEWAY, "trace export failed");
         }
     };
-    let traces = enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows).await;
+    let export_max_rows = state.reader.trace_read_policy().export_max_rows;
+    let truncated = rows.len() as u32 >= export_max_rows;
+    let next_cursor = if truncated {
+        rows.last().map(|r| {
+            let value = match filters.sort {
+                TraceSort::StartTime => r.start_time_us,
+                TraceSort::Duration => r.duration_us,
+                TraceSort::SpanCount => r.span_count as i64,
+                TraceSort::Errors => r.error_count as i64,
+                TraceSort::Cost => r.cost_micro_usd,
+            };
+            encode_cursor(value, &r.trace_id)
+        })
+    } else {
+        None
+    };
+    let traces =
+        enrich_traces_with_cost(state.reader.as_ref(), &claims.tenant_id, rows, &filters).await;
 
-    // OBS-23. The cap is UNCHANGED at MAX_TRACE_EXPORT; what changes is that hitting
+    // The seeded cap is disclosed when hit;
     // it is no longer silent. A short file that looks complete is the worst failure
     // shape for an evidence artifact — someone exports an incident window, gets
     // exactly 10,000 rows, and reasons about a set that was quietly cut.
@@ -5482,11 +6589,10 @@ async fn export_traces_handler(
     // Reported TWICE on purpose. The header is the machine-readable signal, but a
     // browser download discards response headers, so a human opening the CSV would
     // never see it. The terminal row is what survives into the file itself.
-    let truncated = traces.len() as u32 >= MAX_TRACE_EXPORT;
     if truncated {
         tracing::warn!(
             tenant_id = %claims.tenant_id,
-            cap = MAX_TRACE_EXPORT,
+            cap = export_max_rows,
             "trace export hit the row cap — response marked truncated"
         );
     }
@@ -5501,7 +6607,7 @@ async fn export_traces_handler(
         // client reads. The CSV branch below adds a terminal row instead, because its
         // consumer is a human opening a file in a spreadsheet, and a browser download
         // discards response headers entirely.
-        return (
+        let mut response = (
             StatusCode::OK,
             [
                 (
@@ -5514,14 +6620,17 @@ async fn export_traces_handler(
             Json(traces),
         )
             .into_response();
+        attach_export_cursor(&mut response, next_cursor.as_deref());
+        return response;
     }
     let mut csv = traces_to_csv(&traces);
     if truncated {
         csv.push_str(&format!(
-            "# TRUNCATED: this export stopped at the {MAX_TRACE_EXPORT}-row cap and is NOT complete. Narrow the filters (time range, model, error-only) and export again.\n"
+            "# TRUNCATED: this export stopped at the {export_max_rows}-row cap and is NOT complete. Resume with cursor={}. Rows may change while a live export is resumed.\n",
+            next_cursor.as_deref().unwrap_or("")
         ));
     }
-    (
+    let mut response = (
         StatusCode::OK,
         [
             (
@@ -5537,7 +6646,17 @@ async fn export_traces_handler(
         ],
         csv,
     )
-        .into_response()
+        .into_response();
+    attach_export_cursor(&mut response, next_cursor.as_deref());
+    response
+}
+
+fn attach_export_cursor(response: &mut Response, cursor: Option<&str>) {
+    if let Some(cursor) = cursor
+        && let Ok(value) = axum::http::HeaderValue::from_str(cursor)
+    {
+        response.headers_mut().insert(X_NEXT_CURSOR, value);
+    }
 }
 
 /// CSV-escape one field: quote it + double internal quotes iff it contains a
@@ -5609,7 +6728,7 @@ async fn list_trace_groups_handler(
     let Some(by) = parse_group_by(q.by.as_deref().unwrap_or("")) else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid group — expected by=model|operation|status",
+            "invalid group — expected by=model|operation|status|environment|release|service|user|tag",
         );
     };
     let since_us = match parse_rfc3339_micros(q.since.as_deref()) {
@@ -5624,8 +6743,25 @@ async fn list_trace_groups_handler(
         .min_latency_ms
         .filter(|ms| ms.is_finite() && *ms > 0.0)
         .map(|ms| (ms * 1000.0) as i64);
+    if q.repeated_tool == Some(true) && state.reader.agent_loop_policy().is_none() {
+        return error_response(StatusCode::BAD_GATEWAY, "loop policy unavailable");
+    }
     let filters = TraceListFilters {
+        rescued: q.rescued,
+        loop_policy: if q.repeated_tool == Some(true) {
+            state.reader.agent_loop_policy()
+        } else {
+            None
+        },
         issues,
+        environment: q.environment.filter(|s| !s.is_empty()),
+        release: q.release.filter(|s| !s.is_empty()),
+        service: q.service.filter(|s| !s.is_empty()),
+        tag: q.tag.filter(|s| !s.is_empty()),
+        meta: match parse_meta_filter(q.meta.as_deref()) {
+            Ok(meta) => meta,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid_meta_filter"),
+        },
         agent: q.agent.filter(|s| !s.is_empty()),
         model_family: q.model_family.filter(|s| !s.is_empty()),
         q: None,
@@ -5635,6 +6771,7 @@ async fn list_trace_groups_handler(
         signature_id: q.signature_id.filter(|s| !s.is_empty()),
         failover: parse_failover(q.failover.as_deref()),
         end_user: q.end_user.filter(|s| !s.is_empty()),
+        api_key: q.key.filter(|s| !s.is_empty()),
         since_us,
         until_us,
         cursor: None,
@@ -6068,7 +7205,7 @@ struct BreakdownWindow {
 #[derive(Debug, Serialize)]
 struct MetricBreakdownResponse {
     metric: &'static str,
-    by: &'static str,
+    by: String,
     rows: Vec<BreakdownRow>,
     window: BreakdownWindow,
 }
@@ -6091,14 +7228,13 @@ async fn metric_breakdown_handler(
     let Some(metric) = BreakdownMetric::parse(q.metric.as_deref()) else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid `metric` — expected one of: requests, errors, error_rate, p50_ms, p95_ms, \
-             input_tokens, output_tokens, cost_usd",
+            "invalid `metric` — expected one of: requests, errors, error_rate, p50_ms, p90_ms, p95_ms, p99_ms, input_tokens, output_tokens, cost_usd, output_tps_p50",
         );
     };
     let Some(by) = BreakdownBy::parse(q.by.as_deref()) else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid `by` — expected one of: model, provider, key, status, operation",
+            "invalid `by` — expected one of: model, provider, key, status, operation, user, tag, environment, release, service, meta:<key>",
         );
     };
     let since_secs = match parse_rfc3339_secs(q.since.as_deref()) {
@@ -6121,6 +7257,12 @@ async fn metric_breakdown_handler(
         MAX_WINDOW_SECS,
     );
     let filters = BreakdownFilters {
+        meta_key: q
+            .by
+            .as_deref()
+            .and_then(|s| s.strip_prefix("meta:"))
+            .map(str::to_owned),
+        min_generation_ms: state.reader.output_speed_min_generation_ms(),
         metric,
         by,
         since_us: served.since_secs.saturating_mul(1_000_000),
@@ -6145,7 +7287,7 @@ async fn metric_breakdown_handler(
     };
     let out = MetricBreakdownResponse {
         metric: metric.as_str(),
-        by: by.as_str(),
+        by: q.by.unwrap_or_else(|| by.as_str().to_owned()),
         rows,
         window: BreakdownWindow {
             since: iso(served.since_secs),
@@ -6169,7 +7311,7 @@ async fn cost_breakdown_handler(
     Query(q): Query<CostQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let claims = match authenticate(&headers).await {
+    let claims = match authenticate_spend(&headers).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -6178,7 +7320,7 @@ async fn cost_breakdown_handler(
     let Some(dimension) = CostDimension::parse(q.by.as_deref()) else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid `by` — expected one of: key, model, provider",
+            "invalid `by` — expected one of: key, model, provider, user, tag, environment, release, service, meta:<key>",
         );
     };
     let Some(scope) = CostScope::parse(q.scope.as_deref()) else {
@@ -6212,6 +7354,11 @@ async fn cost_breakdown_handler(
     // The echoed `window_hours` is the window ACTUALLY served.
     let hours = (served.width_secs() / 3600).max(1) as u32;
     let filters = CostFilters {
+        meta_key: q
+            .by
+            .as_deref()
+            .and_then(|s| s.strip_prefix("meta:"))
+            .map(str::to_owned),
         since_secs: since_secs.map(|_| served.since_secs),
         until_secs: until_secs.map(|_| served.until_secs),
         hours,
@@ -6248,7 +7395,7 @@ async fn cost_breakdown_handler(
     let truncated = (rows.len() as u64) < group_count;
     let out = CostBreakdownResponse {
         window_hours: hours,
-        by: dimension.as_str(),
+        by: q.by.unwrap_or_else(|| dimension.as_str().to_owned()),
         total_cost_usd,
         total_requests,
         priced_requests,
@@ -6298,7 +7445,66 @@ async fn cost_breakdown_handler(
 pub fn effective_settings_routes(state: crate::server::AppState) -> Router {
     Router::new()
         .route("/v1/gateway/settings", get(effective_settings_handler))
+        // OG-13: THIS tenant's credential breakers and the provider-wide tier.
+        .route("/v1/gateway/breakers", get(breakers_handler))
         .with_state(state)
+}
+
+/// `GET /v1/gateway/breakers` (`OG-13` §2 slice a): the caller's OWN credential breakers
+/// (`provider, region, label, state`) and the derived provider-wide state of each
+/// `(provider, region)` they touch. Never another tenant's credential; the tenant is
+/// `claims.tenant_id` only. Any recognised role (`view_settings`); a read, not audited.
+/// Process-local, "since gateway start" (one gateway per control plane, B-386).
+async fn breakers_handler(headers: HeaderMap) -> Response {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if auth.is_empty() {
+        return error_response(StatusCode::UNAUTHORIZED, "missing Authorization header");
+    }
+    let claims = match crate::auth::validate_authorization(auth).await {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, msg) = crate::auth::failure(&err);
+            return error_response(status, msg);
+        }
+    };
+    if !claims.can(crate::auth::capability::Capability::ViewSettings) {
+        return crate::key_routes::role_forbidden("viewer");
+    }
+    Json(breakers_body(
+        &crate::circuit_breaker::global_owner_snapshot(
+            Some(crate::circuit_breaker::OwnerTag::of(
+                claims.tenant_id.as_uuid(),
+            )),
+            crate::server::env_fallback_allowed(
+                crate::db::global_pool().is_some(),
+                crate::byok::master_key().is_some(),
+            ),
+        ),
+    ))
+    .into_response()
+}
+
+/// The wire shape of [`breakers_handler`]. Pure, so the JSON is asserted directly.
+fn breakers_body(snap: &crate::circuit_breaker::OwnerSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "credentials": snap.credentials.iter().map(|c| serde_json::json!({
+            "provider": c.provider,
+            "region": c.region,
+            "label": c.label,
+            "state": c.state.as_str(),
+        })).collect::<Vec<_>>(),
+        "providers": snap.providers.iter().map(|p| serde_json::json!({
+            "provider": p.provider,
+            "region": p.region,
+            "state": p.state.as_str(),
+            "open_credentials": p.open_credentials,
+            "open_owners": p.open_owners,
+        })).collect::<Vec<_>>(),
+        "since": "gateway_start",
+    })
 }
 async fn effective_settings_handler(
     State(state): State<crate::server::AppState>,
@@ -6356,15 +7562,137 @@ fn effective_settings(
         "routing":{"aliases":crate::server::config::alias_snapshot(),
             "native":crate::providers::NATIVE_PREFIXES.iter().map(|(provider,prefixes)| serde_json::json!({"provider":provider,"prefixes":prefixes})).collect::<Vec<_>>(),
             "catalog":catalog::providers().iter().map(|p| serde_json::json!({"provider":p.id,"prefixes":p.prefixes})).collect::<Vec<_>>()},
-        "failover":{"opt_in":true,"retries":retries.retries,"backoff_ms":retries.backoff_ms,"chain":chain}
+        "failover":{"opt_in":true,"retries":retries.retries,"backoff_ms":retries.backoff_ms,"chain":chain},
+        "output_speed":{"min_generation_ms":state.rate_card.load().policy.output_speed.min_generation_ms}
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct SpendSeriesQuery {
+    #[serde(default)]
+    granularity: crate::spend_spikes::Granularity,
+    since: Option<String>,
+    until: Option<String>,
+}
+async fn spend_series_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<SpendSeriesQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate_spend(&headers).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(policy) = state.reader.spend_policy() else {
+        return error_response(StatusCode::BAD_GATEWAY, "spend policy unavailable");
+    };
+    let since = match parse_rfc3339_secs(q.since.as_deref()) {
+        Ok(s) => s,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
+    };
+    let until = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(s) => s,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let until = until.unwrap_or(now).min(now);
+    if since.is_some_and(|s| s >= until || s < 0) || until <= 0 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid spend window");
+    }
+    let params = q.granularity.params(policy);
+    let (start, end, clamped) =
+        crate::spend_spikes::aligned_window(since, until, q.granularity, params);
+    let served = ServedWindow {
+        since_secs: start,
+        until_secs: end,
+        clamped,
+    };
+    let result = state
+        .reader
+        .spend_series(
+            &claims.tenant_id,
+            start - i64::from(params.baseline_buckets) * q.granularity.seconds(),
+            end,
+            q.granularity,
+        )
+        .await;
+    match result.and_then(|rows| {
+        crate::spend_spikes::build_series(rows, q.granularity, params, start, end, clamped)
+    }) {
+        Ok(series) => served.stamp(Json(series).into_response()),
+        Err(err) => {
+            tracing::warn!(error=%err,"spend series read failed");
+            error_response(StatusCode::BAD_GATEWAY, "spend series unavailable")
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SpendCausesQuery {
+    #[serde(default)]
+    granularity: crate::spend_spikes::Granularity,
+    #[serde(default)]
+    by: crate::spend_causes::Dimension,
+    bucket_start: String,
+}
+async fn spend_causes_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<SpendCausesQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate_spend(&headers).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(policy) = state.reader.spend_policy() else {
+        return error_response(StatusCode::BAD_GATEWAY, "spend policy unavailable");
+    };
+    let start = match parse_rfc3339_secs(Some(&q.bucket_start)) {
+        Ok(Some(s))
+            if s >= 0
+                && s <= chrono::Utc::now().timestamp()
+                && s % q.granularity.seconds() == 0 =>
+        {
+            s
+        }
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bucket_start must be an aligned UTC bucket",
+            );
+        }
+    };
+    let served = ServedWindow {
+        since_secs: start,
+        until_secs: start + q.granularity.seconds(),
+        clamped: false,
+    };
+    match state
+        .reader
+        .spend_causes(
+            &claims.tenant_id,
+            q.by,
+            start,
+            q.granularity,
+            q.granularity.params(policy),
+        )
+        .await
+    {
+        Ok(causes) => served.stamp(Json(causes).into_response()),
+        Err(err) => {
+            tracing::warn!(error=%err,"spend attribution failed");
+            error_response(StatusCode::BAD_GATEWAY, "spend attribution unavailable")
+        }
+    }
 }
 
 /// GET /v1/gateway/stats — per-provider router health for the authenticated
 /// tenant (request volume, error rate, latency p50/p95/p99, prompt-cache hits),
 /// a live aggregate over `spans`. Tenant id comes only from `Claims.tenant_id`.
-/// Failover + rate-limit counters are NOT in the trace store yet (logs only) —
-/// reported via the response's `uninstrumented` list, never a fabricated zero.
+/// Failover flags and dispatch-ledger rescues are read from spans. Pre-dispatch
+/// rate limits are counted by the live rejection registry.
+/// # Errors
+/// Fails CLOSED on auth/primary health reads; optional loop and rescue reads fail OPEN to null.
 #[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
 async fn gateway_stats_handler(
     State(state): State<TraceReadState>,
@@ -6421,29 +7749,72 @@ async fn gateway_stats_handler(
     // live per-tenant counters supply those numbers — process-lifetime, disclosed
     // as "since gateway start" by the surface.
     let rejections = state.rejections.snapshot(&claims.tenant_id);
-    // Live circuit-breaker states (global read handle; ADR-036). Breakers are
-    // per-(provider, region) and shared across tenants — upstream health, not
-    // tenant data — so this is a process-wide snapshot, collapsed to per-provider.
-    // Collapse regions to one state per provider, WORST-wins — a provider with
-    // one Open and one Closed region shows Open, never a healthy lie.
-    let mut breakers: std::collections::HashMap<String, crate::circuit_breaker::State> =
-        std::collections::HashMap::new();
-    for (provider, _region, state) in crate::circuit_breaker::global_snapshot() {
-        breakers
-            .entry(provider)
-            .and_modify(|s| {
-                if state.severity() > s.severity() {
-                    *s = state;
-                }
-            })
-            .or_insert(state);
+    // Live circuit-breaker states (global read handle; ADR-036 / OG-13), collapsed
+    // per provider, WORST-wins. Since OG-13 the breakers are per-CREDENTIAL, so this is
+    // THIS tenant's view: the derived provider-wide tier (upstream health, every tenant)
+    // plus the tenant's OWN credential breakers — never another tenant's Open key shown
+    // as a provider outage (which would also say something about that tenant).
+    let breakers = crate::circuit_breaker::global_view(
+        Some(crate::circuit_breaker::OwnerTag::of(
+            claims.tenant_id.as_uuid(),
+        )),
+        crate::server::env_fallback_allowed(
+            crate::db::global_pool().is_some(),
+            crate::byok::master_key().is_some(),
+        ),
+    );
+    let rescue_rows = match state
+        .reader
+        .rescue_summary(
+            &claims.tenant_id,
+            served.since_secs * 1_000_000,
+            served.until_secs * 1_000_000,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            // Fail OPEN: optional rescue evidence cannot take provider health down.
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::RescueReadFailed,
+            );
+            vec![]
+        }
+    };
+    let mut response = GatewayStatsResponse::from_rows(rows, hours, rejections, &breakers);
+    response.attempt_records_since = state.reader.attempt_records_since();
+    if let Some(total) = rescue_rows.iter().find(|r| r.overall != 0) {
+        response.requests_with_failed_attempt = Some(total.failed);
+        response.rescued_by_failover = Some(total.failover);
+        response.rescued_by_retry = Some(total.retry);
+        response.rescue_rate_pct =
+            (total.failed > 0).then(|| pct(total.failover + total.retry, total.failed));
+        response.rescue_added_ms_p50 = total.added_ms_p50.filter(|n| n.is_finite());
+        for provider in &mut response.providers {
+            provider.rescued_by_failover = Some(
+                rescue_rows
+                    .iter()
+                    .find(|r| r.overall == 0 && r.provider == provider.provider)
+                    .map_or(0, |r| r.failover),
+            );
+        }
     }
-    served.stamp(
-        Json(GatewayStatsResponse::from_rows(
-            rows, hours, rejections, &breakers,
-        ))
-        .into_response(),
-    )
+    response.agent_loops = state
+        .reader
+        .agent_loop_totals(
+            &claims.tenant_id,
+            served.since_secs * 1_000_000,
+            served.until_secs * 1_000_000,
+            &crate::agent_loops::LoopScope::default(),
+        )
+        .await
+        .inspect_err(|_| {
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::TraceIssueReadFailed,
+            );
+        })
+        .ok();
+    served.stamp(Json(response).into_response())
 }
 
 /// GET /v1/query/latency-breakdown — the honest latency SPLIT for the authenticated
@@ -6808,7 +8179,42 @@ async fn list_sessions_handler(
             return error_response(StatusCode::BAD_GATEWAY, "session read failed");
         }
     };
-    let sessions = rows.into_iter().map(SessionSummary::from).collect();
+    let scope = crate::agent_loops::LoopScope {
+        trace_ids: vec![],
+        session_ids: rows.iter().map(|r| r.session_id.clone()).collect(),
+    };
+    let loops = if rows.is_empty() {
+        None
+    } else {
+        state
+            .reader
+            .agent_loop_calls(
+                &claims.tenant_id,
+                served.since_secs * 1_000_000,
+                served.until_secs * 1_000_000,
+                &scope,
+            )
+            .await
+            .inspect_err(|_| {
+                tracelane_shared::degradation::note(
+                    tracelane_shared::degradation::Degradation::TraceIssueReadFailed,
+                );
+            })
+            .ok()
+    };
+    let sessions = rows
+        .into_iter()
+        .map(|row| {
+            let mut session = SessionSummary::from(row);
+            session.loop_calls = loops.as_ref().map_or(0, |d| {
+                d.iter()
+                    .find(|(id, _)| id == &session.session_id)
+                    .map_or(0, |(_, n)| u32::try_from(*n).unwrap_or(u32::MAX))
+            });
+            session.loops_available = loops.is_some();
+            session
+        })
+        .collect();
     served.stamp(Json(SessionListResponse { sessions }).into_response())
 }
 
@@ -6959,6 +8365,21 @@ async fn session_transcript_handler(
 /// Validate `Authorization: Bearer <jwt|tlane_*>` and return the claims, or an
 /// error `Response` (401). The tenant id is taken only from these claims.
 async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Response> {
+    authenticate_for(headers, false).await
+}
+
+/// OG-34: [`authenticate`] for a SPEND read (`/v1/costs`, `/v1/spend/*`) — the
+/// billing role reads spend, not recorded content, so these ask
+/// `Claims::allows_spend_read` (the `read` scope for a key, `view_spend` for a
+/// role) instead of the content gate.
+async fn authenticate_spend(headers: &HeaderMap) -> Result<crate::auth::Claims, Response> {
+    authenticate_for(headers, true).await
+}
+
+async fn authenticate_for(
+    headers: &HeaderMap,
+    spend: bool,
+) -> Result<crate::auth::Claims, Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -6982,9 +8403,15 @@ async fn authenticate(headers: &HeaderMap) -> Result<crate::auth::Claims, Respon
     // gate by construction — which is the point of the seam; a per-route check
     // is a list that drifts.
     //
-    // Legacy keys (`scope IS NULL`) and every JWT resolve to LegacyFullSurface
-    // and are unaffected.
-    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
+    // Legacy keys (`scope IS NULL`) resolve to LegacyFullSurface and are
+    // unaffected. OG-34: a WorkOS session's role caps `read` (`Claims::allows_scope`)
+    // — the billing role reads spend here, never recorded content.
+    let allowed = if spend {
+        claims.allows_spend_read()
+    } else {
+        claims.allows_scope(crate::auth::scope::Scope::Read)
+    };
+    if !allowed {
         tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope");
         return Err(error_response(
             StatusCode::FORBIDDEN,
@@ -7264,7 +8691,12 @@ mod obs23_truncation_tests {
     /// live. A silent bump here is exactly what the marker exists to prevent.
     #[test]
     fn export_cap_is_unchanged() {
-        assert_eq!(MAX_TRACE_EXPORT, 10_000);
+        assert_eq!(
+            crate::billing::rating::Policy::default()
+                .trace_reads
+                .export_max_rows,
+            10_000
+        );
     }
 
     /// A full-cap export must announce itself. The failure this closes is a file that
@@ -7276,11 +8708,17 @@ mod obs23_truncation_tests {
     #[test]
     fn at_cap_is_truncated_below_cap_is_not() {
         fn is_truncated(rows: usize) -> bool {
-            rows as u32 >= MAX_TRACE_EXPORT
+            rows as u32
+                >= crate::billing::rating::Policy::default()
+                    .trace_reads
+                    .export_max_rows
         }
         assert!(!is_truncated(0));
-        assert!(!is_truncated(MAX_TRACE_EXPORT as usize - 1));
-        assert!(is_truncated(MAX_TRACE_EXPORT as usize));
+        let cap = crate::billing::rating::Policy::default()
+            .trace_reads
+            .export_max_rows as usize;
+        assert!(!is_truncated(cap - 1));
+        assert!(is_truncated(cap));
     }
 
     /// The header alone is not enough: a browser download discards response headers,
@@ -7288,8 +8726,11 @@ mod obs23_truncation_tests {
     /// survives into the artifact, and it must name the cap and say what to do.
     #[test]
     fn csv_terminal_row_states_incompleteness_in_the_file() {
+        let cap = crate::billing::rating::Policy::default()
+            .trace_reads
+            .export_max_rows;
         let note = format!(
-            "# TRUNCATED: this export stopped at the {MAX_TRACE_EXPORT}-row cap and is NOT complete. \
+            "# TRUNCATED: this export stopped at the {cap}-row cap and is NOT complete. \
 Narrow the filters (time range, model, error-only) and export again.\n"
         );
         assert!(note.contains("NOT complete"));
@@ -7339,6 +8780,100 @@ mod obs01_search_tests {
     /// The whole point of OBS-01: the predicate must be a form the ngram index can
     /// serve. `multiSearchAny` on the RAW column is; anything wrapped in `lower()`
     /// is not, and would put the hot read path back on a full scan.
+    #[test]
+    fn cf2_m1_search_excludes_private_attributes_for_list_and_count() {
+        let filters = TraceListFilters {
+            q: Some("needle".into()),
+            ..Default::default()
+        };
+        for sql in [
+            build_trace_list_sql(&filters),
+            build_trace_count_sql(&filters),
+        ] {
+            assert!(
+                !sql.contains("multiSearchAny(attributes,"),
+                "raw fingerprints remain searchable: {sql}"
+            );
+            assert!(sql.contains("gen_ai_tool_call_arg_fp"));
+            assert!(sql.contains("tracelane_response_tool_arg_fps"));
+            let sub = sql.split("SELECT trace_id FROM spans").nth(1).unwrap();
+            assert!(sub.trim_start().starts_with("WHERE tenant_id = ?"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the already-installed ClickHouse 24.12 Docker image"]
+    fn cf2_m1_clickhouse_search_preserves_other_attributes() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let source = r#"(SELECT 'tenant' AS tenant_id, 'trace' AS trace_id, fromUnixTimestamp64Micro(toInt64(1)) AS start_time, 'root' AS name, '{"gen_ai_tool_call_arg_fp":"a3secret","tracelane_response_tool_arg_fps":["a3secret"],"other":"kept-value","nested":{"key":"nested-value"}}' AS attributes)"#;
+        for (needle, expected) in [
+            (r#"gen_ai_tool_call_arg_fp":"a3"#, "0"),
+            (r#"tracelane_response_tool_arg_fps":["a3"#, "0"),
+            ("a3secret", "0"),
+            ("kept-value", "1"),
+            ("nested-value", "1"),
+        ] {
+            // Execute the shared predicate used by both list and count, with an offline fixture.
+            let mut sql = String::from("SELECT count() FROM spans WHERE tenant_id = ?");
+            push_trace_filters(
+                &mut sql,
+                &TraceListFilters {
+                    q: Some(needle.into()),
+                    ..Default::default()
+                },
+            );
+            sql = sql.replace("FROM spans", &format!("FROM {source}"));
+            for value in ["tenant", "tenant", needle, needle, needle, needle] {
+                sql = sql.replacen('?', &format!("'{value}'"), 1);
+            }
+            sql = format!(
+                "WITH fromUnixTimestamp64Micro(toInt64(0)) AS w_since, fromUnixTimestamp64Micro(toInt64(2)) AS w_until {sql}"
+            );
+            let mut command = Command::new("timeout");
+            command.args(["--kill-after=1", "300", "docker"]);
+            if let Ok(container) = std::env::var("CF2_CLICKHOUSE_CONTAINER") {
+                // An already-created, disposable, network-disabled proof container.
+                command.args(["exec", "-i", &container, "clickhouse-local"]);
+            } else {
+                command.args([
+                    "run",
+                    "--rm",
+                    "--pull=never",
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "clickhouse-local",
+                    "-i",
+                    "clickhouse/clickhouse-server:24.12-alpine",
+                ]);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(sql.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expected,
+                "{needle}"
+            );
+        }
+    }
+
     #[test]
     fn search_sql_is_index_servable_and_tenant_scoped() {
         let sql = build_trace_list_sql(&TraceListFilters {
@@ -7406,6 +8941,69 @@ mod tests {
     use std::sync::Mutex;
 
     // ── Pure SQL-builder tests (no client, no env) ───────────────────────────
+
+    #[test]
+    fn spend_key_filter_is_tenant_bound_in_every_trace_reader() {
+        let f = TraceListFilters {
+            api_key: Some("key-a".into()),
+            ..Default::default()
+        };
+        for sql in [
+            build_trace_list_sql(&f),
+            build_trace_count_sql(&f),
+            build_trace_groups_sql(TraceGroupBy::Model, &f),
+        ] {
+            assert!(sql.contains("FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until AND api_key_id = ?"));
+            assert!(!sql.contains("key-a"));
+        }
+    }
+    #[tokio::test]
+    async fn spend_endpoints_validate_windows_and_fail_without_aggregate() {
+        let _g = DevAuthGuard::new();
+        let state = TraceReadState {
+            reader: Arc::new(MockTraceReader::new()),
+            rejections: test_rejections(),
+        };
+        let query = || {
+            Query(SpendSeriesQuery {
+                granularity: crate::spend_spikes::Granularity::Hour,
+                since: None,
+                until: None,
+            })
+        };
+        assert_eq!(
+            spend_series_handler(State(state.clone()), query(), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            spend_series_handler(State(state.clone()), query(), bearer_headers())
+                .await
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            spend_causes_handler(
+                State(state.clone()),
+                Query(SpendCausesQuery {
+                    by: crate::spend_causes::Dimension::Key,
+                    granularity: crate::spend_spikes::Granularity::Hour,
+                    bucket_start: "2026-01-01T00:00:01Z".into()
+                }),
+                bearer_headers()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            serde_json::from_str::<SpendCausesQuery>(
+                r#"{"by":"sql","bucket_start":"2026-01-01T00:00:00Z"}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn trace_list_sql_is_tenant_first_and_bound() {
@@ -7777,6 +9375,7 @@ mod tests {
         // CX-26 / B-525: `/v1/costs` was the one windowed builder this test's name
         // did not cover — it substituted a rolling `now() − hours` for the pair.
         let cost = build_cost_breakdown_sql(&CostFilters {
+            meta_key: None,
             since_secs: Some(1),
             until_secs: Some(2),
             hours: 24,
@@ -7797,6 +9396,7 @@ mod tests {
             "since must override hours: {cost}"
         );
         let rolling = build_cost_breakdown_sql(&CostFilters {
+            meta_key: None,
             since_secs: None,
             until_secs: None,
             hours: 24,
@@ -8521,10 +10121,13 @@ mod tests {
                 .with_url(server.uri())
                 .with_compression(clickhouse::Compression::None),
         );
-        let app = routes().with_state(TraceReadState {
-            reader: Arc::new(reader),
-            rejections: test_rejections(),
-        });
+        let app = routes(
+            TraceReadState {
+                reader: Arc::new(reader),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
         let request = || {
             axum::http::Request::builder()
                 .uri("/v1/traces/issues/summary?tenant_id=foreign")
@@ -8613,7 +10216,16 @@ mod tests {
             for ids in [
                 None,
                 Some("".into()),
-                Some(vec!["id"; MAX_TRACE_LIMIT as usize + 1].join(",")),
+                Some(
+                    vec![
+                        "id";
+                        crate::billing::rating::Policy::default()
+                            .trace_reads
+                            .list_max_page as usize
+                            + 1
+                    ]
+                    .join(","),
+                ),
             ] {
                 let r = trace_issue_rollup_handler(
                     State(state.clone()),
@@ -9255,6 +10867,12 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
     /// Records the tenant id every method is called with so tests can assert
     /// the handler always passes `Claims.tenant_id` (never a path/query value).
     struct MockTraceReader {
+        trace_read_policy_override: Option<crate::billing::rating::TraceReadPolicy>,
+        read_rpm: Option<u32>,
+        rescue_fixture: Vec<crate::rescue::RescueRow>,
+        rescue_read_fails: bool,
+        loop_fixture: Option<crate::agent_loops::LoopData>,
+        loop_detail_reads: std::sync::atomic::AtomicUsize,
         traces: Vec<TraceSummaryRow>,
         spans: Vec<SpanRow>,
         slo: Vec<SloRow>,
@@ -9289,6 +10907,15 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
     impl MockTraceReader {
         fn new() -> Self {
             Self {
+                trace_read_policy_override: None,
+                read_rpm: crate::entitlement_cache::ResolvedEntitlements::deny_all().rate_limit_rpm,
+                rescue_read_fails: false,
+                rescue_fixture: vec![crate::rescue::RescueRow {
+                    overall: 1,
+                    ..Default::default()
+                }],
+                loop_fixture: None,
+                loop_detail_reads: std::sync::atomic::AtomicUsize::new(0),
                 traces: Vec::new(),
                 spans: Vec::new(),
                 slo: Vec::new(),
@@ -9320,6 +10947,63 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     #[async_trait::async_trait]
     impl TraceReader for MockTraceReader {
+        fn trace_read_policy(&self) -> crate::billing::rating::TraceReadPolicy {
+            self.trace_read_policy_override
+                .unwrap_or(crate::billing::rating::Policy::default().trace_reads)
+        }
+        async fn trace_read_rpm(&self, _tenant: &TenantId) -> Result<Option<u32>> {
+            self.read_rpm
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("planted missing policy"))
+        }
+        async fn rescue_summary(
+            &self,
+            _tenant: &TenantId,
+            _since: i64,
+            _until: i64,
+        ) -> Result<Vec<crate::rescue::RescueRow>> {
+            anyhow::ensure!(!self.rescue_read_fails, "planted rescue read failure");
+            Ok(self.rescue_fixture.clone())
+        }
+        async fn trace_rescues(
+            &self,
+            _tenant: &TenantId,
+            _ids: &[String],
+            _since: i64,
+            _until: i64,
+        ) -> Result<Vec<crate::rescue::TraceRescueRow>> {
+            Ok(vec![])
+        }
+
+        async fn agent_loop_totals(
+            &self,
+            _tenant: &TenantId,
+            _since: i64,
+            _until: i64,
+            _scope: &crate::agent_loops::LoopScope,
+        ) -> Result<crate::agent_loops::LoopTotals> {
+            self.loop_fixture
+                .as_ref()
+                .map(|d| d.totals())
+                .context("loop totals unavailable")
+        }
+        async fn agent_loop_data(
+            &self,
+            tenant: &TenantId,
+            _since: Option<i64>,
+            _until: Option<i64>,
+            _scope: &crate::agent_loops::LoopScope,
+        ) -> Result<crate::agent_loops::LoopData> {
+            self.loop_detail_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let data = self
+                .loop_fixture
+                .clone()
+                .context("loop fixture unavailable")?;
+            self.seen_tenant.lock().unwrap().push(tenant.to_string());
+            Ok(data)
+        }
+
         async fn generation_issue_summary(
             &self,
             _tenant_id: &TenantId,
@@ -9333,6 +11017,20 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         ) -> Result<Vec<TraceSummaryRow>> {
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
             self.seen_trace_filters.lock().unwrap().push(f.clone());
+            if self.trace_read_policy_override.is_some() {
+                let rows = self
+                    .traces
+                    .iter()
+                    .filter(|r| {
+                        f.cursor
+                            .as_ref()
+                            .is_none_or(|(value, id)| (r.start_time_us, &r.trace_id) < (*value, id))
+                    })
+                    .take(f.limit as usize)
+                    .cloned()
+                    .collect();
+                return Ok(rows);
+            }
             Ok(self.traces.clone())
         }
         async fn trace_cost_rollup(
@@ -9432,7 +11130,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
             // Records the tenant so the isolation assertion below can prove the
             // handler binds `Claims.tenant_id` and never a query parameter.
             self.seen_tenant.lock().unwrap().push(tenant_id.to_string());
-            self.seen_cost_filters.lock().unwrap().push(*f);
+            self.seen_cost_filters.lock().unwrap().push(f.clone());
             Ok(self.costs.clone())
         }
         async fn latency_breakdown(
@@ -9537,6 +11235,8 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
             error_count: 0,
             intervention: 0,
             model: "claude-sonnet-4-6".into(),
+            cost_micro_usd: 0,
+            priced_spans_in_window: 0,
         }
     }
 
@@ -9616,6 +11316,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     fn cost_filters(dim: CostDimension) -> CostFilters {
         CostFilters {
+            meta_key: None,
             since_secs: None,
             until_secs: None,
             hours: 24,
@@ -9627,6 +11328,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     fn cost_filters_scoped(dim: CostDimension, scope: CostScope) -> CostFilters {
         CostFilters {
+            meta_key: None,
             since_secs: None,
             until_secs: None,
             hours: 24,
@@ -10022,6 +11724,38 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         assert!(resp.providers.is_empty());
         assert!(resp.error_rate_pct.is_finite());
         assert_eq!(resp.open_breakers, 0);
+    }
+
+    /// `OG-13` proof 9 (route half): `GET /v1/gateway/breakers` renders the caller's own
+    /// credentials by LABEL — no fingerprint, no tenant id — and the provider-wide tier
+    /// with its distinct-open count.
+    #[test]
+    fn og13_breakers_body_shows_labels_and_the_provider_tier_never_an_identifier() {
+        use crate::circuit_breaker::{CredentialView, OwnerSnapshot, ProviderView, State};
+        let snap = OwnerSnapshot {
+            credentials: vec![CredentialView {
+                provider: "openai".into(),
+                region: "default".into(),
+                label: "team-a".into(),
+                state: State::Open,
+            }],
+            providers: vec![ProviderView {
+                provider: "openai".into(),
+                region: "default".into(),
+                state: State::Closed,
+                open_credentials: 1,
+                open_owners: 1,
+            }],
+        };
+        let body = breakers_body(&snap);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "credentials": [{"provider":"openai","region":"default","label":"team-a","state":"open"}],
+                "providers": [{"provider":"openai","region":"default","state":"closed","open_credentials":1,"open_owners":1}],
+                "since": "gateway_start",
+            })
+        );
     }
 
     #[test]
@@ -10644,6 +12378,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -10687,6 +12429,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 trace_id: "t1".into(),
                 cost_usd: 0.004896,
                 total_tokens: 1224,
+                priced_spans: 1,
             }],
             ..MockTraceReader::new()
         });
@@ -10696,6 +12439,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -10727,6 +12478,49 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         assert_eq!(traces[1]["trace_id"], "t2");
         assert_eq!(traces[1]["cost_usd"].as_f64().unwrap(), 0.0);
         assert_eq!(traces[1]["total_tokens"].as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cost_sort_displays_the_windowed_sort_key_and_unknown_cost() {
+        let _g = DevAuthGuard::new();
+        let mut priced = trace_row("priced", 100);
+        priced.cost_micro_usd = 1_000;
+        priced.priced_spans_in_window = 1;
+        let reader = Arc::new(MockTraceReader {
+            traces: vec![priced, trace_row("outside-window", 90)],
+            trace_costs: vec![TraceCostRow {
+                trace_id: "outside-window".into(),
+                cost_usd: 9.0,
+                total_tokens: 1,
+                priced_spans: 1,
+            }],
+            ..MockTraceReader::new()
+        });
+        let query = serde_json::from_value::<TraceListQuery>(serde_json::json!({
+            "sort":"cost", "limit":2, "include_issues":false
+        }))
+        .unwrap();
+        let response = list_traces_handler(
+            State(TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            }),
+            Query(query),
+            bearer_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["traces"][0]["cost_usd"], 0.001);
+        assert_eq!(value["traces"][0]["cost_usd_present"], true);
+        assert_eq!(value["traces"][1]["cost_usd"], 0.0);
+        assert_eq!(value["traces"][1]["cost_usd_present"], false);
+        assert_eq!(
+            decode_cursor(value["next_cursor"].as_str().unwrap())
+                .unwrap()
+                .0,
+            0
+        );
     }
 
     #[tokio::test]
@@ -10783,6 +12577,19 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         assert_eq!(v["anchored"], false);
     }
 
+    #[test]
+    fn trace_group_and_breakdown_expose_exact_p90_and_p99() {
+        let sql = build_trace_groups_sql(TraceGroupBy::Model, &TraceListFilters::default());
+        for percentile in ["0.5", "0.9", "0.95", "0.99"] {
+            assert!(
+                sql.contains(&format!("quantileExact({percentile})(duration_us)")),
+                "missing {percentile}"
+            );
+        }
+        assert!(BreakdownMetric::parse(Some("p90_ms")).is_some());
+        assert!(BreakdownMetric::parse(Some("p99_ms")).is_some());
+    }
+
     #[tokio::test]
     async fn export_traces_csv_has_header_and_rows() {
         let _g = DevAuthGuard::new();
@@ -10796,10 +12603,20 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceExportQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 issue: None,
                 agent: None,
                 model_family: None,
                 format: Some("csv".into()),
+                q: None,
+                cursor: None,
                 model: None,
                 has_error: None,
                 min_latency_ms: None,
@@ -10844,6 +12661,126 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
     }
 
     #[tokio::test]
+    async fn export_search_and_cursor_are_parsed_before_the_read() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader::new());
+        let app = routes(
+            TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let req = axum::http::Request::builder()
+            .uri("/v1/traces/export?q=needle&cursor=90%3At2&format=json")
+            .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = reader.seen_trace_filters.lock().unwrap();
+        assert_eq!(seen[0].q.as_deref(), Some("needle"));
+        assert_eq!(seen[0].cursor, Some((90, "t2".into())));
+    }
+
+    #[tokio::test]
+    async fn export_rejects_short_search_and_malformed_cursor_before_reading() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader::new());
+        let app = routes(
+            TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        for uri in ["/v1/traces/export?q=abc", "/v1/traces/export?cursor=bad"] {
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(reader.seen_trace_filters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_continuation_walks_the_same_bounded_set_without_duplicates() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        let mut policy = crate::billing::rating::Policy::default().trace_reads;
+        policy.export_max_rows = 2;
+        let reader = Arc::new(MockTraceReader {
+            trace_read_policy_override: Some(policy),
+            traces: vec![
+                trace_row("t1", 100),
+                trace_row("t2", 90),
+                trace_row("t3", 80),
+            ],
+            ..MockTraceReader::new()
+        });
+        let app = routes(
+            TraceReadState {
+                reader,
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let request = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let first = app
+            .clone()
+            .oneshot(request("/v1/traces/export?format=json"))
+            .await
+            .unwrap();
+        assert_eq!(first.headers().get(X_TRUNCATED).unwrap(), "true");
+        assert_eq!(first.headers().get(X_ROW_COUNT).unwrap(), "2");
+        let cursor = first
+            .headers()
+            .get(X_NEXT_CURSOR)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(cursor, "90:t2");
+        let first_rows = body_json(first).await;
+        let second = app
+            .clone()
+            .oneshot(request(&format!(
+                "/v1/traces/export?format=json&cursor={cursor}"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(second.headers().get(X_TRUNCATED).unwrap(), "false");
+        assert!(second.headers().get(X_NEXT_CURSOR).is_none());
+        let second_rows = body_json(second).await;
+        let ids = first_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second_rows.as_array().unwrap())
+            .map(|r| r["trace_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["t1", "t2", "t3"]);
+        let csv = app
+            .clone()
+            .oneshot(request("/v1/traces/export?format=csv"))
+            .await
+            .unwrap();
+        assert_eq!(csv.headers().get(X_NEXT_CURSOR).unwrap(), "90:t2");
+        assert!(body_text(csv).await.contains("Resume with cursor=90:t2"));
+    }
+
+    #[tokio::test]
     async fn export_traces_json_is_an_attachment() {
         let _g = DevAuthGuard::new();
         let reader = Arc::new(MockTraceReader {
@@ -10856,10 +12793,20 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceExportQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 issue: None,
                 agent: None,
                 model_family: None,
                 format: Some("json".into()),
+                q: None,
+                cursor: None,
                 model: None,
                 has_error: None,
                 min_latency_ms: None,
@@ -10997,10 +12944,110 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         });
         assert!(sql.contains("toUnixTimestamp64Micro(st_min) > ?"));
         assert!(sql.contains("trace_id > ?"));
+
+        let sql = build_trace_list_sql(&TraceListFilters {
+            sort: TraceSort::Errors,
+            cursor: Some((2, "t".into())),
+            ..Default::default()
+        });
+        assert!(sql.contains("ORDER BY error_count DESC, trace_id DESC"));
+        assert!(sql.contains("error_count < ?"));
+        let sql = build_trace_list_sql(&TraceListFilters {
+            sort: TraceSort::Cost,
+            cursor: Some((42, "t".into())),
+            ..Default::default()
+        });
+        assert!(sql.contains("FROM spans FINAL WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until"));
+        assert!(sql.contains("ORDER BY cost_micro_usd DESC, trace_id DESC"));
+        assert!(sql.contains("cost_by_trace.cost_micro_usd, toInt64(0)) < ?"));
+        assert!(sql.contains("AS priced_spans_in_window"));
+    }
+
+    #[test]
+    fn cost_sort_window_uses_seeded_ceiling() {
+        let hour = 3_600_000_000_i64;
+        assert!(cost_sort_window(TraceSort::Cost, Some(0), Some(168 * hour), 168).is_ok());
+        let rejected = cost_sort_window(TraceSort::Cost, Some(0), Some(169 * hour), 168)
+            .expect_err("too wide");
+        assert_eq!(rejected, 168);
+        assert!(cost_sort_window(TraceSort::Errors, Some(0), Some(169 * hour), 168).is_ok());
+    }
+
+    #[test]
+    fn trace_list_text_params_are_bound_not_interpolated() {
+        const ATTACK: &str = "x' OR tenant_id != ? --";
+        let variants = [
+            (
+                "model",
+                TraceListFilters {
+                    model: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "q",
+                TraceListFilters {
+                    q: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "signature_id",
+                TraceListFilters {
+                    signature_id: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "end_user",
+                TraceListFilters {
+                    end_user: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api_key",
+                TraceListFilters {
+                    api_key: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "agent",
+                TraceListFilters {
+                    agent: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "model_family",
+                TraceListFilters {
+                    model_family: Some(ATTACK.into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cursor",
+                TraceListFilters {
+                    cursor: Some((3, ATTACK.into())),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (param, filter) in variants {
+            let sql = build_trace_list_sql(&filter);
+            assert!(!sql.contains(ATTACK), "{param} entered SQL");
+            assert!(
+                sql.contains("WHERE tenant_id = ?"),
+                "{param} lost tenant bound"
+            );
+        }
     }
 
     #[test]
     fn parse_sort_and_order_allowlist() {
+        assert_eq!(parse_sort(Some("cost")), TraceSort::Cost);
+        assert_eq!(parse_sort(Some("errors")), TraceSort::Errors);
         assert_eq!(parse_sort(Some("duration")), TraceSort::Duration);
         assert_eq!(parse_sort(Some("start_time")), TraceSort::StartTime);
         assert_eq!(parse_sort(Some("bogus")), TraceSort::StartTime); // default
@@ -11055,7 +13102,10 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 trace_count: 42,
                 error_traces: 3,
                 avg_duration_us: 1200.0,
+                p50_duration_us: 900.0,
+                p90_duration_us: 2500.0,
                 p95_duration_us: 3400.0,
+                p99_duration_us: 3800.0,
             }],
             ..MockTraceReader::new()
         });
@@ -11065,6 +13115,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceGroupsQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 issue: None,
                 agent: None,
                 model_family: None,
@@ -11086,6 +13144,10 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let v = body_json(resp).await;
         assert_eq!(v[0]["group_key"], "gpt-4o");
         assert_eq!(v[0]["trace_count"], 42);
+        assert_eq!(v[0]["p50_duration_us"], 900.0);
+        assert_eq!(v[0]["p90_duration_us"], 2500.0);
+        assert_eq!(v[0]["p95_duration_us"], 3400.0);
+        assert_eq!(v[0]["p99_duration_us"], 3800.0);
 
         // Unknown `by` → 400 (grouping has no default).
         let resp = list_trace_groups_handler(
@@ -11094,6 +13156,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 rejections: test_rejections(),
             }),
             Query(TraceGroupsQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 issue: None,
                 agent: None,
                 model_family: None,
@@ -11128,6 +13198,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -11288,6 +13366,26 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
     }
 
     #[test]
+    fn obs59_span_detail_exposes_usage_and_recorder_caps() {
+        let mut span = span_row("llm");
+        span.attributes = serde_json::json!({
+            "gen_ai_request_model": "claude-sonnet-4-6",
+            "gen_ai_usage_input_tokens": 1234,
+            "gen_ai_usage_output_tokens": 57,
+            "gen_ai_usage_cache_read_input_tokens": 300,
+            "tracelane_usage_input_includes_cache": false,
+            "tracelane_usage_cost_origin": "computed",
+            "gen_ai_usage_cost": 0.00381
+        })
+        .to_string();
+        let detail = serde_json::to_value(SpanResponse::from(span)).unwrap();
+        assert_eq!(detail["usage"]["buckets"]["uncached_input"], 1234);
+        assert_eq!(detail["usage"]["convention"], "exclusive");
+        assert_eq!(detail["caps"]["tool_names"], 32);
+        assert_eq!(detail["caps"]["logprob_tokens"], 2048);
+    }
+
+    #[test]
     fn generation_signal_details_exchange_sql_keeps_tenant_first_and_reads_span_status() {
         let sql = build_session_exchange_sql(2);
         assert!(sql.starts_with("SELECT trace_id, span_id, attributes, status_code FROM spans FINAL WHERE tenant_id = ? AND trace_id IN (?, ?)"), "{sql}");
@@ -11383,6 +13481,632 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         assert_eq!(v.as_array().unwrap().len(), 1);
     }
 
+    #[test]
+    fn rescue_filters_are_tenant_scoped_and_reject_unknown_values() {
+        for kind in [
+            crate::rescue::RescueFilter::Any,
+            crate::rescue::RescueFilter::Failover,
+            crate::rescue::RescueFilter::Retry,
+        ] {
+            let f = TraceListFilters {
+                rescued: Some(kind),
+                ..Default::default()
+            };
+            for sql in [
+                build_trace_list_sql(&f),
+                build_trace_count_sql(&f),
+                build_trace_groups_sql(TraceGroupBy::Model, &f),
+            ] {
+                assert!(sql.contains(
+                    "WHERE tenant_id = ? AND start_time >= w_since AND start_time <= w_until"
+                ));
+                assert!(sql.contains(&kind.predicate()));
+                assert!(!sql.contains("tracelane_failover_activated"));
+            }
+        }
+        assert!(serde_json::from_str::<TraceListQuery>(r#"{"rescued":"maybe"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn cf_m2_rescue_errors_and_empty_rows_preserve_provider_health() {
+        let _g = DevAuthGuard::new();
+        for fails in [false, true] {
+            let reader = Arc::new(MockTraceReader {
+                gateway: vec![gw_row("anthropic", 3, 0, 0)],
+                rescue_fixture: vec![],
+                rescue_read_fails: fails,
+                ..MockTraceReader::new()
+            });
+            let response = gateway_stats_handler(
+                State(TraceReadState {
+                    reader,
+                    rejections: test_rejections(),
+                }),
+                Query(GatewayStatsQuery {
+                    hours: Some(24),
+                    since: None,
+                    until: None,
+                }),
+                bearer_headers(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "optional rescue evidence must not break provider health"
+            );
+            let body = body_json(response).await;
+            assert_eq!(body["providers"][0]["provider"], "anthropic");
+            for key in [
+                "requests_with_failed_attempt",
+                "rescued_by_failover",
+                "rescued_by_retry",
+                "rescue_rate_pct",
+                "rescue_added_ms_p50",
+            ] {
+                assert!(body[key].is_null(), "{key} must be unknown");
+            }
+            assert!(body["providers"][0]["rescued_by_failover"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn cf2_low_failed_rescue_read_has_its_own_degradation() {
+        let _g = DevAuthGuard::new();
+        let count = || {
+            tracelane_shared::degradation::snapshot()
+                .iter()
+                .find(|s| s.kind == "rescue_read_failed")
+                .map_or(0, |s| s.count)
+        };
+        let before = count();
+        let response = gateway_stats_handler(
+            State(TraceReadState {
+                reader: Arc::new(MockTraceReader {
+                    rescue_read_fails: true,
+                    ..MockTraceReader::new()
+                }),
+                rejections: test_rejections(),
+            }),
+            Query(GatewayStatsQuery {
+                hours: Some(24),
+                since: None,
+                until: None,
+            }),
+            bearer_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            count() > before,
+            "failed rescue read must record rescue_read_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cf2_m2_read_rpm_resolves_each_tenant_entitlement() {
+        use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json")).unwrap();
+        let plans = seed["plans"].as_object().unwrap();
+        for plan in plans.values() {
+            let rpm = plan["rate_limit_rpm"].as_u64().map(|v| v as u32);
+            let cache = EntitlementCache::new(Arc::new(move |_| {
+                Box::pin(async move {
+                    let mut ent = ResolvedEntitlements::deny_all();
+                    ent.rate_limit_rpm = rpm;
+                    Ok(ent)
+                })
+            }));
+            let reader = ClickHouseTraceReader::new(ClickhouseClient::default())
+                .with_entitlements(Some(Arc::new(cache)), Some(60));
+            assert_eq!(
+                reader
+                    .trace_read_rpm(&TenantId::from_jwt_claim(uuid::Uuid::from_u128(1)))
+                    .await
+                    .unwrap(),
+                rpm,
+                "plan {plan}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cf3_self_host_no_control_plane_reads_are_unlimited() {
+        let reader =
+            ClickHouseTraceReader::new(ClickhouseClient::default()).with_entitlements(None, None);
+        assert_eq!(
+            reader
+                .trace_read_rpm(&TenantId::from_jwt_claim(uuid::Uuid::from_u128(1)))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cf3_hosted_poolless_reads_are_restricted() {
+        let reader = ClickHouseTraceReader::new(ClickhouseClient::default())
+            .with_entitlements(None, Some(60));
+        assert_eq!(
+            reader
+                .trace_read_rpm(&TenantId::from_jwt_claim(uuid::Uuid::from_u128(1)))
+                .await
+                .unwrap(),
+            Some(60)
+        );
+    }
+
+    fn cf3_limit_probe(reader: Arc<dyn TraceReader>) -> Router {
+        Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                (
+                    TraceReadState {
+                        reader,
+                        rejections: test_rejections(),
+                    },
+                    Arc::new(crate::rate_limiter::RateLimiter::new()),
+                    Arc::new(crate::rate_limiter::RateLimiter::new()),
+                ),
+                trace_read_limit,
+            ))
+    }
+
+    fn cf3_probe_request() -> axum::extract::Request {
+        axum::http::Request::builder()
+            .uri("/")
+            .header("authorization", "Bearer test")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cf3_key_caps_and_explicit_unlimited_plan() {
+        use crate::entitlement_cache::{EntitlementCache, ResolvedEntitlements};
+        use tower::ServiceExt;
+        for (plan_rpm, key_rpm, allowed, unlimited) in [
+            (Some(2), Some(1), 1, false),
+            (Some(2), Some(100), 2, false),
+            (Some(2), None, 2, false),
+            (None, Some(1), 1, false),
+            (None, None, 200, true),
+        ] {
+            let cache = EntitlementCache::new(Arc::new(move |_| {
+                Box::pin(async move {
+                    let mut ent = ResolvedEntitlements::deny_all();
+                    ent.plan_lookup_key = if plan_rpm.is_none() {
+                        "enterprise_v1"
+                    } else {
+                        "free_v1"
+                    }
+                    .into();
+                    ent.rate_limit_rpm = plan_rpm;
+                    Ok(ent)
+                })
+            }));
+            let reader = ClickHouseTraceReader::new(ClickhouseClient::default())
+                .with_entitlements(Some(Arc::new(cache)), Some(60));
+            let app = cf3_limit_probe(Arc::new(reader));
+            let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+            claims.rate_limit_rpm = key_rpm;
+            let _guard = crate::auth::test_claims::Guard::set(claims);
+            for _ in 0..allowed {
+                assert_eq!(
+                    app.clone()
+                        .oneshot(cf3_probe_request())
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::OK
+                );
+            }
+            let last = app.oneshot(cf3_probe_request()).await.unwrap();
+            assert_eq!(
+                last.status(),
+                if unlimited {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cf3_multiplier_reads_live_cached_policy_and_missing_is_closed() {
+        use tower::ServiceExt;
+        let mut card = crate::billing::RateCard::unavailable();
+        card.policy.trace_reads_tenant_key_multiplier = Some(2);
+        let rate_card = Arc::new(arc_swap::ArcSwap::from_pointee(card));
+        let reader = ClickHouseTraceReader::new(ClickhouseClient::default())
+            .with_entitlements(None, Some(2))
+            .with_rate_card(rate_card.clone());
+        let app = cf3_limit_probe(Arc::new(reader));
+        for i in 0..5 {
+            let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+            claims.sub = format!("apikey:key-{i}");
+            let _guard = crate::auth::test_claims::Guard::set(claims);
+            assert_eq!(
+                app.clone()
+                    .oneshot(cf3_probe_request())
+                    .await
+                    .unwrap()
+                    .status(),
+                if i < 4 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+        for multiplier in [None, Some(0)] {
+            let mut card = (**rate_card.load()).clone();
+            card.policy.trace_reads_tenant_key_multiplier = multiplier;
+            rate_card.store(Arc::new(card));
+            let _guard = crate::auth::test_claims::Guard::set(crate::auth::dev_stub_claims(
+                crate::auth::AuthMethod::ApiKey,
+            ));
+            assert_eq!(
+                app.clone()
+                    .oneshot(cf3_probe_request())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cf3_failed_entitlement_resolve_is_finite() {
+        let cache = crate::entitlement_cache::EntitlementCache::new(Arc::new(|_| {
+            Box::pin(async { anyhow::bail!("planted control-plane failure") })
+        }));
+        let reader = ClickHouseTraceReader::new(ClickhouseClient::default())
+            .with_entitlements(Some(Arc::new(cache)), None);
+        assert_eq!(
+            reader
+                .trace_read_rpm(&TenantId::from_jwt_claim(uuid::Uuid::from_u128(1)))
+                .await
+                .unwrap(),
+            Some(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn cf3_rotating_keys_hits_tenant_ceiling() {
+        use tower::ServiceExt;
+        let reader = Arc::new(MockTraceReader {
+            read_rpm: Some(2),
+            ..MockTraceReader::new()
+        });
+        let app = routes(
+            TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/traces/count")
+                .header("authorization", "Bearer test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for i in 0..6 {
+            let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+            claims.sub = format!("apikey:key-{i}");
+            let _guard = crate::auth::test_claims::Guard::set(claims);
+            assert_eq!(
+                app.clone().oneshot(request()).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        claims.sub = "apikey:fresh-key".into();
+        let before = reader.seen_tenant.lock().unwrap().len();
+        {
+            let _guard = crate::auth::test_claims::Guard::set(claims.clone());
+            let denied = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(denied.headers().contains_key("retry-after"));
+        }
+        assert_eq!(reader.seen_tenant.lock().unwrap().len(), before);
+        // Exhausting this tenant's keys cannot spend another tenant's allowance.
+        claims.tenant_id = TenantId::from_jwt_claim(uuid::Uuid::from_u128(2));
+        {
+            let _guard = crate::auth::test_claims::Guard::set(claims);
+            assert_eq!(
+                app.clone().oneshot(request()).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        // The dashboard keeps its separate tenant session bucket.
+        let _guard = crate::auth::test_claims::Guard::set(crate::auth::dev_stub_claims(
+            crate::auth::AuthMethod::JwtBearer,
+        ));
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn cf2_m2_api_keys_and_sessions_have_independent_read_buckets() {
+        use tower::ServiceExt;
+        let app = routes(
+            TraceReadState {
+                reader: Arc::new(MockTraceReader {
+                    read_rpm: Some(2),
+                    ..MockTraceReader::new()
+                }),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/traces/count")
+                .header("authorization", "Bearer test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for (method, sub) in [
+            (crate::auth::AuthMethod::ApiKey, "apikey:key-a"),
+            (crate::auth::AuthMethod::JwtBearer, "user-a"),
+            (crate::auth::AuthMethod::ApiKey, "apikey:key-b"),
+        ] {
+            let mut claims = crate::auth::dev_stub_claims(method);
+            claims.sub = sub.into();
+            let _guard = crate::auth::test_claims::Guard::set(claims);
+            for _ in 0..2 {
+                assert_eq!(
+                    app.clone().oneshot(request()).await.unwrap().status(),
+                    StatusCode::OK,
+                    "{sub}"
+                );
+            }
+            let denied = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS, "{sub}");
+            assert!(denied.headers().contains_key("retry-after"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cf_m3_missing_read_policy_fails_closed_before_storage() {
+        use tower::ServiceExt;
+        let _claims = crate::auth::test_claims::Guard::set(crate::auth::dev_stub_claims(
+            crate::auth::AuthMethod::ApiKey,
+        ));
+        let reader = Arc::new(MockTraceReader {
+            read_rpm: None,
+            ..MockTraceReader::new()
+        });
+        let app = routes(
+            TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let req = axum::http::Request::builder()
+            .uri("/v1/traces/count")
+            .header("authorization", "Bearer test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(reader.seen_tenant.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cf_m3_trace_router_limits_reads_per_tenant() {
+        use tower::ServiceExt;
+        let claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
+        let guard = crate::auth::test_claims::Guard::set(claims.clone());
+        let app = routes(
+            TraceReadState {
+                reader: Arc::new(MockTraceReader::new()),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json")).unwrap();
+        let rpm = seed["plans"]["free_v1"]["rate_limit_rpm"]
+            .as_u64()
+            .unwrap_or(1);
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/traces/count")
+                .header("authorization", "Bearer test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for _ in 0..rpm {
+            assert_eq!(
+                app.clone().oneshot(request()).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        let denied = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            denied
+                .headers()
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+                > 0
+        );
+        drop(guard);
+        let _other = crate::auth::test_claims::Guard::set(crate::auth::Claims {
+            tenant_id: TenantId::from_jwt_claim(uuid::Uuid::from_u128(2)),
+            ..claims
+        });
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn rescue_stats_report_rate_latency_and_serving_provider() {
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader {
+            gateway: vec![gw_row("anthropic", 3, 0, 0)],
+            rescue_fixture: vec![
+                crate::rescue::RescueRow {
+                    overall: 1,
+                    provider: String::new(),
+                    failed: 4,
+                    failover: 2,
+                    retry: 1,
+                    added_ms_p50: Some(200.),
+                },
+                crate::rescue::RescueRow {
+                    provider: "anthropic".into(),
+                    failover: 2,
+                    ..Default::default()
+                },
+            ],
+            ..MockTraceReader::new()
+        });
+        let state = TraceReadState {
+            reader,
+            rejections: test_rejections(),
+        };
+        let response = gateway_stats_handler(
+            State(state),
+            Query(GatewayStatsQuery {
+                hours: Some(24),
+                since: None,
+                until: None,
+            }),
+            bearer_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["rescued_by_failover"], 2);
+        assert_eq!(body["rescued_by_retry"], 1);
+        assert_eq!(body["rescue_rate_pct"], 75.);
+        assert_eq!(body["rescue_added_ms_p50"], 200.);
+        assert_eq!(body["attempt_records_since"], "2026-09-19");
+        assert_eq!(body["providers"][0]["rescued_by_failover"], 2);
+    }
+
+    #[tokio::test]
+    async fn cf_h1_stats_only_reads_scalar_loop_counts() {
+        let _g = DevAuthGuard::new();
+        let reader = Arc::new(MockTraceReader {
+            loop_fixture: Some(crate::agent_loops::LoopData {
+                policy: crate::billing::rating::AgentLoopPolicy::embedded().unwrap(),
+                rows: vec![],
+                total_instances: 999,
+                groups: 3,
+                tool_calls: 1_000_000,
+                unfingerprinted: 0,
+            }),
+            ..MockTraceReader::new()
+        });
+        let response = gateway_stats_handler(
+            State(TraceReadState {
+                reader: reader.clone(),
+                rejections: test_rejections(),
+            }),
+            Query(GatewayStatsQuery {
+                hours: Some(24),
+                since: None,
+                until: None,
+            }),
+            bearer_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["agent_loops"]["instances"], 999);
+        assert_eq!(
+            reader
+                .loop_detail_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn loop_filter_is_tenant_bound_in_list_count_and_groups() {
+        let filters = TraceListFilters {
+            loop_policy: crate::billing::rating::AgentLoopPolicy::embedded(),
+            ..Default::default()
+        };
+        for sql in [
+            build_trace_list_sql(&filters),
+            build_trace_count_sql(&filters),
+            build_trace_groups_sql(TraceGroupBy::Model, &filters),
+        ] {
+            assert!(sql.contains("arrayJoin(arrayMap(r -> r.3, records))"));
+            assert!(sql.contains("FROM tracelane.spans FINAL"));
+            assert!(sql.contains("WHERE tenant_id = ? AND start_time >= w_since"));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_endpoint_uses_claims_and_reports_unavailable() {
+        let _g = DevAuthGuard::new();
+        let query = || {
+            Query(AgentLoopQuery {
+                since: None,
+                until: None,
+                trace_id: None,
+                session_id: None,
+                limit: None,
+            })
+        };
+        let reader = Arc::new(MockTraceReader {
+            loop_fixture: Some(crate::agent_loops::LoopData {
+                policy: crate::billing::rating::AgentLoopPolicy::embedded().unwrap(),
+                rows: vec![],
+                total_instances: 0,
+                groups: 0,
+                tool_calls: 2,
+                unfingerprinted: 2,
+            }),
+            ..MockTraceReader::new()
+        });
+        let state = TraceReadState {
+            reader: reader.clone(),
+            rejections: test_rejections(),
+        };
+        assert_eq!(
+            agent_loops_handler(State(state.clone()), query(), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = agent_loops_handler(State(state), query(), bearer_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-tracelane-window").is_some());
+        assert_eq!(body_json(response).await["unfingerprinted_tool_calls"], 2);
+        assert_eq!(reader.seen_tenant.lock().unwrap().as_slice(), &[DEV_TENANT]);
+        let state = TraceReadState {
+            reader: Arc::new(MockTraceReader::new()),
+            rejections: test_rejections(),
+        };
+        assert_eq!(
+            agent_loops_handler(State(state), query(), bearer_headers())
+                .await
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
     #[tokio::test]
     async fn missing_authorization_is_401() {
         let reader = Arc::new(MockTraceReader::new());
@@ -11393,6 +14117,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -11431,6 +14163,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -11467,6 +14207,14 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         let resp = list_traces_handler(
             State(state),
             Query(TraceListQuery {
+                environment: None,
+                release: None,
+                service: None,
+                tag: None,
+                meta: None,
+                key: None,
+                rescued: None,
+                repeated_tool: None,
                 include_issues: None,
                 issue: None,
                 agent: None,
@@ -12070,7 +14818,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         use tower::ServiceExt;
         let src = include_str!("trace_reads.rs");
         let body = &src[src
-            .find("pub fn routes() -> Router<TraceReadState> {")
+            .find("pub fn routes(state: TraceReadState, extra_routes: Router) -> Router {")
             .expect("routes()")..];
         let body = &body[..body.find("\n}\n").expect("end of routes()")];
         let paths: Vec<String> = body
@@ -12091,10 +14839,13 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
             ..crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey)
         };
         let _claims = crate::auth::test_claims::Guard::set(read_less);
-        let app = routes().with_state(TraceReadState {
-            reader: Arc::new(MockTraceReader::new()),
-            rejections: test_rejections(),
-        });
+        let app = routes(
+            TraceReadState {
+                reader: Arc::new(MockTraceReader::new()),
+                rejections: test_rejections(),
+            },
+            Router::new(),
+        );
         for path in &paths {
             let uri = path
                 .replace("{trace_id}", "3f2a9c1e-1b2c-4d5e-8f90-a1b2c3d4e5f6")
@@ -12102,7 +14853,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
             // Valid query params so a route's extractors pass and the request reaches the
             // handler — a 400 from a missing param would never exercise the scope gate.
             let uri = format!(
-                "{uri}?a=3f2a9c1e-1b2c-4d5e-8f90-a1b2c3d4e5f6&b=4f2a9c1e-1b2c-4d5e-8f90-a1b2c3d4e5f6"
+                "{uri}?a=3f2a9c1e-1b2c-4d5e-8f90-a1b2c3d4e5f6&b=4f2a9c1e-1b2c-4d5e-8f90-a1b2c3d4e5f6&bucket_start=2026-09-30T00:00:00Z"
             );
             let req = axum::http::Request::builder()
                 .uri(&uri)
@@ -12152,6 +14903,53 @@ mod clickhouse_roundtrip {
     /// for the whole test, is the honest fix: the hazard is real sharing, not a
     /// flaky assertion.
     static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 2026-10-01 — the A+C deploy auto-rolled back on Proof F: `/v1/agent-loops` 502'd
+    /// because the loop SQL read a `conversation_id` COLUMN that only migration 04 adds;
+    /// prod and schema.sql never had it, and the loop tests ran against a synthetic source
+    /// that DEFINED it. This drives the PRODUCTION read path against the REAL spans table
+    /// built from schema.sql: three identical calls in one conversation = one loop.
+    #[tokio::test]
+    #[ignore = "needs CLICKHOUSE_TEST_URL; isolated fixture writes, never production"]
+    async fn agent_loops_read_runs_against_the_real_spans_schema() {
+        let _serial = SHARED_DB.lock().await;
+        let client = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&client).await;
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let conversation = format!("conv-{}", uuid::Uuid::new_v4());
+        for i in 0..3_i64 {
+            client.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, attributes) VALUES (?, ?, ?, 'gen_ai.chat', now64(6) - toIntervalSecond(?), now64(6), ?)")
+                .bind(tenant.to_string()).bind(uuid::Uuid::new_v4().to_string()).bind(uuid::Uuid::new_v4().to_string())
+                .bind(30 - i)
+                .bind(serde_json::json!({
+                    "gen_ai_conversation_id": conversation,
+                    "tracelane_response_tool_names": ["search"],
+                    "tracelane_response_tool_arg_fps": ["fp-real-schema"],
+                }).to_string())
+                .execute().await.expect("fixture span insert");
+        }
+        let reader = ClickHouseTraceReader::new(client);
+        let data = reader
+            .agent_loop_data(
+                &tenant,
+                None,
+                None,
+                &crate::agent_loops::LoopScope::default(),
+            )
+            .await
+            .expect("the loop read must run against the real spans schema");
+        assert_eq!(data.total_instances, 1, "three identical calls = one loop");
+        assert!(
+            data.rows
+                .iter()
+                .any(|r| r.group_kind == "session" && r.group_id == conversation && r.calls == 3),
+            "the loop groups by the conversation read from attributes: {:?}",
+            data.rows
+                .iter()
+                .map(|r| (&r.group_kind, &r.group_id, r.calls))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[tokio::test]
     #[ignore = "needs CLICKHOUSE_TEST_URL; isolated fixture writes, never production"]
@@ -12328,7 +15126,9 @@ mod clickhouse_roundtrip {
         Some(
             clickhouse::Client::default()
                 .with_url(url)
-                .with_database("tracelane"),
+                .with_database("tracelane")
+                .with_user("default")
+                .with_password(std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_default()),
         )
     }
 
@@ -12397,6 +15197,8 @@ mod clickhouse_roundtrip {
     async fn ensure_spans(c: &clickhouse::Client) {
         clickhouse::Client::default()
             .with_url(std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL"))
+            .with_user("default")
+            .with_password(std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_default())
             .query("CREATE DATABASE IF NOT EXISTS tracelane")
             .execute()
             .await
@@ -12418,6 +15220,229 @@ mod clickhouse_roundtrip {
             exists, 1,
             "`spans` was not created — the rest of this test would pass by querying nothing"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CLICKHOUSE_TEST_URL with the checked-in schema"]
+    async fn gwy54_labels_round_trip_on_real_clickhouse() {
+        let _serial = SHARED_DB.lock().await;
+        let c = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&c).await;
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let foreign = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let base = chrono::Utc::now().timestamp() - 60;
+        for (who, cost) in [(&tenant, 0.5), (&foreign, 999.0)] {
+            let attrs = serde_json::json!({
+                "tracelane_tags":["red","blue"],
+                "tracelane_metadata":{"cost.center":"O'Reilly"},
+                "deployment_environment":"production",
+                "service_version":"abc",
+                "service_name":"api",
+                "user_id":"user1",
+                "gen_ai_usage_cost":cost,
+                "gen_ai_request_model":"model-a",
+                "gen_ai_request_stream":true,
+                "gen_ai_response_time_to_first_chunk":0.2,
+                "gen_ai_usage_output_tokens":20
+            });
+            c.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, status_code, attributes) VALUES (?, ?, ?, 'gen_ai.chat', toDateTime64(?, 6), toDateTime64(?, 6), 1, ?)")
+                .bind(who.to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(base)
+                .bind(base + 1)
+                .bind(attrs.to_string())
+                .execute().await.expect("insert labelled span");
+        }
+        let reader = ClickHouseTraceReader::new(c);
+        let trace_filters = TraceListFilters {
+            environment: Some("production".into()),
+            tag: Some("red".into()),
+            meta: Some(("cost.center".into(), "O'Reilly".into())),
+            since_us: Some((base - 1) * 1_000_000),
+            until_us: Some((base + 2) * 1_000_000),
+            limit: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            reader.count_traces(&tenant, &trace_filters).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            reader
+                .list_traces(&tenant, &trace_filters)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let groups = reader
+            .list_trace_groups(&tenant, TraceGroupBy::Tag, &trace_filters)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| g.trace_count == 1));
+        let costs = reader
+            .cost_breakdown(
+                &tenant,
+                &CostFilters {
+                    meta_key: None,
+                    since_secs: Some(base - 1),
+                    until_secs: Some(base + 2),
+                    hours: 1,
+                    dimension: CostDimension::Tag,
+                    limit: 20,
+                    scope: CostScope::All,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(costs.len(), 2);
+        assert!(costs.iter().all(|r| r.requests == 1
+            && r.all_requests == 1
+            && (r.cost_usd - 0.5).abs() < 0.000001));
+        let meta_key = "cost.center".to_owned();
+        let meta_filter = CostFilters {
+            meta_key: Some(meta_key.clone()),
+            since_secs: Some(base - 1),
+            until_secs: Some(base + 2),
+            hours: 1,
+            dimension: CostDimension::Meta,
+            limit: 20,
+            scope: CostScope::All,
+        };
+        assert!(!build_cost_breakdown_sql(&meta_filter).contains(&meta_key));
+        let meta_costs = reader.cost_breakdown(&tenant, &meta_filter).await.unwrap();
+        assert_eq!(meta_costs[0].dimension, "O'Reilly");
+        assert_eq!(meta_costs[0].all_requests, 1);
+        let speed = reader
+            .metric_breakdown(
+                &tenant,
+                &BreakdownFilters {
+                    meta_key: None,
+                    min_generation_ms: 50,
+                    metric: BreakdownMetric::OutputTpsP50,
+                    by: BreakdownBy::Model,
+                    since_us: (base - 1) * 1_000_000,
+                    until_us: (base + 2) * 1_000_000,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(speed.len(), 1);
+        assert_eq!(speed[0].n, 1);
+        assert!((speed[0].value - 25.0).abs() < 0.000001);
+        let below_policy_floor = reader
+            .metric_breakdown(
+                &tenant,
+                &BreakdownFilters {
+                    meta_key: None,
+                    min_generation_ms: 900,
+                    metric: BreakdownMetric::OutputTpsP50,
+                    by: BreakdownBy::Model,
+                    since_us: (base - 1) * 1_000_000,
+                    until_us: (base + 2) * 1_000_000,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(below_policy_floor[0].n, 0);
+        assert_eq!(below_policy_floor[0].value, 0.0);
+        for by in [
+            TraceGroupBy::Environment,
+            TraceGroupBy::Release,
+            TraceGroupBy::Service,
+            TraceGroupBy::User,
+        ] {
+            let rows = reader
+                .list_trace_groups(&tenant, by, &trace_filters)
+                .await
+                .unwrap_or_else(|e| panic!("{by:?} trace grouping failed: {e}"));
+            assert_eq!(rows.len(), 1, "{by:?}");
+            assert_eq!(rows[0].trace_count, 1, "{by:?}");
+        }
+        for dimension in [
+            CostDimension::User,
+            CostDimension::Environment,
+            CostDimension::Release,
+            CostDimension::Service,
+        ] {
+            let rows = reader
+                .cost_breakdown(
+                    &tenant,
+                    &CostFilters {
+                        meta_key: None,
+                        since_secs: Some(base - 1),
+                        until_secs: Some(base + 2),
+                        hours: 1,
+                        dimension,
+                        limit: 20,
+                        scope: CostScope::All,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{dimension:?} cost failed: {e}"));
+            assert_eq!(rows.len(), 1, "{dimension:?}");
+            assert_eq!(rows[0].all_requests, 1, "{dimension:?}");
+        }
+        for by in [
+            BreakdownBy::User,
+            BreakdownBy::Tag,
+            BreakdownBy::Environment,
+            BreakdownBy::Release,
+            BreakdownBy::Service,
+            BreakdownBy::Meta,
+        ] {
+            let rows = reader
+                .metric_breakdown(
+                    &tenant,
+                    &BreakdownFilters {
+                        meta_key: (by == BreakdownBy::Meta).then_some(meta_key.clone()),
+                        min_generation_ms: 50,
+                        metric: BreakdownMetric::Requests,
+                        by,
+                        since_us: (base - 1) * 1_000_000,
+                        until_us: (base + 2) * 1_000_000,
+                        limit: 20,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{by:?} metric failed: {e}"));
+            assert_eq!(
+                rows.iter().map(|r| r.n).sum::<u64>(),
+                if by == BreakdownBy::Tag { 2 } else { 1 },
+                "{by:?}"
+            );
+        }
+        let c = ch().unwrap();
+        c.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, status_code, attributes) VALUES (?, ?, ?, 'gen_ai.chat', toDateTime64(?, 6), toDateTime64(?, 6), 1, ?)")
+            .bind(tenant.to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(base)
+            .bind(base + 1)
+            .bind(r#"{"gen_ai_request_model":"model-b","gen_ai_request_stream":false,"gen_ai_usage_output_tokens":20}"#)
+            .execute().await.unwrap();
+        let rows = reader
+            .metric_breakdown(
+                &tenant,
+                &BreakdownFilters {
+                    meta_key: None,
+                    min_generation_ms: 50,
+                    metric: BreakdownMetric::OutputTpsP50,
+                    by: BreakdownBy::Model,
+                    since_us: (base - 1) * 1_000_000,
+                    until_us: (base + 2) * 1_000_000,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        let unmeasurable = rows.iter().find(|r| r.key == "model-b").unwrap();
+        assert_eq!(unmeasurable.n, 0);
+        assert_eq!(unmeasurable.value, 0.0);
     }
 
     /// EVERY dimension × EVERY scope must be a query the server ACCEPTS.
@@ -12811,6 +15836,7 @@ mod clickhouse_roundtrip {
         r.cost_breakdown(
             &tenant,
             &CostFilters {
+                meta_key: None,
                 since_secs: Some(since),
                 until_secs: Some(until),
                 hours: 6,
@@ -13472,6 +16498,7 @@ mod clickhouse_roundtrip {
         insert_cost_span(&c, &t, now - 30 * 60, "model-a-recent", Some(1.0)).await;
         insert_cost_span(&c, &t, now - 3 * 86_400, "model-b-historical", Some(2.0)).await;
         let f = CostFilters {
+            meta_key: None,
             since_secs: Some(now - 4 * 86_400),
             until_secs: Some(now - 2 * 86_400),
             hours: 48,
@@ -13499,6 +16526,7 @@ mod clickhouse_roundtrip {
             .cost_breakdown(
                 &tenant,
                 &CostFilters {
+                    meta_key: None,
                     since_secs: None,
                     until_secs: None,
                     hours: 24,
@@ -13662,6 +16690,7 @@ mod clickhouse_roundtrip {
         ] {
             for scope in [CostScope::All, CostScope::Production, CostScope::Eval] {
                 let f = CostFilters {
+                    meta_key: None,
                     since_secs: None,
                     until_secs: None,
                     hours: 24,
@@ -13753,6 +16782,7 @@ mod clickhouse_roundtrip {
         }
 
         let f = CostFilters {
+            meta_key: None,
             since_secs: None,
             until_secs: None,
             hours: 24,
@@ -13802,6 +16832,7 @@ mod clickhouse_roundtrip {
         // is exact in both directions, which is what a filter reading its own
         // alias would break.
         let f = CostFilters {
+            meta_key: None,
             scope: CostScope::Eval,
             ..f
         };
@@ -13851,25 +16882,39 @@ mod dsh13_tests {
             assert_eq!(BreakdownMetric::parse(Some(m.as_str())), Some(m));
         }
         for b in BreakdownBy::ALL {
-            assert_eq!(BreakdownBy::parse(Some(b.as_str())), Some(b));
+            let parameter = if b == BreakdownBy::Meta {
+                "meta:sample"
+            } else {
+                b.as_str()
+            };
+            assert_eq!(BreakdownBy::parse(Some(parameter)), Some(b));
         }
+        assert_eq!(BreakdownBy::parse(Some("meta:bad'key")), None);
+        assert_eq!(CostDimension::parse(Some("meta:bad'key")), None);
+        assert_eq!(parse_meta_filter(Some("bad'key:value")), Err(()));
     }
 
-    /// Spec §7.3: the SQL text is one of N constants — 8 metrics × 5 dimensions = 40
-    /// distinct strings, each with exactly the four binds and the tenant filter first.
+    /// Every metric/dimension SQL shape keeps the tenant predicate and bounded binds.
     #[test]
-    fn breakdown_sql_is_a_closed_set_of_forty_constants() {
+    fn breakdown_sql_is_a_closed_set_of_constants() {
         let mut seen = std::collections::HashSet::new();
         for m in BreakdownMetric::ALL {
             for b in BreakdownBy::ALL {
-                let sql = build_metric_breakdown_sql(m, b);
+                let sql = build_metric_breakdown_sql(m, b, 50);
                 assert!(sql.contains("WHERE tenant_id = ?"), "{sql}");
-                assert_eq!(sql.matches('?').count(), 4, "{sql}");
+                assert_eq!(
+                    sql.matches('?').count(),
+                    if b == BreakdownBy::Meta { 5 } else { 4 },
+                    "{sql}"
+                );
                 assert!(sql.contains("FROM spans FINAL"), "{sql}");
                 assert!(seen.insert(sql));
             }
         }
-        assert_eq!(seen.len(), 40);
+        assert_eq!(
+            seen.len(),
+            BreakdownMetric::ALL.len() * BreakdownBy::ALL.len()
+        );
     }
 
     /// B-330 / DSH-13 §3: the tier-blind literal is gone from this file. The needle is
@@ -13905,6 +16950,7 @@ mod effective_settings_tests {
             crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
         let response = effective_settings_handler(State(state.clone()), HeaderMap::new()).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let min_generation_ms = state.rate_card.load().policy.output_speed.min_generation_ms;
         let response =
             effective_settings_handler(State(state), crate::handler_harness::authed()).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -13918,6 +16964,7 @@ mod effective_settings_tests {
             crate::providers::NATIVE_PREFIXES.len()
         );
         assert_eq!(data["cache"]["enabled"], false);
+        assert_eq!(data["output_speed"]["min_generation_ms"], min_generation_ms);
         assert_eq!(data["limits"]["available"], false);
         for row in data["routing"]["catalog"].as_array().unwrap() {
             assert!(row.get("base_url").is_none());
@@ -13956,5 +17003,27 @@ mod effective_settings_tests {
                 "identity values are bound, not interpolated"
             );
         }
+    }
+
+    #[test]
+    fn trace_list_model_prefers_the_first_successful_span_over_error_models() {
+        assert!(
+            MERGED_SUMMARIES.contains("min(model_rank)"),
+            "the merged trace model must use an ordered success candidate, not max(model)"
+        );
+        assert!(MERGED_SUMMARIES.contains("substring(min(model_rank), 24)"));
+        let schema = include_str!("../../../infra/dev/clickhouse/schema.sql");
+        let migration = include_str!(
+            "../../../infra/dev/clickhouse/migrations/35_trace_first_successful_model.sql"
+        );
+        assert!(schema.contains("model_rank       SimpleAggregateFunction(min, String)"));
+        assert!(migration.contains("s.status_code != 2"));
+        assert!(migration.contains("toUInt64(0) AS span_count"));
+        let first = format!("0:{:020}:{}", 10, "served-model");
+        let later = format!("0:{:020}:{}", 20, "later-model");
+        assert_eq!(
+            ["2:", later.as_str(), first.as_str()].into_iter().min(),
+            Some(first.as_str())
+        );
     }
 }

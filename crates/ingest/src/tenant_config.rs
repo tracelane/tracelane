@@ -75,9 +75,10 @@
 //! connection, so there was never a reason to plumb the contact through here
 //! only to leave it unread; `TenantConfig` carries no billing_email field.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -177,7 +178,8 @@ pub fn resolve_policy(i: PolicyInputs) -> SamplingPolicy {
 
 /// Boxed async resolver: `tenant_id -> TenantConfig`. Production injects a
 /// Postgres-backed closure (see module docs); tests inject a map-backed mock.
-/// A resolver MUST resolve internal errors to the safe default (Tail) itself.
+/// A resolver MUST handle internal errors itself; the production fault path
+/// returns keep-all Full with content closed.
 pub type ResolveFn =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = TenantConfig> + Send>> + Send + Sync>;
 
@@ -191,6 +193,7 @@ pub struct TenantConfigCache {
     resolver: ResolveFn,
     ttl: Duration,
     entries: DashMap<Uuid, Cached>,
+    locks: DashMap<Uuid, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl TenantConfigCache {
@@ -200,6 +203,7 @@ impl TenantConfigCache {
             resolver,
             ttl,
             entries: DashMap::new(),
+            locks: DashMap::new(),
         }
     }
 
@@ -229,6 +233,21 @@ impl TenantConfigCache {
     /// TTL). The resolver is responsible for fail-safe (Tail) on error, so this
     /// never surfaces an error to the hot path.
     pub async fn resolve_into_cache(&self, tenant: Uuid) -> TenantConfig {
+        if let Some(e) = self.entries.get(&tenant)
+            && e.fetched_at.elapsed() < self.ttl
+        {
+            return e.cfg.clone();
+        }
+        // One tenant's lookup, episode transition and cache publication must
+        // keep the same order. A late fault must not overwrite a newer healthy
+        // result after that healthy lookup has closed the episode.
+        let lock = Arc::clone(
+            self.locks
+                .entry(tenant)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        );
+        let _guard = lock.lock().await;
         if let Some(e) = self.entries.get(&tenant)
             && e.fetched_at.elapsed() < self.ttl
         {
@@ -271,33 +290,61 @@ impl TenantConfigCache {
 /// [`TenantConfig::fault_keep_all`] (Full, keep-all — no quota cap any more,
 /// ADR-076). The hot path never sees an error.
 pub fn pg_tenant_config_resolver(pool: DbPool) -> ResolveFn {
+    // A success for tenant B does not prove tenant A's cached fault fallback has
+    // expired. Track affected tenants until each has a successful real lookup.
+    let unresolved = Arc::new(Mutex::new(HashSet::new()));
     Arc::new(move |tenant: Uuid| {
         let pool = pool.clone();
+        let unresolved = Arc::clone(&unresolved);
         Box::pin(async move {
-            match resolve_one(&pool, tenant).await {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    // C1. This is the site: it faulted continuously for
-                    // THREE WEEKS after a migration, promoting every tenant to Full
-                    // capture and leaving force_tail inert, and the per-resolve `warn!`
-                    // below was the only trace of it — a line nobody greps, in a log
-                    // nobody tails, that looks identical on resolve #1 and #3,000,000.
-                    // The counter carries first_seen, so "how long has this been open?"
-                    // now has an answer.
-                    tracelane_shared::degradation::note(
-                        tracelane_shared::degradation::Degradation::TenantConfigFault,
-                    );
-                    tracing::warn!(
-                        %tenant, error = %e,
-                        "tenant config resolve FAULTED — keep-all (Full) so a control-plane blip \
-                         never drops benign spans (#81 class); bounded by the per-trace ceiling \
-                         (ADR-076: no quota cap exists any more)"
-                    );
-                    TenantConfig::fault_keep_all()
-                }
-            }
+            record_tenant_config_result(&unresolved, tenant, resolve_one(&pool, tenant).await)
         })
     })
+}
+
+/// Record the outcome of a real control-plane lookup. Cache hits never call this:
+/// only a successful query proves the failure condition has ended.
+fn record_tenant_config_result(
+    unresolved: &Mutex<HashSet<Uuid>>,
+    tenant: Uuid,
+    result: anyhow::Result<TenantConfig>,
+) -> TenantConfig {
+    let mut faults = match unresolved.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match result {
+        Ok(cfg) => {
+            faults.remove(&tenant);
+            if faults.is_empty() {
+                tracelane_shared::degradation::resolve(
+                    tracelane_shared::degradation::Degradation::TenantConfigFault,
+                );
+            }
+            cfg
+        }
+        Err(e) => {
+            // C1. This is the site: it faulted continuously for
+            // THREE WEEKS after a migration, promoting every tenant to Full
+            // capture and leaving force_tail inert, and the per-resolve `warn!`
+            // below was the only trace of it — a line nobody greps, in a log
+            // nobody tails, that looks identical on resolve #1 and #3,000,000.
+            // The counter carries first_seen, so "how long has this been open?"
+            // now has an answer.
+            faults.insert(tenant);
+            tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::TenantConfigFault,
+            );
+            drop(faults);
+            tracing::warn!(
+                %tenant, error = %e,
+                "tenant config resolve FAULTED — keep-all (Full) so a control-plane blip \
+                 never drops benign spans (#81 class); bounded by the per-trace ceiling \
+                 (ADR-076: no quota cap exists any more)"
+            );
+            TenantConfig::fault_keep_all()
+        }
+    }
 }
 
 const RESOLVE_SQL: &str = "\
@@ -502,6 +549,7 @@ async fn listen_once(conn_str: &str, cache: &TenantConfigCache) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
+    static EPISODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// The DEGRADED branch must FIRE on the config the ordinary Neon
     /// deployment produces, and must NOT fire on a direct endpoint whose
@@ -649,6 +697,7 @@ mod tests {
     #[tokio::test]
     async fn resolver_fault_advances_the_degradation_counter() {
         use tracelane_shared::degradation::{Degradation, count};
+        let _episode_guard = EPISODE_TEST_LOCK.lock().await;
 
         // Port 1 on loopback: nothing listens, so pool.get() fails fast. deadpool is
         // lazy, so building the pool itself does not connect.
@@ -685,6 +734,126 @@ mod tests {
             "a faulting resolver must advance the degradation counter (before={before}, \
              after={after}) — otherwise three weeks of every-tenant-promoted looks exactly \
              like a healthy control plane"
+        );
+    }
+
+    #[test]
+    fn resolver_success_closes_prior_fault_episode() {
+        use tracelane_shared::degradation::{Degradation, count, is_open, note, resolve};
+        let _episode_guard = EPISODE_TEST_LOCK.blocking_lock();
+
+        let kind = Degradation::TenantConfigFault;
+        resolve(kind);
+        let before = count(kind);
+        let tenant = Uuid::from_u128(0xB602);
+        let unresolved = Mutex::new(HashSet::new());
+        let fault = record_tenant_config_result(
+            &unresolved,
+            tenant,
+            Err(anyhow::anyhow!("pool unavailable")),
+        );
+        assert_eq!(fault.policy, SamplingPolicy::Full);
+        assert!(is_open(kind), "a real resolver fault opens an episode");
+        let after_fault = count(kind);
+        assert_eq!(after_fault, before + 1);
+
+        let healthy = record_tenant_config_result(&unresolved, tenant, Ok(TenantConfig::default()));
+        assert_eq!(healthy.policy, SamplingPolicy::Tail);
+        assert!(
+            !is_open(kind),
+            "a successful no-row lookup must close the episode"
+        );
+        assert_eq!(
+            count(kind),
+            after_fault,
+            "recovery preserves the lifetime count"
+        );
+        assert!(!resolve(kind), "another healthy lookup must be idempotent");
+        let _ = note(kind);
+        assert!(is_open(kind), "a later fault may open a fresh episode");
+        resolve(kind);
+    }
+
+    #[test]
+    fn another_tenants_success_does_not_close_a_cached_fault_episode() {
+        use tracelane_shared::degradation::{Degradation, is_open, resolve};
+        let _episode_guard = EPISODE_TEST_LOCK.blocking_lock();
+
+        let kind = Degradation::TenantConfigFault;
+        resolve(kind);
+        let faulted_tenant = Uuid::from_u128(0xB6021);
+        let healthy_tenant = Uuid::from_u128(0xB6022);
+        let unresolved = Mutex::new(HashSet::new());
+        record_tenant_config_result(
+            &unresolved,
+            faulted_tenant,
+            Err(anyhow::anyhow!("pool unavailable")),
+        );
+        assert!(is_open(kind));
+        record_tenant_config_result(&unresolved, healthy_tenant, Ok(TenantConfig::default()));
+        assert!(
+            is_open(kind),
+            "a different tenant's success does not prove the cached fallback recovered"
+        );
+        record_tenant_config_result(&unresolved, faulted_tenant, Ok(TenantConfig::default()));
+        assert!(!is_open(kind));
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_tenant_resolves_in_cache_publication_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{Notify, oneshot};
+
+        let tenant = Uuid::from_u128(0xB6023);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (second_started_tx, second_started_rx) = oneshot::channel();
+        let resolver: ResolveFn = Arc::new({
+            let calls = Arc::clone(&calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |_| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    if n == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                        TenantConfig::fault_keep_all()
+                    } else {
+                        TenantConfig::default()
+                    }
+                })
+            }
+        });
+        let cache = Arc::new(TenantConfigCache::new(resolver, Duration::ZERO));
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.resolve_into_cache(tenant).await }
+        });
+        entered.notified().await;
+        let second = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move {
+                let _ = second_started_tx.send(());
+                cache.resolve_into_cache(tenant).await
+            }
+        });
+        second_started_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entered_before_first_published = calls.load(Ordering::SeqCst) > 1;
+        release.notify_one();
+        assert_eq!(first.await.unwrap().policy, SamplingPolicy::Full);
+        assert_eq!(second.await.unwrap().policy, SamplingPolicy::Tail);
+        assert!(
+            !entered_before_first_published,
+            "the second lookup must wait until the first result is cached"
+        );
+        assert_eq!(
+            cache.resolve_into_cache(tenant).await.policy,
+            SamplingPolicy::Tail
         );
     }
 

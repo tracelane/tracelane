@@ -9,7 +9,10 @@
  *      reference-tables.md`). A handful of pre-existing feature flags
  *      (full-capture, BYOK, prompt-promotion-write, …) are outside that
  *      ADR's scope and stay in the small `LEGACY_FLAGS` table below.
- *   2. plan_entitlements row keyed by `<plan>_v1`.
+ *   2. plan_entitlements row keyed by `<plan>_v1` (the current catalog).
+ *   2b. B-409: the tenant's `plan_allowances` row — its PINNED `plan_version`
+ *      while price protection is live, else the current one — for the six
+ *      allowances + three windows; no row → the free tier's (fail-closed).
  *   3. workspace_entitlements row (per-tenant overrides) — every non-NULL
  *      column overrides the plan default. A FALSE here overrides a TRUE
  *      in plan_entitlements (deny-overrides-grant).
@@ -38,8 +41,13 @@
 
 import { db } from "@/db";
 import plansV3Json from "@/db/plans.v3.json";
-import { planEntitlements, workspaceEntitlements } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import {
+	planAllowances,
+	planEntitlements,
+	tenants,
+	workspaceEntitlements,
+} from "@/db/schema";
+import { and, eq, sql } from "drizzle-orm";
 
 export type Plan = "free" | "builder" | "team" | "business" | "enterprise";
 
@@ -91,6 +99,8 @@ export interface PlansV3PlanRow {
 	rate_limit_rpm: number | null;
 }
 export interface PlansV3 {
+	/** B-409: the `plan_allowances.plan_version` the `plans` allowances ARE. */
+	plan_version: string;
 	meters: PlansV3Meters;
 	policy: PlansV3Policy;
 	plans: Record<string, PlansV3PlanRow>;
@@ -405,6 +415,102 @@ function rowToOverrides(
 	};
 }
 
+/** The eight versioned fields (B-409) the web `Entitlements` shape carries. */
+const ALLOWANCE_FIELDS = [
+	"hot_gb_included",
+	"ingest_gb_included",
+	"series_included",
+	"scan_units_included",
+	"eval_runs_included",
+	"indexed_window_days",
+	"queryable_days",
+	"ledger_days",
+] as const satisfies readonly (keyof Entitlements)[];
+
+/**
+ * rev4 L7: what the GATEWAY serves when no allowance row resolves —
+ * `ResolvedEntitlements::deny_all()` in `crates/gateway/src/entitlement_cache.rs`:
+ * zero on every meter, 30-day windows (ADR-076: "deny = zero allowances, 30-day
+ * window"). An invariant fail-closed floor, not a ruling (`.claude/rules/
+ * reference-tables.md` — values only a code change could make meaningful), held
+ * equal to the gateway's by `entitlement_cache::tests::rev4_l7_the_web_deny_floor_is_the_gateways`.
+ * The web used to show the FREE tier's numbers here while the gateway enforced
+ * zero — two answers to one question.
+ */
+export const ALLOWANCE_DENY_FLOOR = {
+	hot_gb_included: 0,
+	ingest_gb_included: 0,
+	series_included: 0,
+	scan_units_included: 0,
+	eval_runs_included: 0,
+	indexed_window_days: 30,
+	queryable_days: 30,
+	ledger_days: 30,
+} as const satisfies Record<(typeof ALLOWANCE_FIELDS)[number], number>;
+
+/**
+ * B-409: the tenant's allowance row — `tenants.plan_version` while
+ * `price_protected_until` is in the future (NULL = no expiry known), else the
+ * `is_current` row — for `lookupKey`. The SAME rule the gateway's
+ * `allowance_pin_join!` applies (`crates/gateway/src/entitlement_cache.rs`),
+ * including rev4 M3/L7: a pinned version with NO row falls back to the plan's
+ * CURRENT row (one query — both candidate rows joined, the pinned one ordered
+ * first, `limit 1`).
+ *
+ * @returns the override shape when a row exists, `"missing"` when the read
+ *   succeeded and found neither, `null` when the read failed — the caller applies
+ *   the deny floor to both of the last two (fail CLOSED).
+ */
+async function readPinnedAllowance(
+	tenantDbId: string,
+	lookupKey: string,
+): Promise<Partial<Record<keyof Entitlements, unknown>> | "missing" | null> {
+	try {
+		const pinLive = sql`(${tenants.planVersion} is not null and (${tenants.priceProtectedUntil} is null or ${tenants.priceProtectedUntil} > now()))`;
+		const pinnedRow = sql`(${pinLive} and ${planAllowances.planVersion} = ${tenants.planVersion})`;
+		const rows = await db
+			.select({
+				found: sql<boolean>`${planAllowances.planLookupKey} is not null`,
+				planVersion: planAllowances.planVersion,
+				hotGbIncluded: planAllowances.hotGbIncluded,
+				ingestGbIncluded: planAllowances.ingestGbIncluded,
+				seriesIncluded: planAllowances.seriesIncluded,
+				scanUnitsIncluded: planAllowances.scanUnitsIncluded,
+				evalRunsIncluded: planAllowances.evalRunsIncluded,
+				indexedWindowDays: planAllowances.indexedWindowDays,
+				queryableDays: planAllowances.queryableDays,
+				ledgerDays: planAllowances.ledgerDays,
+			})
+			.from(tenants)
+			.leftJoin(
+				planAllowances,
+				and(
+					eq(planAllowances.planLookupKey, lookupKey),
+					sql`(${planAllowances.isCurrent} or ${pinnedRow})`,
+				),
+			)
+			.where(eq(tenants.id, tenantDbId))
+			.orderBy(sql`coalesce(${pinnedRow}, false) desc`)
+			.limit(1);
+		const row = (rows as unknown[] | undefined)?.[0] as
+			| Record<string, unknown>
+			| undefined;
+		if (!row?.found) return "missing";
+		return {
+			hot_gb_included: row.hotGbIncluded,
+			ingest_gb_included: row.ingestGbIncluded,
+			series_included: row.seriesIncluded,
+			scan_units_included: row.scanUnitsIncluded,
+			eval_runs_included: row.evalRunsIncluded,
+			indexed_window_days: row.indexedWindowDays,
+			queryable_days: row.queryableDays,
+			ledger_days: row.ledgerDays,
+		};
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Resolve the effective entitlements for a tenant.
  *
@@ -443,6 +549,21 @@ export async function resolveEntitlements(
 				.from(workspaceEntitlements)
 				.where(eq(workspaceEntitlements.tenantId, tenantDbId))
 				.limit(1);
+
+			// B-409: the allowances + windows come from the tenant's PINNED
+			// `plan_allowances` row (or, missing that, the plan's current one —
+			// rev4 M3/L7), applied OVER the catalog row and UNDER the workspace
+			// overrides. Neither row, or a read ERROR: the gateway's deny floor
+			// (`ALLOWANCE_DENY_FLOOR`, `.claude/rules/tenancy.md`) — never the
+			// catalog's paid numbers, which are not this tenant's when it is pinned,
+			// and never a number the gateway does not enforce.
+			const allowance = await readPinnedAllowance(tenantDbId, lookupKey);
+			if (allowance && allowance !== "missing") {
+				entitlements = mergeOverrides(entitlements, allowance);
+			} else {
+				entitlements = { ...entitlements, ...ALLOWANCE_DENY_FLOOR };
+			}
+
 			if (wsRow) {
 				entitlements = mergeOverrides(
 					entitlements,
@@ -450,7 +571,13 @@ export async function resolveEntitlements(
 				);
 			}
 		} catch {
-			// Postgres unreachable / table missing — fall through with map default.
+			// Postgres unreachable / table missing — the plan-map default for the
+			// flags, and (rev4 L7) the deny floor for the allowances: the map's
+			// numbers are the CURRENT ruling's, not necessarily this tenant's.
+			entitlements = {
+				...PLAN_ENTITLEMENTS[plan],
+				...ALLOWANCE_DENY_FLOOR,
+			};
 		}
 	}
 

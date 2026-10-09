@@ -55,6 +55,7 @@ struct ToolCallSlot {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    anthropic_initial_input: bool,
 }
 
 impl ToolCallAccumulator {
@@ -73,6 +74,7 @@ impl ToolCallAccumulator {
                     id: None,
                     name: None,
                     arguments: String::new(),
+                    anthropic_initial_input: false,
                 });
                 // The push above guarantees a last element.
                 match self.slots.last_mut() {
@@ -88,6 +90,69 @@ impl ToolCallAccumulator {
             slot.name = name;
         }
         slot.arguments.push_str(delta);
+    }
+
+    /// Native Anthropic frames and bodies share the same bounded metadata writer.
+    pub(crate) fn absorb_anthropic(&mut self, value: &serde_json::Value) {
+        if let Some(blocks) = value.get("content").and_then(serde_json::Value::as_array) {
+            for (index, block) in blocks.iter().enumerate() {
+                self.start_anthropic(index, block);
+            }
+        }
+        let Some(index) = value
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|i| usize::try_from(i).ok())
+        else {
+            return;
+        };
+        if value["type"] == "content_block_start" {
+            self.start_anthropic(index, &value["content_block"]);
+        } else if value["type"] == "content_block_delta"
+            && value["delta"]["type"] == "input_json_delta"
+            && let Some(delta) = value["delta"]["partial_json"].as_str()
+        {
+            if let Some(slot) = self
+                .slots
+                .iter_mut()
+                .find(|s| s.index == index && s.anthropic_initial_input)
+            {
+                slot.arguments.clear();
+                slot.anthropic_initial_input = false;
+            }
+            self.push(index, None, None, delta);
+        }
+    }
+
+    fn start_anthropic(&mut self, index: usize, block: &serde_json::Value) {
+        if block["type"] != "tool_use" {
+            return;
+        }
+        self.push(
+            index,
+            block["id"].as_str().map(str::to_owned),
+            block["name"].as_str().map(str::to_owned),
+            &block["input"].to_string(),
+        );
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.index == index) {
+            slot.anthropic_initial_input = true;
+        }
+    }
+
+    pub(crate) fn response_tool_arg_fps(
+        &self,
+        tenant: &tracelane_shared::TenantId,
+    ) -> Option<Vec<String>> {
+        let key = crate::tool_fingerprint::workspace_key(tenant)?;
+        let cap = self.response_tool_names()?.len();
+        Some(
+            self.slots
+                .iter()
+                .filter(|s| s.name.as_deref().is_some_and(|n| !n.is_empty()))
+                .take(cap)
+                .map(|s| crate::tool_fingerprint::with_key(&key, &s.arguments))
+                .collect(),
+        )
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -142,7 +207,7 @@ impl ToolCallAccumulator {
         super::spans::bounded_tool_arg_bytes(
             self.slots
                 .iter()
-                .filter(|s| s.name.is_some())
+                .filter(|s| s.name.as_deref().is_some_and(|n| !n.is_empty()))
                 .map(|s| s.arguments.as_str()),
         )
     }
@@ -290,6 +355,12 @@ impl BufferedToolState {
     /// `OBS-50`: see `ToolCallAccumulator::response_tool_arg_bytes`.
     pub(crate) fn response_tool_arg_bytes(&self) -> Option<Vec<u32>> {
         self.calls.response_tool_arg_bytes()
+    }
+    pub(crate) fn response_tool_arg_fps(
+        &self,
+        tenant: &tracelane_shared::TenantId,
+    ) -> Option<Vec<String>> {
+        self.calls.response_tool_arg_fps(tenant)
     }
 
     /// RI-05: raw `(id, name, arguments)` for `CapturedOutput::build`. See
@@ -452,7 +523,7 @@ pub(super) async fn buffer_provider_stream(
     // (`server/chat.rs`) across the primary dispatch and any cross-provider
     // failover hops/skips. Empty for a bench-mock call, a semantic-cache hit
     // (neither reaches `dispatch_with_retry`), or a clean single attempt.
-    dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
+    mut dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
     // GWY-43: the API key that authorised this request, for per-key cost
     // attribution and budget enforcement.
     api_key_id: Option<&str>,
@@ -482,6 +553,7 @@ pub(super) async fn buffer_provider_stream(
     //  #3: set on a mid-stream provider error so the span below records status
     // Error (a buffered-collection failure must move the error-rate metric).
     let mut buffered_error: Option<&str> = None;
+    let mut timeout_error = None;
     let mut cost_usd: Option<f64> = None;
     // RI-05 / M11: reasoning ("thinking") output tokens, last-write-wins —
     // same idiom as `cache_read`/`cache_creation` below.
@@ -575,6 +647,11 @@ pub(super) async fn buffer_provider_stream(
             Err(err) => {
                 tracing::warn!(error = %err, "stream error during buffered response collection");
                 buffered_error = Some("provider_stream_error");
+                if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+                    timeout_error = Some(timeout);
+                    buffered_error = Some("upstream_timeout");
+                    timeout.record_attempt(&mut dispatch_attempts);
+                }
                 // gen_ai.client.operation.exception (v1.41) — breaker trip input
                 // (ADR-036). Classification only, never the raw error body.
                 crate::otlp_emit::emit_operation_exception(
@@ -642,6 +719,7 @@ pub(super) async fn buffer_provider_stream(
     // developer-chosen, not end-user text. `None` when no tool was called.
     span.attributes.tracelane_response_tool_names = tool_state.response_tool_names();
     span.attributes.tracelane_response_tool_arg_bytes = tool_state.response_tool_arg_bytes();
+    span.attributes.tracelane_response_tool_arg_fps = tool_state.response_tool_arg_fps(tenant_id);
     // B-447: the MISS half of the three-state attribute. This path only runs after
     // `chat.rs` consulted the cache and found nothing (a hit returns before dispatch;
     // a streaming request is never looked up), so "the cache was configured AND a key
@@ -668,7 +746,7 @@ pub(super) async fn buffer_provider_stream(
         // Unchanged position: BEFORE the guardrail seam, on the pre-redaction
         // `text` — the judge samples what the model actually produced, the
         // same way it always has on this path.
-        if let Some(pending) = online_eval {
+        if let Some(pending) = online_eval.filter(|_| buffered_error.is_none()) {
             crate::online_eval::spawn(pending.into_job(
                 tenant_id.clone(),
                 trace_id,
@@ -681,6 +759,16 @@ pub(super) async fn buffer_provider_stream(
         crate::otlp_emit::note_span_dropped_no_nats();
     }
     post.mark("span_build");
+
+    if let Some(timeout) = timeout_error {
+        publish_and_time_post(state, span, post, provider_complete_ts);
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(
+                serde_json::json!({"error":"upstream_timeout", "phase":timeout.phase,"limit_ms":timeout.limit_ms}),
+            ),
+        );
+    }
 
     // Response-side guardrail seam — the SAME ResponseGuard as the streaming
     // path (one seam, not two). The full response flows through it in one
@@ -698,6 +786,15 @@ pub(super) async fn buffer_provider_stream(
         };
         let mut guard =
             crate::guardrail::ResponseGuard::new(guardrail, response_inputs, redaction_map);
+        if !tool_state.calls_for_span().is_empty()
+            && let Some(reason_code) = guard.refuse_unscanned_output().await
+        {
+            span.attributes.tracelane_intervention =
+                Some(tracelane_shared::span::Intervention::Block);
+            post.mark("response_guard");
+            publish_and_time_post(state, span, post, provider_complete_ts);
+            return content_filter_response(model, reason_code, input_tokens, output_tokens);
+        }
         let head = match guard.on_delta(&text, Some(&final_usage)).await {
             crate::guardrail::GuardStep::Emit(s) => s,
             crate::guardrail::GuardStep::Block { reason_code } => {
@@ -807,8 +904,9 @@ pub(super) async fn buffer_provider_stream(
         // the gateway never fabricates a cost (ADR-055).
         let cost = cost_usd
             .or_else(|| {
-                crate::pricing::cost_usd(
+                crate::pricing::cost_usd_for_routed_model(
                     model,
+                    super::config::alias(model),
                     &tracelane_shared::Usage {
                         input_tokens,
                         output_tokens,
@@ -1024,6 +1122,43 @@ mod tests {
     }
 
     // ── B-354, streaming half: the TERMINAL SSE chunk ───────────────────────
+
+    #[test]
+    fn tool_fingerprints_align_with_names_before_capture_truncates() {
+        crate::tool_fingerprint::init_from_existing_pepper(&"07".repeat(32)).unwrap();
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(1));
+        let mut calls = ToolCallAccumulator::default();
+        calls.push(0, None, None, "missing name");
+        calls.push(1, None, Some(String::new()), "empty name");
+        let raw = serde_json::json!({"private": "x".repeat(70_000)}).to_string();
+        for index in 2..37 {
+            calls.push(index, None, Some("search".into()), &raw);
+        }
+        let names = calls.response_tool_names().unwrap();
+        let fps = calls.response_tool_arg_fps(&tenant).unwrap();
+        assert_eq!(names.len(), 32);
+        assert_eq!(fps.len(), names.len());
+        assert_eq!(calls.response_tool_arg_bytes().unwrap().len(), names.len());
+        let key = crate::tool_fingerprint::workspace_key(&tenant).unwrap();
+        assert!(
+            fps.iter()
+                .all(|fp| fp == &crate::tool_fingerprint::with_key(&key, &raw))
+        );
+        let capture = crate::server::config::ContentCapture::OFF;
+        assert!(
+            super::super::spans::CapturedOutput::build(capture, "", &calls.for_span()).is_none()
+        );
+        let mut native = ToolCallAccumulator::default();
+        native.absorb_anthropic(&serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"search","id":"test", "input":{}}}));
+        native.absorb_anthropic(&serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}));
+        native.absorb_anthropic(&serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}));
+        let mut buffered = ToolCallAccumulator::default();
+        buffered.absorb_anthropic(&serde_json::json!({"content":[{"type":"tool_use","name":"search","id":"test","input":{"a":1}}]}));
+        assert_eq!(
+            native.response_tool_arg_fps(&tenant),
+            buffered.response_tool_arg_fps(&tenant)
+        );
+    }
 
     /// Two tools called in one turn, arguments arriving in fragments under
     /// their own indices — the shape both Anthropic and OpenAI produce.

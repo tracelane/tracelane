@@ -35,6 +35,74 @@ import { type TimeRange, windowParams } from "./time-range";
 
 type Win = Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs">;
 
+type GlanceState = "ok" | "unavailable" | "over_cap" | "denied";
+export type WorkspaceGlanceResponse = {
+	as_of: string;
+	cache_ttl_seconds: number;
+	deployment: "hosted" | "self_host";
+	volume: {
+		state: GlanceState;
+		window_days: number;
+		traces: number | null;
+		spans: number | null;
+	};
+	ingest: {
+		state: GlanceState;
+		source: "meter" | "spans";
+		total_bytes: number | null;
+		since: string | null;
+		period_bytes: number | null;
+		period_start: string | null;
+		period_kind: string | null;
+	};
+	stored: {
+		state: GlanceState;
+		kind: "hot_resident_gauge" | "span_bytes_sum";
+		bytes: number | null;
+		as_of: string | null;
+	};
+	agents: {
+		state: GlanceState;
+		window_days: number;
+		active: number | null;
+		direct_calls: number | null;
+	};
+	spend: {
+		state: GlanceState;
+		period_start: string | null;
+		period_kind: string | null;
+		usd: number | null;
+		unpriced_requests: number | null;
+	};
+	providers: {
+		state: GlanceState;
+		window_days: number;
+		count: number | null;
+		top: string[];
+	};
+	storage: null | {
+		state: GlanceState;
+		compressed_bytes: number | null;
+		uncompressed_bytes: number | null;
+		index_bytes: number | null;
+		primary_index_bytes: number | null;
+		on_disk_bytes: number | null;
+		ratio: number | null;
+		tables: { name: string; on_disk_bytes: number; rows: number }[];
+		disk: { free: number; total: number } | null;
+	};
+};
+
+/** Snapshot independent of the dashboard range; the gateway caches one response per tenant. */
+export function fetchWorkspaceGlance(): Promise<WorkspaceGlanceResponse | null> {
+	return gatewayGet<WorkspaceGlanceResponse>("/v1/workspace/glance").catch(
+		(error) => {
+			if (error instanceof GatewayError && error.status !== 403) return null;
+			throw error;
+		},
+	);
+}
+
 async function orNull<T>(p: Promise<T>): Promise<T | null> {
 	try {
 		return await p;
@@ -143,6 +211,20 @@ export function fetchCostBreakdownFor(
 	q.set("by", by);
 	if (scope) q.set("scope", scope);
 	return orNull(gatewayGet<CostBreakdown>(url("/v1/costs", q)));
+}
+
+/** Defined only for streamed generations with a measured first-token time. */
+export function fetchOutputSpeedByModelFor(
+	r: Win,
+): Promise<{ key: string; value: number; n: number }[] | null> {
+	const q = windowParams(r);
+	q.set("metric", "output_tps_p50");
+	q.set("by", "model");
+	return orNull(
+		gatewayGet<{ rows: { key: string; value: number; n: number }[] }>(
+			url("/v1/metrics/breakdown", q),
+		),
+	).then((data) => data?.rows ?? null);
 }
 
 /** `GET /v1/query/latency-breakdown` — gateway overhead vs provider vs TTFT. */

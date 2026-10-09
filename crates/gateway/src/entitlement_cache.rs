@@ -86,6 +86,15 @@ static LISTEN_RECONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Requests served a last-known grant past the TTL while a refresh ran off-path.
 pub static STALE_SERVED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIL_OPEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// B-409: resolves that found no `plan_allowances` row for the tenant's pinned
+/// (or current) version and fell back to the deny floor. Should be 0 in prod;
+/// >0 = the seed did not run or a pinned version was removed.
+pub static ALLOWANCE_ROW_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// rev4 M3: resolves whose PINNED `plan_allowances` row was missing and that read
+/// the plan's CURRENT row instead. Should be 0 in prod (the 0055 trigger refuses
+/// to delete or truncate a pinned version); >0 = a pin names a version that does
+/// not exist.
+pub static ALLOWANCE_PIN_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // `metrics_snapshot` / `EntitlementMetrics` (a `(cache_miss_total,
 // listen_reconnect_total, fail_open_total)` reader) were deleted 2026-09-12
@@ -252,8 +261,15 @@ pub struct ResolvedEntitlements {
     /// `FeatureKey`) because the resolver reads it directly for the pricing
     /// page + `/v1/billing/usage`'s `plan` block.
     pub f_sso: bool,
+    pub f_customer_kms: bool,
     pub f_cache_control: bool,
     pub cache_ttl_hours: u32,
+    /// `OG-50`: the plan grants OTLP span export (`plan_entitlements.f_otel_export`, seeded OFF
+    /// for every plan until the founder rules). Plan-only. **Fail-CLOSED**: `false` on
+    /// `deny_all`, on bench and with no control plane — an absent read exports nothing.
+    pub f_otel_export: bool,
+    /// `OG-50`: how many exports the plan allows (`plan_entitlements.max_exports`).
+    pub max_exports: u32,
     // ── BILL-01 / ADR-076 — the six-meter model's per-plan allowances ───────
     //
     // `None` on any `*_included` field means CUSTOM (Enterprise only — the
@@ -304,6 +320,11 @@ pub struct ResolvedEntitlements {
     /// (`tenants.price_version`) — price protection (ADR-076 §0.5). `None`
     /// means "the current version", read by `billing::rating`.
     pub price_version: Option<String>,
+    /// B-409: the `plan_allowances.plan_version` the allowances above were
+    /// resolved from — the tenant's pinned version while protection is live,
+    /// else the current one. `None` = no row (the allowances are the deny
+    /// floor), no control plane, or a synthetic grant.
+    pub plan_version: Option<String>,
     /// GWY-43: the workspace-wide monthly USD spend ceiling (`tenants
     /// .budget_usd_monthly`), in integer **micro-USD**. `0` = uncapped.
     ///
@@ -350,6 +371,25 @@ pub struct ResolvedEntitlements {
     /// the read FAILED — fail-closed, the privacy-safe direction. Applied only through
     /// `config::capture_decision`.
     pub content_capture: crate::db::workspace_capture::WorkspaceCapture,
+    /// `OG-51`: the workspace's response-cache settings, invalidation epochs and per-key
+    /// narrowings (`workspace_cache_settings`, `cache_epochs`, `api_keys.cache`), loaded in
+    /// the same refresh, never per request. `Default` = no settings = today's behaviour.
+    /// A FAILED read resolves to the PRIVACY default (mode `off`), never to "on" — see
+    /// [`attach_cache_settings`].
+    pub cache: Arc<crate::db::cache_settings::Loaded>,
+    /// `OG-25` / `OG-21` / `OG-22`: the workspace's own controls (`workspace_controls`):
+    /// pause, block lists, and the workspace policy layer. Read on the resolve's
+    /// connection ([`attach_workspace_controls`]), never per request. Empty when unset,
+    /// on `deny_all` / bench, and with no control plane. A FAILED read fails the whole
+    /// resolve, so the cache keeps serving the LAST-KNOWN controls.
+    pub controls: std::sync::Arc<crate::controls::WorkspaceControls>,
+    pub guardrail_policies: Arc<crate::guardrail::policy::Policies>,
+    /// `OG-11`/`OG-12`/`OG-13`: the workspace's routing document (`workspace_routing`),
+    /// parsed once per refresh — never per request. `None` when unset, on `deny_all` /
+    /// bench and with no control plane; `Invalid` for a stored document this gateway
+    /// cannot parse (routed requests are refused, fail-CLOSED). A FAILED read fails the
+    /// whole resolve, so the cache keeps serving the LAST-KNOWN document.
+    pub routing: std::sync::Arc<crate::routing::RoutingState>,
 }
 
 impl ResolvedEntitlements {
@@ -364,6 +404,17 @@ impl ResolvedEntitlements {
         self.auto_age_window_days
             .unwrap_or(self.indexed_window_days)
     }
+
+    /// rev4 M3: whether the six allowances and three windows came from a real
+    /// `plan_allowances` row (the tenant's pinned version, or its plan's current
+    /// one). `false` = the deny floor, a cold no-control-plane default, or a
+    /// synthetic grant — numbers that say nothing about what the customer bought,
+    /// so nothing may WARN or AUTO-AGE against them (the metering job checks).
+    #[must_use]
+    pub fn allowances_known(&self) -> bool {
+        self.plan_version.is_some()
+    }
+
     /// The deny-all default served on a cache miss during a control-plane
     /// outage when no last-known grant exists. Deny-new-features per ADR-035.
     pub fn deny_all() -> Self {
@@ -395,8 +446,11 @@ impl ResolvedEntitlements {
             f_online_evals: false,
             f_annotation_queues: false,
             f_sso: false,
+            f_customer_kms: false,
             f_cache_control: false,
             cache_ttl_hours: 0,
+            f_otel_export: false,
+            max_exports: 0,
             // Deny-all = zero allowances on every meter, a conservative 30-day
             // window (ADR-076: "deny = zero allowances, 30-day window"). NOT
             // `None` (which would mean "custom/unlimited") — this is the
@@ -424,6 +478,7 @@ impl ResolvedEntitlements {
             billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
+            plan_version: None,
             workspace_budget_micro_usd: 0,
             // Deny-all: no ceiling, no auto-age shrink — the fail-closed
             // floor is a denial via zero allowances, not a spend-ceiling
@@ -431,9 +486,13 @@ impl ResolvedEntitlements {
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            controls: std::sync::Arc::default(),
+            guardrail_policies: Arc::default(),
             failover_enabled: false,
             failover_models: std::sync::Arc::default(),
+            routing: std::sync::Arc::default(),
             content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
+            cache: std::sync::Arc::default(),
         }
     }
 
@@ -515,8 +574,11 @@ impl ResolvedEntitlements {
             f_online_evals: false,
             f_annotation_queues: false,
             f_sso: false,
+            f_customer_kms: false,
             f_cache_control: false,
             cache_ttl_hours: 0,
+            f_otel_export: false,
+            max_exports: 0,
             // BILL-01: bench = None/unlimited on every meter — the point of the
             // grant is that no allowance and no rate-limit tier can reject the
             // run (`rate_limit_rpm: None` on this grant is what confers it —
@@ -543,15 +605,20 @@ impl ResolvedEntitlements {
             billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
+            plan_version: None,
             workspace_budget_micro_usd: 0,
             // Bench measures the gateway's own overhead — no ceiling exists
             // for a no-control-plane grant, so no auto-age shrink either.
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            controls: std::sync::Arc::default(),
+            guardrail_policies: Arc::default(),
             failover_enabled: false,
             failover_models: std::sync::Arc::default(),
+            routing: std::sync::Arc::default(),
             content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
+            cache: std::sync::Arc::default(),
         }
     }
 
@@ -613,7 +680,7 @@ impl ResolvedEntitlements {
 /// Cached value plus the instant it was resolved (drives refresh-ahead).
 #[derive(Debug)]
 struct Cached {
-    resolved: ResolvedEntitlements,
+    resolved: Arc<ResolvedEntitlements>,
     fetched_at: Instant,
 }
 
@@ -627,6 +694,22 @@ pub type ResolveFn = Arc<
         + Sync,
 >;
 
+/// rev5 M6: the process's entitlement cache, for the one reader that holds no `AppState`
+/// — the API-key authenticator, which enforces the workspace policy's `source_ips` on
+/// every route a key can reach. Installed once at boot iff a control plane exists; absent
+/// (self-host, tests) ⇒ no workspace policy (nothing can have been set).
+static GLOBAL: std::sync::OnceLock<Arc<EntitlementCache>> = std::sync::OnceLock::new();
+
+/// Install the boot-time cache (first call wins).
+pub(crate) fn install_global(cache: Arc<EntitlementCache>) {
+    let _ = GLOBAL.set(cache);
+}
+
+/// The boot-time cache, when a control plane exists.
+pub(crate) fn global() -> Option<&'static Arc<EntitlementCache>> {
+    GLOBAL.get()
+}
+
 /// In-process entitlement cache. Cheap to clone (all fields are `Arc`-backed).
 #[derive(Clone)]
 pub struct EntitlementCache {
@@ -636,6 +719,10 @@ pub struct EntitlementCache {
     /// Tenants whose next miss must re-resolve INLINE (an explicit invalidation).
     forced: Arc<dashmap::DashSet<Uuid>>,
     resolve: ResolveFn,
+    /// Only outstanding resolves live here. The lock serializes cache publication
+    /// with invalidation; database waits never hold it. Weak tickets let cancelled
+    /// requests be reclaimed without a permanent per-tenant generation map.
+    pending: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Weak<()>>>>,
 }
 
 impl EntitlementCache {
@@ -648,6 +735,7 @@ impl EntitlementCache {
             last_known: Arc::new(DashMap::new()),
             forced: Arc::new(dashmap::DashSet::new()),
             resolve,
+            pending: Arc::default(),
         }
     }
 
@@ -670,7 +758,7 @@ impl EntitlementCache {
             if cached.fetched_at.elapsed() >= REFRESH_AHEAD {
                 self.spawn_refresh(tenant);
             }
-            return (Arc::new(cached.resolved.clone()), false);
+            return (cached.resolved.clone(), false);
         }
         // STALE-WHILE-REVALIDATE (2026-09-04, the p95 investigation). After the
         // 15-minute TTL the entry is gone from `cache`, but `last_known` still
@@ -689,7 +777,7 @@ impl EntitlementCache {
             self.spawn_refresh(tenant);
             return (last.clone(), false);
         }
-        (self.resolve_and_store(tenant).await, true)
+        (self.resolve_and_store(tenant, false).await, true)
     }
 
     /// Whether a real resolver result exists, rather than the outage fallback.
@@ -697,41 +785,92 @@ impl EntitlementCache {
         self.last_known.contains_key(&tenant)
     }
 
-    /// Miss path: resolve from Postgres, populate the cache + last-known store.
-    /// On resolver error, fail-open to the last-known grant, else deny-all.
-    async fn resolve_and_store(&self, tenant: Uuid) -> Arc<ResolvedEntitlements> {
+    /// A request can wait on a credential or budget after reading controls. Fence
+    /// that wait against a newer published policy or an explicit invalidation.
+    pub(crate) fn is_current(&self, tenant: Uuid, resolved: &Arc<ResolvedEntitlements>) -> bool {
+        !self.forced.contains(&tenant)
+            && self
+                .last_known
+                .get(&tenant)
+                .is_some_and(|current| Arc::ptr_eq(current.value(), resolved))
+    }
+
+    /// Preserve feature grants during an outage, but never restore an unknown
+    /// routing or security policy. An explicit invalidation is a revocation fence.
+    fn unavailable(&self, tenant: Uuid) -> Arc<ResolvedEntitlements> {
+        let mut resolved = self
+            .last_known
+            .get(&tenant)
+            .map_or_else(ResolvedEntitlements::deny_all, |last| (**last).clone());
+        resolved.routing = Arc::new(crate::routing::RoutingState::Invalid);
+        let mut controls = (*resolved.controls).clone();
+        controls.policy = Some(tracelane_shared::key_policy::LayerPolicy::Invalid);
+        resolved.controls = Arc::new(controls);
+        Arc::new(resolved)
+    }
+
+    /// Each resolve gets a publication ticket. Invalidation or a newer resolve
+    /// removes its authority to publish, including when the old query later succeeds.
+    async fn resolve_and_store(&self, tenant: Uuid, background: bool) -> Arc<ResolvedEntitlements> {
+        let ticket = Arc::new(());
+        {
+            let mut pending = self.pending.lock().await;
+            if background
+                && pending
+                    .get(&tenant)
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some()
+            {
+                return self.unavailable(tenant);
+            }
+            if pending.len() >= MAX_CAPACITY as usize {
+                pending.retain(|_, value| value.strong_count() != 0);
+                if pending.len() >= MAX_CAPACITY as usize && !pending.contains_key(&tenant) {
+                    return self.unavailable(tenant);
+                }
+            }
+            pending.insert(tenant, Arc::downgrade(&ticket));
+        }
         CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        match (self.resolve)(tenant).await {
+        let result = (self.resolve)(tenant).await;
+        let mut pending = self.pending.lock().await;
+        let current = pending
+            .get(&tenant)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|active| Arc::ptr_eq(&active, &ticket));
+        if !current {
+            // A newer published answer is safe to return; otherwise this caller
+            // cannot know the post-invalidation controls and must refuse dispatch.
+            return if !self.forced.contains(&tenant) {
+                self.last_known
+                    .get(&tenant)
+                    .map(|last| last.clone())
+                    .unwrap_or_else(|| self.unavailable(tenant))
+            } else {
+                self.unavailable(tenant)
+            };
+        }
+        pending.remove(&tenant);
+        match result {
             Ok(resolved) => {
-                let arc = Arc::new(resolved.clone());
-                self.forced.remove(&tenant);
-                self.last_known.insert(tenant, arc.clone());
+                let arc = Arc::new(resolved);
                 self.cache
                     .insert(
                         tenant,
                         Arc::new(Cached {
-                            resolved,
+                            resolved: arc.clone(),
                             fetched_at: Instant::now(),
                         }),
                     )
                     .await;
+                self.last_known.insert(tenant, arc.clone());
+                self.forced.remove(&tenant);
                 arc
             }
             Err(err) => {
                 FAIL_OPEN_TOTAL.fetch_add(1, Ordering::Relaxed);
-                if let Some(last) = self.last_known.get(&tenant) {
-                    tracing::warn!(
-                        error = %err,
-                        "entitlement resolve failed — failing open to last-known grant"
-                    );
-                    last.clone()
-                } else {
-                    tracing::warn!(
-                        error = %err,
-                        "entitlement resolve failed with no last-known grant — denying new features"
-                    );
-                    Arc::new(ResolvedEntitlements::deny_all())
-                }
+                tracing::warn!(error = %err, "entitlement resolve failed; security policy unavailable");
+                self.unavailable(tenant)
             }
         }
     }
@@ -741,29 +880,30 @@ impl EntitlementCache {
         let this = self.clone();
         tokio::spawn(async move {
             // Re-resolve; ignore the value (resolve_and_store re-inserts).
-            let _ = this.resolve_and_store(tenant).await;
+            let _ = this.resolve_and_store(tenant, true).await;
         });
     }
 
-    /// Evict a workspace's entry (called by the `LISTEN` task on `NOTIFY`).
-    /// The next read re-resolves; the last-known store is intentionally kept
-    /// so a concurrent outage still has a fallback.
+    /// Fence every pending lookup before evicting this workspace. Feature grants
+    /// remain available on outage, but routing and security controls fail closed.
     pub async fn invalidate(&self, tenant: Uuid) {
-        self.cache.invalidate(&tenant).await;
-        // An EXPLICIT invalidation (NOTIFY, a plan change) must force an INLINE
-        // re-resolve — the stale-while-revalidate branch in `resolved` may not
-        // serve the value that was just declared wrong. `last_known` is kept:
-        // it is still the fail-open answer if that re-resolve hits an outage.
+        let mut pending = self.pending.lock().await;
+        pending.remove(&tenant);
         self.forced.insert(tenant);
+        self.cache.invalidate(&tenant).await;
     }
 
-    /// Evict every workspace — used when a `plan_entitlements` row changes, which
-    /// affects all tenants on that plan (the `NOTIFY` payload `ALL` triggers this).
-    pub fn invalidate_all(&self) {
-        self.cache.invalidate_all();
+    /// Fence outstanding lookups too, including tenants with no previous cached row.
+    pub async fn invalidate_all(&self) {
+        let mut pending = self.pending.lock().await;
+        for tenant in pending.keys() {
+            self.forced.insert(*tenant);
+        }
+        pending.clear();
         for e in self.last_known.iter() {
             self.forced.insert(*e.key());
         }
+        self.cache.invalidate_all();
     }
 
     #[cfg(test)]
@@ -786,10 +926,58 @@ impl EntitlementCache {
 /// the `LEFT JOIN`; only a MISSING `tenants` ROW (the tenant does not exist at
 /// all) reaches `deny_all()`.
 ///
+/// B-409 — the ONE rule for which `plan_allowances` row a tenant reads, as SQL
+/// text shared by every query that reads an allowance or a window (this
+/// resolver, `billing::metering_job`'s window map, `retention_sweep`'s deletion
+/// boundary). `$key` is the SQL expression naming the plan lookup key; the
+/// query must alias `tenants` as `t`.
+///
+/// While the tenant's price protection is live — `t.plan_version` set by the
+/// Polar webhook on the first paid activation, and `t.price_protected_until`
+/// still in the future (NULL = no expiry recorded) — the PINNED version's row;
+/// otherwise the `is_current` row.
+///
+/// rev4 M3 (2026-10-03): a pinned version with NO row falls back to the plan's
+/// `is_current` row — never straight to a fail-direction floor. The pin's row can
+/// only be absent through a defect (0055's trigger refuses DELETE and TRUNCATE of a
+/// pinned version), and the zero floor turned that defect into "0 GB included"
+/// while overage/overflow still came from the plan: 75/90 % warnings against zero
+/// and an AUTO-AGE narrowing. One LATERAL row: the pinned row when it exists
+/// (ordered first), else the current one; `LIMIT 1` plus the partial unique index
+/// `plan_allowances_one_current_per_plan` make it at most one. Only when the plan
+/// has NO current row either does each caller apply its own fail direction (the
+/// resolver: the deny floor; the metering job: its 3-day window; the sweep: 730
+/// days, never delete early). The inner alias is `pa` too, so `verify_schema`'s
+/// alias scan sees every `plan_allowances` column the rule names.
+macro_rules! allowance_pin_join {
+    ($key:literal) => {
+        concat!(
+            " LEFT JOIN LATERAL (SELECT pa.* FROM plan_allowances pa \
+               WHERE pa.plan_lookup_key = ",
+            $key,
+            " AND (pa.is_current OR (t.plan_version IS NOT NULL \
+                 AND (t.price_protected_until IS NULL OR t.price_protected_until > now()) \
+                 AND pa.plan_version = t.plan_version)) \
+               ORDER BY (t.plan_version IS NOT NULL \
+                 AND (t.price_protected_until IS NULL OR t.price_protected_until > now()) \
+                 AND pa.plan_version = t.plan_version) DESC \
+               LIMIT 1) pa ON true "
+        )
+    };
+}
+pub(crate) use allowance_pin_join;
+
 /// The ONE entitlement query. Module-level so the boot schema check
 /// (`verify_schema`) parses the same text the resolver runs — no second list
 /// of columns to drift (founder, 2026-09-14, B6 audit item B).
-pub(crate) const SQL: &str = "\
+///
+/// B-409: the six allowances and three windows come from `plan_allowances pa`
+/// (the tenant's pinned version, [`allowance_pin_join`]), NOT the catalog
+/// `plan_entitlements` columns — a new ruling inserts a version and no pinned
+/// tenant's allowance moves. `allowance_row_found` tells "custom" (an Enterprise
+/// NULL in a real row) from "no row" (fail closed, [`row_to_resolved`]).
+pub(crate) const SQL: &str = concat!(
+    "\
                 SELECT pe.plan_lookup_key, \
                   COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory) AS f_pr7_trajectory, \
                   COALESCE(we.f_pr8_argdrift, pe.f_pr8_argdrift) AS f_pr8_argdrift, \
@@ -814,16 +1002,22 @@ pub(crate) const SQL: &str = "\
                   COALESCE(we.f_annotation_queues, pe.f_annotation_queues) AS f_annotation_queues, \
                   COALESCE(we.f_audit_selfverify, pe.f_audit_selfverify) AS f_audit_selfverify, \
                   COALESCE(we.f_sso, pe.f_sso) AS f_sso, \
-                  pe.f_cache_control AS f_cache_control, pe.cache_ttl_hours AS cache_ttl_hours, \
-                  COALESCE(we.hot_gb_included, pe.hot_gb_included)::text AS hot_gb_included_text, \
-                  COALESCE(we.ingest_gb_included, pe.ingest_gb_included)::text AS ingest_gb_included_text, \
-                  COALESCE(we.cold_gb_included, pe.cold_gb_included)::text AS cold_gb_included_text, \
-                  COALESCE(we.series_included, pe.series_included) AS series_included, \
-                  COALESCE(we.scan_units_included, pe.scan_units_included) AS scan_units_included, \
-                  COALESCE(we.eval_runs_included, pe.eval_runs_included) AS eval_runs_included, \
-                  COALESCE(we.indexed_window_days, pe.indexed_window_days) AS indexed_window_days, \
-                  COALESCE(we.queryable_days, pe.queryable_days) AS queryable_days, \
-                  COALESCE(we.ledger_days, pe.ledger_days) AS ledger_days, \
+                  pe.f_customer_kms AS f_customer_kms, pe.f_cache_control AS f_cache_control, pe.cache_ttl_hours AS cache_ttl_hours, \
+                  pe.f_otel_export AS f_otel_export, pe.max_exports AS max_exports, \
+                  COALESCE(we.hot_gb_included, pa.hot_gb_included)::text AS hot_gb_included_text, \
+                  COALESCE(we.ingest_gb_included, pa.ingest_gb_included)::text AS ingest_gb_included_text, \
+                  COALESCE(we.cold_gb_included, pa.cold_gb_included)::text AS cold_gb_included_text, \
+                  COALESCE(we.series_included, pa.series_included) AS series_included, \
+                  COALESCE(we.scan_units_included, pa.scan_units_included) AS scan_units_included, \
+                  COALESCE(we.eval_runs_included, pa.eval_runs_included) AS eval_runs_included, \
+                  COALESCE(we.indexed_window_days, pa.indexed_window_days) AS indexed_window_days, \
+                  COALESCE(we.queryable_days, pa.queryable_days) AS queryable_days, \
+                  COALESCE(we.ledger_days, pa.ledger_days) AS ledger_days, \
+                  (pa.plan_lookup_key IS NOT NULL) AS allowance_row_found, \
+                  pa.plan_version AS plan_version, \
+                  (t.plan_version IS NOT NULL \
+                    AND (t.price_protected_until IS NULL OR t.price_protected_until > now()) \
+                    AND COALESCE(pa.plan_version <> t.plan_version, true)) AS allowance_pin_fell_back, \
                   pe.unlimited_seats AS unlimited_seats, \
                   COALESCE(we.overage_allowed, pe.overage_allowed) AS overage_allowed, \
                   COALESCE(t.overflow_mode, we.overflow_mode, pe.overflow_mode) AS overflow_mode, \
@@ -844,8 +1038,10 @@ pub(crate) const SQL: &str = "\
                   t.auto_age_since AS auto_age_since \
                 FROM tenants t \
                 JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
-                LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
-                WHERE t.id = $1 AND t.archived_at IS NULL";
+                LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id",
+    allowance_pin_join!("pe.plan_lookup_key"),
+    "WHERE t.id = $1 AND t.archived_at IS NULL"
+);
 
 /// `pe.plan_lookup_key = t.plan::text || '_v1'` mirrors the exact mapping
 /// `apps/web/lib/entitlements.ts`'s `PLAN_TO_LOOKUP_KEY` and the Polar webhook's
@@ -869,6 +1065,11 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                     attach_model_aliases(&client, &tenant, &mut resolved).await;
                     attach_workspace_failover(&client, &tenant, &mut resolved).await;
                     attach_content_capture(&client, &tenant, &mut resolved).await;
+                    attach_cache_settings(&client, &tenant, &mut resolved).await;
+                    attach_workspace_controls(&client, &tenant, &mut resolved).await?;
+                    resolved.guardrail_policies =
+                        Arc::new(crate::guardrail::policy_store::load(&client, &tenant).await?);
+                    attach_workspace_routing(&client, &tenant, &mut resolved).await?;
                     Ok(resolved)
                 }
                 // No tenant row at all (unknown / archived tenant) — fail
@@ -879,6 +1080,54 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
             }
         }) as Pin<Box<dyn Future<Output = anyhow::Result<ResolvedEntitlements>> + Send>>
     })
+}
+
+/// `OG-25`: load the workspace's controls onto an already-resolved entitlement set, on
+/// the refresh's connection.
+///
+/// # Errors
+/// Fail-CLOSED in effect: a failed read FAILS the resolve, so the cache serves the
+/// last-known controls (a pause is never dropped because a read failed); a tenant never
+/// resolved fails to `deny_all` exactly as any resolve failure does.
+pub(crate) async fn attach_workspace_controls(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) -> anyhow::Result<()> {
+    let row = crate::db::controls::read_with(client, tenant).await?;
+    if let Some(r) = row {
+        resolved.controls = Arc::new(crate::controls::WorkspaceControls::from_row(
+            r.policy.as_ref(),
+            r.paused_at.map(|at| crate::controls::Pause {
+                at,
+                by: r.paused_by,
+                reason: r.pause_reason,
+            }),
+            r.blocked_models,
+            r.blocked_providers,
+            r.blocked_end_users,
+        ));
+    }
+    Ok(())
+}
+
+/// `OG-11`: load the workspace's routing document onto an already-resolved entitlement
+/// set, on the refresh's connection.
+///
+/// # Errors
+/// Fail-CLOSED in effect, as [`attach_workspace_controls`]: a failed read FAILS the
+/// resolve, so the cache serves the last-known document; a document that reads but does
+/// not parse becomes `RoutingState::Invalid` (routed requests refused 503).
+pub(crate) async fn attach_workspace_routing(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) -> anyhow::Result<()> {
+    let row = crate::db::routing::get_with(client, tenant).await?;
+    resolved.routing = Arc::new(crate::routing::RoutingState::from_stored(
+        row.as_ref().map(|r| &r.doc),
+    ));
+    Ok(())
 }
 
 /// GWY-27: load the workspace's model aliases onto an already-resolved entitlement
@@ -963,6 +1212,41 @@ pub(crate) async fn attach_content_capture(
     }
 }
 
+/// `OG-51`: load the workspace's response-cache settings, invalidation epochs and per-key
+/// narrowings, on the refresh's connection. **Fail-CLOSED on a failed read**: the workspace
+/// resolves to cache mode `off` — the privacy-safe direction, because a workspace that
+/// invalidated its cache or switched it off must never be served from it while the read is
+/// broken — and counts `workspace_gateway_config_unreadable`. The entitlements are untouched.
+pub(crate) async fn attach_cache_settings(
+    client: &tokio_postgres::Client,
+    tenant: &Uuid,
+    resolved: &mut ResolvedEntitlements,
+) {
+    match crate::db::cache_settings::read_with(client, tenant).await {
+        Ok(loaded) => {
+            resolved.cache = Arc::new(loaded);
+            tracelane_shared::degradation::resolve(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            );
+        }
+        Err(e) => {
+            resolved.cache = Arc::new(crate::db::cache_settings::Loaded {
+                settings: crate::db::cache_settings::Settings {
+                    mode: crate::db::cache_settings::Mode::Off,
+                    ..crate::db::cache_settings::Settings::default()
+                },
+                ..crate::db::cache_settings::Loaded::default()
+            });
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::WorkspaceGatewayConfigUnreadable,
+            ) == 1
+            {
+                tracing::warn!(error = %e, tenant_id = %tenant, "workspace cache settings unreadable — the response cache is OFF for this workspace until the next refresh. Further occurrences are counted, not logged (kind=workspace_gateway_config_unreadable)");
+            }
+        }
+    }
+}
+
 /// Map one entitlements row onto [`ResolvedEntitlements`], **by COLUMN NAME**.
 ///
 /// ## Why this is not `row.get(0..23)` any more
@@ -999,6 +1283,46 @@ pub(crate) async fn attach_content_capture(
 /// beats resolving a tenant's entitlements from a half-read row. The one
 /// genuinely optional column uses `try_get` — see below.
 fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
+    // B-409: no `plan_allowances` row for the tenant's pinned (or current)
+    // version → fail CLOSED. Each allowance/window the workspace does not
+    // override takes the `deny_all()` floor — never NULL, which would read as
+    // "custom / unlimited". Feature flags are not versioned and are untouched.
+    let found: bool = row.get("allowance_row_found");
+    let floor = ResolvedEntitlements::deny_all();
+    // rev4 M3: the pin named a version with no row and the plan's CURRENT row
+    // answered instead (`allowance_pin_join!`). Counted, warned once — a pin that
+    // resolves to nothing is a defect even when the fallback hides it.
+    if found && row.get::<_, bool>("allowance_pin_fell_back") {
+        let n = ALLOWANCE_PIN_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 {
+            tracing::warn!(
+                plan_lookup_key = %row.get::<_, String>("plan_lookup_key"),
+                "a tenant's pinned plan_allowances version has no row — the plan's CURRENT \
+                 row answered (rev4 M3). Further occurrences are counted \
+                 (ALLOWANCE_PIN_FALLBACK_TOTAL), not logged"
+            );
+        }
+    }
+    if !found {
+        ALLOWANCE_ROW_MISSING_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if ALLOWANCE_ROW_MISSING_TOTAL.load(Ordering::Relaxed) == 1 {
+            tracing::warn!(
+                plan_lookup_key = %row.get::<_, String>("plan_lookup_key"),
+                "no plan_allowances row for this tenant's pinned/current version — \
+                 allowances resolve to the deny floor (fail-closed). Seed missing? \
+                 Further occurrences are counted (ALLOWANCE_ROW_MISSING_TOTAL), not logged"
+            );
+        }
+    }
+    let bytes = |col: &str, floor_v: Option<u64>| {
+        let v = numeric_text_to_bytes(row.get(col));
+        if found { v } else { v.or(floor_v) }
+    };
+    let count = |col: &str, floor_v: Option<i64>| {
+        let v: Option<i64> = row.get(col);
+        if found { v } else { v.or(floor_v) }
+    };
+    let days = |col: &str, floor_v: i32| row.get::<_, Option<i32>>(col).unwrap_or(floor_v);
     ResolvedEntitlements {
         plan_lookup_key: row.get("plan_lookup_key"),
         f_pr7_trajectory: row.get("f_pr7_trajectory"),
@@ -1026,26 +1350,27 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         f_annotation_queues: row.get("f_annotation_queues"),
         f_audit_selfverify: row.get("f_audit_selfverify"),
         f_sso: row.get("f_sso"),
+        f_customer_kms: row.get("f_customer_kms"),
         f_cache_control: row.get("f_cache_control"),
         cache_ttl_hours: u32::try_from(row.get::<_, i32>("cache_ttl_hours")).unwrap_or(0),
+        f_otel_export: row.get("f_otel_export"),
+        max_exports: u32::try_from(row.get::<_, i32>("max_exports")).unwrap_or(0),
         // BILL-01 / ADR-076 — numeric(12,3) GB figures arrive cast to text
         // (tokio-postgres has no native numeric->f64); NULL (Enterprise
         // "custom") survives as `None`, never a coerced zero. Converted to
         // BYTES here, once, so every downstream caller compares one unit.
-        hot_bytes_included: numeric_text_to_bytes(row.get("hot_gb_included_text")),
-        ingest_bytes_included: numeric_text_to_bytes(row.get("ingest_gb_included_text")),
-        cold_bytes_included: numeric_text_to_bytes(row.get("cold_gb_included_text")),
-        series_included: row.get("series_included"),
-        scan_units_included: row.get("scan_units_included"),
-        eval_runs_included: row.get("eval_runs_included"),
-        // NOT NULL in practice for every one of the five seeded plan rows
-        // (`apps/web/db/seed.mjs` upserts all five); `Row::get` panics on a
-        // genuine NULL here, which is the correct direction per this file's
-        // own rule (a half-seeded plan row is a deploy-time bug, not a value
-        // to silently paper over).
-        indexed_window_days: row.get("indexed_window_days"),
-        queryable_days: row.get("queryable_days"),
-        ledger_days: row.get("ledger_days"),
+        hot_bytes_included: bytes("hot_gb_included_text", floor.hot_bytes_included),
+        ingest_bytes_included: bytes("ingest_gb_included_text", floor.ingest_bytes_included),
+        cold_bytes_included: bytes("cold_gb_included_text", floor.cold_bytes_included),
+        series_included: count("series_included", floor.series_included),
+        scan_units_included: count("scan_units_included", floor.scan_units_included),
+        eval_runs_included: count("eval_runs_included", floor.eval_runs_included),
+        // B-409: NOT NULL in `plan_allowances` (migration 0055), so a NULL here
+        // means the row is MISSING (the LEFT JOIN) and no workspace override
+        // exists — the deny floor, never a panic on a cache miss.
+        indexed_window_days: days("indexed_window_days", floor.indexed_window_days),
+        queryable_days: days("queryable_days", floor.queryable_days),
+        ledger_days: days("ledger_days", floor.ledger_days),
         unlimited_seats: row.get("unlimited_seats"),
         overage_allowed: row.get("overage_allowed"),
         overflow_mode: OverflowMode::from_column(row.get::<_, &str>("overflow_mode")),
@@ -1065,6 +1390,7 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         },
         promotion_frozen_reason: row.get("promotion_frozen_reason"),
         price_version: row.get("price_version"),
+        plan_version: row.get("plan_version"),
         // `try_get` by name absorbs both "absent column" and "NULL" without
         // conflating them with a real zero.
         //
@@ -1091,10 +1417,14 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         auto_age_window_days: row.get("auto_age_window_days"),
         // Filled by `pg_resolver` from `model_aliases` after this row is mapped.
         model_aliases: std::sync::Arc::default(),
+        controls: std::sync::Arc::default(),
+        guardrail_policies: Arc::default(),
         // Filled by `pg_resolver` from `workspace_failover` after this row is mapped.
         failover_enabled: false,
         failover_models: std::sync::Arc::default(),
+        routing: std::sync::Arc::default(),
         content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
+        cache: std::sync::Arc::default(),
     }
 }
 
@@ -1321,7 +1651,7 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
                 _ => {
                     let payload = note.payload();
                     if payload == "ALL" {
-                        cache.invalidate_all();
+                        cache.invalidate_all().await;
                         tracing::debug!("entitlement cache fully invalidated via NOTIFY ALL");
                     } else if let Ok(tenant) = Uuid::parse_str(payload) {
                         cache.invalidate(tenant).await;
@@ -1347,6 +1677,54 @@ async fn listen_once(conn_str: &str, cache: &EntitlementCache) -> anyhow::Result
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn og11_old_resolve_cannot_overwrite_post_invalidation_controls() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver: ResolveFn = {
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move |_| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    let mut resolved = ResolvedEntitlements::deny_all();
+                    if first {
+                        entered.notify_one();
+                        release.notified().await;
+                    } else {
+                        resolved.controls = Arc::new(crate::controls::WorkspaceControls {
+                            blocked_models: vec!["gpt-*".to_owned()],
+                            ..Default::default()
+                        });
+                    }
+                    Ok(resolved)
+                })
+            })
+        };
+        let cache = EntitlementCache::new(resolver);
+        let tenant = Uuid::new_v4();
+        let old = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.resolved(tenant).await })
+        };
+        entered.notified().await;
+        cache.invalidate(tenant).await;
+        assert_eq!(
+            cache.resolved(tenant).await.controls.blocked_models,
+            ["gpt-*"]
+        );
+        release.notify_one();
+        old.await.unwrap();
+        assert_eq!(
+            cache.resolved(tenant).await.controls.blocked_models,
+            ["gpt-*"],
+            "a pre-invalidation resolve must never resurrect permissive controls"
+        );
+    }
 
     /// The DEGRADED branch must actually FIRE on the config the ordinary
     /// Neon deployment produces. Driven from a DSN string, not a hand-built
@@ -1424,8 +1802,11 @@ mod tests {
             f_full_capture: true,
             f_alerts: true,
             f_sso: true,
+            f_customer_kms: false,
             f_cache_control: false,
             cache_ttl_hours: 0,
+            f_otel_export: false,
+            max_exports: 0,
             // Enterprise: every allowance is "custom" — genuinely `None`, not a
             // large number, matching what a NULL `plan_entitlements` column
             // resolves to.
@@ -1451,13 +1832,18 @@ mod tests {
             billing_period: None,
             promotion_frozen_reason: None,
             price_version: None,
+            plan_version: None,
             workspace_budget_micro_usd: 0,
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            controls: std::sync::Arc::default(),
+            guardrail_policies: Arc::default(),
             failover_enabled: false,
             failover_models: std::sync::Arc::default(),
+            routing: std::sync::Arc::default(),
             content_capture: crate::db::workspace_capture::WorkspaceCapture::default(),
+            cache: std::sync::Arc::default(),
         }
     }
 
@@ -2109,20 +2495,48 @@ pub enum SchemaCheck {
     Unavailable(String),
 }
 
+/// `OG-11` (S2, migration 0070): the routing document the resolve reads and the BYOK
+/// label every key lookup selects. Absent → the boot check refuses, rather than every
+/// resolve failing (routing) or every BYOK lookup 503-ing (label).
+const ROUTING_SCHEMA_COLUMNS: &[(&str, &str)] = &[
+    ("workspace_routing", "tenant_id"),
+    ("workspace_routing", "doc"),
+    ("workspace_routing", "version"),
+    ("provider_keys", "label"),
+];
+
 /// Every `(table, column)` the entitlement query reads, parsed from `SQL`
-/// itself. Aliases: `pe` plan_entitlements · `we` workspace_entitlements · `t` tenants.
+/// itself. Aliases: `pe` plan_entitlements · `we` workspace_entitlements · `t` tenants
+/// · `pa` plan_allowances (B-409).
 pub fn selected_columns() -> Vec<(&'static str, String)> {
-    let re = regex::Regex::new(r"\b(pe|we|t)\.([a-z_][a-z0-9_]*)").expect("static regex");
+    let re = regex::Regex::new(r"\b(pe|we|pa|t)\.([a-z_][a-z0-9_]*)").expect("static regex");
     let mut out: Vec<(&'static str, String)> = Vec::new();
     for cap in re.captures_iter(SQL) {
         let table = match &cap[1] {
             "pe" => "plan_entitlements",
             "we" => "workspace_entitlements",
+            "pa" => "plan_allowances",
             _ => "tenants",
         };
         let col = cap[2].to_string();
         if !out.iter().any(|(t, c)| *t == table && *c == col) {
             out.push((table, col));
+        }
+    }
+    // OG-20 / OG-23 (S2): the API-key auth SELECT's project JOIN and governance
+    // columns. Not this module's SQL, but the same failure if absent — every API key's
+    // cold lookup would fail (503) — so the same boot refusal names them.
+    for (t, c) in crate::db::api_keys::AUTH_SCHEMA_COLUMNS
+        .iter()
+        .chain(crate::db::controls::CONTROLS_SCHEMA_COLUMNS)
+        .chain(crate::db::cache_settings::CACHE_SCHEMA_COLUMNS)
+        .chain(crate::guardrail::policy_store::SCHEMA_COLUMNS)
+        .chain(crate::guardrail::hooks_api::SCHEMA_COLUMNS)
+        .chain(crate::db::control_audit::CONTROL_AUDIT_SCHEMA_COLUMNS)
+        .chain(ROUTING_SCHEMA_COLUMNS)
+    {
+        if !out.iter().any(|(ot, oc)| ot == t && oc == c) {
+            out.push((t, (*c).to_string()));
         }
     }
     out
@@ -2140,11 +2554,15 @@ pub fn missing_columns(
         .collect()
 }
 
-/// Ask `information_schema.columns` for the three tables and compare with what
+/// Ask `information_schema.columns` for every required table and compare with what
 /// `SQL` reads. `Ok(n)` = every one of the `n` selected columns exists.
 pub async fn verify_schema(pool: &crate::db::DbPool) -> Result<usize, SchemaCheck> {
     let selected = selected_columns();
-    let tables: Vec<&str> = vec!["plan_entitlements", "workspace_entitlements", "tenants"];
+    // Query the same tables whose columns we require, so a newly registered
+    // control schema cannot be absent from the catalog read itself.
+    let mut tables: Vec<&str> = selected.iter().map(|(table, _)| *table).collect();
+    tables.sort_unstable();
+    tables.dedup();
     let client = pool
         .get()
         .await
@@ -2185,11 +2603,22 @@ mod boot_schema_check_tests {
             cols.len()
         );
         for pair in [
-            ("plan_entitlements", "hot_gb_included"),
+            // B-409: allowances are read from the versioned table, and the pin
+            // itself (`tenants.plan_version` + its expiry) is a boot requirement.
+            ("plan_allowances", "hot_gb_included"),
+            ("plan_allowances", "plan_version"),
+            ("plan_allowances", "is_current"),
+            ("tenants", "plan_version"),
+            ("tenants", "price_protected_until"),
+            ("plan_entitlements", "f_sso"),
             ("workspace_entitlements", "ingest_gb_included"),
             ("tenants", "spend_ceiling_usd"),
             ("tenants", "plan"),
             ("workspace_entitlements", "tenant_id"),
+            // OG-20 / OG-23: the API-key auth SELECT's JOIN and policy columns.
+            ("api_keys", "project_id"),
+            ("api_keys", "policy"),
+            ("projects", "policy"),
         ] {
             assert!(
                 cols.iter().any(|(t, c)| (*t, c.as_str()) == pair),
@@ -2212,13 +2641,13 @@ mod boot_schema_check_tests {
             .collect();
         assert!(missing_columns(&selected, &present).is_empty());
         // Falsify: drop exactly the column migration 0043 will add, plus one more.
-        present.retain(|(t, c)| !(t == "plan_entitlements" && c == "hot_gb_included"));
+        present.retain(|(t, c)| !(t == "plan_allowances" && c == "hot_gb_included"));
         present.retain(|(t, c)| !(t == "tenants" && c == "spend_ceiling_usd"));
         let missing = missing_columns(&selected, &present);
         assert_eq!(
             missing,
             vec![
-                "plan_entitlements.hot_gb_included".to_string(),
+                "plan_allowances.hot_gb_included".to_string(),
                 "tenants.spend_ceiling_usd".to_string()
             ]
         );
@@ -2228,7 +2657,7 @@ mod boot_schema_check_tests {
     /// control-plane tables are built from `selected_columns()` itself (every
     /// column `text`; only presence matters to `information_schema`), so this
     /// test needs no migration and cannot disturb any other test's database.
-    async fn fresh_pool(url: &str, ddl: &[String]) -> crate::db::DbPool {
+    pub(crate) async fn fresh_pool(url: &str, ddl: &[String]) -> crate::db::DbPool {
         let (admin, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
             .await
             .expect("connect to the integration Postgres");
@@ -2333,5 +2762,401 @@ mod boot_schema_check_tests {
             Err(SchemaCheck::Unavailable(_)) => {}
             other => panic!("expected Unavailable on an empty schema, got {other:?}"),
         }
+    }
+}
+
+/// B-409 real-Postgres fixture: a FRESH, fully migrated database per test (so the
+/// tests run in parallel without sharing `is_current` state), the builder allowances
+/// read from `apps/web/db/plans.v3.json` (never re-typed — `.claude/rules/
+/// reference-tables.md`), and a hypothetical later ruling `v4` whose every number
+/// differs from v3's. Shared with the metering-job and retention-sweep tests.
+#[cfg(test)]
+pub(crate) mod b409_fixture {
+    use uuid::Uuid;
+
+    /// One plan's versioned allowances, in the units `plan_allowances` stores.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Allow {
+        pub hot_gb: f64,
+        pub ingest_gb: f64,
+        pub cold_gb: f64,
+        pub series: i64,
+        pub scan: i64,
+        pub eval: i64,
+        pub indexed: i32,
+        pub queryable: i32,
+        pub ledger: i32,
+    }
+
+    /// `builder_v1` exactly as `plans.v3.json` rules it.
+    pub(crate) fn v3_builder() -> Allow {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../../apps/web/db/plans.v3.json"))
+                .expect("plans.v3.json parses");
+        let p = &v["plans"]["builder_v1"];
+        let f = |k: &str| {
+            p[k].as_f64()
+                .unwrap_or_else(|| panic!("plans.v3.json builder_v1.{k}"))
+        };
+        Allow {
+            hot_gb: f("hot_gb_included"),
+            ingest_gb: f("ingest_gb_included"),
+            cold_gb: f("cold_gb_included"),
+            series: f("series_included") as i64,
+            scan: f("scan_units_included") as i64,
+            eval: f("eval_runs_included") as i64,
+            indexed: f("indexed_window_days") as i32,
+            queryable: f("queryable_days") as i32,
+            ledger: f("ledger_days") as i32,
+        }
+    }
+
+    /// A later ruling: every allowance and window DIFFERENT from v3's, so a test that
+    /// reads the wrong version cannot pass by coincidence.
+    pub(crate) fn v4_builder() -> Allow {
+        let a = v3_builder();
+        Allow {
+            hot_gb: a.hot_gb * 2.0,
+            ingest_gb: a.ingest_gb * 2.0,
+            cold_gb: a.cold_gb * 2.0,
+            series: a.series * 2,
+            scan: a.scan * 2,
+            eval: a.eval * 2,
+            indexed: a.indexed * 2,
+            queryable: a.queryable / 2,
+            ledger: a.ledger / 2,
+        }
+    }
+
+    pub(crate) fn gb_to_bytes(gb: f64) -> Option<u64> {
+        Some((gb * 1_000_000_000.0).round() as u64)
+    }
+
+    /// A fresh database on the integration server, migrated with EVERY file the
+    /// gateway's `apply_migrations` lists (0055 included).
+    pub(crate) async fn fresh_migrated_pool() -> crate::db::DbPool {
+        let Ok(url) = std::env::var("POSTGRES_TEST_URL") else {
+            panic!("POSTGRES_TEST_URL not set — this test cannot run, which is not a pass");
+        };
+        let pool = super::boot_schema_check_tests::fresh_pool(&url, &[]).await;
+        crate::db::apply_migrations(&pool)
+            .await
+            .expect("apply every migration to the fresh database");
+        pool
+    }
+
+    async fn insert_allowance(c: &tokio_postgres::Client, version: &str, a: Allow, current: bool) {
+        c.execute(
+            "INSERT INTO plan_allowances (plan_version, plan_lookup_key, hot_gb_included, \
+               ingest_gb_included, cold_gb_included, series_included, scan_units_included, \
+               eval_runs_included, indexed_window_days, queryable_days, ledger_days, is_current) \
+             VALUES ($1, 'builder_v1', $2::float8::numeric, $3::float8::numeric, \
+               $4::float8::numeric, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &version,
+                &a.hot_gb,
+                &a.ingest_gb,
+                &a.cold_gb,
+                &a.series,
+                &a.scan,
+                &a.eval,
+                &a.indexed,
+                &a.queryable,
+                &a.ledger,
+                &current,
+            ],
+        )
+        .await
+        .expect("insert plan_allowances row");
+    }
+
+    /// The state right after a NEW ruling `v4` is seeded: the catalog
+    /// (`plan_entitlements`, what the seed's `update plan_entitlements` writes) carries
+    /// v4's numbers; `plan_allowances` keeps v3 (no longer current) and adds v4 (current).
+    pub(crate) async fn seed_v3_then_v4(pool: &crate::db::DbPool) {
+        let c = pool.get().await.expect("client");
+        let n = v4_builder();
+        c.execute(
+            "INSERT INTO plan_entitlements (plan_lookup_key, hot_gb_included, ingest_gb_included, \
+               cold_gb_included, series_included, scan_units_included, eval_runs_included, \
+               indexed_window_days, queryable_days, ledger_days, overage_allowed, unlimited_seats) \
+             VALUES ('builder_v1', $1::float8::numeric, $2::float8::numeric, $3::float8::numeric, \
+               $4, $5, $6, $7, $8, $9, true, true)",
+            &[
+                &n.hot_gb,
+                &n.ingest_gb,
+                &n.cold_gb,
+                &n.series,
+                &n.scan,
+                &n.eval,
+                &n.indexed,
+                &n.queryable,
+                &n.ledger,
+            ],
+        )
+        .await
+        .expect("plan_entitlements catalog row (v4 numbers)");
+        insert_allowance(&c, "v3", v3_builder(), false).await;
+        insert_allowance(&c, "v4", n, true).await;
+    }
+
+    /// A builder tenant. `pin` = `tenants.plan_version`; `protected_days` = days until
+    /// `price_protected_until` (negative = already expired; `None` = never set).
+    pub(crate) async fn builder_tenant(
+        pool: &crate::db::DbPool,
+        pin: Option<&str>,
+        protected_days: Option<i32>,
+    ) -> Uuid {
+        let c = pool.get().await.expect("client");
+        c.query_one(
+            "INSERT INTO tenants (workos_org_id, plan, plan_version, price_protected_until) \
+             VALUES ($1, 'builder'::text::plan, $2, \
+               CASE WHEN $3::int IS NULL THEN NULL ELSE now() + make_interval(days => $3::int) END) \
+             RETURNING id",
+            &[
+                &format!("org_b409_{}", Uuid::new_v4().simple()),
+                &pin,
+                &protected_days,
+            ],
+        )
+        .await
+        .expect("insert builder tenant")
+        .get(0)
+    }
+}
+
+/// B-409 — allowances pinned by version. Real Postgres, `#[ignore]`d; run by
+/// `scripts/ci/run-postgres-integration.sh` (filter `entitlement_cache::b409_tests`).
+#[cfg(test)]
+mod b409_tests {
+    use super::b409_fixture::*;
+    use super::*;
+
+    fn assert_allowances(e: &ResolvedEntitlements, a: Allow, what: &str) {
+        assert_eq!(e.hot_bytes_included, gb_to_bytes(a.hot_gb), "{what}: hot");
+        assert_eq!(
+            e.ingest_bytes_included,
+            gb_to_bytes(a.ingest_gb),
+            "{what}: ingest"
+        );
+        assert_eq!(
+            e.cold_bytes_included,
+            gb_to_bytes(a.cold_gb),
+            "{what}: cold"
+        );
+        assert_eq!(e.series_included, Some(a.series), "{what}: series");
+        assert_eq!(e.scan_units_included, Some(a.scan), "{what}: scan units");
+        assert_eq!(e.eval_runs_included, Some(a.eval), "{what}: eval runs");
+        assert_eq!(e.indexed_window_days, a.indexed, "{what}: indexed window");
+        assert_eq!(e.queryable_days, a.queryable, "{what}: queryable");
+        assert_eq!(e.ledger_days, a.ledger, "{what}: ledger");
+    }
+
+    /// The defect itself: a tenant pinned to v3 keeps v3's allowances after a new
+    /// ruling v4 is seeded with different numbers (and made current).
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_pinned_tenant_keeps_its_version_after_a_new_one_is_seeded() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let pinned = builder_tenant(&pool, Some("v3"), Some(200)).await;
+        let e = pg_resolver(pool)(pinned).await.expect("resolve");
+        assert_eq!(e.plan_lookup_key, "builder_v1");
+        assert_allowances(&e, v3_builder(), "pinned to v3 after v4 was seeded");
+        assert_eq!(e.plan_version.as_deref(), Some("v3"));
+    }
+
+    /// A tenant with no pin (never paid) reads the CURRENT version; so does one whose
+    /// protection window has expired.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_unpinned_and_expired_tenants_read_the_current_version() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let fresh = builder_tenant(&pool, None, None).await;
+        let expired = builder_tenant(&pool, Some("v3"), Some(-1)).await;
+        let resolve = pg_resolver(pool);
+        let f = resolve(fresh).await.unwrap();
+        assert_allowances(&f, v4_builder(), "unpinned");
+        assert_eq!(f.plan_version.as_deref(), Some("v4"));
+        let x = resolve(expired).await.unwrap();
+        assert_allowances(&x, v4_builder(), "protection expired");
+        assert_eq!(x.plan_version.as_deref(), Some("v4"));
+    }
+
+    /// rev4 M3: the pinned version's row is MISSING → the tenant's plan's CURRENT
+    /// row, never the zero floor. The floor would answer zero allowances while
+    /// overage/overflow still come from the plan — 75/90 % warnings against zero and
+    /// an auto-age narrowing on a deploy defect, not on the customer's usage.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_missing_pinned_row_falls_back_to_the_current_row() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let orphan = builder_tenant(&pool, Some("v_never_seeded"), Some(200)).await;
+        let before = ALLOWANCE_PIN_FALLBACK_TOTAL.load(Ordering::Relaxed);
+        let e = pg_resolver(pool)(orphan).await.expect("resolve");
+        assert_eq!(e.plan_lookup_key, "builder_v1");
+        assert_allowances(&e, v4_builder(), "pinned row missing → current row");
+        assert_eq!(e.plan_version.as_deref(), Some("v4"));
+        assert!(e.allowances_known());
+        assert!(
+            ALLOWANCE_PIN_FALLBACK_TOTAL.load(Ordering::Relaxed) > before,
+            "the fallback is counted"
+        );
+    }
+
+    /// Neither the pinned nor a current row → fail CLOSED to the deny floor: zero
+    /// allowances (never `None`, which means custom/unlimited) and the floor windows.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_missing_pinned_and_current_rows_fail_closed_to_the_deny_floor() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        // v4 (the current row) is unpinned, so it may go; v3 is not current.
+        pool.get()
+            .await
+            .unwrap()
+            .execute("DELETE FROM plan_allowances WHERE plan_version = 'v4'", &[])
+            .await
+            .expect("an unpinned version is deletable");
+        let orphan = builder_tenant(&pool, Some("v_never_seeded"), Some(200)).await;
+        let e = pg_resolver(pool)(orphan).await.expect("resolve");
+        let floor = ResolvedEntitlements::deny_all();
+        assert_eq!(
+            e.plan_lookup_key, "builder_v1",
+            "the tenant row itself resolved"
+        );
+        assert_eq!(e.hot_bytes_included, Some(0), "never None (= unlimited)");
+        assert_eq!(e.ingest_bytes_included, floor.ingest_bytes_included);
+        assert_eq!(e.series_included, Some(0));
+        assert_eq!(e.scan_units_included, Some(0));
+        assert_eq!(e.eval_runs_included, Some(0));
+        assert_eq!(e.indexed_window_days, floor.indexed_window_days);
+        assert_eq!(e.queryable_days, floor.queryable_days);
+        assert_eq!(e.ledger_days, floor.ledger_days);
+        assert_eq!(e.plan_version, None, "no row resolved");
+        assert!(
+            !e.allowances_known(),
+            "the metering job must not warn or auto-age against this floor"
+        );
+        assert!(
+            ALLOWANCE_ROW_MISSING_TOTAL.load(Ordering::Relaxed) >= 1,
+            "counted"
+        );
+    }
+
+    /// The pinned allowance is served by the cache: one resolve, then warm reads
+    /// that never reach Postgres (`CLAUDE.md` §2 — never a per-request round trip).
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_cache_serves_the_pinned_allowance_without_a_per_request_db_call() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let pinned = builder_tenant(&pool, Some("v3"), Some(200)).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = pg_resolver(pool);
+        let counted: ResolveFn = {
+            let calls = calls.clone();
+            Arc::new(move |t: Uuid| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                inner(t)
+            })
+        };
+        let cache = EntitlementCache::new(counted);
+        for _ in 0..20 {
+            let served = cache.resolved(pinned).await;
+            assert_allowances(served.as_ref(), v3_builder(), "cached pinned read");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "warm reads must not re-resolve"
+        );
+    }
+
+    /// A version's numbers are immutable (only `is_current` flips) and a pinned
+    /// version cannot be deleted — the migration's trigger, proven to REFUSE.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_a_versions_numbers_are_immutable_and_a_pinned_version_undeletable() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        builder_tenant(&pool, Some("v3"), Some(200)).await;
+        let c = pool.get().await.unwrap();
+        let edit = c
+            .execute(
+                "UPDATE plan_allowances SET series_included = series_included + 1 \
+                 WHERE plan_version = 'v3'",
+                &[],
+            )
+            .await;
+        assert!(
+            edit.is_err(),
+            "editing a version's numbers in place must be refused"
+        );
+        let del = c
+            .execute("DELETE FROM plan_allowances WHERE plan_version = 'v3'", &[])
+            .await;
+        assert!(del.is_err(), "deleting a pinned version must be refused");
+        // rev4 L6: a statement-level TRUNCATE skips every row trigger — it must be
+        // refused too while any tenant pins a version.
+        let trunc = c.batch_execute("TRUNCATE plan_allowances").await;
+        assert!(
+            trunc.is_err(),
+            "TRUNCATE must be refused while a version is pinned"
+        );
+        // Flipping is_current is the ONE permitted update (the seed's job).
+        c.batch_execute(
+            "BEGIN; UPDATE plan_allowances SET is_current = false WHERE plan_version = 'v4'; \
+             UPDATE plan_allowances SET is_current = true WHERE plan_version = 'v3'; COMMIT;",
+        )
+        .await
+        .expect("is_current may flip");
+        // An unpinned version CAN be deleted (nothing pins it).
+        c.execute("DELETE FROM plan_allowances WHERE plan_version = 'v4'", &[])
+            .await
+            .expect("an unpinned version is deletable");
+    }
+}
+
+/// rev4 L7: the dashboard shows the SAME floor this gateway enforces when no
+/// allowance row resolves — `apps/web/lib/entitlements.ts` `ALLOWANCE_DENY_FLOOR`
+/// is read from source and held equal to [`ResolvedEntitlements::deny_all`].
+#[cfg(test)]
+mod rev4_l7_tests {
+    use super::*;
+
+    #[test]
+    fn rev4_l7_the_web_deny_floor_is_the_gateways() {
+        let ts = include_str!("../../../apps/web/lib/entitlements.ts");
+        let start = ts
+            .find("export const ALLOWANCE_DENY_FLOOR = {")
+            .expect("the web deny floor exists");
+        let body = &ts[start..start + ts[start..].find('}').expect("closing brace")];
+        let field = |k: &str| -> i64 {
+            let at = body.find(&format!("{k}:")).unwrap_or_else(|| panic!("{k}"));
+            body[at + k.len() + 1..]
+                .trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{k} is not a number"))
+        };
+        let d = ResolvedEntitlements::deny_all();
+        assert_eq!(Some(field("hot_gb_included") as u64), d.hot_bytes_included);
+        assert_eq!(
+            Some(field("ingest_gb_included") as u64),
+            d.ingest_bytes_included
+        );
+        assert_eq!(Some(field("series_included")), d.series_included);
+        assert_eq!(Some(field("scan_units_included")), d.scan_units_included);
+        assert_eq!(Some(field("eval_runs_included")), d.eval_runs_included);
+        assert_eq!(
+            field("indexed_window_days"),
+            i64::from(d.indexed_window_days)
+        );
+        assert_eq!(field("queryable_days"), i64::from(d.queryable_days));
+        assert_eq!(field("ledger_days"), i64::from(d.ledger_days));
     }
 }

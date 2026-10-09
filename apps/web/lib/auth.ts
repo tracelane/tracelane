@@ -13,6 +13,7 @@ import {
 	e2eTestSession,
 } from "@/lib/e2e-auth";
 import { signInPath } from "@/lib/return-to";
+import { roleCan } from "@/lib/role-capabilities.generated";
 import { withAuth } from "@workos-inc/authkit-nextjs";
 import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
@@ -23,21 +24,25 @@ export type Session = {
 	userId: string;
 	email: string;
 	/**
-	 * WorkOS membership role slug for the active org (`owner`/`member`/`viewer`),
+	 * WorkOS membership role slug for the active org (`owner`/`admin`/`developer`/`member`/`viewer`/`billing`),
 	 * read from the session JWT — never a Tracelane role table (IDENTITY_TEAM_SPEC
-	 * §1). `null` for the WorkOS default `admin`, unknown slugs, or a session
+	 * §1). `null` when no role is present, for unknown slugs, or a session
 	 * predating role configuration. UI gating only; the gateway is authoritative.
 	 */
 	role: string | null;
 };
 
 /**
- * Owner-scoped UI gating (IDENTITY_TEAM_SPEC §1): billing, member management,
+ * Admin-scoped UI gating (the `manage_team` row of the gateway's capability matrix) (IDENTITY_TEAM_SPEC §1): billing, member management,
  * BYOK/encryption keys, workspace/org settings.
  *
- * **Allowlist, not a denylist (PL-9).** This mirrors the gateway's
- * `Claims::can_admin`, which is authoritative — and that means it must mirror
- * the FIXED one. It previously denied only a literal `member`/`viewer`, so an
+ * Backed by `roleCan(role, "manage_team")` from `role-capabilities.generated.ts`,
+ * generated from the gateway's `MATRIX` (`scripts/ci/build-role-capabilities.py`),
+ * so there is one authority and no hand-copied role list. Only the admin column
+ * (`owner`/`admin`) has it; developer, viewer, billing and unrecognised slugs do not.
+ *
+ * **Allowlist, not a denylist (PL-9).** The gateway is authoritative — and
+ * the UI must mirror the FIXED one. It previously denied only a literal `member`/`viewer`, so an
  * unrecognised slug, a renamed role, `null` and `undefined` all passed. WorkOS's
  * default org role is `admin`, so the default fell through to full access.
  *
@@ -46,9 +51,7 @@ export type Session = {
  * dead-button class the L16 Playwright gate exists to catch.
  */
 export function canAdmin(role: string | null | undefined): boolean {
-	// `admin` is WorkOS's built-in org role and maps to owner, exactly as
-	// `Role::from_slug` does in crates/gateway/src/auth/mod.rs.
-	return role === "owner" || role === "admin";
+	return roleCan(role, "manage_team");
 }
 
 /**

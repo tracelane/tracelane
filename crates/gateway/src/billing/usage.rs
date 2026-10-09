@@ -92,8 +92,10 @@ async fn read_tenant(headers: &HeaderMap) -> Result<tracelane_shared::TenantId, 
     let claims = crate::auth::validate_authorization(auth)
         .await
         .map_err(|e| error(crate::auth::failure_status(&e), "invalid token"))?;
-    if !claims.allows_scope(crate::auth::scope::Scope::Read) {
-        tracing::warn!(sub = %claims.sub, "api key lacks the `read` scope");
+    // OG-34: usage is SPEND, which the billing role reads (recorded content it
+    // does not): the `read` scope for a key, `view_spend` for a role.
+    if !claims.allows_spend_read() {
+        tracing::warn!(sub = %claims.sub, "credential may not read spend");
         return Err(error(
             StatusCode::FORBIDDEN,
             "this API key is not scoped to read recorded data — it needs the `read` scope",
@@ -102,11 +104,28 @@ async fn read_tenant(headers: &HeaderMap) -> Result<tracelane_shared::TenantId, 
     Ok(claims.tenant_id)
 }
 
-/// Authenticate + `admin`-scope-gate a billing WRITE (`PUT ceiling`,
-/// `DELETE promotion-freeze`). Mutating the spend ceiling or clearing a
-/// velocity-breaker freeze is a workspace-configuration change, the same
-/// bar `prompt_routes.rs`'s `Admin` scope sets for promotion.
-async fn admin_tenant(headers: &HeaderMap) -> Result<tracelane_shared::TenantId, Response> {
+/// The pure scope half of [`admin_tenant`]: a key needs the `admin` scope (rev5 H1 drives
+/// every developer-mintable key through it). The `edit_budgets` capability is the
+/// `require_control` half, which renders its own `role_forbidden` body.
+pub(crate) fn authorize_budget_edit(claims: &crate::auth::Claims) -> Result<(), Box<Response>> {
+    if !claims.allows_scope(crate::auth::scope::Scope::Admin) {
+        tracing::warn!(sub = %claims.sub, "api key lacks the `admin` scope");
+        return Err(Box::new(error(
+            StatusCode::FORBIDDEN,
+            "this API key is not scoped to change billing configuration — it needs the `admin` scope",
+        )));
+    }
+    Ok(())
+}
+
+/// Authenticate + gate a billing WRITE (`PUT ceiling`, `DELETE promotion-freeze`).
+/// Mutating the spend ceiling or clearing a velocity-breaker freeze is a
+/// workspace-configuration change: a key needs the `admin` scope (the bar
+/// `prompt_routes.rs` sets for promotion), and — OG-34 — a human needs the
+/// `edit_budgets` capability (admin or billing). Before OG-34 only the scope was
+/// asked, and a WorkOS session is `LegacyFullSurface`, so a VIEWER could move the
+/// ceiling. Then the admin-plane gate (OG-36 allowlist + SSO-required).
+async fn admin_tenant(headers: &HeaderMap) -> Result<crate::control_plane::ControlActor, Response> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -117,14 +136,14 @@ async fn admin_tenant(headers: &HeaderMap) -> Result<tracelane_shared::TenantId,
     let claims = crate::auth::validate_authorization(auth)
         .await
         .map_err(|e| error(crate::auth::failure_status(&e), "invalid token"))?;
-    if !claims.allows_scope(crate::auth::scope::Scope::Admin) {
-        tracing::warn!(sub = %claims.sub, "api key lacks the `admin` scope");
-        return Err(error(
-            StatusCode::FORBIDDEN,
-            "this API key is not scoped to change billing configuration — it needs the `admin` scope",
-        ));
-    }
-    Ok(claims.tenant_id)
+    authorize_budget_edit(&claims).map_err(|r| *r)?;
+    crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::EditBudgets,
+        headers,
+    )
+    .await
+    .map_err(IntoResponse::into_response)
 }
 
 // ── GET /v1/billing/usage ────────────────────────────────────────────────
@@ -1144,16 +1163,61 @@ pub const SET_CEILING_SQL: &str = "UPDATE tenants \
      SET spend_ceiling_usd = ($2::float8)::numeric(12,2), overflow_mode = $3 \
      WHERE id = $1";
 
+/// OG-35: set the ceiling and record it (before/after) in ONE transaction.
+///
+/// # Errors
+/// Fail-CLOSED: a store OR audit failure rolls the change back.
+async fn set_ceiling_audited(
+    pool: &crate::db::DbPool,
+    actor: &crate::control_plane::ControlActor,
+    usd: Option<f64>,
+    overflow_mode: &str,
+) -> anyhow::Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let tenant = &actor.tenant_id;
+    let before = tx
+        .query_opt(
+            "SELECT spend_ceiling_usd::float8, overflow_mode FROM tenants WHERE id = $1 FOR UPDATE",
+            &[tenant.as_uuid()],
+        )
+        .await?
+        .map(|r| {
+            serde_json::json!({
+                "usd": r.get::<_, Option<f64>>(0),
+                "overflow_mode": r.get::<_, Option<String>>(1),
+            })
+        });
+    tx.execute(SET_CEILING_SQL, &[tenant.as_uuid(), &usd, &overflow_mode])
+        .await?;
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.audit,
+        crate::db::control_audit::Change {
+            action: "billing.ceiling.set",
+            target_type: "workspace",
+            target_id: tenant.to_string(),
+            before,
+            after: Some(serde_json::json!({"usd": usd, "overflow_mode": overflow_mode})),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[tracing::instrument(skip(state, headers, body), fields(tenant_id = tracing::field::Empty))]
 async fn set_ceiling_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CeilingBody>,
 ) -> Response {
-    let tenant_id = match admin_tenant(&headers).await {
-        Ok(t) => t,
+    let actor = match admin_tenant(&headers).await {
+        Ok(a) => a,
         Err(r) => return r,
     };
+    let tenant_id = actor.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
     if let Some(usd) = body.usd
@@ -1178,21 +1242,9 @@ async fn set_ceiling_handler(
     let Some(pool) = state.pg.as_ref() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "control plane unavailable");
     };
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "billing ceiling: pool checkout failed");
-            return error(StatusCode::SERVICE_UNAVAILABLE, "control plane unavailable");
-        }
-    };
-    if let Err(e) = client
-        .execute(
-            SET_CEILING_SQL,
-            &[&tenant_id.as_uuid(), &body.usd, &overflow_mode],
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "billing ceiling: update failed");
+    // OG-35: the change and its audit row commit together, or neither does.
+    if let Err(e) = set_ceiling_audited(pool, &actor, body.usd, overflow_mode).await {
+        tracing::warn!(error = %crate::db::pg_error_chain(&e), "billing ceiling: update failed (store or audit)");
         return error(StatusCode::SERVICE_UNAVAILABLE, "update failed");
     }
     // Reading the new ceiling requires the entitlement cache to re-resolve —
@@ -1212,17 +1264,17 @@ async fn clear_promotion_freeze_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let tenant_id = match admin_tenant(&headers).await {
-        Ok(t) => t,
+    let actor = match admin_tenant(&headers).await {
+        Ok(a) => a,
         Err(r) => return r,
     };
+    let tenant_id = actor.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
     let Some(pool) = state.pg.as_ref() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "control plane unavailable");
     };
-    if let Err(e) = crate::billing::velocity_breaker::clear_freeze(pool, *tenant_id.as_uuid()).await
-    {
+    if let Err(e) = crate::billing::velocity_breaker::clear_freeze(pool, &actor).await {
         tracing::warn!(error = %e, "promotion-freeze clear failed");
         return error(StatusCode::SERVICE_UNAVAILABLE, "clear failed");
     }

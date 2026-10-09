@@ -38,7 +38,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::auth::{Claims, Role};
+use crate::auth::Claims;
 use anyhow::Context;
 use tracelane_shared::TenantId;
 use uuid::Uuid;
@@ -65,8 +65,13 @@ fn valid_label(s: &str) -> bool {
 /// tenant DATA, not a privilege change, so this is deliberately not the
 /// `can_mint_keys` shape — that one guards key minting, where an API key writing
 /// is escalation. Here it is just a machine recording a verdict.
+///
+/// OG-34: the matrix's `annotate_traces` row — admin, developer, an API key and
+/// the self-host operator. Not a viewer, not the billing role (it reads no traces),
+/// and not a WorkOS session with an unrecognised slug (PL-9: until OG-34 that one
+/// slipped through, because only `Viewer` was refused).
 fn may_write(claims: &Claims) -> bool {
-    !matches!(claims.role, Some(Role::Viewer))
+    claims.can(crate::auth::capability::Capability::AnnotateTraces)
 }
 
 /// One stored annotation.
@@ -2764,6 +2769,7 @@ async fn submit_review_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Role;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -3012,6 +3018,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
 
@@ -3030,12 +3037,34 @@ mod tests {
         assert!(may_write(&claims(Some(Role::Member))));
     }
 
+    /// OG-34 / PL-9: an unrecognised slug on a human session is the matrix's
+    /// least-privilege column, and the billing role reads no traces — neither
+    /// annotates. A machine credential still may (its scopes govern it).
+    #[test]
+    fn og34_an_unrecognised_slug_and_the_billing_role_may_not_write() {
+        assert!(
+            !may_write(&claims(None)),
+            "unrecognised slug must NOT write"
+        );
+        assert!(
+            !may_write(&claims(Some(Role::Billing))),
+            "billing must NOT write"
+        );
+        let mut key = claims(None);
+        key.auth_method = crate::auth::AuthMethod::ApiKey;
+        assert!(may_write(&key), "an API key still annotates");
+    }
+
     /// An API key has `role: None`. Writing an annotation is recording tenant
     /// DATA, not changing a privilege, so it is allowed — deliberately NOT the
     /// `can_mint_keys` shape, where an API key writing would be escalation.
     #[test]
     fn api_key_no_role_may_write_because_this_is_data_not_privilege() {
-        assert!(may_write(&claims(None)));
+        // OG-34: built as an API key now — `claims(None)` is a WorkOS session with an
+        // unrecognised slug, which the matrix refuses (PL-9).
+        let mut key = claims(None);
+        key.auth_method = crate::auth::AuthMethod::ApiKey;
+        assert!(may_write(&key));
     }
 
     // `EVL-31` §6a — the review-into-a-tombstoned-dataset guard. Written

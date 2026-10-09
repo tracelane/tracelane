@@ -1055,6 +1055,10 @@ pub fn eval_suite_id_for(tenant_id: &TenantId, prompt_name: &str, suite: &str) -
 pub struct PromptEvalEngine {
     /// SRE #20: the entitlement cache, so reads run at the tenant's OWN cap tier.
     entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
+    /// rev5 H2: what every case / judge call is checked against before it is dispatched —
+    /// the workspace controls, the caller's key policy, limits and budgets
+    /// (`crate::offpath`). The same entitlement cache as above, plus the spend source.
+    offpath: crate::offpath::OffPathEnv,
     ch: ClickhouseClient,
     providers: Arc<ProviderRegistry>,
     router: Arc<PromptRouter>,
@@ -1085,7 +1089,22 @@ impl PromptEvalEngine {
         mut self,
         entitlements: Option<std::sync::Arc<crate::entitlement_cache::EntitlementCache>>,
     ) -> Self {
+        self.offpath.entitlements.clone_from(&entitlements);
         self.entitlements = entitlements;
+        self
+    }
+
+    /// rev5 H2: what this engine checks every provider call against — for a caller (the
+    /// experiment surface) that must run the same pre-flight before it writes anything.
+    pub(crate) fn offpath_env(&self) -> &crate::offpath::OffPathEnv {
+        &self.offpath
+    }
+
+    /// rev5 H2: the ClickHouse URL the `OG-22` / `GWY-43` budget baselines are seeded from
+    /// (`AppState::quota_ch_url`), so a run's budget checks read what admission reads.
+    #[must_use]
+    pub fn with_spend_source(mut self, quota_ch_url: Option<String>) -> Self {
+        self.offpath.quota_ch_url = quota_ch_url;
         self
     }
 
@@ -1097,6 +1116,7 @@ impl PromptEvalEngine {
     ) -> Self {
         Self {
             entitlements: None,
+            offpath: crate::offpath::OffPathEnv::default(),
             ch,
             providers,
             router,
@@ -1786,7 +1806,7 @@ impl PromptEvalEngine {
     #[allow(clippy::too_many_arguments)]
     fn emit_case_span(
         &self,
-        tenant_id: &TenantId,
+        caller: &crate::auth::Claims,
         model: &str,
         eval_run_id: Uuid,
         experiment_id: Option<Uuid>,
@@ -1798,6 +1818,7 @@ impl PromptEvalEngine {
             crate::otlp_emit::note_span_dropped_no_nats();
             return;
         };
+        let tenant_id = &caller.tenant_id;
         let mut span = crate::server::build_gateway_span(
             tenant_id,
             // Each case is its OWN trace. An eval run is N independent requests, not
@@ -1809,8 +1830,17 @@ impl PromptEvalEngine {
             // This span is Tracelane's OWN call, not a customer request — there is
             // no caller identity on the other side of it, and inventing one would
             // put a synthetic agent or end user into the same aggregates real ones
-            // are counted in.
-            &crate::server::CallerIdentity::default(),
+            // are counted in. rev5 H2: the run's KEY and its project are attributed,
+            // though — the spend is that key's, and its budgets' durable baselines
+            // (`budgets::KEY_TOTAL_SQL`, `PROJECT_TOTAL_SQL`) must count it after a restart.
+            &crate::server::CallerIdentity {
+                project_id: caller
+                    .governance
+                    .as_deref()
+                    .and_then(|g| g.project_id)
+                    .map(|p| p.to_string()),
+                ..crate::server::CallerIdentity::default()
+            },
             started_at,
             out.input_tokens,
             out.output_tokens,
@@ -1831,7 +1861,7 @@ impl PromptEvalEngine {
             None,
             None,
             None,
-            None,
+            caller.api_key_id(),
         );
         span.attributes.tracelane_eval_run_id = Some(eval_run_id.to_string());
         // `EVL-02` §2.3. Set ONLY for an arm — a standalone run has no experiment,
@@ -1854,9 +1884,9 @@ impl PromptEvalEngine {
     /// supplies the messages. Non-streaming: an eval wants the whole answer, and
     /// the streaming path has no text accumulator anyway.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_case(
+    pub(crate) async fn execute_case(
         &self,
-        tenant_id: &TenantId,
+        caller: &crate::auth::Claims,
         model: &str,
         system: &str,
         case: &EvalCase,
@@ -1864,24 +1894,8 @@ impl PromptEvalEngine {
         experiment_id: Option<Uuid>,
         role: EvalSpanRole,
     ) -> Result<CaseOutcome> {
-        let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
-            bail!("unroutable model '{model}': no provider configured");
-        };
-        let env_var = ProviderRegistry::env_var_for_provider_id(provider_id);
-        let key = match crate::server::resolve_provider_key(tenant_id, provider_id, env_var).await {
-            crate::server::ProviderKey::Found(k) => k,
-            crate::server::ProviderKey::NotConfigured => bail!(
-                "no provider key configured for '{provider_id}' — add one in Settings → LLM Providers"
-            ),
-            crate::server::ProviderKey::Unusable => bail!(
-                "the stored '{provider_id}' key could not be decrypted — rotate it in Settings → LLM Providers"
-            ),
-            crate::server::ProviderKey::LookupFailed => {
-                bail!("the key store could not be reached for '{provider_id}' — retry shortly")
-            }
-        };
-
-        let request = ChatRequest {
+        let tenant_id = &caller.tenant_id;
+        let mut request = ChatRequest {
             top_p: None,
             seed: None,
             logprobs: None,
@@ -1895,12 +1909,40 @@ impl PromptEvalEngine {
             stream: Some(false),
             system: (!system.is_empty()).then(|| system.to_string()),
             metadata: None,
+            ..Default::default()
+        };
+        // rev5 H2: the Wave C/D controls, BEFORE the BYOK key is decrypted and before a cent
+        // is spent — pause, blocks, the caller's key policy, limits and budgets, re-read for
+        // THIS call so a pause or a block stops a run already in flight. Fail-CLOSED.
+        if let Err(r) = crate::offpath::admit(&self.offpath, caller, &request).await {
+            return Err(anyhow::Error::new(crate::offpath::OffPathRefused::from(&r)));
+        }
+        let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
+            bail!("unroutable model '{model}': no provider configured");
+        };
+        let env_var = ProviderRegistry::env_var_for_provider_id(provider_id);
+        let key = match crate::server::resolve_provider_key(tenant_id, provider_id, env_var).await {
+            crate::server::ProviderKey::Found(k) => k,
+            crate::server::ProviderKey::KmsUnavailable => anyhow::bail!("kms_unavailable"),
+            crate::server::ProviderKey::KmsDenied => anyhow::bail!("kms_access_denied"),
+            crate::server::ProviderKey::NotConfigured => bail!(
+                "no provider key configured for '{provider_id}' — add one in Settings → LLM Providers"
+            ),
+            crate::server::ProviderKey::Unusable => bail!(
+                "the stored '{provider_id}' key could not be decrypted — rotate it in Settings → LLM Providers"
+            ),
+            crate::server::ProviderKey::LookupFailed => {
+                bail!("the key store could not be reached for '{provider_id}' — retry shortly")
+            }
         };
 
         let started = std::time::Instant::now();
         // R81: wall-clock start, for the span. `Instant` cannot be turned into a
         // timestamp, so the two clocks are taken together rather than derived.
         let span_started_at = chrono::Utc::now();
+        if let Some(alias) = crate::server::config::alias(model) {
+            request.model.clone_from(&alias.upstream_model);
+        }
         let dispatch_result = crate::server::dispatch_to_provider(
             &self.providers,
             request,
@@ -1962,8 +2004,9 @@ impl PromptEvalEngine {
         // an unpriced model must not be reported as costing zero, and
         // `MaxCostUsd` treats `None` as a FAILURE rather than a free pass.
         if out.cost_usd.is_none() {
-            out.cost_usd = crate::pricing::cost_usd(
+            out.cost_usd = crate::pricing::cost_usd_for_routed_model(
                 model,
+                crate::server::config::alias(model),
                 &tracelane_shared::Usage {
                     input_tokens: out.input_tokens,
                     output_tokens: out.output_tokens,
@@ -1993,8 +2036,12 @@ impl PromptEvalEngine {
         // (`build_gateway_span` is `pub(crate)` for exactly this). A second span
         // builder for eval traffic would be a second definition of "a gateway span"
         // and the two would drift on the next column added.
+        // rev5 H2: the call's cost reaches the caller's OG-22 counters (workspace, project,
+        // key) and its GWY-43 key counter — the workspace `spend` tracker is recorded once
+        // by `execute_run`.
+        crate::offpath::record_spend(caller, out.cost_usd);
         self.emit_case_span(
-            tenant_id,
+            caller,
             model,
             eval_run_id,
             experiment_id,
@@ -2062,7 +2109,7 @@ impl PromptEvalEngine {
     #[allow(clippy::too_many_arguments)]
     async fn run_judges(
         &self,
-        tenant_id: &TenantId,
+        caller: &crate::auth::Claims,
         case: &EvalCase,
         outcome: &CaseOutcome,
         assertions: &[Assertion],
@@ -2084,7 +2131,7 @@ impl PromptEvalEngine {
             };
             slots.push(Some(
                 self.run_one_judge(
-                    tenant_id,
+                    caller,
                     case,
                     outcome,
                     rubric,
@@ -2103,7 +2150,7 @@ impl PromptEvalEngine {
     #[allow(clippy::too_many_arguments)]
     async fn run_one_judge(
         &self,
-        tenant_id: &TenantId,
+        caller: &crate::auth::Claims,
         case: &EvalCase,
         outcome: &CaseOutcome,
         rubric: &JudgeRubric,
@@ -2112,6 +2159,7 @@ impl PromptEvalEngine {
         eval_run_id: Uuid,
         experiment_id: Option<Uuid>,
     ) -> std::result::Result<JudgeDetail, String> {
+        let tenant_id = &caller.tenant_id;
         // ── Rubric resolution, with OBJECT-LEVEL AUTHORIZATION on the custom
         // path. `version_for_tenant` is the SAME check `prepare_run` makes on the
         // prompt under test: a version id from a request body is not evidence the
@@ -2159,7 +2207,7 @@ impl PromptEvalEngine {
 
         let judged = self
             .execute_case(
-                tenant_id,
+                caller,
                 judge_model,
                 &judge_system,
                 &judge_case,
@@ -2401,7 +2449,7 @@ pub struct ArmContext {
 /// giving a money-spending executor its own entitlement handle is how a second
 /// resolution path appears and the two disagree. The arm linkage is known only
 /// to the experiment runner. So both arrive as data.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct RunContext {
     /// The workspace's monthly ceiling in USD, or `None` for uncapped —
     /// **matching `SpendTracker::check`'s own semantics and the column's**
@@ -2409,6 +2457,15 @@ pub struct RunContext {
     pub budget_usd: Option<f64>,
     /// `Some` iff this run is an experiment arm.
     pub arm: Option<ArmContext>,
+    /// rev5 H2: WHO started the run — every case and judge call is checked against this
+    /// principal's key policy, limits and budgets, and the workspace's controls
+    /// (`crate::offpath`). Required: a run has no anonymous form.
+    pub caller: Arc<crate::auth::Claims>,
+    /// rev6 H2 residual: the `tlane_` bearer the run was started with
+    /// (`offpath::key_credential`), so the key is re-validated BETWEEN chunks — revoked,
+    /// revoke-all or a tightened policy stops / binds the run, as realtime does mid-session.
+    /// `None` for a session or for a credential that is not an API key.
+    pub credential: Option<Arc<secrecy::SecretString>>,
 }
 
 /// Everything one run needs, assembled once by [`PromptEvalEngine::prepare_run`]
@@ -2443,6 +2500,10 @@ struct RunPlan {
     /// call. **The ceiling cannot move mid-run; the SPEND can, and that is the
     /// half the mid-run check actually needs to see.**
     budget_usd: Option<f64>,
+    /// rev5 H2: the principal every call is checked as (`RunContext::caller`).
+    caller: Arc<crate::auth::Claims>,
+    /// rev6 H2 residual (`RunContext::credential`).
+    credential: Option<Arc<secrecy::SecretString>>,
 }
 
 /// What a completed run produced. Returned by `execute_run` so an experiment can
@@ -2596,6 +2657,28 @@ impl PromptEvalEngine {
                 )
             })?;
 
+        // rev5 H2: the Wave C/D controls, BEFORE anything is claimed or written — for the
+        // model under test and every judge model — so a paused workspace, a blocked model,
+        // a key policy the run cannot satisfy or a spent budget is a refusal with a code,
+        // not a 202 followed by N errored cases. Charges nothing (each call is admitted,
+        // and charged, as it is made).
+        let mut models = vec![model.clone()];
+        for a in &req.assertions {
+            if let Assertion::LlmJudge { model: m, .. } = a {
+                models.push(m.clone().unwrap_or_else(|| model.clone()));
+            }
+        }
+        for m in models {
+            let probe = ChatRequest {
+                model: m,
+                stream: Some(false),
+                ..Default::default()
+            };
+            if let Err(r) = crate::offpath::check(&self.offpath, &ctx.caller, &probe).await {
+                return Err(anyhow::Error::new(crate::offpath::OffPathRefused::from(&r)));
+            }
+        }
+
         let ResolvedCases {
             cases,
             snapshot_id: dataset_snapshot_id,
@@ -2648,6 +2731,8 @@ impl PromptEvalEngine {
             dataset_snapshot_id,
             arm: ctx.arm,
             budget_usd: ctx.budget_usd,
+            caller: ctx.caller,
+            credential: ctx.credential,
         };
 
         Ok((
@@ -2678,6 +2763,8 @@ impl PromptEvalEngine {
             dataset_snapshot_id,
             arm,
             budget_usd,
+            mut caller,
+            credential,
         } = plan;
         // R81: captured BEFORE `row` moves into the guard. Every case's span carries
         // this, which is what makes eval traffic separable in `/v1/costs` and
@@ -2711,6 +2798,20 @@ impl PromptEvalEngine {
         let mut stopped_early: Option<String> = None;
 
         for chunk in cases.chunks(limits::CASE_CONCURRENCY) {
+            // rev6 H2 residual: the starting key, re-validated BETWEEN chunks (the realtime
+            // session's mid-session check). Revoked (revoke-all included) or unverifiable
+            // stops the run; a policy tightened since the start binds every later call.
+            match crate::offpath::revalidate_caller(&caller, credential.as_deref()).await {
+                Ok(current) => caller = current,
+                Err(reason) => {
+                    stopped_early = Some(format!(
+                        "{reason}; {} of {} cases ran",
+                        results.len(),
+                        cases.len()
+                    ));
+                    break;
+                }
+            }
             if started.elapsed() > deadline {
                 stopped_early = Some(format!(
                     "run exceeded its {}s wall clock; {} of {} cases ran",
@@ -2752,7 +2853,7 @@ impl PromptEvalEngine {
             let mut futs = Vec::with_capacity(chunk.len());
             for resolved in chunk {
                 let engine = Arc::clone(&self);
-                let t = tenant_id.clone();
+                let who = Arc::clone(&caller);
                 let m = model.clone();
                 let sys = system.clone();
                 let c = resolved.case.clone();
@@ -2775,10 +2876,10 @@ impl PromptEvalEngine {
                             // than read from `self`, because the engine is shared
                             // across runs.
                             let outcome = engine
-                                .execute_case(&t, &m, &sys, &c, rid, xid, EvalSpanRole::Case)
+                                .execute_case(&who, &m, &sys, &c, rid, xid, EvalSpanRole::Case)
                                 .await?;
                             let judged = engine
-                                .run_judges(&t, &c, &outcome, &asserts, &sys, &m, rid, xid)
+                                .run_judges(&who, &c, &outcome, &asserts, &sys, &m, rid, xid)
                                 .await;
                             Ok::<_, anyhow::Error>((outcome, judged))
                         },
@@ -2787,6 +2888,7 @@ impl PromptEvalEngine {
                     (c, r)
                 });
             }
+            let mut refused: Option<String> = None;
             for (case, r) in futures::future::join_all(futs).await {
                 match r {
                     Ok(Ok((outcome, judged))) => {
@@ -2807,6 +2909,14 @@ impl PromptEvalEngine {
                         }
                         results.push(Self::score(&case, &outcome, &assertions, &judged));
                     }
+                    // rev5 H2: a workspace control refused the call (paused, blocked,
+                    // the key's policy, a limit, a budget). Nothing was dispatched; the
+                    // run stops after this chunk, naming why, like the budget stop above.
+                    Ok(Err(e)) if e.downcast_ref::<crate::offpath::OffPathRefused>().is_some() => {
+                        let why = format!("{e:#}");
+                        results.push(errored_case(&case.name, why.clone()));
+                        refused.get_or_insert(why);
+                    }
                     // An upstream failure is ERRORED, never FAILED — a broken
                     // provider must not read as a bad prompt.
                     Ok(Err(e)) => results.push(errored_case(&case.name, format!("{e:#}"))),
@@ -2815,6 +2925,15 @@ impl PromptEvalEngine {
                         format!("case exceeded its {}s timeout", limits::CASE_TIMEOUT_SECS),
                     )),
                 }
+            }
+            if let Some(why) = refused {
+                tracing::warn!(tenant_id = %tenant_id, %eval_run_id, "eval run stopped: a workspace control refused its provider call");
+                stopped_early = Some(format!(
+                    "{why}; {} of {} cases ran",
+                    results.len(),
+                    cases.len()
+                ));
+                break;
             }
         }
 
@@ -3433,6 +3552,7 @@ mod tests {
     fn only_one_run_per_prompt_may_be_in_flight() {
         let engine = PromptEvalEngine {
             entitlements: None,
+            offpath: crate::offpath::OffPathEnv::default(),
             ch: clickhouse::Client::default(),
             providers: Arc::new(ProviderRegistry::new().expect("registry")),
             router: Arc::new(PromptRouter::new()),

@@ -1,0 +1,21 @@
+# OG-91 layer-1 replay fixture (specs/OG-91-client-conformance-harness.md §3).
+# CLIENT:     Claude Code (the `claude` CLI), pointed at the gateway with ANTHROPIC_BASE_URL.
+# PROVENANCE: HAND-BUILT from the client's published protocol and source — NOT a wire capture.
+#             Shape sources: code.claude.com/docs/en/llm-gateway-protocol (headers, `?beta=true`,
+#             block-form `system`, `anthropic-beta`), and the @anthropic-ai/sdk request the CLI
+#             builds (`messages.create`, stream:true, tools[], `metadata.user_id`).
+#             The `anthropic-beta` value was corrected on 2026-10-02 against a capture of claude
+#             2.1.286 through `scripts/ops/client-conformance.sh --refresh-fixtures`; the capture
+#             itself is NOT committed (a 114 KB body: the client's whole system prompt and tool
+#             descriptions, the machine's paths and a device id), and the body below stays
+#             hand-built. That client now also sends `context_management`, `safeguards` and
+#             `output_config`, which the byte-faithful relay forwards untouched.
+# METHOD:     POST
+# PATH:       /v1/messages?beta=true
+# HEADER:     anthropic-version: 2023-06-01
+# HEADER:     anthropic-beta: claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31
+# HEADER:     x-app: cli
+# HEADER:     user-agent: claude-cli/2.0.0 (external, cli)
+# HEADER:     x-api-key: tlane_live_og91_fixture_key_do_not_use
+# HEADER:     authorization: Bearer tlane_live_og91_fixture_key_do_not_use
+{"model":"claude-sonnet-4-6","max_tokens":32000,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"You are an interactive CLI tool that helps users with software engineering tasks.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what is the weather in Paris?"}]},{"role":"assistant","content":[{"type":"text","text":"Let me look that up."},{"type":"tool_use","id":"toolu_01OG91FIXTURE","name":"get_weather","input":{"city":"Paris"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01OG91FIXTURE","content":"18C and clear","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"get_weather","description":"Get the weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"metadata":{"user_id":"user_og91fixture_account__session_00000000-0000-4000-8000-000000000000"},"thinking":{"type":"enabled","budget_tokens":8000}}

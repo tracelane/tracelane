@@ -1,0 +1,246 @@
+{
+  "module": "crates/gateway/src/otel_export_routes.rs",
+  "operations": {
+    "GET /v1/exports/otel": {
+      "summary": "This workspace's OTLP/HTTP span exports \u2014 header NAMES only, the URL as host + path, honest best-effort delivery counters.",
+      "tags": [
+        "otel-export"
+      ],
+      "responses": {
+        "200": {
+          "description": "`exports`, the `plan` gate and `delivery: best_effort`.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "no_control_plane",
+        "unavailable"
+      ]
+    },
+    "POST /v1/exports/otel": {
+      "summary": "Create an export (header values are sealed before storage and never returned).",
+      "tags": [
+        "otel-export"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "include_content": {
+            "type": "boolean"
+          },
+          "sample_ratio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "only_errors": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The export.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_field (names `field`), invalid_url or ssrf_blocked.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "otel_export_required: the plan does not include span export.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "export_limit: the plan's `max_exports` is reached.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_url",
+        "ssrf_blocked",
+        "encryption_unavailable",
+        "otel_export_required",
+        "export_limit",
+        "no_control_plane",
+        "unavailable"
+      ]
+    },
+    "PATCH /v1/exports/otel/{id}": {
+      "summary": "Update an export (`headers: null` clears the sealed map; the URL cannot be changed).",
+      "tags": [
+        "otel-export"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "include_content": {
+            "type": "boolean"
+          },
+          "sample_ratio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "only_errors": {
+            "type": "boolean"
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The export.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "export_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "export_not_found",
+        "encryption_unavailable",
+        "otel_export_required",
+        "no_control_plane",
+        "unavailable"
+      ]
+    },
+    "DELETE /v1/exports/otel/{id}": {
+      "summary": "Delete an export.",
+      "tags": [
+        "otel-export"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "204": {
+          "description": "Deleted."
+        },
+        "404": {
+          "description": "export_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "export_not_found",
+        "no_control_plane",
+        "unavailable"
+      ]
+    },
+    "POST /v1/exports/otel/{id}/test": {
+      "summary": "Send one synthetic span to the collector and report the outcome class and latency (no state changes).",
+      "tags": [
+        "otel-export"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "`ok`, `class`, `latency_ms`.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "boolean"
+              },
+              "class": {
+                "type": "string"
+              },
+              "latency_ms": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "export_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "export_not_found",
+        "encryption_unavailable",
+        "ssrf_blocked",
+        "no_control_plane",
+        "unavailable"
+      ]
+    }
+  }
+}

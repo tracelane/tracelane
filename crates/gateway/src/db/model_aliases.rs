@@ -149,10 +149,11 @@ pub async fn list_with(
 }
 
 /// Outcome of [`put`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
     Created,
-    Updated,
+    /// Replaced; carries the PREVIOUS target (the audit row's `before`).
+    Updated(String),
     /// `create_only` and the alias already exists — nothing written (`409`).
     Exists,
     /// A concurrent writer filled the cap between validation and insert — nothing written.
@@ -166,8 +167,55 @@ pub enum PutOutcome {
 /// # Errors
 /// Fails CLOSED: any pool/statement error propagates — a write reported as success
 /// must have happened.
+///
+/// OG-35: the write and its `model_alias.put` audit row (before/after target) are ONE
+/// transaction — an audit row that cannot be written rolls the alias back.
 pub async fn put(
     pool: &Pool,
+    tenant_id: &TenantId,
+    alias: &str,
+    target: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    max: u32,
+    create_only: bool,
+) -> Result<PutOutcome> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let outcome = put_in(
+        &tx,
+        tenant_id,
+        alias,
+        target,
+        &actor.as_actor().sub,
+        max,
+        create_only,
+    )
+    .await?;
+    if let Some((before, verb)) = match outcome {
+        PutOutcome::Created => Some((None, "created")),
+        PutOutcome::Updated(ref prev) => Some((Some(prev.clone()), "updated")),
+        PutOutcome::Exists | PutOutcome::CapReached => None,
+    } {
+        crate::db::control_audit::record(
+            &tx,
+            tenant_id,
+            &actor.as_actor(),
+            crate::db::control_audit::Change {
+                action: "model_alias.put",
+                target_type: "model_alias",
+                target_id: alias.to_owned(),
+                before: before.map(|t: String| serde_json::json!({"target_model": t})),
+                after: Some(serde_json::json!({"target_model": target, "result": verb})),
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+async fn put_in(
+    client: &deadpool_postgres::Transaction<'_>,
     tenant_id: &TenantId,
     alias: &str,
     target: &str,
@@ -175,17 +223,16 @@ pub async fn put(
     max: u32,
     create_only: bool,
 ) -> Result<PutOutcome> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tenant = tenant_id.as_uuid();
-    let exists = client
+    let existing: Option<String> = client
         .query_opt(
-            "SELECT 1 FROM model_aliases WHERE tenant_id = $1 AND alias = $2",
+            "SELECT target_model FROM model_aliases WHERE tenant_id = $1 AND alias = $2 FOR UPDATE",
             &[tenant, &alias],
         )
         .await
         .map_err(|e| anyhow!("model_aliases probe: {e}"))?
-        .is_some();
-    if exists {
+        .map(|r| r.get(0));
+    if let Some(previous) = existing {
         if create_only {
             return Ok(PutOutcome::Exists);
         }
@@ -197,7 +244,7 @@ pub async fn put(
             )
             .await
             .map_err(|e| anyhow!("model_aliases update: {e}"))?;
-        return Ok(PutOutcome::Updated);
+        return Ok(PutOutcome::Updated(previous));
     }
     let max = i64::from(max);
     let inserted = client
@@ -236,16 +283,42 @@ pub async fn put(
 ///
 /// # Errors
 /// Fails CLOSED on pool/statement errors.
-pub async fn delete(pool: &Pool, tenant_id: &TenantId, alias: &str) -> Result<bool> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    let n = client
-        .execute(
-            "DELETE FROM model_aliases WHERE tenant_id = $1 AND alias = $2",
+///
+/// OG-35: the delete and its `model_alias.delete` audit row are ONE transaction.
+pub async fn delete(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    alias: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<bool> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let removed: Option<String> = tx
+        .query_opt(
+            "DELETE FROM model_aliases WHERE tenant_id = $1 AND alias = $2 RETURNING target_model",
             &[tenant_id.as_uuid(), &alias],
         )
         .await
-        .map_err(|e| anyhow!("model_aliases delete: {e}"))?;
-    Ok(n == 1)
+        .map_err(|e| anyhow!("model_aliases delete: {e}"))?
+        .map(|r| r.get(0));
+    let Some(previous) = removed else {
+        return Ok(false);
+    };
+    crate::db::control_audit::record(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "model_alias.delete",
+            target_type: "model_alias",
+            target_id: alias.to_owned(),
+            before: Some(serde_json::json!({"target_model": previous})),
+            after: None,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// `billing_policy.model_aliases_max_per_workspace` — read on the WRITE path only
@@ -378,7 +451,11 @@ mod tests {
             PutOutcome::Exists,
             "create never overwrites"
         );
-        assert_eq!(put("fast", "gpt-4o", false).await, PutOutcome::Updated);
+        assert_eq!(
+            put("fast", "gpt-4o", false).await,
+            PutOutcome::Updated("gpt-4o-mini".into()),
+            "an update carries the previous target (the OG-35 before)"
+        );
         assert_eq!(put("smart", "gpt-5", true).await, PutOutcome::Created);
         assert_eq!(
             put("third", "gpt-5-mini", true).await,
@@ -420,9 +497,9 @@ mod tests {
             "model_aliases_alias_shape must refuse a leading dash"
         );
 
-        assert!(delete(&pool, &tenant, "fast").await.unwrap());
+        assert!(delete(&pool, &tenant, "fast", "test").await.unwrap());
         assert!(
-            !delete(&pool, &tenant, "fast").await.unwrap(),
+            !delete(&pool, &tenant, "fast", "test").await.unwrap(),
             "a second delete finds nothing"
         );
 

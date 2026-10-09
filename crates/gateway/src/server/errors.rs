@@ -25,6 +25,7 @@ pub(super) enum DispatchFailure {
     RequestRejected(u16),
     /// Timeout, connection failure, or 5xx after retry. A genuine outage.
     Unavailable,
+    Timeout(crate::routing::deadlines::Timeout),
 }
 
 impl DispatchFailure {
@@ -37,6 +38,7 @@ impl DispatchFailure {
             Self::ModelNotFound => "model_not_found",
             Self::RequestRejected(_) => "provider_request_rejected",
             Self::Unavailable => "provider_unavailable",
+            Self::Timeout(_) => "upstream_timeout",
         }
     }
 }
@@ -47,6 +49,9 @@ impl DispatchFailure {
 /// exactly; that cascade predates this helper and should be collapsed onto it,
 /// which is a pure refactor and deliberately not bundled into this change.
 pub(super) fn classify_dispatch_error(err: &anyhow::Error) -> DispatchFailure {
+    if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+        return DispatchFailure::Timeout(timeout);
+    }
     let Some(http) = err.downcast_ref::<crate::providers::ProviderHttpError>() else {
         return DispatchFailure::Unavailable;
     };
@@ -70,8 +75,11 @@ pub(super) fn classify_dispatch_error(err: &anyhow::Error) -> DispatchFailure {
 pub(super) fn dispatch_failure_response(
     failure: DispatchFailure,
     upstream: &'static str,
+    // OG-10: the upstream's own `Retry-After` for a 429/503, from [`upstream_retry_after_secs`].
+    upstream_retry_after: Option<u64>,
 ) -> axum::response::Response {
     match failure {
+        DispatchFailure::Timeout(timeout) => timeout.response(),
         DispatchFailure::KeyRejected => provider_error_response(
             StatusCode::UNAUTHORIZED,
             failure.reason(),
@@ -81,13 +89,15 @@ pub(super) fn dispatch_failure_response(
             Some(upstream),
             None,
         ),
-        DispatchFailure::RateLimited => provider_error_response(
+        DispatchFailure::RateLimited => provider_error_response_retry(
             StatusCode::TOO_MANY_REQUESTS,
             failure.reason(),
             Some(
                 "the upstream provider rate-limited or quota-exhausted this request — retry later, or check the provider account's plan and billing",
             ),
             Some(upstream),
+            None,
+            upstream_retry_after,
             Some("60"),
         ),
         DispatchFailure::ModelNotFound => provider_error_response(
@@ -118,11 +128,13 @@ pub(super) fn dispatch_failure_response(
                 None,
             )
         }
-        DispatchFailure::Unavailable => provider_error_response(
+        DispatchFailure::Unavailable => provider_error_response_retry(
             StatusCode::BAD_GATEWAY,
             "provider unavailable",
             None,
             None,
+            None,
+            upstream_retry_after,
             None,
         ),
     }
@@ -255,6 +267,91 @@ pub(crate) fn provider_error_response(
     provider: Option<&str>,
     retry_after_secs: Option<&'static str>,
 ) -> axum::response::Response {
+    provider_error_response_with_detail(
+        status,
+        error_code,
+        message,
+        provider,
+        None,
+        retry_after_secs,
+    )
+}
+
+/// [`provider_error_response`] plus `OG-03` §3.4's `provider_message`: the upstream's own
+/// `error.message`, already scrubbed and truncated by `ProviderHttpError::from_response`
+/// (which refuses 401/403/407, every 5xx and any auth rejection — those arrive here as
+/// `None`). It sits beside the gateway's own `message`, never in place of it, and the whole
+/// body is scrubbed once more below.
+pub(crate) fn provider_error_response_with_detail(
+    status: StatusCode,
+    error_code: &str,
+    message: Option<&str>,
+    provider: Option<&str>,
+    provider_message: Option<&str>,
+    retry_after_secs: Option<&'static str>,
+) -> axum::response::Response {
+    build_provider_error(
+        status,
+        error_code,
+        message,
+        provider,
+        provider_message,
+        retry_after_secs.map(str::to_owned),
+        None,
+    )
+}
+
+/// `OG-10` §3: the upstream's own `Retry-After`, in whole seconds rounded UP (telling a
+/// client "1 s" when the provider said "1.2 s" sends it back to be refused again), for a
+/// final upstream failure that carries one — a 429 or a 503 and nothing else. `None`
+/// otherwise, so a status that is not about waiting never grows a `Retry-After`.
+pub(crate) fn upstream_retry_after_secs(err: &anyhow::Error) -> Option<u64> {
+    let http = err.downcast_ref::<crate::providers::ProviderHttpError>()?;
+    if !matches!(http.status, 429 | 503) {
+        return None;
+    }
+    let d = http.retry_after?;
+    Some(d.as_secs() + u64::from(d.subsec_nanos() > 0))
+}
+
+/// [`provider_error_response_with_detail`] for a failure whose upstream said how long to
+/// wait (`OG-10`): the `Retry-After` header is the provider's value (`upstream_secs`), and
+/// the body carries `retry_after_secs` beside it. With `None` it is the gateway's own
+/// `fallback_header` guess and NO body field — a guessed number is not presented as the
+/// provider's.
+pub(crate) fn provider_error_response_retry(
+    status: StatusCode,
+    error_code: &str,
+    message: Option<&str>,
+    provider: Option<&str>,
+    provider_message: Option<&str>,
+    upstream_secs: Option<u64>,
+    fallback_header: Option<&'static str>,
+) -> axum::response::Response {
+    let (header, body_secs) = match upstream_secs {
+        Some(secs) => (Some(secs.to_string()), Some(secs)),
+        None => (fallback_header.map(str::to_owned), None),
+    };
+    build_provider_error(
+        status,
+        error_code,
+        message,
+        provider,
+        provider_message,
+        header,
+        body_secs,
+    )
+}
+
+fn build_provider_error(
+    status: StatusCode,
+    error_code: &str,
+    message: Option<&str>,
+    provider: Option<&str>,
+    provider_message: Option<&str>,
+    retry_after_header: Option<String>,
+    retry_after_body_secs: Option<u64>,
+) -> axum::response::Response {
     let mut map = serde_json::Map::new();
     map.insert("error".into(), error_code.into());
     if let Some(m) = message {
@@ -262,6 +359,12 @@ pub(crate) fn provider_error_response(
     }
     if let Some(p) = provider {
         map.insert("provider".into(), p.into());
+    }
+    if let Some(pm) = provider_message {
+        map.insert("provider_message".into(), pm.into());
+    }
+    if let Some(secs) = retry_after_body_secs {
+        map.insert("retry_after_secs".into(), secs.into());
     }
     let raw = serde_json::to_vec(&serde_json::Value::Object(map))
         .unwrap_or_else(|_| b"{\"error\":\"internal\"}".to_vec());
@@ -271,13 +374,13 @@ pub(crate) fn provider_error_response(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
     );
-    if let Some(ra) = retry_after_secs {
-        resp.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from_static(ra),
-        );
+    if let Some(ra) = retry_after_header
+        && let Ok(v) = axum::http::HeaderValue::from_str(&ra)
+    {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
     }
-    resp
+    crate::kms::retry_after(resp, error_code)
 }
 
 #[cfg(test)]
@@ -305,6 +408,28 @@ mod tests {
         );
         assert_eq!(not_configured.status(), StatusCode::BAD_REQUEST);
         assert_eq!(unusable.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// OG-03 §3.4: the upstream's message rides beside ours as `provider_message`, and the
+    /// final scrub still runs over it.
+    #[tokio::test]
+    async fn provider_message_is_relayed_beside_the_gateway_message_and_scrubbed() {
+        let resp = provider_error_response_with_detail(
+            StatusCode::BAD_REQUEST,
+            "provider_request_rejected",
+            Some("the gateway's own words"),
+            Some("openai"),
+            Some("Unsupported parameter: max_tokens. key sk-proj-abcdefghijklmnopqrstuvwxyz0123"),
+            None,
+        );
+        let body = crate::handler_harness::body_json(resp).await;
+        assert_eq!(body["message"], "the gateway's own words");
+        let pm = body["provider_message"].as_str().expect("provider_message");
+        assert!(pm.starts_with("Unsupported parameter: max_tokens"), "{pm}");
+        assert!(
+            !pm.contains("sk-proj-"),
+            "a key shape must not survive: {pm}"
+        );
     }
 
     /// An unclassified upstream 4xx mirrors the upstream status as a 4xx

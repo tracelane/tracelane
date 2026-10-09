@@ -43,16 +43,16 @@ describe("API key creation — scope defaults", () => {
 	it("pre-grants NO scope, so the quiet path cannot hand out chat", () => {
 		const html = markup();
 
-		// All four scopes are offered. The checkbox carries no `value` attribute —
+		// All five scopes are offered. The checkbox carries no `value` attribute —
 		// the slug reaches the DOM only through the label — so assert on what is
 		// actually rendered rather than on what I assumed was.
-		for (const label of ["Chat", "Read", "Ingest", "Admin"]) {
+		for (const label of ["Chat", "Read", "Ingest", "Admin", "Passthrough"]) {
 			expect(html, `the ${label} scope must be offered`).toContain(label);
 		}
 		expect(
 			(html.match(/type="checkbox"/g) ?? []).length,
-			"all four scopes must render as checkboxes",
-		).toBe(4);
+			"all five scopes must render as checkboxes",
+		).toBe(5);
 
 		// ...and NONE is checked. React omits the attribute entirely when false,
 		// so any occurrence of `checked` in this markup is a pre-granted scope.
@@ -62,6 +62,12 @@ describe("API key creation — scope defaults", () => {
 				"default grants the most is a default that fails OPEN. Minting a " +
 				"read-only key must not require noticing and un-ticking boxes.",
 		).toBe(false);
+	});
+
+	it("OG-08: the Passthrough grant says what it bypasses, and that nothing implies it", () => {
+		const html = markup();
+		expect(html).toContain("no guardrails");
+		expect(html).toContain("Never implied by another scope");
 	});
 
 	it("refuses to submit with no scope selected, so the empty default is usable", () => {

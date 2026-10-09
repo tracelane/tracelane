@@ -124,6 +124,17 @@ fn decide<E>(probe: Result<bool, E>) -> Decision<E> {
     }
 }
 
+/// A successful probe proves the claim database path is available whether this
+/// process won the lock or another process legitimately holds it.
+fn record_claim_decision<E>(decision: Decision<E>) -> Decision<E> {
+    if matches!(&decision, Decision::Won | Decision::Lost) {
+        tracelane_shared::degradation::resolve(
+            tracelane_shared::degradation::Degradation::JobClaimFailed,
+        );
+    }
+    decision
+}
+
 /// Try to claim `job` for this tick on the existing connection pool.
 ///
 /// Opens a transaction on `client` purely to scope the advisory lock's
@@ -162,7 +173,7 @@ pub async fn claim<'a>(client: &'a mut deadpool_postgres::Client, job: &str) -> 
         )
         .await
         .map(|row| row.get::<_, bool>(0));
-    match decide(probe) {
+    match record_claim_decision(decide(probe)) {
         Decision::Won => {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
             tracing::info!(job, leader = %hostname, "job claim won");
@@ -254,6 +265,22 @@ mod tests {
             decide(Err::<bool, _>("pg down")),
             Decision::CannotTell("pg down")
         ));
+    }
+
+    #[test]
+    fn successful_claim_probe_closes_prior_failure_even_when_lock_is_held_elsewhere() {
+        use tracelane_shared::degradation::{Degradation, is_open, note, resolve};
+        let kind = Degradation::JobClaimFailed;
+        resolve(kind);
+        note(kind);
+        assert!(matches!(
+            record_claim_decision(decide::<&str>(Ok(false))),
+            Decision::Lost
+        ));
+        assert!(
+            !is_open(kind),
+            "a successful Postgres probe proves the claim path recovered"
+        );
     }
 
     /// The classid is a stable wire-adjacent value once a deploy has claims

@@ -1,150 +1,178 @@
 {
-	"$schema": "https://mintlify.com/docs.json",
-	"theme": "maple",
-	"name": "Tracelane",
-	"colors": {
-		"primary": "#0071e3",
-		"light": "#2997ff",
-		"dark": "#0071e3"
-	},
-	"appearance": {
-		"default": "system",
-		"strict": false
-	},
-	"background": {
-		"color": {
-			"light": "#f5f5f7",
-			"dark": "#000000"
-		}
-	},
-	"fonts": {
-		"family": "Geist"
-	},
-	"styling": {
-		"eyebrows": "section",
-		"codeblocks": "system"
-	},
-	"favicon": "/favicon.svg",
-	"navigation": {
-		"tabs": [
-			{
-				"tab": "Documentation",
-				"groups": [
-					{
-						"group": "Get started",
-						"pages": ["index", "quickstart", "concepts", "onboarding"]
-					},
-					{
-						"group": "SDKs",
-						"pages": ["sdk-python", "sdk-typescript"]
-					},
-					{
-						"group": "Integrations",
-						"pages": [
-							"integrations/opentelemetry",
-							"integrations/langchain",
-							"integrations/langgraph",
-							"integrations/helicone-history",
-							"integrations/llamaindex",
-							"integrations/crewai",
-							"integrations/vercel-ai",
-							"integrations/claude-code"
-						]
-					},
-					{
-						"group": "Concepts",
-						"pages": [
-							"architecture",
-							"benchmarks",
-							"predictive-guardrails",
-							"providers",
-							"audit-ledger",
-							"byok",
-							"pricing"
-						]
-					},
-					{
-						"group": "Features",
-						"pages": ["agent-identity", "ask-tara", "prompt-promotion", "eval-gates", "slo", "time-travel"]
-					},
-					{
-						"group": "Tools",
-						"pages": ["cli", "mcp-server", "api-reference"]
-					},
-					{
-						"group": "Audit & compliance",
-						"pages": [
-							"audit/conformance-statement",
-							"audit/verifier-cli",
-							"compliance/eu-ai-act-article-12"
-						]
-					},
-					{
-						"group": "Operations",
-						"pages": ["self-hosting", "security", "troubleshooting"]
-					},
-					{
-						"group": "Migrations",
-						"pages": [
-							"migrations/from-litellm",
-							"migrations/from-helicone",
-							"migrations/from-langsmith",
-							"migrations/from-langfuse",
-							"migrations/from-datadog"
-						]
-					},
-					{
-						"group": "Comparisons",
-						"pages": [
-							"comparisons/index",
-							"comparisons/vs-langsmith-engine",
-							"comparisons/vs-litellm",
-							"comparisons/vs-portkey",
-							"comparisons/vs-helicone"
-						]
-					}
-				]
-			},
-			{
-				"tab": "Decisions",
-				"groups": [
-					{
-						"group": "Architecture decisions",
-						"pages": ["decisions/index"]
-					}
-				]
-			}
-		]
-	},
-	"logo": {
-		"light": "/logo/light.svg",
-		"dark": "/logo/dark.svg"
-	},
-	"navbar": {
-		"links": [
-			{
-				"label": "Dashboard",
-				"href": "https://app.tracelane.dev"
-			},
-			{
-				"label": "GitHub",
-				"href": "https://github.com/tracelane/tracelane"
-			}
-		],
-		"primary": {
-			"type": "button",
-			"label": "Sign in",
-			"href": "https://app.tracelane.dev/sign-in"
-		}
-	},
-	"footer": {
-		"socials": {
-			"github": "https://github.com/tracelane/tracelane",
-			"x": "https://x.com/xsanjeevlabs",
-			"linkedin": "https://www.linkedin.com/in/sanjeevlabs"
-		}
-	},
-	"search": {
-		"prompt": "Search Tracelane docs"
-	}
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "Tracelane",
+  "colors": {
+    "primary": "#7c85e0",
+    "light": "#a5adf5",
+    "dark": "#7c85e0"
+  },
+  "appearance": {
+    "default": "dark",
+    "strict": false
+  },
+  "background": {
+    "color": {
+      "light": "#f5f5f7",
+      "dark": "#101113"
+    }
+  },
+  "fonts": {
+    "family": "Geist"
+  },
+  "styling": {
+    "eyebrows": "section",
+    "codeblocks": "system"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "quickstart",
+              "concepts",
+              "onboarding"
+            ]
+          },
+          {
+            "group": "SDKs",
+            "pages": [
+              "sdk-python",
+              "sdk-typescript"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/opentelemetry",
+              "integrations/langchain",
+              "integrations/langgraph",
+              "integrations/helicone-history",
+              "integrations/llamaindex",
+              "integrations/crewai",
+              "integrations/vercel-ai",
+              "integrations/claude-code",
+              "integrations/codex"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "architecture",
+              "diagnostics",
+              "benchmarks",
+              "predictive-guardrails",
+              "providers",
+              "audit-ledger",
+              "byok",
+              "pricing"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "agent-identity",
+              "ask-tara",
+              "prompt-promotion",
+              "eval-gates",
+              "slo",
+              "time-travel"
+            ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "cli",
+              "mcp-server",
+              "api-reference"
+            ]
+          },
+          {
+            "group": "Audit & compliance",
+            "pages": [
+              "audit/conformance-statement",
+              "audit/verifier-cli",
+              "compliance/eu-ai-act-article-12",
+              "compliance/regulated-use"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "self-hosting",
+              "security",
+              "troubleshooting"
+            ]
+          },
+          {
+            "group": "Migrations",
+            "pages": [
+              "migrations/from-litellm",
+              "migrations/from-helicone",
+              "migrations/from-langsmith",
+              "migrations/from-langfuse",
+              "migrations/from-datadog"
+            ]
+          },
+          {
+            "group": "Comparisons",
+            "pages": [
+              "comparisons/index",
+              "comparisons/vs-langsmith-engine",
+              "comparisons/vs-litellm",
+              "comparisons/vs-portkey",
+              "comparisons/vs-helicone"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Decisions",
+        "groups": [
+          {
+            "group": "Architecture decisions",
+            "pages": [
+              "decisions/index"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Dashboard",
+        "href": "https://app.tracelane.dev"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/tracelane/tracelane"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Sign in",
+      "href": "https://app.tracelane.dev/sign-in"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/tracelane/tracelane",
+      "x": "https://x.com/xsanjeevlabs",
+      "linkedin": "https://www.linkedin.com/in/sanjeevlabs"
+    }
+  },
+  "search": {
+    "prompt": "Search Tracelane docs"
+  }
 }

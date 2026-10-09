@@ -132,9 +132,26 @@ pub async fn approve(
     tenant_id: &TenantId,
     tool_name: &str,
     def_hash: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<bool> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    let n = client
+    // OG-35: the approve and its `guardrail.tool_pin.approve` row are ONE transaction.
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let before = tx
+        .query_opt(
+            "SELECT caps, def_hash FROM tool_capabilities
+             WHERE tenant_id = $1 AND tool_name = $2 FOR UPDATE",
+            &[tenant_id.as_uuid(), &tool_name],
+        )
+        .await
+        .map_err(|e| anyhow!("tool_capabilities read: {e}"))?
+        .map(|r| {
+            serde_json::json!({
+                "caps": r.get::<_, i16>(0),
+                "def_hash": r.get::<_, Option<String>>(1),
+            })
+        });
+    let n = tx
         .execute(
             "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
              SELECT o.tenant_id, o.tool_name, 0, o.def_hash
@@ -147,5 +164,19 @@ pub async fn approve(
         )
         .await
         .map_err(|e| anyhow!("observed_tools approve: {e}"))?;
-    Ok(n > 0)
+    if n == 0 {
+        return Ok(false);
+    }
+    crate::db::tool_capabilities::audit(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        "guardrail.tool_pin.approve",
+        tool_name,
+        before,
+        Some(serde_json::json!({"def_hash": def_hash})),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }

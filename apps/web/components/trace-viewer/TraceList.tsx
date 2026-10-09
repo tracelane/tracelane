@@ -62,6 +62,10 @@ import { IssueChips, useIssueRollup } from "./IssueChip";
 import { TraceBulkBar } from "./TraceBulkBar";
 
 export type TraceSummary = {
+	loop_calls?: number;
+	loops_available?: boolean;
+	rescued?: "failover" | "retry" | null;
+	rescues_available?: boolean;
 	trace_id: string;
 	root_name: string;
 	start_time: string;
@@ -72,6 +76,7 @@ export type TraceSummary = {
 	model: string;
 	/** Summed real cost (USD) over the trace's spans; 0 when unpriced. */
 	cost_usd: number;
+	cost_usd_present?: boolean;
 	/** Summed input + output tokens over the trace's spans; 0 when no usage. */
 	total_tokens: number;
 };
@@ -104,7 +109,10 @@ function traceWindow(
 }
 
 /** Cost as USD; `—` for zero/absent so the column reads honestly, not "$0.00". */
-const formatCost = (usd: number) => (usd ? fmtUsd(usd) : "—");
+const formatCost = (usd: number, present?: boolean) =>
+	present === false || (present === undefined && !usd)
+		? "Unknown cost"
+		: fmtUsd(usd);
 
 /** Compact token count (1.2K / 1.4M); `—` for zero/absent. */
 const formatTokens = (n: number) => (n ? fmtCompact(n) : "—");
@@ -221,6 +229,8 @@ export function TraceList({
 	durationHref,
 	startedHref,
 	spansHref,
+	costHref,
+	errorsHref,
 	selectable = false,
 	selectionMax,
 	viewerRole,
@@ -233,6 +243,8 @@ export function TraceList({
 	durationHref?: string;
 	startedHref?: string;
 	spansHref?: string;
+	costHref?: string;
+	errorsHref?: string;
 	selectable?: boolean;
 	selectionMax?: number;
 	viewerRole?: string | null;
@@ -482,13 +494,27 @@ export function TraceList({
 							>
 								Tokens
 							</TH>
-							<TH
-								className="px-3 py-1.5 text-right t-metric-label"
-								title="Tokens/cost sum per span — may double-count when usage is recorded on both a wrapper and its inner span. '—' = unpriced or no usage, not necessarily zero."
-							>
-								Cost
-							</TH>
-							<TH className="px-3 py-1.5 text-left t-metric-label">Status</TH>
+							{costHref ? (
+								<SortHeader
+									label="Cost"
+									href={costHref}
+									active={sort === "cost"}
+									order={order}
+									align="text-right"
+								/>
+							) : (
+								<TH className="px-3 py-1.5 text-right t-metric-label">Cost</TH>
+							)}
+							{errorsHref ? (
+								<SortHeader
+									label="Errors / status"
+									href={errorsHref}
+									active={sort === "errors"}
+									order={order}
+								/>
+							) : (
+								<TH className="px-3 py-1.5 text-left t-metric-label">Status</TH>
+							)}
 							{startedHref ? (
 								<SortHeader
 									label="Started (UTC)"
@@ -606,10 +632,24 @@ export function TraceList({
 									{formatTokens(t.total_tokens)}
 								</TD>
 								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
-									{formatCost(t.cost_usd)}
+									{formatCost(t.cost_usd, t.cost_usd_present)}
 								</TD>
 								<TD className="px-3 py-2">
 									<div className="flex items-center gap-1.5">
+										{t.loops_available && (t.loop_calls ?? 0) > 0 && (
+											<StatusBadge
+												status="loop"
+												tone="warn"
+												label={`Repeated tool call ×${t.loop_calls}`}
+											/>
+										)}
+										{t.rescues_available && t.rescued && (
+											<StatusBadge
+												status="rescued"
+												tone="info"
+												label={`Rescued by ${t.rescued}`}
+											/>
+										)}
 										{t.error_count > 0 && (
 											<StatusBadge status="error" detail={t.error_count} />
 										)}

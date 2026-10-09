@@ -13,6 +13,12 @@ const h = vi.hoisted(() => ({
 	db: null as DbMock | null,
 }));
 
+vi.mock("@workos-inc/authkit-nextjs", () => ({
+	withAuth: async () => ({
+		user: { id: h.session.userId, email: h.session.email },
+		organizationId: h.session.tenantId,
+	}),
+}));
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -113,8 +119,9 @@ it("CASE 1: sole user → org soft-delete + WorkOS user delete, orgDeleted:true"
 	const res = await del({ confirmEmail: "ME@X.co" }); // case-insensitive confirm
 	expect(res.status).toBe(200);
 	expect(((await res.json()) as { orgDeleted: boolean }).orgDeleted).toBe(true);
-	// select tenant + update tenants + update apiKeys + tombstone = 4 db chains.
+	// Tenant lookup, atomic local erasure, org archive, key revocation.
 	expect(h.db?.cursor()).toBe(4);
+	expect(h.db?.db.execute).toHaveBeenCalledTimes(1);
 	expect(spy.mock.calls.some((c) => methodOf(c) === "DELETE")).toBe(true);
 });
 
@@ -126,7 +133,40 @@ it("CASE 3: non-owner member with others → delete self, orgDeleted:false, org 
 	expect(((await res.json()) as { orgDeleted: boolean }).orgDeleted).toBe(
 		false,
 	);
-	// select tenant + tombstone = 2 db chains (NO archive/revoke — org lives).
+	// Tenant lookup and atomic local erasure; the org lives.
 	expect(h.db?.cursor()).toBe(2);
+	expect(h.db?.db.execute).toHaveBeenCalledTimes(1);
 	expect(spy.mock.calls.some((c) => methodOf(c) === "DELETE")).toBe(true);
+});
+
+it("SET-60 REJECT: WorkOS user delete fails → 502 after durable local erasure", async () => {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (...args: unknown[]) => {
+			const url = args[0] as string;
+			if (url.includes("organization_memberships")) {
+				return {
+					ok: true,
+					json: async () => ({ data: [me("member"), otherOwner] }),
+				} as unknown as Response;
+			}
+			return { ok: false, status: 500 } as unknown as Response;
+		}),
+	);
+	const res = await del({ confirmEmail: "me@x.co" });
+	expect(res.status).toBe(502);
+	expect(h.db?.db.execute).toHaveBeenCalledTimes(1);
+});
+
+it("local erasure failure refuses success and keeps the WorkOS identity for retry", async () => {
+	const spy = stub([me("member"), otherOwner]);
+	vi.spyOn(console, "error").mockImplementation(() => {});
+	if (h.db) {
+		h.db.db.execute.mockImplementation(() => {
+			throw new Error("signups table missing");
+		});
+	}
+	const res = await del({ confirmEmail: "me@x.co" });
+	expect(res.status).toBe(503);
+	expect(spy.mock.calls.every((c) => methodOf(c) !== "DELETE")).toBe(true);
 });

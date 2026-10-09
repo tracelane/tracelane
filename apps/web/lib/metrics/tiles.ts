@@ -493,6 +493,41 @@ async function fetchStatValue(
 			if (gs === null) return null;
 			return { formatted: fmtCount(gs.provider_count), n: null };
 		}
+		case "agent_loops": {
+			const gs = await (await F()).fetchGatewayStatsFor(r);
+			return gs?.agent_loops
+				? {
+						formatted: fmtCount(gs.agent_loops.instances),
+						n: gs.agent_loops.tool_calls,
+					}
+				: null;
+		}
+		case "rescued_failover":
+		case "rescued_retry":
+		case "rescue_rate":
+		case "rescue_latency": {
+			const gs = await (await F()).fetchGatewayStatsFor(r);
+			if (gs?.requests_with_failed_attempt == null) return null;
+			const value =
+				id === "rescued_failover"
+					? gs.rescued_by_failover
+					: id === "rescued_retry"
+						? gs.rescued_by_retry
+						: id === "rescue_rate"
+							? gs.rescue_rate_pct
+							: gs.rescue_added_ms_p50;
+			return {
+				formatted:
+					value == null
+						? "—"
+						: id === "rescue_rate"
+							? `${value.toFixed(1)}%`
+							: id === "rescue_latency"
+								? `${value.toFixed(1)} ms`
+								: fmtCount(value),
+				n: gs.requests_with_failed_attempt,
+			};
+		}
 		case "failovers": {
 			const gs = await (await F()).fetchGatewayStatsFor(r);
 			if (gs === null) return null;
@@ -533,7 +568,7 @@ async function fetchStatValue(
 			// for every metric that can be shown without that entity context.
 			const _entity: Extract<
 				(typeof METRICS)[MetricId],
-				{ window: "entity" } | { family: "kya" }
+				{ window: "entity" } | { family: "kya" } | { family: "workspace" }
 			>["id"] = id;
 			return null;
 		}

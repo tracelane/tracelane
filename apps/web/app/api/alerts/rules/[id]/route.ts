@@ -7,24 +7,18 @@
  * Upstream error bodies are never echoed.
  */
 
-import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { NextResponse } from "next/server";
 
 export async function DELETE(
 	_req: Request,
 	{ params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
 	const { id } = await params;
-	const base = gatewayBaseUrl();
 
-	const upstream = await fetch(
-		`${base}/v1/alerts/rules/${encodeURIComponent(id)}`,
-		{
-			method: "DELETE",
-			headers: { authorization: `Bearer ${token}` },
-		},
+	const upstream = await gatewayResponse(
+		`/v1/alerts/rules/${encodeURIComponent(id)}`,
+		{ method: "DELETE" },
 	);
 
 	if (!upstream.ok) {

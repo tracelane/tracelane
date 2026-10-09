@@ -1043,7 +1043,10 @@ describe("breakdown parity — traces/groups (B-502 / CX-03)", () => {
 		trace_count: traces,
 		error_traces: 0,
 		avg_duration_us: 100,
+		p50_duration_us: 120,
+		p90_duration_us: 180,
 		p95_duration_us: 200,
+		p99_duration_us: 220,
 	});
 
 	it("traces_total by model reads the BARE ARRAY the gateway actually returns (group_key/trace_count), not a { groups } wrapper", async () => {

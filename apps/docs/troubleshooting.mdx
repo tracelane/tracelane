@@ -84,13 +84,13 @@ downstream in the chain, the upstream error is proxied back. A workspace
 can set its own ordered fallback models in settings — see
 [Failover](/providers#failover).
 
-### `predictive.verdict = block` — request blocked by guardrail
+### `predictive.verdict = block` — guardrail finding
 
-**Cause:** A predictive guardrail blocked the request before it reached the provider.
+**Cause:** A guardrail recorded a block verdict. In observe-first mode the request can still reach the provider; with enforcement enabled, a preflight block returns 403 before dispatch.
 
-**Fix:** Check which guard fired — it's recorded in the trace span attributes
-(and, when present, the `x-tracelane-guard` response header). Use the MCP tool
-`explain_guardrail_block` (it takes `trace_id` and `span_id`) for a breakdown.
+**Fix:** For a recorded span, check its guardrail attributes and use the MCP tool
+`explain_guardrail_block` with `trace_id` and `span_id`. For a preflight 403,
+there is no trace span; use the response body's `correlation_id` with the same tool.
 
 ```bash
 # Get full explanation via the MCP tool

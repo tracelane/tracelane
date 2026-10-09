@@ -1,0 +1,20 @@
+# OG-91 layer-1 replay fixture (specs/OG-91-client-conformance-harness.md §3).
+# CLIENT:     Codex CLI (`codex`), responses-lite, pointed at the gateway with a custom
+#             model provider (`base_url = ".../v1"`, wire_api = "responses").
+# PROVENANCE: HAND-BUILT from the client's published source (openai/codex, codex-rs
+#             `ResponsesApiRequest` and its tool specs: function tools, a `namespace`, the
+#             freeform/`custom` `apply_patch` with a lark grammar, `store:false`,
+#             `include:["reasoning.encrypted_content"]`, `prompt_cache_key`) — NOT a wire capture.
+#             HEADER NAMES (`session-id`, `x-codex-turn-metadata`, `originator`) were corrected
+#             on 2026-10-02 against a capture of codex-cli 0.159.2 through
+#             `scripts/ops/client-conformance.sh --refresh-fixtures`; the capture itself is NOT
+#             committed (it carries the client's whole system prompt, the machine's paths and an
+#             installation id), and the body below stays hand-built.
+# METHOD:     POST
+# PATH:       /v1/responses
+# HEADER:     authorization: Bearer tlane_live_og91_fixture_key_do_not_use
+# HEADER:     session-id: 019a0000-0000-7000-8000-000000000091
+# HEADER:     x-codex-turn-metadata: {"turn_id":"og91-fixture"}
+# HEADER:     user-agent: codex_cli_rs/0.0.0 (Linux; x86_64)
+# HEADER:     originator: codex_cli_rs
+{"model":"gpt-5.5","instructions":"You are Codex, a coding agent running in the Codex CLI.","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>sandbox_mode: workspace-write</permissions instructions>"}]},{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"codex","description":"Codex built-in tools","tools":[{"type":"function","name":"shell","description":"Runs a shell command and returns its output.","strict":false,"parameters":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"}},"workdir":{"type":"string"}},"required":["command"],"additionalProperties":false}},{"type":"custom","name":"apply_patch","description":"Use the `apply_patch` tool to edit files.","format":{"type":"grammar","syntax":"lark","definition":"start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: /(.|\\n)+/"}}]}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the failing test in src/lib.rs"}]},{"type":"function_call","call_id":"call_og91_1","name":"shell","arguments":"{\"command\":[\"cargo\",\"test\"]}"},{"type":"function_call_output","call_id":"call_og91_1","output":"test result: FAILED. 1 passed; 1 failed"}],"tools":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"medium","summary":"auto"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"019a0000-0000-7000-8000-000000000091","text":{"verbosity":"low"}}

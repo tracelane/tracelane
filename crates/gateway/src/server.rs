@@ -84,16 +84,22 @@ mod errors;
 mod quota;
 pub(crate) mod request_labels;
 mod spans;
+pub(crate) use spans::{MAX_LOGPROB_TOKENS, MAX_TOOL_NAMES};
 mod stream;
 
-pub(crate) use chat::chat_completions_handler;
+pub(crate) use buffered::ToolCallAccumulator;
+// The handlers themselves are mounted through their strict-parse routes (`M-A`); tests
+// call them directly — their test-only re-exports sit at the bottom of this file.
+pub(crate) use chat::chat_completions_route;
 pub(crate) use dispatch::{
-    DispatchGuard, ProviderKey, REQUESTS_CANCELLED_IN_DISPATCH, bench_mock_active,
-    dispatch_to_provider, resolve_provider_key, resolve_provider_key_traced,
+    DispatchGuard, KeyCursor, ProviderKey, REQUESTS_CANCELLED_IN_DISPATCH, bench_mock_active,
+    breaker_cred, dispatch_to_provider, env_fallback_allowed, provider_id_from_name,
+    resolve_provider_key, resolve_provider_key_labeled, transport_outcome,
 };
-pub(crate) use embeddings::embeddings_handler;
+pub(crate) use embeddings::embeddings_route;
 pub(crate) use errors::{
-    INVALID_ZDR_CONSTRAINT_MESSAGE, provider_error_response, zdr_unsatisfiable_message,
+    INVALID_ZDR_CONSTRAINT_MESSAGE, provider_error_response, upstream_retry_after_secs,
+    zdr_unsatisfiable_message,
 };
 pub use quota::{WORKSPACE_SPEND_THIS_MONTH_SQL, next_month_boundary_iso};
 pub(crate) use quota::{
@@ -101,12 +107,13 @@ pub(crate) use quota::{
     workspace_spend_baseline_from_clickhouse,
 };
 pub(crate) use spans::{
-    CallerIdentity, CapturedInput, GatewayTiming, RequestConfig, ServedMeta, SpanUsageMeta,
-    build_gateway_span, build_prompt_resolution_span, record_key_spend, spawn_span_publish,
+    CallerIdentity, CapturedInput, CapturedOutput, GatewayTiming, RequestConfig, RouteMeta,
+    ServedMeta, SpanUsageMeta, build_gateway_span, build_prompt_resolution_span, record_key_spend,
+    spawn_span_publish,
 };
 #[allow(unused_imports)]
 pub(crate) use stream::DROP_COUNTER_TEST_LOCK;
-pub(crate) use stream::STREAMS_FINALIZED_ON_DROP;
+pub(crate) use stream::{STREAMS_FINALIZED_ON_DROP, ring_push};
 
 /// Gateway configuration loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -298,9 +305,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // to authenticate every request as the one configured tenant (gated on the
     // operator's TRACELANE_MASTER_KEY) — self-host has no Postgres/WorkOS to
     // authenticate against, so without this the release gateway 401s every call.
-    if let Some(sh) = tracelane_shared::self_host::from_env()
-        .context("single-tenant self-host config (TRACELANE_SELF_HOST) is invalid")?
-    {
+    let self_host_mode = tracelane_shared::self_host::from_env()
+        .context("single-tenant self-host config (TRACELANE_SELF_HOST) is invalid")?;
+    if let Some(sh) = &self_host_mode {
         let master_key = std::env::var("TRACELANE_MASTER_KEY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -327,8 +334,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // silent fallback). Debug builds may continue with a deterministic
     // test pepper so the dev loop doesn't break.
     match std::env::var("TRACELANE_APIKEY_PEPPER") {
-        Ok(raw) => crate::db::api_keys::init_pepper(&raw)
-            .context("TRACELANE_APIKEY_PEPPER could not be decoded")?,
+        Ok(raw) => {
+            crate::db::api_keys::init_pepper(&raw)
+                .context("TRACELANE_APIKEY_PEPPER could not be decoded")?;
+            crate::tool_fingerprint::init_from_existing_pepper(&raw)?;
+        }
         Err(_) => {
             #[cfg(debug_assertions)]
             {
@@ -487,7 +497,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             crate::entitlement_cache::pg_resolver(pool.clone()),
         );
         crate::entitlement_cache::spawn_listen_task(cache.clone());
-        Arc::new(cache)
+        let cache = Arc::new(cache);
+        // rev5 M6: the workspace's `source_ips` bind every key on EVERY route, so the
+        // key authenticator (which holds no `AppState`) reads the same cache.
+        crate::entitlement_cache::install_global(Arc::clone(&cache));
+        cache
     });
 
     // Entitlement-driven per-plan retention sweep. Gated OFF by default;
@@ -760,11 +774,29 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // (entitlements cache is constructed earlier — before the audit key store —
     // so the per-tenant audit keypair mint can be gated on f_audit_addon.)
 
-    // Per-upstream circuit breakers (ADR-036) — bulkhead each provider.
+    // Per-upstream, per-credential circuit breakers (ADR-036, OG-13) — tunables from
+    // the `breaker` reference table.
     let circuit_breaker = Arc::new(crate::circuit_breaker::CircuitBreaker::default());
     // Expose it to the read surfaces (/gateway router health) via a process-wide
     // read handle — mirrors rejection_metrics, no state threading needed.
     crate::circuit_breaker::register_global(circuit_breaker.clone());
+    // OG-13: evict idle credential breakers on a cadence, not only when the map is
+    // full, so a credential nobody uses stops occupying a slot. Fault-tolerance
+    // housekeeping: the task only removes entries `evictable` allows.
+    {
+        let cb = circuit_breaker.clone();
+        let every = crate::circuit_breaker::BreakerConfig::from_policy()
+            .idle_evict
+            .max(std::time::Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                cb.sweep_idle();
+            }
+        });
+    }
 
     // B1 prompt router — built once and shared between the chat handler
     // (drift-metric feed) and the /v1/prompts/* sub-router.
@@ -1028,11 +1060,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // end of this function for why the liveness probe must answer under shed.
     let mut app = Router::new()
         .route("/v1/auth/whoami", get(whoami_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/chat/completions", post(chat_completions_route))
         // GWY-26. Mounted UNCONDITIONALLY, beside chat/completions — an
         // embeddings call that silently bypasses the gateway is the fidelity
         // hole this closes, so it must not be env-gated into a 404.
-        .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/embeddings", post(embeddings_route))
         // GWY-47 — the Anthropic-native wire. Mounted UNCONDITIONALLY, beside
         // `/v1/chat/completions`, for the same reason `/v1/embeddings` is: a
         // Claude Code / Anthropic-SDK user points `ANTHROPIC_BASE_URL` here and
@@ -1050,6 +1082,122 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route(
             "/v1/messages/count_tokens",
             post(crate::anthropic_messages::count_tokens_handler),
+        )
+        // OG-01 — the OpenAI Responses wire (Codex CLI, `client.responses.create`).
+        // UNCONDITIONAL for the reason `/v1/messages` is. The handlers live in
+        // `crate::openai_responses`: the chat hot path gains no call (asserted
+        // by that module's `chat_handler_gains_no_call_into_this_module`).
+        // `input_tokens` is a static segment, so it wins over `{id}`.
+        .route(
+            "/v1/responses",
+            post(crate::openai_responses::responses_handler),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(crate::openai_responses::input_tokens_handler),
+        )
+        .route(
+            "/v1/responses/{id}",
+            get(crate::openai_responses::retrieve_handler)
+                .delete(crate::openai_responses::delete_handler),
+        )
+        .route(
+            "/v1/responses/{id}/cancel",
+            post(crate::openai_responses::cancel_handler),
+        )
+        .route(
+            "/v1/responses/{id}/input_items",
+            get(crate::openai_responses::input_items_handler),
+        )
+        // OG-06 — images, speech, transcription, moderation, rerank, files, batches. UNCONDITIONAL
+        // for the reason `/v1/embeddings` is. Each dispatch route runs `admission::admit_authenticated`
+        // (authenticate BEFORE the body is read, then the ONE pipeline); the companions authenticate
+        // + scope + rate-limit inline and use the caller tenant's own BYOK key only. Handlers live in
+        // `crate::media_routes` and `crate::files_batches`.
+        .route(
+            "/v1/images/generations",
+            post(crate::media_routes::images_generations_handler),
+        )
+        .route(
+            "/v1/images/edits",
+            post(crate::media_routes::images_edits_handler),
+        )
+        .route(
+            "/v1/audio/speech",
+            post(crate::media_routes::audio_speech_handler),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(crate::media_routes::audio_transcriptions_handler),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(crate::media_routes::audio_translations_handler),
+        )
+        .route(
+            "/v1/moderations",
+            post(crate::media_routes::moderations_handler),
+        )
+        .route("/v1/rerank", post(crate::media_routes::rerank_handler))
+        .route(
+            "/v1/files",
+            post(crate::files_batches::files_upload_handler)
+                .get(crate::files_batches::files_list_handler),
+        )
+        .route(
+            "/v1/files/{id}",
+            get(crate::files_batches::file_get_handler)
+                .delete(crate::files_batches::file_delete_handler),
+        )
+        .route(
+            "/v1/files/{id}/content",
+            get(crate::files_batches::file_content_handler),
+        )
+        .route(
+            "/v1/batches",
+            post(crate::files_batches::batches_create_handler)
+                .get(crate::files_batches::batches_list_handler),
+        )
+        .route(
+            "/v1/batches/{id}",
+            get(crate::files_batches::batch_get_handler),
+        )
+        .route(
+            "/v1/batches/{id}/cancel",
+            post(crate::files_batches::batch_cancel_handler),
+        )
+        // OG-05 §3.3 — `GET /v1/models`, the OpenAI list shape: the aliases and
+        // verified models the CALLER's own BYOK keys can reach. UNCONDITIONAL for
+        // the reason `/v1/embeddings` is (a tool probing it must not read a 404 as
+        // "wrong host"); with no control plane it answers an empty list.
+        .route("/v1/models", get(crate::models_list::models_handler))
+        // OG-02 — the Gemini-native wire. UNCONDITIONAL, for the same reason `/v1/messages`
+        // is: Gemini CLI / google-genai point their base URL here, and an env-gated 404 would
+        // read as "wrong hostname". One path serves POST (`{model}:generateContent`,
+        // `:streamGenerateContent`, `:countTokens` — split in the handler) and GET (a model
+        // resource). Generating calls run `admission::admit`; a `key` query parameter is
+        // refused 401 before anything else. The handlers live in `crate::gemini_native`.
+        .route(
+            "/v1beta/models/{model_action}",
+            get(crate::gemini_native::model_get_handler)
+                .post(crate::gemini_native::model_action_handler),
+        )
+        .route(
+            "/v1beta/models",
+            get(crate::gemini_native::models_list_handler),
+        )
+        // OG-07 — Realtime over WebSocket. UNCONDITIONAL for the reason `/v1/messages` is:
+        // an env-gated 404 reads as "wrong hostname". Admission (auth → chat scope → … → audit)
+        // runs BEFORE the upgrade, so a refusal is a plain HTTP error and no socket opens; a
+        // `key` query parameter is refused 401 first. The handler lives in `crate::realtime`.
+        .route("/v1/realtime", get(crate::realtime::realtime_handler))
+        // OG-08 — scoped raw provider passthrough. UNCONDITIONAL; the `passthrough` scope is
+        // granted explicitly per key and a legacy NULL-scope key does NOT hold it. The handler
+        // lives in `crate::passthrough`, which reads the RAW path (axum's `Path` would decode
+        // `%2e%2e` before the traversal check saw it).
+        .route(
+            "/v1/passthrough/{provider}/{*path}",
+            axum::routing::any(crate::passthrough::passthrough_handler),
         )
         // GWY-41 / B-227 — the OTLP WRITE path, mounted DELIBERATELY here.
         //
@@ -1230,15 +1378,62 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let trace_reader: std::sync::Arc<dyn crate::trace_reads::TraceReader> = std::sync::Arc::new(
             crate::trace_reads::ClickHouseTraceReader::new(trace_ch)
                 .with_rate_card(state.rate_card.clone())
-                .with_entitlements(state.entitlements.clone())
+                .with_entitlements(
+                    state.entitlements.clone(),
+                    state.no_control_plane_rate_limit_rpm,
+                )
                 .with_pg_pool(state.pg.clone()),
+        );
+        let outcomes: Arc<dyn crate::outcome_routes::OutcomeStore> =
+            Arc::new(crate::outcome_routes::ClickHouseOutcomeStore {
+                ch: crate::clickhouse_query::ch_client(ch_url.clone()),
+            });
+        let outcome_state = crate::outcome_routes::OutcomeState::new(
+            outcomes.clone(),
+            state.rate_card.clone(),
+            Some(state.audit_chain.clone()),
+        );
+        let incident_limiter = outcome_state.read_limiter.clone();
+        app = app.merge(crate::outcome_routes::routes().with_state(outcome_state));
+        let incident_state = crate::incident_routes::IncidentState {
+            limiter: incident_limiter,
+            store: Arc::new(crate::incident_routes::ClickHouseIncidentStore {
+                ch: crate::clickhouse_query::ch_client(ch_url.clone()),
+                pg: state.pg.clone(),
+            }),
+            rate_card: state.rate_card.clone(),
+            outcomes,
+            entitlements: state.entitlements.clone(),
+        };
+        app = app.merge(crate::incident_routes::routes().with_state(incident_state.clone()));
+        app = app.merge(
+            crate::regression_routes::routes().with_state(
+                crate::regression_routes::RegressionState {
+                    incident: incident_state,
+                    datasets: Arc::new(
+                        crate::dataset_routes::ClickHouseDatasetStore::new(
+                            crate::clickhouse_query::ch_client(ch_url.clone()),
+                        )
+                        .with_entitlements(state.entitlements.clone()),
+                    ),
+                    entitlements: state.entitlements.clone(),
+                },
+            ),
         );
         let trace_state = crate::trace_reads::TraceReadState {
             reader: trace_reader.clone(),
             // The SAME counters the admission pipeline records on (B-386 b).
             rejections: state.rejection_metrics.clone(),
         };
-        let trace_app = crate::trace_reads::routes().with_state(trace_state);
+        let glance_state = crate::workspace_glance::GlanceState::new(
+            crate::clickhouse_query::ch_client(ch_url.clone()),
+            trace_reader.clone(),
+            state.rate_card.clone(),
+            state.entitlements.clone(),
+            self_host_mode.is_some(),
+        );
+        let trace_app =
+            crate::trace_reads::routes(trace_state, crate::workspace_glance::routes(glance_state));
         app = app.merge(trace_app);
         // OBS-48 shareable trace links. Needs BOTH ClickHouse (reuses `trace_reader`
         // above — one reader, one cap seam, never a second client for this data) AND
@@ -1307,8 +1502,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // table lives there); without it there is nothing to manage and the route is
         // a clean 404, like every other Postgres-gated group.
         app = app.merge(crate::model_alias_routes::router(state.clone()));
+        // OG-11: the workspace routing document (virtual models, key pools).
+        app = app.merge(crate::routing::routes::router(state.clone()));
         // GWY-53: the owner's content-capture opt-in, ledgered. Same Postgres gate.
         app = app.merge(crate::workspace_capture_routes::router(state.clone()));
+        // OG-51: the workspace's response-cache controls (mode, TTL, namespace, invalidate).
+        app = app.merge(crate::cache_routes::router(state.clone()));
+        // OG-50: the workspace's OTLP span exports, and the ONE background task that serves them
+        // (directory refresh + status flush), off the request path.
+        app = app.merge(crate::otel_export_routes::router(state.clone()));
+        crate::otel_export::spawn(pg.clone(), state.entitlements.clone());
 
         // The WRITE path for R3 rug-pull detection. The read path
         // (registry_loader), the table and the comparison all shipped earlier;
@@ -1318,6 +1521,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let pins_app = crate::guardrail::tool_pins_api::router(state.clone());
         app = app.merge(pins_app);
         tracing::info!("Tool pinning mounted at /v1/guardrails/tool-pins (POST/GET/DELETE)");
+
+        // OG-35 / OG-36: the admin-access policy and the control-change trail. Same
+        // Postgres gate — both live in the control plane.
+        app = app.merge(crate::control_plane::router(pg.clone()));
+        tracing::info!(
+            "Admin plane mounted at /v1/security/admin-access (GET/PUT) and /v1/audit/control-changes (GET/POST)"
+        );
     }
 
     // Gateway-side API-key mint. The dashboard proxies key creation here
@@ -1336,6 +1546,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         };
         app = app.merge(crate::key_routes::routes().with_state(key_state));
         tracing::info!("API keys mounted at POST /v1/keys and GET/PATCH/DELETE /v1/keys/{{id}}");
+
+        // OG-23 / OG-20: projects (and the policy each imposes on its keys). Postgres
+        // control plane only, beside the key routes that assign keys to them.
+        let project_state = crate::project_routes::ProjectRoutesState {
+            store: std::sync::Arc::new(crate::project_routes::PgProjectStore {
+                pool: pool.clone(),
+            }),
+        };
+        app = app.merge(crate::project_routes::routes().with_state(project_state));
+        tracing::info!(
+            "projects mounted at GET/POST /v1/projects and GET/PATCH/DELETE /v1/projects/{{id}}"
+        );
+
+        // OG-21 / OG-22 / OG-24 / OG-25: the workspace's own controls — pause, blocks,
+        // revoke-all, the workspace policy layer, budget status, spend-alert channels.
+        // They never run admission, so they keep working while the workspace is paused.
+        let control_state = crate::control_routes::ControlRoutesState {
+            store: std::sync::Arc::new(crate::control_routes::PgControlStore {
+                pool: pool.clone(),
+            }),
+            entitlements: state.entitlements.clone(),
+        };
+        app = app.merge(crate::control_routes::routes().with_state(control_state));
+        app = app
+            .merge(crate::kms::api::router(state.clone()))
+            .merge(crate::guardrail::policy_api::router(state.clone()));
+        app = app.merge(crate::guardrail::hooks_api::router(state.clone()));
+        // OG-24: the ONE spend-alert worker (outbox + delivery), off the request path.
+        crate::spend_alerts::spawn(pool.clone(), crate::spend_alerts::Mail::from_env());
+        tracing::info!("workspace controls mounted at /v1/controls/*");
 
         // OBS-18 annotations. Postgres-backed (mutable, low-volume, read one
         // trace at a time), so it mounts here beside the other PG routes rather
@@ -1405,7 +1645,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     // captured", and the two would disagree on the first failure.
                     state.nats.clone(),
                 )
-                .with_entitlements(state.entitlements.clone()),
+                .with_entitlements(state.entitlements.clone())
+                // rev5 H2: the SAME spend source admission seeds budgets from.
+                .with_spend_source(state.quota_ch_url.clone()),
             )
         });
         if let Some(engine) = eval.clone() {
@@ -1548,12 +1790,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         request_timeout_secs = admission.request_timeout.as_secs(),
         "admission control: load-shed above max_inflight, head-of-response timeout"
     );
-    // B-383 (f): a source past its failed-auth budget is refused with 429 BEFORE
-    // the handler — no HMAC, no key lookup, no Postgres. Inside the admission
-    // stack (so an overloaded node still sheds first) and on every route except
-    // `/health`, which is mounted below. `preauth_limiter.rs` says why it is
-    // fail-open and what it deliberately is not.
-    let preauth = crate::preauth_limiter::PreAuthLimiter::from_env();
+    // B-594 (2026-10-03; supersedes B-383 f): every request gets a cold-lookup
+    // gate keyed on its source, and an API-key lookup that would reach Postgres
+    // first reserves a token from it — an empty bucket is 429 + Retry-After with
+    // no connection taken. Warm keys never touch it. Inside the admission stack
+    // (so an overloaded node still sheds first) and on every route except
+    // `/health`, mounted below. The source needs the TCP peer, which is why the
+    // listener is served with `ConnectInfo` further down. `preauth_limiter.rs`
+    // says how the source is derived and what it deliberately is not.
+    let preauth = crate::preauth_limiter::PreAuthLimiter::from_policy();
     let app = app.layer(axum::middleware::from_fn_with_state(
         preauth,
         crate::preauth_limiter::layer,
@@ -1586,10 +1831,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // `metrics::run` never returns `Err` — and aborted with the process.
     tokio::spawn(crate::metrics::run());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("axum serve error")?;
+    // B-594: `ConnectInfo` so the pre-auth limiter can tell a proxy hop (whose
+    // forwarding headers it believes) from a client talking to us directly.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("axum serve error")?;
     drain_on_shutdown(nats.as_deref(), Some(&state.audit_chain)).await;
     Ok(())
 }
@@ -1937,6 +2187,19 @@ pub(crate) fn health_body(
             "stale_served": auth_stale_served,
             "negative_hits": auth_negative_hits,
         },
+        // OG-50: spans a customer's OTLP export dropped because a queue was full — per
+        // export (`queue_full`) and across the process (`global_full`) — since boot. Capture
+        // is untouched by an export drop and `capture_healthy` does not read it; a rising
+        // count means a customer's collector is not keeping up. Per-export detail:
+        // `GET /v1/exports/otel`.
+        "otel_export": {
+            "dropped_queue_full": crate::otel_export::drop_counters().0,
+            "dropped_global_full": crate::otel_export::drop_counters().1,
+        },
+        // B-594 (2026-10-03): the per-source throttle on store-reaching key
+        // lookups — refused (429), charged (store found no valid key), overflowed
+        // (the source map was full), and the map's size against its cap.
+        "auth_throttle": crate::preauth_limiter::health_json(),
         // B-568 F2: BYOK keys served past their TTL while one refresh re-read them,
         // and entries a refresh evicted because the key was gone (fail-CLOSED).
         "byok_cache": {
@@ -1950,6 +2213,14 @@ pub(crate) fn health_body(
         "hotpath": {
             "slow_total": crate::hotpath::slow_total(),
             "slow_post_total": crate::hotpath::slow_post_total(),
+        },
+        // OG-13: circuit-breaker trips and rejections since boot, and calls admitted
+        // because the per-credential breaker map was full (`breaker.max_entries`) —
+        // a fault-tolerance path that fails OPEN, so it is counted, never refused.
+        "breaker": {
+            "trips": crate::circuit_breaker::counters().0,
+            "rejects": crate::circuit_breaker::counters().1,
+            "capacity_admitted": crate::circuit_breaker::counters().2,
         },
         // R17. Deliberately NOT folded into `capture_healthy`: capture and
         // attestation fail independently and a reader must be able to tell which
@@ -2066,6 +2337,12 @@ async fn health_handler() -> impl IntoResponse {
     ))
 }
 
+/// TEST-ONLY: `/v1/auth/whoami` alone, for a test that mounts it behind the real B-594 layer.
+#[cfg(test)]
+pub(crate) fn whoami_router() -> Router {
+    Router::new().route("/v1/auth/whoami", get(whoami_handler))
+}
+
 /// A2: validate the bearer credential and return the tenant. Lets sub-
 /// services (e.g. the MCP server's HTTP transport) reuse the gateway's
 /// hardened auth surface (JWT alg allowlist, audience check, JWKS,
@@ -2088,6 +2365,11 @@ async fn whoami_handler(headers: HeaderMap) -> impl IntoResponse {
         Ok(claims) => Json(serde_json::json!({
             "tenant_id": claims.tenant_id.to_string(),
             "auth_method": format!("{:?}", claims.auth_method),
+            // rev6 N2: the address the gateway derived for THIS request (B-594's
+            // trusted-proxy derivation — what OG-20 `source_ips`, the OG-36 allowlist and
+            // the pre-auth throttle judge), for the authenticated caller only. The deploy's
+            // Proof G asks for it through Cloudflare and refuses a private / bridge one.
+            "client_ip": crate::db::api_keys::current_client_ip().map(|ip| ip.to_string()),
         }))
         .into_response(),
         Err(err) => {
@@ -2144,6 +2426,11 @@ pub(crate) fn build_prompt_router(
 // FIRST `cfg(test)` attribute and treat everything after it as test code.
 #[cfg(test)]
 pub(crate) use buffered::{BufferedToolState, buffered_completion_payload};
+// `M-A`: production mounts the strict-parse `*_route` wrappers; tests call the handlers.
+#[cfg(test)]
+pub(crate) use chat::chat_completions_handler;
+#[cfg(test)]
+pub(crate) use embeddings::embeddings_handler;
 
 #[cfg(test)]
 mod tests {
@@ -2924,6 +3211,9 @@ mod tests {
     fn every_b230_route_gates_on_scope_after_authenticating() {
         let auth_call = format!("{}{}", "validate_", "authorization");
         let read_gate = format!("{}{}", "allows_scope(crate::auth::scope::", "Scope::Read)");
+        // OG-34: billing usage is a SPEND read — `allows_spend_read` checks the same
+        // `read` scope for a key, plus `view_spend` for a role.
+        let spend_gate = format!("{}{}", "allows_spend", "_read()");
 
         for (label, src, gate) in [
             (
@@ -2934,7 +3224,7 @@ mod tests {
             (
                 "billing-usage",
                 include_str!("billing/usage.rs"),
-                &read_gate,
+                &spend_gate,
             ),
             (
                 "audit-export/summary",
@@ -2946,6 +3236,9 @@ mod tests {
                 include_str!("audit_self_verify.rs"),
                 &read_gate,
             ),
+            // OG-05: `GET /v1/models` accepts `chat` OR `read`; its `read` arm is
+            // the needle, and it must sit below authentication like the rest.
+            ("models-list", include_str!("models_list.rs"), &read_gate),
         ] {
             let g = src
                 .find(gate.as_str())

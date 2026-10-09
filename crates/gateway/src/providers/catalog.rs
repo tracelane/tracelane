@@ -68,9 +68,32 @@ pub struct ProviderDef {
     /// Empty for a provider that needs no key (Ollama is local).
     pub api_key_env: &'static str,
     pub prefixes: Vec<&'static str>,
+    /// `OG-01`: column 7 of `providers.tsv`. `true` only for a provider whose
+    /// OWN documentation confirms an OpenAI-Responses-compatible
+    /// `{base_url}/v1/responses` endpoint — the generator's `RESPONSES_WIRE`
+    /// table carries the doc URL for every `true`. `false` (or a row written
+    /// before the column existed) means `/v1/responses` TRANSLATES for this
+    /// provider instead of relaying, which is the conservative answer: a relay
+    /// to a host without the endpoint is a 404 that reads as an outage.
+    pub responses_wire: bool,
+    /// `OG-06`: column 8 of `providers.tsv` — the non-chat endpoints (`images`,
+    /// `images_edits`, `audio_speech`, `audio_transcription`, `moderation`, `rerank`,
+    /// `files`, `batch`) the provider's OWN documentation shows at the OpenAI path. The
+    /// generator derives it from a doc-URL table; the DEFAULT is none, so an endpoint
+    /// is refused `400 unsupported_endpoint` for a provider that was never verified.
+    pub capabilities: Vec<&'static str>,
 }
 
 impl ProviderDef {
+    /// Does the provider's documentation show `capability` at the OpenAI path?
+    #[must_use]
+    pub fn has_capability(&self, capability: &str) -> bool {
+        // `contains` would need `capability: &'static str`; the caller's is not.
+        #[allow(clippy::manual_contains)]
+        let has = self.capabilities.iter().any(|c| *c == capability);
+        has
+    }
+
     /// The base URL to actually dial: `<PROVIDER>_BASE_URL` if set, else the
     /// compiled-in default. Read at construction, not per request.
     #[must_use]
@@ -118,6 +141,15 @@ fn parse(tsv: &'static str) -> Catalog {
             base_url_env: base_env,
             api_key_env: key_env,
             prefixes: prefixes.split(',').filter(|p| !p.is_empty()).collect(),
+            // Optional 7th column; absent or anything but `true` is `false`.
+            responses_wire: f.next() == Some("true"),
+            // Optional 8th column (OG-06); a row written before it has none.
+            capabilities: f
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .collect(),
         });
     }
     assert!(
@@ -200,9 +232,56 @@ pub fn api_key_env(provider_id: &str) -> Option<&'static str> {
     by_id(provider_id).map(|p| p.api_key_env)
 }
 
+/// `OG-01`: does this catalog provider serve the OpenAI Responses wire natively?
+/// `false` for every native adapter and for an id the catalog does not carry —
+/// the caller then translates, never relays to an endpoint that may not exist.
+#[must_use]
+pub fn responses_wire(provider_id: &str) -> bool {
+    by_id(provider_id).is_some_and(|p| p.responses_wire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OG-06`: the capability column is the ONLY thing that lets a non-chat endpoint
+    /// reach a provider, and its default is none.
+    #[test]
+    fn og06_capabilities_are_doc_derived_and_default_to_none() {
+        let openai = by_id("openai").expect("openai");
+        for c in [
+            "images",
+            "images_edits",
+            "audio_speech",
+            "audio_transcription",
+            "moderation",
+            "files",
+            "batch",
+        ] {
+            assert!(openai.has_capability(c), "openai {c}");
+        }
+        // OpenAI publishes no rerank endpoint: never granted by default.
+        assert!(!openai.has_capability("rerank"));
+        // xAI documents generations but its edit endpoint takes JSON, not OpenAI's multipart.
+        let xai = by_id("xai").expect("xai");
+        assert!(xai.has_capability("images") && !xai.has_capability("images_edits"));
+        assert!(
+            by_id("together")
+                .expect("together")
+                .has_capability("rerank")
+        );
+        assert!(
+            by_id("mistral")
+                .expect("mistral")
+                .has_capability("moderation")
+        );
+        // An unverified provider has NOTHING.
+        let p = providers();
+        let with_any = p.iter().filter(|d| !d.capabilities.is_empty()).count();
+        assert!(with_any < 10, "capabilities must stay opt-in per doc URL");
+        assert!(by_id("cerebras").is_some_and(|d| d.capabilities.is_empty()));
+        assert!(!openai.has_capability("teleport"));
+    }
 
     #[test]
     fn catalog_parses_and_is_large_enough_to_be_the_catalog() {
@@ -233,6 +312,26 @@ mod tests {
                 "{}: no prefixes — it would be unreachable",
                 p.id
             );
+        }
+    }
+
+    /// `OG-01`: exactly the providers whose own docs confirm a Responses
+    /// endpoint relay natively; everything else (and every unknown id)
+    /// translates. A row flipped by hand without a doc URL in the generator's
+    /// table fails `build-provider-catalog.py --check`; this pins the result.
+    #[test]
+    fn responses_wire_is_true_only_for_doc_confirmed_providers() {
+        for id in ["openai", "xai", "openrouter"] {
+            assert!(responses_wire(id), "{id} serves /v1/responses natively");
+        }
+        for id in [
+            "groq",
+            "deepseek",
+            "anthropic",
+            "google",
+            "no-such-provider",
+        ] {
+            assert!(!responses_wire(id), "{id} must translate, not relay");
         }
     }
 
@@ -272,7 +371,7 @@ mod tests {
             // The ordering case: BOTH of these start with `llama`.
             ("llama-3.1-sonar-small-128k-online", "perplexity"),
             ("llama-3.3-70b-versatile", "groq"),
-            ("qwen-2.5-32b", "groq"),
+            ("qwen/qwen3-32b", "groq"),
             ("gemma2-9b-it", "groq"),
             ("deepseek-chat", "deepseek"),
             ("deepseek-reasoner", "deepseek"),

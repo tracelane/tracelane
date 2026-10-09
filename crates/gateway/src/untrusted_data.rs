@@ -171,6 +171,7 @@ mod tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

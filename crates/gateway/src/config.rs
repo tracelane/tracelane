@@ -32,7 +32,7 @@
 //! ## The `failover:` block, and why it refuses so much
 //!
 //! A chain entry is `provider` or `provider:model`. Bare providers take their
-//! model from `failover::DEFAULT_CHAIN`, which covers three of the 191 routable
+//! model from `failover::DEFAULT_CHAIN`, which covers three of the 205 routable
 //! providers; every other provider must name its model.
 //!
 //! Every hop is proved dispatchable **at parse time**: the provider id must be
@@ -1047,8 +1047,8 @@ fn set_once(
 ///
 /// **Fails CLOSED**, naming the line, on: a non-numeric or negative `retries:`
 /// / `backoff_ms:`; a `retries:` above `failover::MAX_RETRIES`; a `backoff_ms:`
-/// at or beyond the `failover::FAILOVER_BUDGET_MS` total budget; a
-/// retries×backoff plan that spends the whole budget sleeping; and every
+/// at or beyond the `failover::FAILOVER_BUDGET_MS` total budget; a plan whose
+/// worst-case sleep (`Σ backoff_ms × 2^i`, OG-10) reaches the whole budget; and every
 /// chain defect [`parse_chain`] refuses.
 fn build_failover(
     chain: Option<(String, usize)>,
@@ -1113,8 +1113,9 @@ fn build_failover(
         };
         if policy.planned_backoff_ms() >= failover::FAILOVER_BUDGET_MS {
             bail!(
-                "line {lineno}: `retries: {retries}` x `backoff_ms: {backoff_ms}` spends {}ms of \
-                 the {}ms failover budget sleeping alone — the later attempts could never run",
+                "line {lineno}: `retries: {retries}` with `backoff_ms: {backoff_ms}` doubling per \
+                 attempt (jittered) can spend up to {}ms of the {}ms failover budget sleeping \
+                 alone — the later attempts could never run",
                 policy.planned_backoff_ms(),
                 failover::FAILOVER_BUDGET_MS
             );
@@ -1981,8 +1982,20 @@ failover:
         let err = parse("failover:\n  retries: 3\n  backoff_ms: 80\n")
             .expect_err("retries x backoff over the budget must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("240ms"), "{msg}");
+        // OG-10: the worst case is geometric — 80 + 160 + 320 = 560, not 3 x 80.
+        assert!(msg.contains("560ms"), "{msg}");
         assert!(msg.contains("could never run"), "{msg}");
+    }
+
+    /// OG-10 §3.4: a plan the OLD linear check accepted (2 x 70 = 140 < 200) is refused
+    /// now, because the jittered pauses can each reach `backoff x 2^i` (70 + 140 = 210).
+    #[test]
+    fn rejects_a_plan_that_only_fits_when_the_backoff_is_not_exponential() {
+        let err = parse("failover:\n  retries: 2\n  backoff_ms: 70\n")
+            .expect_err("the geometric worst case 210ms exceeds the 200ms budget");
+        assert!(err.to_string().contains("210ms"), "{err}");
+        // ...and the shipped prod plan (2 x 50 -> 50 + 100 = 150) still fits.
+        parse("failover:\n  retries: 2\n  backoff_ms: 50\n").expect("150ms fits");
     }
 
     #[test]

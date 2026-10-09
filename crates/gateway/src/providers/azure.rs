@@ -33,6 +33,14 @@ pub struct AzureOpenAiProvider {
 }
 
 impl AzureOpenAiProvider {
+    /// `OG-13`: the region the circuit breaker keys this adapter's dispatches on.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl AzureOpenAiProvider {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             client: crate::ssrf_guard::safe_client_builder()
@@ -139,29 +147,30 @@ impl AzureOpenAiProvider {
             );
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header("api-key", api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("azure openai request")?;
+        let response = crate::routing::deadlines::send(
+            self.client
+                .post(&url)
+                .header("api-key", api_key)
+                .header("Content-Type", "application/json")
+                .json(&body),
+        )
+        .await
+        .context("azure openai request")?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             // SECURITY: drop the body — Azure echoes the
             // api-key header value in 401 responses.
-            let _body = response.text().await.unwrap_or_default();
+            let retry_after = crate::providers::retry_after_from(response.headers());
+            let body = crate::routing::deadlines::error_text(response).await?;
             tracing::warn!(status, "Azure OpenAI API error");
             // B-391: typed (see cohere.rs) — a rejected `api-key` is 401
             // `provider_key_rejected`, not 502.
-            return Err(crate::providers::ProviderHttpError {
-                provider: "azure",
-                status,
-                reason: None,
-            }
+            // OG-03 §3.4: a relayable 4xx carries the scrubbed upstream message.
+            return Err(crate::providers::ProviderHttpError::from_response(
+                "azure", status, None, &body, api_key,
+            )
+            .with_retry_after(retry_after)
             .into());
         }
 
@@ -189,7 +198,7 @@ impl AzureOpenAiProvider {
             // Bytes, not text: a chunk boundary can fall inside a character.
             let mut lines = super::sse_lines::LineBuffer::default();
             while let Some(chunk) = byte_stream.next().await {
-                let chunk: Bytes = chunk.context("stream chunk")?;
+                let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("stream chunk")?;
                 lines.push(&chunk);
                 while let Some(line) = lines.next_line_lossy() {
                     let line = line.trim();
@@ -305,6 +314,7 @@ mod tests {
             stream: Some(true),
             system: None,
             metadata: None,
+            ..Default::default()
         };
 
         let body = serde_json::to_value(super::super::openai::OpenAiRequest::from_universal(req))

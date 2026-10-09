@@ -17,6 +17,10 @@ import { ipFromRequest, recordAdminAction } from "@/lib/admin-audit";
 import { requireOrgAdmin } from "@/lib/admin-gate";
 import { requireSession } from "@/lib/auth";
 import { sha256Fingerprint } from "@/lib/cmk-fingerprint";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { and, eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 import { resolveCmkAlgorithm } from "../../algorithm";
@@ -88,24 +92,42 @@ export async function POST(
 	// (duplicate fingerprint under the unique index, dropped connection) the
 	// old key stays ACTIVE — never "rotating" with no successor. neon-http has
 	// no transactions, so write ordering is the atomicity lever here.
-	const newKey = await db
-		.insert(cmkKeys)
-		.values({
-			tenantId: tenant[0].id,
-			alias: `${oldKey.alias} (rotated)`,
-			fingerprint,
-			algorithm: resolved.algorithm,
-			purpose: oldKey.purpose,
-			rotatedAt: new Date(),
-		})
-		.returning();
+	// Gateway control-change audit BEFORE the writes; refuse if not recorded.
+	// Fingerprints/status/algorithm only — never key material.
+	const before = { status: "active", fingerprint: oldKey.fingerprint };
+	const after = {
+		status: "rotating",
+		new_fingerprint: fingerprint,
+		algorithm: resolved.algorithm,
+	};
+	const rec = await recordControlChange("cmk.rotate", keyId, before, after);
+	if (!rec.ok) return rec.response;
 
-	await db
-		.update(cmkKeys)
-		.set({ status: "rotating", rotatedAt: new Date() })
-		.where(eq(cmkKeys.id, keyId));
+	let newKey: (typeof cmkKeys.$inferSelect)[];
+	try {
+		newKey = await db
+			.insert(cmkKeys)
+			.values({
+				tenantId: tenant[0].id,
+				alias: `${oldKey.alias} (rotated)`,
+				fingerprint,
+				algorithm: resolved.algorithm,
+				purpose: oldKey.purpose,
+				rotatedAt: new Date(),
+			})
+			.returning();
 
-	// ADR-031: key-material changes leave an audit trail.
+		await db
+			.update(cmkKeys)
+			.set({ status: "rotating", rotatedAt: new Date() })
+			.where(eq(cmkKeys.id, keyId));
+	} catch (err) {
+		await recordControlChangeFailed("cmk.rotate", keyId, before, after);
+		throw err;
+	}
+
+	// ADR-031: local admin_audit_log row, kept alongside the gateway
+	// control-change row recorded above (which now precedes the change).
 	await recordAdminAction({
 		actorUserId: session.userId,
 		actorWorkspaceId: tenant[0].id,

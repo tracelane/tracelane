@@ -59,14 +59,24 @@ fn tokenize_with_spans(s: &str) -> Vec<(String, usize, usize)> {
 
 /// Detect + redact a verbatim system-prompt leak in `response`. Returns the
 /// (possibly redacted) text and whether anything matched. Pure + deterministic.
+#[cfg(test)]
 #[must_use]
 pub fn scan_sysprompt_leak(response: &str, system_prompt: &str) -> LeakScan {
+    scan_sysprompt_leak_with_min(response, system_prompt, MIN_LEAK_TOKENS)
+}
+
+pub fn scan_sysprompt_leak_with_min(
+    response: &str,
+    system_prompt: &str,
+    min_tokens: usize,
+) -> LeakScan {
+    let min_tokens = min_tokens.clamp(1, MIN_LEAK_TOKENS);
     let sys_tokens: Vec<String> = tokenize_with_spans(system_prompt)
         .into_iter()
         .map(|(t, _, _)| t)
         .collect();
     let resp_tokens = tokenize_with_spans(response);
-    if sys_tokens.len() < MIN_LEAK_TOKENS || resp_tokens.len() < MIN_LEAK_TOKENS {
+    if sys_tokens.len() < min_tokens || resp_tokens.len() < min_tokens {
         return LeakScan {
             redacted: response.to_owned(),
             hit: false,
@@ -75,14 +85,14 @@ pub fn scan_sysprompt_leak(response: &str, system_prompt: &str) -> LeakScan {
 
     // Contiguous MIN_LEAK_TOKENS-grams of the system prompt.
     let sys_grams: HashSet<String> = sys_tokens
-        .windows(MIN_LEAK_TOKENS)
+        .windows(min_tokens)
         .map(|w| w.join(" "))
         .collect();
 
     // Slide the same window over the response; collect the byte ranges of every
     // matching run.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for w in resp_tokens.windows(MIN_LEAK_TOKENS) {
+    for w in resp_tokens.windows(min_tokens) {
         let gram = w
             .iter()
             .map(|(t, _, _)| t.as_str())
@@ -90,7 +100,7 @@ pub fn scan_sysprompt_leak(response: &str, system_prompt: &str) -> LeakScan {
             .join(" ");
         if sys_grams.contains(&gram) {
             let start = w[0].1;
-            let end = w[MIN_LEAK_TOKENS - 1].2;
+            let end = w[min_tokens - 1].2;
             ranges.push((start, end));
         }
     }
@@ -147,12 +157,17 @@ impl R6SysPromptLeak {
             // Request side (no buffer) or no system prompt to leak → nothing.
             return RailOutcome::not_applicable();
         };
-        let scan = scan_sysprompt_leak(buf.accumulated(), sys);
+        let min_tokens = ctx
+            .policy
+            .threshold("R6_sysprompt_leak", "min_tokens")
+            .map_or(MIN_LEAK_TOKENS, |n| n as usize);
+        let scan = scan_sysprompt_leak_with_min(buf.accumulated(), sys, min_tokens);
         if scan.hit {
             // Details carry the leaked-span COUNT only — never the leaked text.
             let spans = scan.redacted.matches(LEAK_MARKER).count();
-            RailOutcome::redact(reason_codes::SYS_PROMPT_LEAK)
-                .with_details(serde_json::json!({ "leaked_spans": spans }))
+            RailOutcome::redact(reason_codes::SYS_PROMPT_LEAK).with_details(
+                serde_json::json!({ "leaked_spans": spans, "min_tokens": min_tokens }),
+            )
         } else {
             RailOutcome::allow()
         }
@@ -254,6 +269,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         };
         let reg = CapabilityRegistry::new();
         let base = GuardrailContext::from_request(

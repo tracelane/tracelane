@@ -147,6 +147,15 @@ export function verifySignature(opts: {
 	return matched ? { ok: true } : { ok: false, reason: "signature mismatch" };
 }
 
+/**
+ * rev4 L8 (2026-10-03): first paid activations that wrote NO price-protection pin
+ * because `billing_policy.price_protection_months` was missing (a seed defect).
+ * Process-lifetime, like the gateway's counters; the route also logs each one
+ * (they are rare — one per first activation, and only while the policy row is
+ * absent).
+ */
+export const pinRefusals = { total: 0 };
+
 /** tenants.plan enum values (planEnum in db/schema.ts). */
 export type PlanEnum = "builder" | "team" | "business" | "enterprise";
 

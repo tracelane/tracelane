@@ -118,11 +118,15 @@ pub async fn get(pool: &Pool, tenant_id: &TenantId) -> Result<StoredCapture> {
 /// # Errors
 /// [`SetError::Ledger`] when `record` fails, [`SetError::Store`] on any Postgres error.
 /// Fail-CLOSED either way: nothing changed.
+///
+/// OG-35: the `workspace.capture.set` row in `admin_audit_log` (before/after) is
+/// written in the SAME transaction, before the ledger is asked — an audit row that
+/// cannot be written is [`SetError::Store`] and nothing changes.
 pub async fn set_recorded<F, Fut>(
     pool: &Pool,
     tenant_id: &TenantId,
     new: WorkspaceCapture,
-    updated_by: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
     record: F,
 ) -> std::result::Result<SetOutcome, SetError>
 where
@@ -167,11 +171,25 @@ where
         .query_one(
             "UPDATE workspace_content_capture SET input = $2, output = $3, updated_by = $4, \
              updated_at = now() WHERE tenant_id = $1 RETURNING updated_at",
-            &[tenant, &new.input, &new.output, &updated_by],
+            &[tenant, &new.input, &new.output, &actor.as_actor().sub],
         )
         .await
         .map_err(|e| store("update", &e))?
         .get(0);
+    crate::db::control_audit::record(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "workspace.capture.set",
+            target_type: "workspace",
+            target_id: tenant_id.to_string(),
+            before: Some(serde_json::json!({"input": previous.input, "output": previous.output})),
+            after: Some(serde_json::json!({"input": new.input, "output": new.output})),
+        },
+    )
+    .await
+    .map_err(|e| store("audit", &e))?;
     record(previous).await.map_err(SetError::Ledger)?;
     tx.commit().await.map_err(|e| store("commit", &e))?;
     Ok(SetOutcome {
@@ -227,9 +245,13 @@ mod tests {
         assert_eq!(unset.updated_at, None);
 
         // A refused ledger: nothing changes, not even the materialised row.
-        let refused = set_recorded(&pool, &tenant, ON, "user_a", |_| async {
-            Err(anyhow!("ledger down"))
-        })
+        let refused = set_recorded(
+            &pool,
+            &tenant,
+            ON,
+            &crate::db::control_audit::Actor::system("user_a"),
+            |_| async { Err(anyhow!("ledger down")) },
+        )
         .await;
         assert!(matches!(refused, Err(SetError::Ledger(_))), "{refused:?}");
         assert_eq!(
@@ -250,10 +272,16 @@ mod tests {
         // Recorded: the ledger sees the PREVIOUS value, and the change lands.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let s = seen.clone();
-        let out = set_recorded(&pool, &tenant, ON, "user_a", move |prev| async move {
-            s.lock().expect("lock").push(prev);
-            Ok(())
-        })
+        let out = set_recorded(
+            &pool,
+            &tenant,
+            ON,
+            &crate::db::control_audit::Actor::system("user_a"),
+            move |prev| async move {
+                s.lock().expect("lock").push(prev);
+                Ok(())
+            },
+        )
         .await
         .expect("set");
         assert!(out.changed);
@@ -272,9 +300,13 @@ mod tests {
         assert_eq!(refreshed, ON, "the refresh read sees the same row");
 
         // A no-op: nothing recorded.
-        let noop = set_recorded(&pool, &tenant, ON, "user_b", |_| async {
-            panic!("a no-op must never reach the ledger")
-        })
+        let noop = set_recorded(
+            &pool,
+            &tenant,
+            ON,
+            &crate::db::control_audit::Actor::system("user_b"),
+            |_| async { panic!("a no-op must never reach the ledger") },
+        )
         .await
         .expect("noop");
         assert!(!noop.changed);
@@ -285,10 +317,16 @@ mod tests {
             input: true,
             output: false,
         };
-        let out = set_recorded(&pool, &tenant, half, "user_b", |prev| async move {
-            assert_eq!(prev, ON);
-            Ok(())
-        })
+        let out = set_recorded(
+            &pool,
+            &tenant,
+            half,
+            &crate::db::control_audit::Actor::system("user_b"),
+            |prev| async move {
+                assert_eq!(prev, ON);
+                Ok(())
+            },
+        )
         .await
         .expect("half");
         assert!(out.changed);

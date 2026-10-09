@@ -43,6 +43,8 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
 			{ href: "/settings/providers", label: "LLM Providers" },
 			{ href: "/settings/byok", label: "Encryption Keys" },
 			{ href: "/settings/audit", label: "Audit signing key" },
+			// OG-60: admin IP allowlist, SSO-required and the role matrix (OG-34/36).
+			{ href: "/settings/security", label: "Security" },
 		],
 	},
 	{
@@ -63,6 +65,8 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
 			{ href: "/settings/billing", label: "Billing" },
 			{ href: "/settings/team", label: "Team" },
 			{ href: "/settings/workspace", label: "Workspace" },
+			// OG-60: every change to a gateway control, who made it (OG-35).
+			{ href: "/settings/change-log", label: "Change log" },
 		],
 	},
 	{

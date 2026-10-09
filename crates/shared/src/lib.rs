@@ -26,6 +26,7 @@ pub mod degradation;
 /// emails (step 8) reuse ONE implementation rather than a second copy.
 pub mod email;
 pub mod jetstream_limits;
+pub mod key_policy;
 pub mod labels;
 pub mod listen_dsn;
 pub mod model;
@@ -38,8 +39,8 @@ pub mod spend;
 pub mod tenant;
 
 pub use model::{
-    ChatRequest, ChatResponse, Choice, ContentPart, ImageUrl, Message, MessageContent,
-    RequestMetadata, Role, Tool, ToolCall, ToolChoice, Usage,
+    ChatRequest, ChatResponse, Choice, ContentPart, FilePart, ImageUrl, InputAudio, Message,
+    MessageContent, RequestMetadata, Role, Stop, Tool, ToolCall, ToolChoice, Usage,
 };
 pub use span::{
     DispatchAttempt, Intervention, SpanAttributes, SpanStatus, SpanStatusCode, TracelaneSpan,

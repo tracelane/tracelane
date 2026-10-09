@@ -10,6 +10,10 @@
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { callerIsOrgAdmin } from "@/lib/workos-org";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -60,6 +64,28 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
+	// Current name for the audit `before` — best-effort; the record itself is not.
+	let beforeName: string | null = null;
+	try {
+		const [cur] = await db
+			.select({ name: tenants.name })
+			.from(tenants)
+			.where(eq(tenants.workosOrgId, session.tenantId))
+			.limit(1);
+		beforeName = cur?.name ?? null;
+	} catch {
+		// leave `before` null
+	}
+	const before = { name: beforeName };
+	const after = { name };
+	const rec = await recordControlChange(
+		"workspace.rename",
+		session.tenantId,
+		before,
+		after,
+	);
+	if (!rec.ok) return rec.response;
+
 	// Rename the WorkOS org (the source of truth for identity).
 	const res = await fetch(
 		`https://api.workos.com/organizations/${encodeURIComponent(session.tenantId)}`,
@@ -73,6 +99,12 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
 		},
 	);
 	if (!res.ok) {
+		await recordControlChangeFailed(
+			"workspace.rename",
+			session.tenantId,
+			before,
+			after,
+		);
 		return NextResponse.json(
 			{ error: "WorkOS rename failed" },
 			{ status: 502 },
@@ -158,6 +190,16 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
+	const delBefore = { name: t.name, archived: false };
+	const delAfter = { archived: true };
+	const rec = await recordControlChange(
+		"workspace.delete",
+		session.tenantId,
+		delBefore,
+		delAfter,
+	);
+	if (!rec.ok) return rec.response;
+
 	try {
 		await db
 			.update(tenants)
@@ -178,6 +220,12 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 				),
 			);
 	} catch {
+		await recordControlChangeFailed(
+			"workspace.delete",
+			session.tenantId,
+			delBefore,
+			delAfter,
+		);
 		console.error("[workspace/delete] soft-delete side effects failed");
 		return NextResponse.json({ error: "soft_delete_failed" }, { status: 502 });
 	}

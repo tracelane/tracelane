@@ -1,0 +1,42 @@
+{
+  "module": "crates/gateway/src/guardrail/policy_api.rs",
+  "operations": {
+    "PUT /v1/guardrails/policy": {
+      "summary": "Replace the workspace's (or one project's / key's) scoped guardrail policy document (specs/OG-30).",
+      "tags": [
+        "guardrails"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "The stored policy and its effective view.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_policy / invalid_scope / schema_invalid",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "scope_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_policy",
+        "invalid_scope",
+        "scope_not_found",
+        "schema_invalid",
+        "policy_unavailable",
+        "policy_write_failed"
+      ]
+    }
+  }
+}

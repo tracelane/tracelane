@@ -466,7 +466,7 @@ async fn tenant_from_auth(headers: &HeaderMap) -> Result<TenantId, (StatusCode, 
 /// surface can be driven with real `viewer` / API-key claims in a test —
 /// `validate_authorization` needs a signed token, and a gate that can only be
 /// exercised through one is a gate that gets asserted by description.
-fn authorize_write(claims: &crate::auth::Claims) -> Result<(), (StatusCode, String)> {
+pub(crate) fn authorize_write(claims: &crate::auth::Claims) -> Result<(), (StatusCode, String)> {
     if !claims.can_write_prompts() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -530,6 +530,14 @@ fn authorize_write(claims: &crate::auth::Claims) -> Result<(), (StatusCode, Stri
 /// the auto-rollback engine, which moves the production pointer on its own.
 /// Five call sites, one predicate.
 async fn actor_from_auth(headers: &HeaderMap) -> Result<(TenantId, String), (StatusCode, String)> {
+    let claims = writer_claims(headers).await?;
+    Ok((claims.tenant_id, claims.sub))
+}
+
+/// [`actor_from_auth`]'s authentication and write gate, returning the whole principal —
+/// rev5 H2: an eval run is checked, call by call, against the caller's key policy, limits
+/// and budgets, so it needs the claims, not only the tenant.
+async fn writer_claims(headers: &HeaderMap) -> Result<crate::auth::Claims, (StatusCode, String)> {
     let header = headers.get("authorization").ok_or((
         StatusCode::UNAUTHORIZED,
         "missing Authorization header".into(),
@@ -544,7 +552,7 @@ async fn actor_from_auth(headers: &HeaderMap) -> Result<(TenantId, String), (Sta
         .await
         .map_err(|e| (crate::auth::failure_status(&e), format!("auth failed: {e}")))?;
     authorize_write(&claims)?;
-    Ok((claims.tenant_id, claims.sub))
+    Ok(claims)
 }
 
 #[tracing::instrument(skip(state, headers), fields(prompt_name = %name, tenant_id = tracing::field::Empty))]
@@ -1122,9 +1130,10 @@ async fn start_eval_handler(
     headers: HeaderMap,
     Json(body): Json<crate::prompt_eval::EvalRunRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), WriteError> {
-    let (tenant, _actor) = actor_from_auth(&headers)
+    let claims = writer_claims(&headers)
         .await
         .map_err(|(s, m)| write_err(s, m))?;
+    let tenant = claims.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tenant.to_string());
     let Some(engine) = state.eval.clone() else {
         return Err(write_err(
@@ -1170,6 +1179,9 @@ async fn start_eval_handler(
         // `tracelane_experiment_id` off its spans, which is what lets the compare
         // and cost surfaces tell an experiment's spend from an ad-hoc run's.
         arm: None,
+        caller: std::sync::Arc::new(claims),
+        // rev6 H2 residual: kept so the run re-validates the key between chunks.
+        credential: crate::offpath::key_credential(&headers),
     };
     match engine.start_run(tenant, &name, body, ctx).await {
         Ok(started) => Ok((
@@ -1179,6 +1191,23 @@ async fn start_eval_handler(
         // The message is the product here — every refusal from `start_run` names
         // what to do about it (add a key, supply cases inline, wait for the run
         // in flight), so it is surfaced rather than swallowed into a 500.
+        // rev5 H2: a Wave C/D control refused (paused, blocked, the key's policy, a limit,
+        // a budget) — admission's own status and code, nothing claimed or spent.
+        Err(e) if e.downcast_ref::<crate::offpath::OffPathRefused>().is_some() => {
+            let r = e.downcast_ref::<crate::offpath::OffPathRefused>().map_or(
+                (StatusCode::FORBIDDEN, "refused"),
+                |r| {
+                    (
+                        StatusCode::from_u16(r.status).unwrap_or(StatusCode::FORBIDDEN),
+                        r.code,
+                    )
+                },
+            );
+            Err(write_err(
+                r.0,
+                serde_json::json!({ "error": r.1, "message": format!("{e:#}") }).to_string(),
+            ))
+        }
         Err(e) => {
             let msg = format!("{e:#}");
             let status = if msg.contains("already in flight") {
@@ -1776,6 +1805,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
 

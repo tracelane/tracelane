@@ -40,13 +40,10 @@ ignore:
   # REVIEW: 2026-11-07
   - package:
       name: rustls-webpki
-  # vite / vitest — dev/test tooling only (vitest), never shipped in any product
-  # artifact. Grype catalogs them from pnpm-lock.yaml (not just node_modules),
-  # so the exclude below is insufficient — the ignore is what suppresses them.
-  # Mirrors osv-scanner.toml; tied to the vitest-major migration.
-  # REVIEW: 2026-11-07
-  - package:
-      name: vite
+  # vitest — dev/test tooling only, never shipped in any product artifact. Grype catalogs
+  # it from pnpm-lock.yaml (not just node_modules), so the exclude below is insufficient.
+  # Still needed for GHSA-82fw-gwwq-j7x9 (fix 4.1.11, a major). The `vite` ignore was REMOVED
+  # 2026-10-03: vitest 3.2.7 now resolves vite 7.3.6 (package.json overrides).
   # REVIEW: 2026-11-07
   - package:
       name: vitest
@@ -73,6 +70,13 @@ ignore:
   - vulnerability: GHSA-mh99-v99m-4gvg
     package:
       name: brace-expansion
+  # http-cache-semantics — GHSA-ch52-4w7c-c8xp, no patched version; build-time only via astro
+  # (apps/site remote-image cache), never a shared cache. Names the ADVISORY so any other
+  # advisory on the package still fires. Founder 2026-10-03; mirrors osv-scanner.toml.
+  # REVIEW: 2026-12-03
+  - vulnerability: GHSA-ch52-4w7c-c8xp
+    package:
+      name: http-cache-semantics
   # ── The three below mirror osv-scanner.toml: one decision, two scanners' lists.
 
   # opentelemetry_sdk 0.27.1 — SUPPRESSED, not fixed.
@@ -100,23 +104,8 @@ ignore:
     package:
       name: "@hono/node-server"
 
-  # esbuild (0.18.20 / 0.19.12 / 0.21.5 / 0.27.7) — SUPPRESSED, not fixed.
-  # Reason it does not apply: BOTH advisories require the esbuild DEV SERVER
-  # (`esbuild --serve`), which this repo never runs. Every affected copy is build
-  # tooling only — drizzle-kit, @opennextjs/aws, bundle-require, esbuild-register,
-  # @esbuild-kit/core-utils — and esbuild is never shipped in a product artifact.
-  # An override to 0.25.0 would drag four build tools off their pinned majors to patch
-  # a code path we do not execute.
-  # UNBLOCKING CONDITION: drops out naturally as those tools upgrade their pins.
-  # REVIEW: 2026-11-07
-  - vulnerability: GHSA-67mh-4wv8-2f99
-    package:
-      name: esbuild
-  # REVIEW: 2026-11-07
-  - vulnerability: GHSA-g7r4-m6w7-qqqr
-    package:
-      name: esbuild
-
+  # esbuild GHSA-67mh-4wv8-2f99 / GHSA-g7r4-m6w7-qqqr: mutes REMOVED 2026-10-03 — package.json
+  # pnpm.overrides now resolves esbuild to 0.25.4 / 0.28.1, above both fixes.
 
 exclude:
   - "./target/**"

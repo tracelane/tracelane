@@ -1,0 +1,17 @@
+# OG-91 layer-1 replay fixture (specs/OG-91-client-conformance-harness.md §3).
+# CLIENT:     Gemini CLI (`gemini`), GEMINI_API_KEY mode, pointed at the gateway with
+#             GOOGLE_GEMINI_BASE_URL.
+# PROVENANCE: HAND-BUILT from the client's published source (google-gemini/gemini-cli on the
+#             @google/genai SDK: `models.generateContentStream` → POST
+#             /v1beta/models/{model}:streamGenerateContent?alt=sse, the key in `x-goog-api-key`,
+#             `systemInstruction`, `tools[].functionDeclarations`, `generationConfig` with `topK`
+#             and `thinkingConfig`) — NOT a wire capture. `scripts/ops/client-conformance.sh
+#             --refresh-fixtures` captures the bytes the installed binary really sends (the
+#             `gemini` CLI is not installed on the dev box today, so that half has never run
+#             and this fixture has had no capture to be corrected against).
+# METHOD:     POST
+# PATH:       /v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse
+# HEADER:     x-goog-api-key: tlane_live_og91_fixture_key_do_not_use
+# HEADER:     user-agent: GeminiCLI/0.1.0 (linux; x64)
+# HEADER:     x-goog-api-client: google-genai-sdk/1.0.0 gl-node/22.0.0
+{"systemInstruction":{"parts":[{"text":"You are an interactive CLI agent specializing in software engineering tasks."}]},"contents":[{"role":"user","parts":[{"text":"what is the weather in Paris?"}]},{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}]},{"role":"user","parts":[{"functionResponse":{"name":"get_weather","response":{"output":"18C and clear"}}}]}],"tools":[{"functionDeclarations":[{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}],"generationConfig":{"temperature":1,"topP":0.95,"topK":64,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}}

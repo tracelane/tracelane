@@ -14,20 +14,15 @@
  * JWT-bound tenant (never the body).
  */
 
-import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { NextResponse } from "next/server";
 
 export async function POST(): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
-
-	const base = gatewayBaseUrl();
-	const upstream = await fetch(`${base}/v1/billing/portal`, {
+	// `gatewayResponse` mints the per-user JWT (redirecting when there is no
+	// session) and attaches the signed client-IP attestation (OG-36).
+	const upstream = await gatewayResponse("/v1/billing/portal", {
 		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			authorization: `Bearer ${token}`,
-		},
+		headers: { "content-type": "application/json" },
 		// The gateway resolves the Polar customer ID from the JWT-bound
 		// tenant; the dashboard sends an empty body to keep the surface minimal.
 		body: JSON.stringify({}),

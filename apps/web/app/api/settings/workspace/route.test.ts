@@ -12,6 +12,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({ db: null as DbMock | null }));
 
+const ctl = vi.hoisted(() => ({
+	record: vi.fn(
+		async (
+			..._a: unknown[]
+		): Promise<{ ok: true } | { ok: false; response: Response }> => ({
+			ok: true,
+		}),
+	),
+	failed: vi.fn(async (..._a: unknown[]) => undefined),
+}));
+const refused = (status: number, error: string) => ({
+	ok: false as const,
+	response: Response.json({ error }, { status }),
+});
+
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: ctl.record,
+	recordControlChangeFailed: ctl.failed,
+	redactEmail: (e: string) => `${e[0]}***${e.slice(e.indexOf("@"))}`,
+}));
+
+beforeEach(() => {
+	ctl.record.mockReset();
+	ctl.record.mockResolvedValue({ ok: true });
+	ctl.failed.mockReset();
+});
+
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -80,7 +107,7 @@ function stub(opts: {
 describe("PATCH /api/settings/workspace — org rename", () => {
 	beforeEach(() => {
 		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
-		h.db = makeDbMock([[]]); // update chain resolves
+		h.db = makeDbMock([[{ name: "Old Co" }], []]); // name read, then update
 	});
 	afterEach(() => {
 		vi.unstubAllGlobals();
@@ -138,5 +165,39 @@ describe("PATCH /api/settings/workspace — org rename", () => {
 			throw new Error("pg down");
 		}) as unknown as typeof h.db.db.update;
 		expect((await PATCH(req({ name: "Acme" }))).status).toBe(200);
+	});
+});
+
+describe("PATCH /api/settings/workspace — control-change recording", () => {
+	beforeEach(() => {
+		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+		h.db = makeDbMock([[{ name: "Old Co" }], []]);
+	});
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		process.env.WORKOS_API_KEY = undefined;
+	});
+
+	it("REJECT: recording refused -> gateway status returned and WorkOS NOT renamed", async () => {
+		ctl.record.mockResolvedValue(refused(403, "admin_ip_not_allowed"));
+		const spy = stub({});
+		const res = await PATCH(req({ name: "Acme" }));
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as { error: string }).error).toBe(
+			"admin_ip_not_allowed",
+		);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "PUT")).toBe(true);
+	});
+
+	it("records workspace.rename before/after, and .failed when WorkOS fails", async () => {
+		stub({ renameOk: false });
+		expect((await PATCH(req({ name: "Acme" }))).status).toBe(502);
+		expect(ctl.record).toHaveBeenCalledWith(
+			"workspace.rename",
+			"org_SESSION",
+			{ name: "Old Co" },
+			{ name: "Acme" },
+		);
+		expect(ctl.failed).toHaveBeenCalledTimes(1);
 	});
 });

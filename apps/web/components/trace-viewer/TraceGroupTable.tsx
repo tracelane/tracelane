@@ -16,7 +16,10 @@ export type TraceGroup = {
 	trace_count: number;
 	error_traces: number;
 	avg_duration_us: number;
+	p50_duration_us: number;
+	p90_duration_us: number;
 	p95_duration_us: number;
+	p99_duration_us: number;
 };
 
 const fmtDuration = fmtDur;
@@ -26,6 +29,9 @@ function groupFilterHref(by: string, key: string): string | null {
 	if (by === "model") return `/traces?model=${encodeURIComponent(key)}`;
 	if (by === "status")
 		return `/traces?status=${key === "error" ? "error" : "ok"}`;
+	const param = by === "user" ? "end_user" : by;
+	if (["environment", "release", "service", "user", "tag"].includes(by) && key)
+		return `/traces?${param}=${encodeURIComponent(key)}`;
 	return null; // operation (root_name) isn't a list filter
 }
 
@@ -45,9 +51,15 @@ export function TraceGroupTable({
 		);
 	}
 	const label =
-		by === "model" ? "Model" : by === "operation" ? "Operation" : "Status";
+		by === "user" ? "User" : by.charAt(0).toUpperCase() + by.slice(1);
 	return (
 		<div className="overflow-x-auto rounded-card border border-line">
+			{by === "tag" && (
+				<p className="p-3 text-xs text-ink-2">
+					A trace with multiple tags appears in each matching group; group
+					counts can exceed the trace count.
+				</p>
+			)}
 			<Table className="w-full text-sm">
 				<THead className="bg-surface-2">
 					<TR>
@@ -57,7 +69,10 @@ export function TraceGroupTable({
 							Error rate
 						</TH>
 						<TH className="px-3 py-1.5 text-right t-metric-label">Avg</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">p50</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">p90</TH>
 						<TH className="px-3 py-1.5 text-right t-metric-label">p95</TH>
+						<TH className="px-3 py-1.5 text-right t-metric-label">p99</TH>
 					</TR>
 				</THead>
 				<TBody className="divide-y">
@@ -76,10 +91,10 @@ export function TraceGroupTable({
 											href={href}
 											className="text-ink-2 underline-offset-2 hover:text-ink hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
 										>
-											{g.group_key || "—"}
+											{g.group_key || "(not set)"}
 										</Link>
 									) : (
-										g.group_key || "—"
+										g.group_key || "(not set)"
 									)}
 								</TD>
 								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
@@ -95,9 +110,21 @@ export function TraceGroupTable({
 								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
 									{fmtDuration(g.avg_duration_us)}
 								</TD>
-								<TD className="px-3 py-2 text-right font-mono text-xs tabular-nums">
-									{fmtDuration(g.p95_duration_us)}
-								</TD>
+								{(
+									[
+										"p50_duration_us",
+										"p90_duration_us",
+										"p95_duration_us",
+										"p99_duration_us",
+									] as const
+								).map((field) => (
+									<TD
+										key={field}
+										className="px-3 py-2 text-right font-mono text-xs tabular-nums"
+									>
+										{fmtDuration(g[field])}
+									</TD>
+								))}
 							</TR>
 						);
 					})}

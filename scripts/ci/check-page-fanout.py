@@ -95,6 +95,8 @@ GATEWAY_CALLS = [
     "fetchSignaturesFor",
     "fetchTraceCountFor",
     "fetchSessionsFor",
+    "fetchWorkspaceGlance",
+    "fetchOutputSpeedByModelFor",
 ]
 CALL_RE = re.compile(r"\b(" + "|".join(GATEWAY_CALLS) + r")\s*[<(]")
 

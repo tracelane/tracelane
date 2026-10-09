@@ -22,21 +22,19 @@ vi.mock("@/components/settings/ByokKeyManager", () => ({
 }));
 import ByokPage from "./page";
 
-it("explains the registry limitation before offering an upgrade", async () => {
+it("distinguishes the registry from gateway KMS before offering an upgrade", async () => {
 	h.entitled = false;
 	const html = renderToStaticMarkup(await ByokPage());
-	expect(html).toContain(
-		"Registration does not enable customer-managed encryption",
-	);
-	expect(html).not.toContain("Customer-managed encryption is available");
+	expect(html).toContain("gateway customer KMS configuration");
+	expect(html).toContain("does not configure KMS encryption");
 	expect(html).toContain('href="/settings/billing"');
 	expect(html).not.toContain("Key registry controls");
 });
 
-it("keeps the enforcement disclaimer alongside the entitled registry", async () => {
+it("explains the gateway KMS setup alongside the entitled registry", async () => {
 	h.entitled = true;
 	const html = renderToStaticMarkup(await ByokPage());
-	expect(html).toContain("Registered now · enforcement in a later release");
-	expect(html).toContain("not yet enforcing");
+	expect(html).toContain("Fingerprint registry · separate from gateway KMS");
+	expect(html).toContain("through the gateway security API");
 	expect(html).toContain("Key registry controls");
 });

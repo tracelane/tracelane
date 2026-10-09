@@ -166,6 +166,15 @@ pub async fn invalidate(tenant_id: &TenantId) {
 /// score correlated traces — without it, "1%" would mean the same 1% of trace
 /// ids everywhere, which is a systematic bias, not a sample.
 #[must_use]
+pub(crate) fn sample_draw(salt: &str, assignment_key: &[u8]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(assignment_key);
+    let digest = hasher.finalize();
+    let bytes: [u8; 8] = digest.as_bytes()[..8].try_into().unwrap_or([0u8; 8]);
+    u64::from_be_bytes(bytes)
+}
+
 pub fn should_sample(salt: &str, assignment_key: &[u8], rate: f64) -> bool {
     // Guard both ends explicitly. `rate <= 0.0` is off; `>= 1.0` is everything.
     // Online evaluation bounds its rate separately; prompt canaries allow the
@@ -180,12 +189,7 @@ pub fn should_sample(salt: &str, assignment_key: &[u8], rate: f64) -> bool {
     if rate >= 1.0 {
         return true;
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(salt.as_bytes());
-    hasher.update(assignment_key);
-    let digest = hasher.finalize();
-    let bytes: [u8; 8] = digest.as_bytes()[..8].try_into().unwrap_or([0u8; 8]);
-    let drawn = u64::from_be_bytes(bytes);
+    let drawn = sample_draw(salt, assignment_key);
     // `rate * 2^64` as f64 then compare in u128 space: at 1% the threshold is
     // ~1.8e17, far inside f64's exact-integer range for this purpose, and the
     // u128 comparison avoids the f64->u64 saturating-cast edge at the top.
@@ -445,28 +449,7 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
     prompt.push_str("\n</output>");
 
     let model = job.policy.judge_model.clone();
-    let Some(provider_id) = ProviderRegistry::provider_id_for_model(&model) else {
-        anyhow::bail!("unroutable judge model '{model}'");
-    };
-    let env_var = ProviderRegistry::env_var_for_provider_id(provider_id);
-    // The tenant's OWN credential. A judge call appears in their traces and
-    // costs us nothing, which is the whole reason it goes through our gateway
-    // rather than a key of ours.
-    let key = match crate::server::resolve_provider_key(&job.tenant_id, provider_id, env_var).await
-    {
-        crate::server::ProviderKey::Found(k) => k,
-        crate::server::ProviderKey::NotConfigured => {
-            anyhow::bail!("no provider key for '{provider_id}'")
-        }
-        crate::server::ProviderKey::Unusable => {
-            anyhow::bail!("stored '{provider_id}' key could not be decrypted")
-        }
-        crate::server::ProviderKey::LookupFailed => {
-            anyhow::bail!("key store unreachable for '{provider_id}' — judge skipped, not guessed")
-        }
-    };
-
-    let request = ChatRequest {
+    let mut request = ChatRequest {
         top_p: None,
         seed: None,
         logprobs: None,
@@ -485,8 +468,54 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
         stream: Some(false),
         system: Some(system),
         metadata: None,
+        ..Default::default()
     };
 
+    // rev5 H2: the judge is a WORKSPACE call (an admin configured it; no key made it), so
+    // the workspace's own Wave C/D controls bind it: a pause, a model / provider block, the
+    // workspace policy's limits and budgets. Checked before the BYOK key is decrypted and
+    // before a cent is spent. A refusal is the control WORKING: counted, not retried, and
+    // not logged per occurrence (`.claude/rules/logging.md`).
+    let principal = crate::offpath::workspace_principal(&job.tenant_id);
+    let env = crate::offpath::OffPathEnv {
+        entitlements: job.entitlements.clone(),
+        quota_ch_url: job.clickhouse_url.clone(),
+    };
+    if crate::offpath::admit(&env, &principal, &request)
+        .await
+        .is_err()
+    {
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::OnlineEvalJudgeFailed,
+        );
+        return Ok(());
+    }
+    let Some(provider_id) = ProviderRegistry::provider_id_for_model(&model) else {
+        anyhow::bail!("unroutable judge model '{model}'");
+    };
+    let env_var = ProviderRegistry::env_var_for_provider_id(provider_id);
+    // The tenant's OWN credential. A judge call appears in their traces and
+    // costs us nothing, which is the whole reason it goes through our gateway
+    // rather than a key of ours.
+    let key = match crate::server::resolve_provider_key(&job.tenant_id, provider_id, env_var).await
+    {
+        crate::server::ProviderKey::Found(k) => k,
+        crate::server::ProviderKey::KmsUnavailable => anyhow::bail!("kms_unavailable"),
+        crate::server::ProviderKey::KmsDenied => anyhow::bail!("kms_access_denied"),
+        crate::server::ProviderKey::NotConfigured => {
+            anyhow::bail!("no provider key for '{provider_id}'")
+        }
+        crate::server::ProviderKey::Unusable => {
+            anyhow::bail!("stored '{provider_id}' key could not be decrypted")
+        }
+        crate::server::ProviderKey::LookupFailed => {
+            anyhow::bail!("key store unreachable for '{provider_id}' — judge skipped, not guessed")
+        }
+    };
+
+    if let Some(alias) = crate::server::config::alias(&model) {
+        request.model.clone_from(&alias.upstream_model);
+    }
     let dispatch_result = crate::server::dispatch_to_provider(
         &job.providers,
         request,
@@ -577,8 +606,9 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
     // Nullable for exactly this reason. Same fallback and same order as
     // `prompt_eval::execute_case`, which is the offline half of this feature.
     let cost_usd = wire_cost_usd.or_else(|| {
-        crate::pricing::cost_usd(
+        crate::pricing::cost_usd_for_routed_model(
             &model,
+            crate::server::config::alias(&model),
             &tracelane_shared::Usage {
                 input_tokens,
                 output_tokens,
@@ -598,6 +628,9 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
         cost_usd,
     );
     crate::spend::tracker().record(sub, cost_usd);
+    // rev5 H2: and the workspace's OG-22 policy budget, which the hard-budget check above
+    // reads (the `spend` tracker is not that counter).
+    crate::offpath::record_spend(&principal, cost_usd);
 
     // ── THE COST SPAN. `/v1/costs` READS SPANS, NOT THE TRACKER. ────────────
     //
@@ -1339,5 +1372,53 @@ mod capture_policy {
             &t,
         );
         assert!(!input_only.judge_may_read());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod kms_tests {
+    use super::*;
+    #[tokio::test]
+    async fn og37_kms_failure_stops_the_online_judge_without_spending_or_dispatch() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let mut reg = ProviderRegistry::new().unwrap();
+        reg.set_compat_base_url_for_test("openai", mock.uri())
+            .unwrap();
+        let job = JudgeJob {
+            entitlements: None,
+            policy: Arc::new(Policy {
+                id: Uuid::new_v4(),
+                enabled: true,
+                rubric_kind: "builtin".into(),
+                rubric: "answers_the_question".into(),
+                judge_model: "gpt-4o".into(),
+                sample_rate: 0.1,
+                sample_salt: "fixture".into(),
+                judge_budget_usd_monthly: 10.0,
+            }),
+            tenant_id: TenantId::from_jwt_claim(Uuid::new_v4()),
+            trace_id: Uuid::new_v4(),
+            span_id: "fixture".into(),
+            providers: Arc::new(reg),
+            clickhouse_url: None,
+            nats: None,
+            question: "hi".into(),
+            answer: "hello".into(),
+        };
+        for (failure, code) in [
+            (crate::kms::KmsError::Unavailable, "kms_unavailable"),
+            (crate::kms::KmsError::Denied, "kms_access_denied"),
+        ] {
+            let result = crate::kms::wire_tests::FAILURE
+                .scope(failure, judge_one(&job))
+                .await;
+            assert_eq!(result.unwrap_err().to_string(), code);
+        }
+        assert!(mock.received_requests().await.unwrap().is_empty());
     }
 }

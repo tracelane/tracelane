@@ -4,6 +4,7 @@
 //! key can be dropped.
 //!
 //! What it touches — every column that holds a BYOK blob:
+//!   `guardrail_hooks.ciphertext_b64`         AAD `guardrail-hook:<tenant>:<identity>`
 //!   `provider_keys.ciphertext_b64`            AAD `provider-key:<tenant>:<provider>`
 //!   `tenant_audit_keys.encrypted_private_key` AAD `audit-key:<tenant>`
 //!   `tenant_audit_keys.encrypted_anchor_key`  AAD `anchor-key:<tenant>` (nullable)
@@ -37,6 +38,7 @@ pub struct TableReport {
     pub rows: u64,
     /// Already sealed under the active KEK.
     pub current: u64,
+    pub customer_managed: u64,
     /// Rewrapped in this run (dry-run: would be).
     pub rewrapped: u64,
     /// Could not be decrypted under any loaded KEK — or is not a BYOK blob.
@@ -77,6 +79,12 @@ impl Report {
             if self.dry_run { "dry-run" } else { "execute" }
         );
         for t in &self.tables {
+            if t.customer_managed > 0 {
+                out.push_str(&format!(
+                    "  {}: customer_managed_skipped={}\n",
+                    t.table, t.customer_managed
+                ));
+            }
             let dist = t
                 .by_kek
                 .iter()
@@ -118,12 +126,36 @@ struct Column {
 
 const COLUMNS: &[Column] = &[
     Column {
+        table: "tenant_kms_configs",
+        select: "SELECT tenant_id, tenant_id::text AS row_id, secret_enc FROM tenant_kms_configs WHERE secret_enc IS NOT NULL ORDER BY tenant_id",
+        update: "UPDATE tenant_kms_configs SET secret_enc=$3 WHERE tenant_id=$1 AND tenant_id::text=$2 AND secret_enc=$4",
+        aad: |tenant, _| crate::byok::kms_config_aad(tenant),
+    },
+    Column {
+        table: "guardrail_hooks",
+        select: "SELECT tenant_id, COALESCE((config->'adapter'->>'kind') || ':', '') || id::text || ':' || (config->>'endpoint'), ciphertext_b64 FROM guardrail_hooks ORDER BY tenant_id, id",
+        update: "UPDATE guardrail_hooks SET ciphertext_b64 = $3 WHERE tenant_id = $1 AND COALESCE((config->'adapter'->>'kind') || ':', '') || id::text || ':' || (config->>'endpoint') = $2 AND ciphertext_b64 = $4",
+        aad: crate::byok::guardrail_hook_aad,
+    },
+    Column {
         table: "provider_keys",
-        select: "SELECT tenant_id, provider_id, ciphertext_b64 FROM provider_keys ORDER BY tenant_id, provider_id",
+        // OG-11: the row key is `provider` for the `default` label and `provider:label`
+        // otherwise (neither part can hold a `:`), so each pool key re-wraps under ITS
+        // own AAD.
+        select: "SELECT tenant_id, \
+                 CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END, \
+                 ciphertext_b64 FROM provider_keys ORDER BY tenant_id, provider_id, label",
         update: "UPDATE provider_keys SET ciphertext_b64 = $3, updated_at = now() \
-                 WHERE tenant_id = $1 AND provider_id = $2 AND ciphertext_b64 = $4",
-        aad: |t, p| {
-            crate::byok::provider_key_aad(&tracelane_shared::TenantId::from_jwt_claim(*t), p)
+                 WHERE tenant_id = $1 \
+                   AND (CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END) = $2 \
+                   AND ciphertext_b64 = $4",
+        aad: |t, k| {
+            let (provider, label) = k.split_once(':').unwrap_or((k, "default"));
+            crate::byok::provider_key_aad_labeled(
+                &tracelane_shared::TenantId::from_jwt_claim(*t),
+                provider,
+                label,
+            )
         },
     },
     Column {
@@ -172,6 +204,10 @@ pub async fn rotate(pool: &Pool, ring: &ByokMasterKey, dry_run: bool) -> Result<
             let tenant: Uuid = row.get(0);
             let key: String = row.get(1);
             let blob: String = row.get(2);
+            if col.table == "provider_keys" && ByokMasterKey::is_customer_envelope(&blob) {
+                t.customer_managed += 1;
+                continue;
+            }
             let Some(kek) = ByokMasterKey::kek_id_of(&blob) else {
                 t.unreadable += 1;
                 tracing::error!(table = col.table, %tenant, "byok-rotate: not a v2/v3 blob — left as is");

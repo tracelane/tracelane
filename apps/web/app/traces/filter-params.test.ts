@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { nextFilterParams } from "./filter-params";
+import { copyGatewayTraceFilters } from "./filter-registry";
 
 const parse = (qs: string) => new URLSearchParams(qs);
 
@@ -51,4 +52,27 @@ describe("nextFilterParams", () => {
 		const cur = parse("status=error&range=1h");
 		expect(parse(nextFilterParams(cur, "status", "")).get("status")).toBeNull();
 	});
+});
+
+it("clearing status also clears a has_error drill-through filter", () => {
+	const next = parse(
+		nextFilterParams(parse("has_error=true&rescued=retry"), "status", ""),
+	);
+	expect(next.has("has_error")).toBe(false);
+	expect(next.get("rescued")).toBe("retry");
+});
+
+it("forwards label filters to list, group and export", () => {
+	for (const mode of ["list", "group", "export"] as const) {
+		const target = new URLSearchParams();
+		copyGatewayTraceFilters(
+			target,
+			parse(
+				"environment=prod&release=r1&service=checkout&tag=priority&meta=team%3Acore&since=2026-09-01",
+			),
+			mode,
+		);
+		for (const key of ["environment", "release", "service", "tag", "meta"])
+			expect(target.has(key)).toBe(true);
+	}
 });

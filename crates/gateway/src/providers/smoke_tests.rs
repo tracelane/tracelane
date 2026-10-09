@@ -90,6 +90,7 @@ fn simple_request() -> ChatRequest {
         tool_choice: None,
         system: None,
         metadata: None,
+        ..Default::default()
     }
 }
 
@@ -601,12 +602,14 @@ async fn every_adapter_types_its_upstream_status() {
 }
 
 // =============================================================================
-// Cohere — POST /chat (Cohere event-stream JSONL); bearer auth.
+// Cohere — POST /v2/chat (v2 SSE: `type` on each `data:` payload); bearer auth.
 // =============================================================================
 
 const COHERE_BODY: &str = concat!(
-    "{\"event_type\":\"text-generation\",\"text\":\"hi\"}\n",
-    "{\"event_type\":\"stream-end\",\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"billed_units\":{\"input_tokens\":1,\"output_tokens\":1}}}}\n",
+    "event: content-delta\n",
+    "data: {\"type\":\"content-delta\",\"index\":0,\"delta\":{\"message\":{\"content\":{\"text\":\"hi\"}}}}\n\n",
+    "event: message-end\n",
+    "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":1,\"output_tokens\":1}}}}\n\n",
 );
 
 #[tokio::test]
@@ -637,8 +640,9 @@ async fn cohere_provider_request_shape() {
 }
 
 // =============================================================================
-// Google Gemini — POST /v1beta/models/{model}:streamGenerateContent
-//                 query: alt=sse, key=<api_key> (in URL, not header).
+// Google Gemini — POST /v1beta/models/{model}:streamGenerateContent?alt=sse
+//                 auth: `x-goog-api-key` HEADER. OG-02 D6: the key is NEVER in the URL
+//                 (a `reqwest::Error` renders its URL, so a query key reaches every log).
 // =============================================================================
 
 const GEMINI_SSE_BODY: &str = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\n\n";
@@ -651,7 +655,7 @@ async fn google_provider_request_shape() {
     Mock::given(method("POST"))
         .and(path_regex(r"^/v1beta/models/[^:]+:streamGenerateContent$"))
         .and(query_param("alt", "sse"))
-        .and(query_param("key", "g-fake"))
+        .and(header("x-goog-api-key", "g-fake"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(GEMINI_SSE_BODY)
@@ -669,6 +673,347 @@ async fn google_provider_request_shape() {
         .await
         .expect("google chat returns stream");
     let _events = drain(stream).await;
+
+    // OG-02 D6: the credential is in the header and NOWHERE in the URL.
+    let reqs = server.received_requests().await.expect("request log");
+    assert_eq!(reqs.len(), 1);
+    let url = reqs[0].url.as_str();
+    assert!(
+        !url.contains("g-fake") && !url.contains("key="),
+        "the API key must not appear in the request URL: {url}"
+    );
+    assert_eq!(
+        reqs[0]
+            .url
+            .query_pairs()
+            .map(|(k, _)| k.into_owned())
+            .collect::<Vec<_>>(),
+        vec!["alt".to_owned()],
+        "`alt=sse` is the only query parameter"
+    );
+}
+
+/// OG-02 D6, the proof. A forced connect error (nothing listens on port 1) renders
+/// through `format!("{:#}")` — the form every `tracing::warn!(error = %err)` and every
+/// `anyhow` chain print uses — and the chain contains neither the key nor `key=`.
+/// Before the fix `reqwest::Error`'s Display carried the full URL, query included.
+#[tokio::test]
+async fn google_connect_error_chain_never_carries_the_api_key() {
+    let _bypass = allow_loopback_for_this_test();
+    const KEY: &str = "AIzaSy-unit-test-key-do-not-use-in-prod-0001";
+    let mut req = simple_request();
+    req.model = "gemini-3-pro".into();
+    let Err(err) = GoogleProvider::for_base_url("http://127.0.0.1:1")
+        .unwrap()
+        .chat(req, KEY, &test_tenant())
+        .await
+    else {
+        panic!("a refused connection must be an error");
+    };
+    for rendered in [format!("{err:#}"), format!("{err:?}"), format!("{err}")] {
+        assert!(
+            !rendered.contains(KEY),
+            "the API key leaked into the error chain: {rendered}"
+        );
+        assert!(
+            !rendered.contains("key="),
+            "a `key=` query reached the error chain: {rendered}"
+        );
+    }
+}
+
+/// OG-02 §3.1: the model is a URL PATH segment, so it is validated
+/// (`^[A-Za-z0-9._-]{1,128}$` after stripping `google/`) rather than interpolated
+/// raw; nothing is sent upstream for an invalid one.
+#[tokio::test]
+async fn google_rejects_a_model_that_is_not_a_safe_path_segment() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    for bad in [
+        "gemini-3/../../admin",
+        "gemini 3",
+        "gemini-3?x=1",
+        "gemini-3#frag",
+        "gemini-3:generateContent",
+        "gemini-3%2e%2e",
+        "",
+        "google/",
+    ] {
+        let mut req = simple_request();
+        req.model = bad.into();
+        let Err(err) = GoogleProvider::for_base_url(server.uri())
+            .unwrap()
+            .chat(req, "g-fake", &test_tenant())
+            .await
+        else {
+            panic!("model {bad:?} must be refused");
+        };
+        let http = err
+            .downcast_ref::<crate::providers::ProviderHttpError>()
+            .unwrap_or_else(|| panic!("model {bad:?}: not a typed error: {err:#}"));
+        assert_eq!(http.status, 400, "model {bad:?}");
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .is_some_and(|r| r.is_empty()),
+        "an invalid model must never reach the provider"
+    );
+}
+
+/// The `google/` routing prefix is the GATEWAY's, not Google's: it is stripped before
+/// the path is built.
+#[tokio::test]
+async fn google_strips_the_routing_prefix_from_the_path() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-3-pro:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(GEMINI_SSE_BODY)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut req = simple_request();
+    req.model = "google/gemini-3-pro".into();
+    let stream = GoogleProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(req, "g-fake", &test_tenant())
+        .await
+        .expect("prefixed model is routed");
+    let _events = drain(stream).await;
+}
+
+// =============================================================================
+// OG-02 D8 — multi-turn tool use on Gemini. An assistant turn's `tool_calls` must
+// become `functionCall` parts, and a `tool` message must become a `functionResponse`
+// carrying the FUNCTION NAME (not the tool_call_id), or Gemini 400s the history.
+// =============================================================================
+
+fn gemini_tool_request(model: &str, messages: serde_json::Value) -> ChatRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "tools": [
+            {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object"}}},
+        ],
+    }))
+    .expect("an OpenAI-shaped tool conversation")
+}
+
+/// POST the request through the Google adapter against a wiremock and return the JSON body
+/// the upstream actually received.
+async fn gemini_upstream_body(req: ChatRequest) -> serde_json::Value {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(GEMINI_SSE_BODY)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let stream = GoogleProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(req, "g-fake", &test_tenant())
+        .await
+        .expect("a tool conversation is accepted");
+    let _ = drain(stream).await;
+    let reqs = server.received_requests().await.expect("request log");
+    assert_eq!(reqs.len(), 1);
+    reqs[0].body_json().expect("the upstream body is JSON")
+}
+
+#[tokio::test]
+async fn d8_a_two_turn_tool_conversation_replays_as_functioncall_then_functionresponse() {
+    let body = gemini_upstream_body(gemini_tool_request(
+        "gemini-2.5-pro",
+        serde_json::json!([
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_abc", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_abc", "content": "18C"},
+        ]),
+    ))
+    .await;
+    let contents = body["contents"].as_array().expect("contents");
+    assert_eq!(contents.len(), 3, "{body}");
+    assert_eq!(contents[0]["role"], "user");
+    // The model turn carries the call as a functionCall part, NOT an empty text part.
+    assert_eq!(contents[1]["role"], "model");
+    let parts = contents[1]["parts"].as_array().expect("parts");
+    assert_eq!(parts.len(), 1, "no stray empty text part: {parts:?}");
+    assert_eq!(parts[0]["functionCall"]["name"], "get_weather");
+    assert_eq!(
+        parts[0]["functionCall"]["args"],
+        serde_json::json!({"city": "Paris"})
+    );
+    // The result carries the FUNCTION NAME, resolved through the tool_call_id.
+    assert_eq!(contents[2]["role"], "user");
+    let fr = &contents[2]["parts"][0]["functionResponse"];
+    assert_eq!(
+        fr["name"], "get_weather",
+        "the name, never `call_abc`: {body}"
+    );
+    assert_eq!(fr["response"]["result"], "18C");
+    // Not a Gemini 3 model: no signature is invented.
+    assert!(parts[0].get("thoughtSignature").is_none(), "{parts:?}");
+}
+
+#[tokio::test]
+async fn d8_assistant_text_alongside_a_call_is_kept_in_order() {
+    let body = gemini_upstream_body(gemini_tool_request(
+        "gemini-2.5-flash",
+        serde_json::json!([
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": "Let me check.", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]),
+    ))
+    .await;
+    let parts = body["contents"][1]["parts"].as_array().expect("parts");
+    assert_eq!(parts[0]["text"], "Let me check.");
+    assert_eq!(parts[1]["functionCall"]["name"], "get_weather");
+    assert_eq!(parts[1]["functionCall"]["args"], serde_json::json!({}));
+}
+
+/// Parallel calls: ONE model turn with both functionCalls, and the two results batched in
+/// ONE user turn with both functionResponses, in call order (Google's documented shape —
+/// `FC1, FC2, FR1, FR2`).
+#[tokio::test]
+async fn d8_parallel_tool_results_batch_into_one_user_turn() {
+    let body = gemini_upstream_body(gemini_tool_request(
+        "gemini-2.5-pro",
+        serde_json::json!([
+            {"role": "user", "content": "weather and time in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_w", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                {"id": "call_t", "type": "function", "function": {"name": "get_time", "arguments": "{\"tz\":\"CET\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_w", "content": "18C"},
+            {"role": "tool", "tool_call_id": "call_t", "content": "14:02"},
+        ]),
+    ))
+    .await;
+    let contents = body["contents"].as_array().expect("contents");
+    assert_eq!(
+        contents.len(),
+        3,
+        "user, model, ONE user turn of results: {body}"
+    );
+    let calls = contents[1]["parts"].as_array().expect("calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["functionCall"]["name"], "get_weather");
+    assert_eq!(calls[1]["functionCall"]["name"], "get_time");
+    let results = contents[2]["parts"].as_array().expect("results");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["functionResponse"]["name"], "get_weather");
+    assert_eq!(results[0]["functionResponse"]["response"]["result"], "18C");
+    assert_eq!(results[1]["functionResponse"]["name"], "get_time");
+    assert_eq!(
+        results[1]["functionResponse"]["response"]["result"],
+        "14:02"
+    );
+}
+
+/// Gemini 3 validates a thought signature on the FIRST functionCall of each step and 400s
+/// without one (ai.google.dev/gemini-api/docs/generate-content/thought-signatures). The
+/// gateway cannot round-trip the model's real signature through an OpenAI-shaped history, so
+/// it sends Google's documented imported-history value on the first call only — and none for
+/// a model that does not validate.
+#[tokio::test]
+async fn d8_gemini_3_gets_the_documented_dummy_signature_on_the_first_call_only() {
+    let body = gemini_upstream_body(gemini_tool_request(
+        "gemini-3-pro",
+        serde_json::json!([
+            {"role": "user", "content": "both?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "get_time", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "x"},
+            {"role": "tool", "tool_call_id": "b", "content": "y"},
+        ]),
+    ))
+    .await;
+    let calls = body["contents"][1]["parts"].as_array().expect("calls");
+    assert_eq!(
+        calls[0]["thoughtSignature"],
+        "skip_thought_signature_validator"
+    );
+    assert!(calls[1].get("thoughtSignature").is_none(), "{calls:?}");
+}
+
+/// A `tool` message that answers no earlier call cannot be named — fail CLOSED, naming the
+/// message index, rather than sending `name: <tool_call_id>`.
+#[tokio::test]
+async fn d8_an_unresolvable_tool_call_id_is_refused_naming_the_message() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    let req = gemini_tool_request(
+        "gemini-2.5-pro",
+        serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_nobody", "content": "orphan"},
+        ]),
+    );
+    let Err(err) = GoogleProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(req, "g-fake", &test_tenant())
+        .await
+    else {
+        panic!("an orphan tool result must be refused");
+    };
+    let http = err
+        .downcast_ref::<crate::providers::ProviderHttpError>()
+        .unwrap_or_else(|| panic!("not a typed 400: {err:#}"));
+    assert_eq!(http.status, 400);
+    assert!(
+        http.message
+            .as_deref()
+            .is_some_and(|m| m.contains("messages[1]")),
+        "{:?}",
+        http.message
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .is_some_and(|r| r.is_empty()),
+        "nothing is sent upstream"
+    );
+}
+
+/// The same refusal at ADMISSION (`check_supported`), where a caller gets the
+/// `unsupported_content` 400 instead of an opaque dispatch failure.
+#[test]
+fn d8_check_supported_refuses_an_orphan_tool_result_for_gemini() {
+    let req = gemini_tool_request(
+        "gemini-2.5-pro",
+        serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_nobody", "content": "orphan"},
+        ]),
+    );
+    for provider in ["google", "vertex"] {
+        let err = crate::request_support::check_supported(provider, &req)
+            .expect_err("an orphan tool result must be refused");
+        assert_eq!(err.code, "unsupported_content");
+        assert_eq!(err.param, "messages[1].tool_call_id");
+    }
+    // An OpenAI-compatible provider resolves ids itself: untouched.
+    crate::request_support::check_supported("openai", &req).expect("compat is unaffected");
 }
 
 // =============================================================================
@@ -722,4 +1067,128 @@ async fn failover_meta_adapter_skips_failover_for_caller_errors() {
     assert!(crate::providers::failover::is_failover_eligible(502));
     assert!(crate::providers::failover::is_failover_eligible(503));
     assert!(crate::providers::failover::is_failover_eligible(504));
+}
+
+// =============================================================================
+// OG-03 D1 — Cohere must refuse (never silently drop) an image part.
+// =============================================================================
+
+#[tokio::test]
+async fn og03_d1_cohere_refuses_an_image_part_instead_of_dropping_it() {
+    use tracelane_shared::{ContentPart, ImageUrl};
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    let mut req = simple_request();
+    req.model = "command-a".into();
+    req.messages = vec![Message {
+        role: Role::User,
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "what is this?".into(),
+                cache_control: None,
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAAA".into(),
+                    detail: None,
+                },
+            },
+        ]),
+        tool_call_id: None,
+        tool_calls: None,
+    }];
+    let result = CohereProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(req, "co-test-key", &test_tenant())
+        .await;
+    let sent = server.received_requests().await.unwrap_or_default();
+    assert!(
+        result.is_err(),
+        "an image Cohere cannot take must be refused"
+    );
+    assert!(
+        sent.is_empty(),
+        "the request must not reach the upstream with the image silently removed"
+    );
+}
+
+#[tokio::test]
+async fn og03_cohere_body_carries_stop_cap_and_penalties() {
+    let _bypass = allow_loopback_for_this_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(COHERE_BODY)
+                .insert_header("content-type", "application/x-ndjson"),
+        )
+        .mount(&server)
+        .await;
+    let mut req = simple_request();
+    req.model = "command-r-plus".into();
+    req.max_tokens = Some(10);
+    req.max_completion_tokens = Some(40);
+    req.stop = Some(tracelane_shared::Stop::Many(vec!["END".into()]));
+    req.presence_penalty = Some(0.25);
+    req.frequency_penalty = Some(0.5);
+    let stream = CohereProvider::for_base_url(server.uri())
+        .unwrap()
+        .chat(req, "co-fake", &test_tenant())
+        .await
+        .expect("cohere chat returns stream");
+    let _events = drain(stream).await;
+    let sent = server.received_requests().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).expect("json body");
+    assert_eq!(body["stop_sequences"], serde_json::json!(["END"]));
+    assert_eq!(body["max_tokens"], 40);
+    assert_eq!(body["presence_penalty"], 0.25);
+    assert_eq!(body["frequency_penalty"], 0.5);
+}
+
+/// Proof 4 at the adapter: a 400 carries its message; a 401 echoing the key carries none.
+#[tokio::test]
+async fn og03_openai_adapter_relays_a_400_message_and_never_a_401_body() {
+    let _bypass = allow_loopback_for_this_test();
+    for (status, body, expect_msg) in [
+        (
+            400u16,
+            "{\"error\":{\"message\":\"Unsupported parameter: x\"}}",
+            true,
+        ),
+        (
+            401u16,
+            "{\"error\":{\"message\":\"bad key sk-live-LEAKEDSECRETKEY0123456789\"}}",
+            false,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        let err = match OpenAiProvider::compatible(server.uri(), "openai")
+            .unwrap()
+            .chat(
+                simple_request(),
+                "sk-live-LEAKEDSECRETKEY0123456789",
+                &test_tenant(),
+            )
+            .await
+        {
+            Ok(_) => panic!("upstream {status} must be an error"),
+            Err(e) => e,
+        };
+        let http = err
+            .downcast_ref::<crate::providers::ProviderHttpError>()
+            .expect("typed error");
+        assert_eq!(http.status, status);
+        if expect_msg {
+            assert_eq!(http.message.as_deref(), Some("Unsupported parameter: x"));
+        } else {
+            assert!(http.message.is_none(), "{http:?}");
+        }
+        assert!(!format!("{err:#}").contains("LEAKEDSECRET"));
+    }
 }

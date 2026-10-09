@@ -15,6 +15,7 @@
  * per-tenant discriminator, not a query filter).
  */
 
+import plans from "@/db/plans.v3.json";
 import { requireGatewayToken } from "@/lib/auth";
 import { forwardParams, gatewayGet } from "@/lib/gateway";
 import { streamQueryWithDeadline } from "@/lib/query-deadline";
@@ -45,6 +46,9 @@ export async function GET(req: NextRequest): Promise<Response> {
 	// owns the WHERE clause; we only pass the same allow-listed params the
 	// `/api/traces` proxy does (limit is fixed at 100 for the live tail).
 	const qs = forwardParams(req.nextUrl.searchParams, [
+		"key",
+		"loop",
+		"rescued",
 		"model",
 		"has_error",
 		// OBS-20. Without this the live tail shows a SUPERSET while a user filter is
@@ -72,7 +76,21 @@ export async function GET(req: NextRequest): Promise<Response> {
 		{ cacheKey: `traces:${tenantId}:${filterSig}` },
 	);
 
-	return new Response(stream, {
+	const withRetry = stream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						`retry: ${plans.policy.trace_live_tail_retry_ms}\n\n`,
+					),
+				);
+			},
+			transform(chunk, controller) {
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+	return new Response(withRetry, {
 		headers: {
 			"Content-Type": "text/event-stream",
 			"Cache-Control": "no-cache, no-transform",

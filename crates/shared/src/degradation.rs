@@ -316,8 +316,38 @@ pub enum Degradation {
     /// wedge that looks exactly like an insider append. It should never happen; when
     /// it does, someone must know the same hour. `crates/gateway/src/audit.rs`.
     AuditPlatformKeyFallback = 33,
-    /// The trace list remains available but generation-issue enrichment failed.
+    /// The trace list remains available but trace-issue enrichment (generation or loops) failed.
     TraceIssueReadFailed = 34,
+    /// Retention deliberately delayed: pending mutation, wait limit or run budget.
+    RetentionSweepSkipped = 35,
+    /// Retention could not read state or submit a mutation; check grants/connectivity.
+    RetentionSweepFailed = 36,
+    /// A purge tombstone still names a live tenant after the policy grace period.
+    TombstoneLiveConflict = 37,
+    /// Optional rescue evidence could not be read; provider health remains usable.
+    RescueReadFailed = 38,
+    /// B-594: the gateway's cold-lookup throttle held `max_sources` buckets and a
+    /// new source was charged against the ONE shared overflow bucket. The bound
+    /// working as designed (Postgres stays bounded), but it means a flood from more
+    /// distinct sources than the map holds — and that cold keys from untracked
+    /// sources now compete for one budget. Resolved when a sweep finds room.
+    AuthThrottleOverflow = 39,
+    /// `OG-22` (2026-10-04): a budget's ClickHouse baseline read failed, so that budget's
+    /// spend is UNKNOWN. A HARD budget refuses (`503 budget_spend_unknown`, fail-CLOSED)
+    /// until a read succeeds; a soft one allows and alerts on nothing. Resolved by the next
+    /// successful read. `crates/gateway/src/budgets.rs`.
+    BudgetSpendUnknown = 40,
+    /// `OG-24` (2026-10-04): a spend-alert delivery (email, Slack, signed webhook) failed
+    /// and is being retried with back-off, or ran out of attempts. The event stays in
+    /// `spend_alert_events` with its `last_error`. `crates/gateway/src/spend_alerts.rs`.
+    SpendAlertDeliveryFailed = 41,
+    /// `OG-50` (2026-10-05): spans bound for a customer's OTLP collector were DROPPED
+    /// (the export's bounded queue was full, or the global ceiling was) or LOST (retries
+    /// exhausted). Export is fail-OPEN for capture: the request and the recorded span are
+    /// untouched; only the copy for the customer's collector is lost. The per-export
+    /// `dropped` / `failed` counters and `status` on `GET /v1/exports/otel` say which.
+    /// `crates/gateway/src/otel_export.rs`.
+    OtelExportDropped = 42,
 }
 
 impl Degradation {
@@ -362,6 +392,14 @@ impl Degradation {
             Self::WorkspaceGatewayConfigUnreadable => "workspace_gateway_config_unreadable",
             Self::AuditPlatformKeyFallback => "audit_platform_key_fallback",
             Self::TraceIssueReadFailed => "trace_issue_read_failed",
+            Self::RetentionSweepSkipped => "retention_sweep_skipped",
+            Self::RetentionSweepFailed => "retention_sweep_failed",
+            Self::TombstoneLiveConflict => "tombstone_live_conflict",
+            Self::RescueReadFailed => "rescue_read_failed",
+            Self::AuthThrottleOverflow => "auth_throttle_overflow",
+            Self::BudgetSpendUnknown => "budget_spend_unknown",
+            Self::SpendAlertDeliveryFailed => "spend_alert_delivery_failed",
+            Self::OtelExportDropped => "otel_export_dropped",
         }
     }
 
@@ -377,8 +415,8 @@ impl Degradation {
                 "spans are being lost on publish; NATS is connected but writes are failing."
             }
             Self::TenantConfigFault => {
-                "every tenant is being served fallback capture policy and quota, and \
-                 force_tail is inert. Check the control-plane pool."
+                "a tenant config lookup failed; that tenant uses keep-all capture \
+                 with content closed until its next successful lookup. Check the control-plane pool."
             }
             Self::MeterFlushFailed => {
                 "billing usage is NOT reaching Polar; the flush still reports success. \
@@ -557,8 +595,44 @@ impl Degradation {
                  to the operator default — until the next entitlement refresh. Check the \
                  control-plane connection and that migrations 0050/0051 are applied."
             }
+            Self::TombstoneLiveConflict => {
+                "a purge tombstone still names a live tenant; finish the purge or manually remove a deliberately abandoned tombstone"
+            }
+            Self::RetentionSweepSkipped => {
+                "retention is delayed; inspect pending ClickHouse mutations and retention sweep policy budgets"
+            }
+            Self::RetentionSweepFailed => {
+                "retention failed; inspect the sweeper credential, grants and database connectivity"
+            }
+            Self::RescueReadFailed => {
+                "Rescue evidence is unavailable; provider health and trace lists remain usable. Check ClickHouse rescue query failures."
+            }
+            Self::BudgetSpendUnknown => {
+                "a budget's spend could not be read from ClickHouse, so every request under a \
+                 HARD budget for that subject is refused 503 budget_spend_unknown until a read \
+                 succeeds (fail-closed). Check ClickHouse reachability and the tenant's tier \
+                 row cap."
+            }
+            Self::OtelExportDropped => {
+                "spans bound for a customer's OTLP collector were dropped (queue full) or lost \
+                 (retries exhausted); the recorded spans in Tracelane are unaffected. \
+                 GET /v1/exports/otel shows each export's dropped / failed counters and status \
+                 — usually the customer's collector is down, slow or refusing the credential."
+            }
+            Self::SpendAlertDeliveryFailed => {
+                "a spend alert could not be delivered to a customer's email, Slack or webhook \
+                 channel and is being retried; GET /v1/controls/alert-events shows the error. \
+                 Check RESEND_API_KEY for email; a webhook/Slack failure is usually the \
+                 customer's endpoint."
+            }
+            Self::AuthThrottleOverflow => {
+                "the API-key auth throttle is tracking its maximum number of sources; new \
+                 sources share one overflow budget for store-reaching key lookups. Warm keys \
+                 are unaffected. A flood of junk keys from many addresses is likely — check \
+                 /health auth_throttle and the edge."
+            }
             Self::TraceIssueReadFailed => {
-                "generation-issue badges are unavailable; the trace list remains usable. Check ClickHouse query failures."
+                "Trace-derived issue badges are unavailable; the trace list remains usable. Check ClickHouse query failures."
             }
             Self::AuditPlatformKeyFallback => {
                 "an audit batch was signed with the shared PLATFORM key because the \
@@ -608,13 +682,21 @@ impl Degradation {
             Self::WorkspaceGatewayConfigUnreadable,
             Self::AuditPlatformKeyFallback,
             Self::TraceIssueReadFailed,
+            Self::RetentionSweepSkipped,
+            Self::RetentionSweepFailed,
+            Self::TombstoneLiveConflict,
+            Self::RescueReadFailed,
+            Self::AuthThrottleOverflow,
+            Self::BudgetSpendUnknown,
+            Self::SpendAlertDeliveryFailed,
+            Self::OtelExportDropped,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 35;
+pub const COUNT: usize = 43;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -665,6 +747,14 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),
@@ -936,6 +1026,15 @@ mod tests {
         assert!(!is_open(k), "note_n(_, 0) must not re-open a resolved kind");
         // note() is note_n(_, 1) — the two stay in lock-step.
         assert_eq!(note(k), before + 16);
+    }
+
+    #[test]
+    fn tenant_config_fault_consequence_describes_one_lookup_without_quota() {
+        let message = Degradation::TenantConfigFault.consequence();
+        assert!(message.contains("tenant config lookup"));
+        assert!(message.contains("keep-all"));
+        assert!(!message.contains("every tenant"));
+        assert!(!message.contains("quota"));
     }
 
     #[test]

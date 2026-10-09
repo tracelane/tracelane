@@ -15,7 +15,7 @@ looks complete on its own — which is exactly the shape that rots silently.
 
 ## The four sources, after GWY-42
 
-The 185 OpenAI-compatible providers now live in `crates/gateway/providers.tsv`
+The 199 OpenAI-compatible providers now live in `crates/gateway/providers.tsv`
 and resolve through `providers::catalog`. Only the SIX native adapters
 (anthropic, google, vertex, bedrock, azure, cohere) are still hand-written arms,
 so the lists this guard compares are:
@@ -76,7 +76,16 @@ UI_TSX = ROOT / "apps/web/components/settings/ProviderKeyManager.tsx"
 
 # The generated catalog's column order, asserted against the header row so a
 # reordered column is caught instead of silently reading the wrong field.
-TSV_COLUMNS = ("id", "label", "base_url", "base_url_env", "api_key_env", "prefixes")
+TSV_COLUMNS = (
+    "id",
+    "label",
+    "base_url",
+    "base_url_env",
+    "api_key_env",
+    "prefixes",
+    "responses_wire",  # OG-01
+    "capabilities",  # OG-06
+)
 
 # Floors, not targets. A guard that parses zero things and reports OK is the
 # defect class this repo calls a broken parser, so smallness is fatal.
@@ -448,7 +457,7 @@ def _fixture_tsv(rows: list[tuple[str, str]]) -> str:
     out = ["# GENERATED — DO NOT EDIT BY HAND.", "\t".join(TSV_COLUMNS)]
     for pid, key_env in rows:
         out.append(
-            f"{pid}\t{pid.title()}\thttps://api.{pid}.test\t{pid.upper()}_BASE_URL\t{key_env}\t{pid}/"
+            f"{pid}\t{pid.title()}\thttps://api.{pid}.test\t{pid.upper()}_BASE_URL\t{key_env}\t{pid}/\tfalse\t"
         )
     return "\n".join(out) + "\n"
 
@@ -769,7 +778,8 @@ def selftest() -> int:
         ("no header", "groq\tGroq\thttps://g\tG_BASE\tG_KEY\tg/\n"),
         (
             "duplicate ids",
-            "\t".join(TSV_COLUMNS) + "\ngroq\tA\tu\tB\tK\tg/\ngroq\tB\tu\tB\tK\th/\n",
+            "\t".join(TSV_COLUMNS)
+            + "\ngroq\tA\tu\tB\tK\tg/\tfalse\t\ngroq\tB\tu\tB\tK\th/\tfalse\t\n",
         ),
     ):
         died, msg = _dies(lambda s: catalog_ids(catalog_rows(s)), bad)

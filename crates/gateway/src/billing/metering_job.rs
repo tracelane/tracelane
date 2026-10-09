@@ -279,16 +279,24 @@ impl TenantMeta {
 /// The tenant → window map (spec §2.5b: "1, from the cache") — also carries
 /// the Polar correlation id + billing contact so emission and the
 /// usage-warning emails need no SECOND Postgres round trip.
-const TENANT_META_SQL: &str = "\
+///
+/// B-409: the windows come from the tenant's PINNED `plan_allowances` row
+/// (`allowance_pin_join!`, the resolver's own rule), not the live catalog — a
+/// later ruling must not move a protected tenant's hot/cold split. A missing row
+/// keeps this job's existing fallbacks (3-day indexed window, 730 queryable).
+const TENANT_META_SQL: &str = concat!(
+    "\
     SELECT t.id, \
-      COALESCE(we.indexed_window_days, pe.indexed_window_days, 3)::int AS indexed_window_days, \
-      COALESCE(we.queryable_days, pe.queryable_days, 730)::int AS queryable_days, \
+      COALESCE(we.indexed_window_days, pa.indexed_window_days, 3)::int AS indexed_window_days, \
+      COALESCE(we.queryable_days, pa.queryable_days, 730)::int AS queryable_days, \
       t.polar_customer_id, t.billing_email, t.auto_age_window_days, \
       t.current_period_start, t.current_period_end \
     FROM tenants t \
     JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
-    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
-    WHERE t.archived_at IS NULL";
+    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id",
+    crate::entitlement_cache::allowance_pin_join!("pe.plan_lookup_key"),
+    "WHERE t.archived_at IS NULL"
+);
 
 async fn fetch_tenant_meta(pool: &DbPool) -> anyhow::Result<Vec<TenantMeta>> {
     let client = pool
@@ -1029,6 +1037,23 @@ fn find_auto_age_window(
     Some(lo)
 }
 
+/// rev4 M3: whether the 75/90 % usage warnings and AUTO-AGE may act on
+/// `resolved`'s allowances. Only a real `plan_allowances` row's numbers qualify
+/// ([`crate::entitlement_cache::ResolvedEntitlements::allowances_known`]); the deny
+/// floor is zero on every meter, so "you used 100 %" mail and a narrowed window
+/// would be the job acting on a deploy defect (or a control-plane outage), not on
+/// the customer's usage. A skipped tenant is counted
+/// ([`ALLOWANCE_ACTIONS_SKIPPED_TOTAL`]) and re-evaluated on the next run; its Polar
+/// usage events are still emitted (they precede this check).
+fn allowance_actions_allowed(resolved: &crate::entitlement_cache::ResolvedEntitlements) -> bool {
+    resolved.allowances_known()
+}
+
+/// Tenants whose warnings + AUTO-AGE were skipped because their allowances were
+/// not a real row (rev4 M3). Process-lifetime; `/metrics`.
+pub static ALLOWANCE_ACTIONS_SKIPPED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Rate this tenant's period-to-date overage USD across all six meters
 /// (the SAME [`rating::rate`] `GET /v1/billing/usage` rates with, over the
 /// SAME window — the tenant's Polar cycle, or the calendar month, B-410) and,
@@ -1566,6 +1591,10 @@ pub async fn run_once(
 
         if let Some(ents) = entitlements {
             let resolved = ents.resolved(meta.tenant_id).await;
+            if !allowance_actions_allowed(&resolved) {
+                ALLOWANCE_ACTIONS_SKIPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
 
             if let Some(resend) = resend {
                 // Exact period-to-date sum over the tenant's billing period —
@@ -1687,31 +1716,42 @@ pub(crate) fn gc_sql(grace_days: i64) -> String {
 /// [`spawn`]). `grace_days` is `billing_policy.blob_gc_grace_days`, read from the rate
 /// card at tick time so a policy change lands on the next Sunday without a redeploy.
 ///
+/// The mutation bounds are the same per-run `billing_policy.retention_sweep`
+/// row as retention; the weekly caller loads it before starting the run.
+///
 /// # Errors
-/// The mutation was refused or the server unreachable — counted on
-/// `MeteringJobFailed`, retried next week. Returned so the real-server test can assert it.
-pub(crate) async fn run_gc(ch_url: &str, grace_days: i64) -> anyhow::Result<()> {
-    let ch = crate::clickhouse_query::ch_client(ch_url.to_string());
-    // `mutations_sync = 1`: the ALTER returns only once the mutation has applied, so the
-    // tick's log line (and the real-server test) describe a finished delete, not a queued one.
-    match ch
-        .query(&capped(&gc_sql(grace_days)))
-        .with_option("mutations_sync", "1")
-        .execute()
-        .await
-    {
-        Err(e) => {
-            tracing::warn!(error = %e, grace_days, "blob GC mutation failed; retried next week");
+/// Fail-CLOSED to deletion if pending state is unknown, or the mutation is refused;
+/// counted on `MeteringJobFailed` and returned for retry next week. Pending/wait/
+/// budget skips return their explicit outcome and increment `RetentionSweepSkipped`.
+/// Fail-OPEN for gateway availability; a submitted mutation can outlive its wait.
+pub(crate) async fn run_gc(
+    ch_url: &str,
+    grace_days: i64,
+    policy: super::rating::RetentionSweepPolicy,
+) -> anyhow::Result<crate::retention_sweep::DeleteOutcome> {
+    use crate::retention_sweep::{DeleteOutcome, SweepRun, delete_bounded};
+    let mut run = SweepRun::new(policy);
+    let ch = crate::clickhouse_query::sweeper_client(ch_url.to_string());
+    let outcome = delete_bounded(
+        &ch,
+        "blobs",
+        ch.query(&capped(&gc_sql(grace_days)))
+            .with_option("mutations_sync", "1"),
+        &mut run,
+    )
+    .await;
+    match outcome {
+        DeleteOutcome::Failed => {
             tracelane_shared::degradation::note(
                 tracelane_shared::degradation::Degradation::MeteringJobFailed,
             );
-            Err(e.into())
+            anyhow::bail!("blob GC failed; retried next week")
         }
-        Ok(()) => {
-            tracing::info!(grace_days, "blob GC mutation issued");
-            Ok(())
-        }
+        DeleteOutcome::Done => tracing::info!(grace_days, "blob GC mutation completed"),
+        _ => tracing::warn!(?outcome, grace_days, "blob GC skipped; retried next week"),
     }
+    // Do not resolve retention's run-level counters from this separate GC job.
+    Ok(outcome)
 }
 
 /// Resend configuration for usage-warning emails, read once at boot.
@@ -1828,7 +1868,8 @@ pub fn spawn(
             // query a WEEK (spec §5).
             crate::db::job_guard::run_claimed(&gc_pool, "blob_gc", || async {
                 let grace = gc_card.load().policy.blob_gc_grace_days;
-                let _ = run_gc(&ch_url2, grace).await; // counted + logged inside
+                let policy = super::rating::RetentionSweepPolicy::load(&gc_pool).await;
+                let _ = run_gc(&ch_url2, grace, policy).await; // counted + logged inside
             })
             .await;
         }
@@ -2828,6 +2869,102 @@ mod tests {
         assert!(gc_sql(-3).contains("INTERVAL 0 DAY"));
     }
 
+    #[tokio::test]
+    #[ignore = "needs isolated ClickHouse with schema + migration 24; users proof"]
+    async fn gc_pending_mutation_returns_without_stacking() {
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("throwaway URL");
+        let ch = crate::clickhouse_query::ch_client(url.clone());
+        ch.query("INSERT INTO tracelane.blobs (tenant_id, hash, bytes, size, first_seen) VALUES ('00000000-0000-0000-0000-00000000beef', unhex(repeat('01',32)), 'x', 1, now()-INTERVAL 40 DAY)").execute().await.unwrap();
+        ch.query("SYSTEM STOP MERGES tracelane.blobs")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("ALTER TABLE tracelane.blobs DELETE WHERE tenant_id='00000000-0000-0000-0000-00000000beef' SETTINGS mutations_sync=0").execute().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_gc(
+                &url,
+                14,
+                super::super::rating::RetentionSweepPolicy::embedded(),
+            ),
+        )
+        .await;
+        let pending: u64 = ch.query("SELECT count() FROM system.mutations WHERE database='tracelane' AND table='blobs' AND is_done=0").fetch_one().await.unwrap();
+        ch.query("SYSTEM START MERGES tracelane.blobs")
+            .execute()
+            .await
+            .unwrap();
+        // Drain the queued mutation before another GC test stops this shared table.
+        ch.query("ALTER TABLE tracelane.blobs DELETE WHERE tenant_id='00000000-0000-0000-0000-00000000beef' AND 0 SETTINGS mutations_sync=2").execute().await.unwrap();
+        assert!(
+            result.is_ok(),
+            "GC must return before the outer timeout when a mutation is pending"
+        );
+        assert_eq!(pending, 1, "GC must not stack a second mutation");
+        assert_eq!(
+            result.unwrap().unwrap(),
+            crate::retention_sweep::DeleteOutcome::SkippedPending
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs isolated ClickHouse with schema + migration 24; users proof"]
+    async fn gc_wait_and_run_budget_bound_submission() {
+        use crate::retention_sweep::DeleteOutcome;
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("throwaway URL");
+        let ch = crate::clickhouse_query::ch_client(url.clone());
+        let mut policy = super::super::rating::RetentionSweepPolicy::embedded();
+        policy.max_mutations_per_run = 0;
+        assert_eq!(
+            run_gc("http://127.0.0.1:9", 14, policy).await.unwrap(),
+            DeleteOutcome::BudgetExhausted
+        );
+        policy.max_mutations_per_run = 1;
+        policy.max_run_secs = 0;
+        assert_eq!(
+            run_gc("http://127.0.0.1:9", 14, policy).await.unwrap(),
+            DeleteOutcome::BudgetExhausted
+        );
+        policy.max_run_secs = 10;
+        policy.delete_wait_secs = 1;
+        ch.query("INSERT INTO tracelane.blobs (tenant_id, hash, bytes, size, first_seen) VALUES ('00000000-0000-0000-0000-00000000beef', unhex(repeat('02',32)), 'x', 1, now()-INTERVAL 40 DAY)").execute().await.unwrap();
+        ch.query("SYSTEM STOP MERGES tracelane.blobs")
+            .execute()
+            .await
+            .unwrap();
+        // The property: a CLIENT-side wait timeout must not KILL the server-side mutation.
+        // A killed mutation is removed from system.mutations; a surviving one stays, done
+        // or not. Counting `is_done=0` raced (STOP MERGES does not reliably hold a
+        // mutation), and counting by create_time caught the previous test's mutation in
+        // the same second (both red, 2026-09-30). So: the mutation ids that are NEW across
+        // this call — exactly one, and still present.
+        let ids = |ch: clickhouse::Client| async move {
+            ch.query("SELECT mutation_id FROM system.mutations WHERE database='tracelane' AND table='blobs'")
+                .fetch_all::<String>()
+                .await
+                .unwrap()
+        };
+        let before = ids(ch.clone()).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), run_gc(&url, 14, policy)).await;
+        let pending = ids(ch.clone())
+            .await
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .count();
+        ch.query("SYSTEM START MERGES tracelane.blobs")
+            .execute()
+            .await
+            .unwrap();
+        // Drain the queued mutation before another GC test stops this shared table.
+        ch.query("ALTER TABLE tracelane.blobs DELETE WHERE tenant_id='00000000-0000-0000-0000-00000000beef' AND 0 SETTINGS mutations_sync=2").execute().await.unwrap();
+        assert_eq!(result.unwrap().unwrap(), DeleteOutcome::WaitExceeded);
+        assert_eq!(
+            pending, 1,
+            "the timed-out mutation must survive on the server (not killed)"
+        );
+    }
+
     /// B-445, against a REAL ClickHouse (`run-clickhouse-integration.sh`): behaviour,
     /// not SQL text. Three blobs — referenced and old, unreferenced and YOUNG,
     /// unreferenced and old — and only the third is deleted. Before B-445 the second
@@ -2866,7 +3003,13 @@ mod tests {
                 .expect("plant ref");
             }
         }
-        run_gc(&url, 14).await.expect("gc runs");
+        run_gc(
+            &url,
+            14,
+            super::super::rating::RetentionSweepPolicy::embedded(),
+        )
+        .await
+        .expect("gc runs");
         let remaining: Vec<String> = ch
             .query("SELECT hex(hash) FROM tracelane.blobs WHERE tenant_id = ? ORDER BY hash")
             .bind(&tenant)
@@ -3267,5 +3410,75 @@ mod tests {
             Some(4.0),
             "calendar tenant: August only: {ingest:?}"
         );
+    }
+}
+
+/// B-409, real Postgres: the metering job's window map reads the tenant's PINNED
+/// allowance version, not the live catalog. Run by `run-postgres-integration.sh`.
+#[cfg(test)]
+mod b409_tests {
+    use super::*;
+    use crate::entitlement_cache::b409_fixture::*;
+
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_metering_windows_read_the_pinned_version() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let pinned = builder_tenant(&pool, Some("v3"), Some(200)).await;
+        let fresh = builder_tenant(&pool, None, None).await;
+        let metas = fetch_tenant_meta(&pool).await.expect("tenant meta");
+        let get = |id: Uuid| {
+            metas
+                .iter()
+                .find(|m| m.tenant_id == id)
+                .map(|m| (m.indexed_window_days, m.queryable_days))
+                .expect("tenant in the window map")
+        };
+        let (v3, v4) = (v3_builder(), v4_builder());
+        assert_eq!(get(pinned), (v3.indexed, v3.queryable), "pinned tenant");
+        assert_eq!(get(fresh), (v4.indexed, v4.queryable), "unpinned tenant");
+    }
+
+    /// rev4 M3: a pin naming a version with no row reads the plan's CURRENT row —
+    /// never this job's 3-day / 730-day fallback, which would shrink a paying
+    /// tenant's indexed window on a deploy defect.
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn b409_metering_windows_fall_back_to_the_current_row_when_the_pin_is_missing() {
+        let pool = fresh_migrated_pool().await;
+        seed_v3_then_v4(&pool).await;
+        let orphan = builder_tenant(&pool, Some("v_never_seeded"), Some(200)).await;
+        let metas = fetch_tenant_meta(&pool).await.expect("tenant meta");
+        let m = metas
+            .iter()
+            .find(|m| m.tenant_id == orphan)
+            .expect("tenant in the window map");
+        let v4 = v4_builder();
+        assert_eq!(
+            (m.indexed_window_days, m.queryable_days),
+            (v4.indexed, v4.queryable)
+        );
+    }
+}
+
+/// rev4 M3: the 75/90 % usage warnings and AUTO-AGE read the resolved allowances.
+/// When those are not a real row's numbers (the deny floor: zero on every meter),
+/// warning "you used 100 %" or narrowing the window is acting on a deploy defect.
+#[cfg(test)]
+mod rev4_m3_tests {
+    use super::*;
+
+    #[test]
+    fn no_warning_or_auto_age_runs_against_allowances_that_are_not_a_real_row() {
+        let floor = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        assert!(!floor.allowances_known());
+        assert!(
+            !allowance_actions_allowed(&floor),
+            "the deny floor's zeros must not drive a warning or a narrowing"
+        );
+        let mut real = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        real.plan_version = Some("v3".into());
+        assert!(allowance_actions_allowed(&real));
     }
 }

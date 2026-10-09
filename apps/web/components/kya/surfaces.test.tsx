@@ -29,6 +29,10 @@ it("trace list model opens the normalized model profile", () => {
 			traces={[
 				{
 					trace_id: "trace",
+					loop_calls: 4,
+					loops_available: true,
+					rescued: "failover",
+					rescues_available: true,
 					root_name: "chat",
 					start_time: span.start_time,
 					duration_us: 1000000,
@@ -43,6 +47,8 @@ it("trace list model opens the normalized model profile", () => {
 		/>,
 	);
 	expect(html).toContain('href="/agents/model/claude-haiku-4-5"');
+	expect(html).toContain("Repeated tool call ×4");
+	expect(html).toContain("Rescued by failover");
 });
 it("trace header links the observed agent and model", () => {
 	const html = renderToStaticMarkup(<TraceSummaryHeader spans={[span]} />);
@@ -65,6 +71,8 @@ it("session agent chip opens the profile and keeps the session link", () => {
 		<SessionRow
 			s={{
 				session_id: "session",
+				loop_calls: 3,
+				loops_available: true,
 				agent_name: "codex",
 				turns: 1,
 				started_at: span.start_time,
@@ -81,4 +89,5 @@ it("session agent chip opens the profile and keeps the session link", () => {
 	);
 	expect(html).toContain('href="/agents/agent/codex"');
 	expect(html).toContain('href="/sessions/session"');
+	expect(html).toContain("Repeated tool call ×3");
 });

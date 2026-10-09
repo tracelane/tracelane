@@ -157,6 +157,6 @@ it("renders recorded generation issues independently of every content state", ()
 				userId="u"
 			/>,
 		);
-		expect(html).toContain(">Truncated</span>");
+		expect(html).toContain(">Hit token limit</span>");
 	}
 });

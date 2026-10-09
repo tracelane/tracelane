@@ -110,29 +110,62 @@ pub async fn get(pool: &Pool, tenant_id: &TenantId) -> Result<WorkspaceFailover>
 /// Replace the workspace's settings. Validation ([`validate`]) runs first.
 ///
 /// # Errors
-/// Fails CLOSED on pool/statement errors.
+/// Fails CLOSED on pool/statement errors — and (OG-35) on the audit insert: the
+/// upsert and its `gateway.failover.set` row (before/after) are ONE transaction.
 pub async fn put(
     pool: &Pool,
     tenant_id: &TenantId,
     settings: &WorkspaceFailover,
-    updated_by: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "INSERT INTO workspace_failover (tenant_id, enabled, models, updated_by) \
+    let actor_cow = actor.as_actor();
+    let updated_by = actor_cow.sub.as_str();
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let before = tx
+        .query_opt(
+            "SELECT enabled, models FROM workspace_failover WHERE tenant_id = $1 FOR UPDATE",
+            &[tenant_id.as_uuid()],
+        )
+        .await
+        .map_err(|e| anyhow!("workspace_failover read: {e}"))?
+        .map(|r| {
+            serde_json::json!({
+                "enabled": r.get::<_, bool>(0),
+                "models": r.get::<_, Vec<String>>(1),
+            })
+        });
+    tx.execute(
+        "INSERT INTO workspace_failover (tenant_id, enabled, models, updated_by) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (tenant_id) DO UPDATE SET enabled = EXCLUDED.enabled, \
                models = EXCLUDED.models, updated_by = EXCLUDED.updated_by, updated_at = NOW()",
-            &[
-                tenant_id.as_uuid(),
-                &settings.enabled,
-                &settings.models,
-                &updated_by,
-            ],
-        )
-        .await
-        .map_err(|e| anyhow!("workspace_failover upsert: {e}"))?;
+        &[
+            tenant_id.as_uuid(),
+            &settings.enabled,
+            &settings.models,
+            &updated_by,
+        ],
+    )
+    .await
+    .map_err(|e| anyhow!("workspace_failover upsert: {e}"))?;
+    crate::db::control_audit::record(
+        &tx,
+        tenant_id,
+        &actor.as_actor(),
+        crate::db::control_audit::Change {
+            action: "gateway.failover.set",
+            target_type: "workspace",
+            target_id: tenant_id.to_string(),
+            before,
+            after: Some(serde_json::json!({
+                "enabled": settings.enabled,
+                "models": settings.models,
+            })),
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 

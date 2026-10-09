@@ -36,6 +36,11 @@ export const TILE_DIMENSIONS = [
 export type TileDimension = (typeof TILE_DIMENSIONS)[number];
 
 export const STAT_IDS: ReadonlySet<string> = new Set([
+	"agent_loops",
+	"rescued_failover",
+	"rescued_retry",
+	"rescue_rate",
+	"rescue_latency",
 	"budget_remaining",
 	"llm_calls",
 	"error_rate",

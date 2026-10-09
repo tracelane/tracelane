@@ -1,6 +1,6 @@
 {
 	"name": "@tracelanedev/sdk",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Tracelane TypeScript SDK — auto-instrument AI agent frameworks",
 	"repository": {
 		"type": "git",
@@ -122,7 +122,7 @@
 		"@types/node": "^22.0.0",
 		"tsup": "^8.0.0",
 		"typescript": "^5.5.0",
-		"vitest": "^2.0.0"
+		"vitest": "^3.2.6"
 	},
 	"files": ["dist"],
 	"engines": { "node": "^18.19.0 || >=20.6.0" },

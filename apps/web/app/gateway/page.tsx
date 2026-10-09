@@ -1,3 +1,5 @@
+import { ResilienceTiles } from "@/components/gateway/ResilienceTiles";
+import { SpendOverTime } from "@/components/gateway/SpendOverTime";
 import { PageHeader } from "@tracelanedev/ui";
 import { StatusBadge } from "@tracelanedev/ui";
 /**
@@ -43,6 +45,7 @@ import {
 	fetchCostBreakdownFor,
 	fetchGatewayStatsFor,
 	fetchLatencyBreakdownFor,
+	fetchOutputSpeedByModelFor,
 } from "@/lib/metrics/fetch";
 import { fmtCount, fmtDurationMs, fmtPercent } from "@/lib/metrics/format";
 import { hintOf } from "@/lib/metrics/hint";
@@ -50,6 +53,7 @@ import { METRICS } from "@/lib/metrics/registry";
 import {
 	type TimeRange,
 	parseTimeRange,
+	windowParams,
 	withWindow,
 } from "@/lib/metrics/time-range";
 import {
@@ -116,10 +120,11 @@ async function GatewayData({
 }) {
 	// Both reads in flight together, for ONE window, through lib/metrics — the
 	// spend panel must not serialize behind router health.
-	const [stats, costs, keyLabels] = await Promise.all([
+	const [stats, costs, keyLabels, outputSpeeds] = await Promise.all([
 		fetchGatewayStatsFor(range),
 		fetchCostBreakdownFor(range, by),
 		by === "key" ? readKeyLabels() : Promise.resolve(undefined),
+		fetchOutputSpeedByModelFor(range),
 	]);
 	const href = (path: string, extra?: Record<string, string | undefined>) =>
 		withWindow(path, range, extra);
@@ -129,6 +134,10 @@ async function GatewayData({
 		return (
 			<>
 				<WarmingBanner />
+				<ResilienceTiles
+					initial={null}
+					query={windowParams(range).toString()}
+				/>
 				<EmptyState
 					title="Waiting on the gateway"
 					description="Router health appears here once the gateway is reachable and requests have flowed."
@@ -154,6 +163,10 @@ async function GatewayData({
 	if (stats.provider_count === 0 && !refusing) {
 		return (
 			<div className="space-y-8">
+				<ResilienceTiles
+					initial={stats}
+					query={windowParams(range).toString()}
+				/>
 				<EmptyState
 					title={`No gateway requests — ${range.label}`}
 					description="Point your agents at the gateway — per-provider request volume, latency, error rate, and cache-hit rate will surface here. Send one request to see it appear:"
@@ -267,6 +280,7 @@ async function GatewayData({
 
 	return (
 		<div className="space-y-8">
+			<ResilienceTiles initial={stats} query={windowParams(range).toString()} />
 			{/* ── 1 · TRAFFIC & ROUTING — the lead group ──────────────────────────
 			    Traffic → errors → cache → provider count, in that order, because
 			    that is the order the questions arrive in. PRIMARY weight: four
@@ -420,6 +434,7 @@ async function GatewayData({
 									</TH>
 									<TH numeric>Cache hit</TH>
 									<TH numeric>Failover</TH>
+									<TH numeric>Rescued (served)</TH>
 									<TH
 										className="text-right"
 										title="Upstream breaker state — process-wide shared-infra health, not tenant-specific."
@@ -471,6 +486,11 @@ async function GatewayData({
 												<span className="text-ink-3">—</span>
 											)}
 										</TD>
+										<TD numeric>
+											<a href={href("/traces", { rescued: "failover" })}>
+												{fmtCount(p.rescued_by_failover)}
+											</a>
+										</TD>
 										<TD className="text-right">
 											<CircuitStatus state={p.circuit_state} />
 										</TD>
@@ -486,6 +506,38 @@ async function GatewayData({
 			    GWY-43: where the money went. Sits above Router events because "what
 			    did this cost" is the question a platform team opens this page with,
 			    and cost was previously only a single tenant-wide total. */}
+			{outputSpeeds && outputSpeeds.length > 0 && (
+				<section aria-label="Output speed by model" className="space-y-3">
+					<SectionLabel>Output speed by model</SectionLabel>
+					<p className="text-xs text-ink-2">
+						Median output tokens per second after the first token, for streamed
+						responses with a measured generation interval.
+					</p>
+					<Card quiet>
+						<Table>
+							<THead>
+								<TR>
+									<TH>Model</TH>
+									<TH numeric>Output speed p50</TH>
+									<TH numeric>Samples</TH>
+								</TR>
+							</THead>
+							<TBody>
+								{outputSpeeds.map((row) => (
+									<TR key={row.key}>
+										<TD mono>{row.key || "(not set)"}</TD>
+										<TD numeric>
+											{row.n > 0 ? `${row.value.toFixed(1)} tok/s` : "—"}
+										</TD>
+										<TD numeric>{fmtCount(row.n)}</TD>
+									</TR>
+								))}
+							</TBody>
+						</Table>
+					</Card>
+				</section>
+			)}
+			<SpendOverTime query={windowParams(range).toString()} />
 			<SpendAttribution
 				data={costs}
 				hrefFor={(v) => href("/gateway", { by: v })}
@@ -589,7 +641,19 @@ export default async function GatewayPage({
 	// gateway rejects it with a 400, and a page that renders an error banner for
 	// a mistyped query string is worse than one that shows the default view.
 	const by: CostBreakdown["by"] =
-		byRaw === "model" || byRaw === "provider" ? byRaw : "key";
+		byRaw &&
+		([
+			"model",
+			"provider",
+			"user",
+			"tag",
+			"environment",
+			"release",
+			"service",
+		].includes(byRaw) ||
+			/^meta:[A-Za-z0-9_.:-]{1,64}$/.test(byRaw))
+			? (byRaw as CostBreakdown["by"])
+			: "key";
 	return (
 		// The dashboard's responsive page frame, to the utility. The gutter ramps
 		// with the viewport instead of pinning one value, and `space-y-8` is the

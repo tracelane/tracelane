@@ -110,7 +110,7 @@ impl Dispatcher {
             if !rail.sides().includes(side) {
                 continue;
             }
-            if !gate.enables(rail.feature()) {
+            if !gate.enables(rail.feature()) || !ctx.policy.enabled(rail.name()) {
                 continue;
             }
             let name = rail.name();
@@ -127,7 +127,7 @@ impl Dispatcher {
                 .await;
                 let latency_micros = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
                 let outcome = match evaluated {
-                    Ok(Ok(Ok(o))) => o,
+                    Ok(Ok(Ok(o))) => ctx.policy.apply(name, o),
                     Ok(Ok(Err(e))) => Self::map_error(name, fail_mode, &e),
                     Ok(Err(_panic)) => Self::map_error(name, fail_mode, &RailError::DetectorPanic),
                     Err(_elapsed) => Self::map_error(name, fail_mode, &RailError::Timeout),
@@ -211,6 +211,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

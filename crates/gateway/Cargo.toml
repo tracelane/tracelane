@@ -70,6 +70,16 @@ futures = { workspace = true }
 # NATS JetStream — span publish to ingest workers
 async-nats = { workspace = true }
 
+# OG-07 Realtime WebSocket. NO new crate in Cargo.lock: `tokio-tungstenite` 0.29 and
+# `tokio-rustls` 0.26 are already resolved (axum's `ws` feature pulls the former; the
+# latter is a workspace dep and a tokio-postgres-rustls dependency). Declared directly so
+# the upstream WebSocket client is not an accident of another crate's graph. `handshake`
+# only: the gateway opens its OWN pinned, SSRF-validated TCP + rustls (aws-lc-rs) stream
+# and hands it to `client_async`; the crate's own connector (which resolves DNS itself)
+# is deliberately not enabled. rustls only — openssl stays banned.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-rustls = { workspace = true }
+
 # Shared crate
 tracelane-shared = { path = "../shared" }
 

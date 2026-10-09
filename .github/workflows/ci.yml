@@ -131,7 +131,13 @@ jobs:
     # (`guards`, `secret-scan`, ~3 min); the full suite is `workflow_dispatch`
     # (and PRs). `ci-status.sh` reads a push run as CANNOT DETERMINE, which is
     # honest — the deploy scripts take the verdict from the FULL stamp instead.
-    if: github.event.pull_request.draft != true && github.event_name != 'push'
+    # DEPENDABOT OFF THE DEV BOX: the
+    # self-hosted runner runs as the developer, whose HOME holds the prod SSH key and the
+    # provider keys. A Dependabot PR installs new third-party package versions whose install
+    # scripts would run there unreviewed. Gated on the PR AUTHOR (not the actor, so a human
+    # re-run cannot slip it through). Nothing auto-merges here (plan limit, see
+    # .github/dependabot.yml), so a bump is reviewed, then merged and gated by hand.
+    if: github.event.pull_request.draft != true && github.event_name != 'push' && github.event.pull_request.user.login != 'dependabot[bot]'
     name: Detect changed areas
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     outputs:
@@ -232,6 +238,9 @@ jobs:
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
           # Share ONE debug cache across the rust / span-publish / live-eval jobs
           # (they all compile the workspace in the debug profile). Without a
           # shared-key each job wrote its own multi-GB cache → 4 caches blew the
@@ -331,6 +340,9 @@ jobs:
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
           shared-key: "rust-ci"
       # The ONLY test that exercises `db::api_keys::create()` against a real
       # Postgres. It was `#[ignore]`d and referenced by NEITHER this workflow nor
@@ -437,6 +449,9 @@ jobs:
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
           shared-key: "rust-ci"
       # Persistent cargo target dir — see the full rationale on the `rust` job.
       # Self-hosted only; 40 GiB floor on `/`; safe only at concurrency=1.
@@ -531,7 +546,13 @@ jobs:
   guards:
     # Runs on every push and non-draft PR. A draft run would otherwise read as
     # `guards` green with everything else skipped.
-    if: github.event.pull_request.draft != true
+    # DEPENDABOT OFF THE DEV BOX: the
+    # self-hosted runner runs as the developer, whose HOME holds the prod SSH key and the
+    # provider keys. A Dependabot PR installs new third-party package versions whose install
+    # scripts would run there unreviewed. Gated on the PR AUTHOR (not the actor, so a human
+    # re-run cannot slip it through). Nothing auto-merges here (plan limit, see
+    # .github/dependabot.yml), so a bump is reviewed, then merged and gated by hand.
+    if: github.event.pull_request.draft != true && github.event.pull_request.user.login != 'dependabot[bot]'
     name: Repo guards (20 structural checks)
     # Python/shell structural checks only — no cargo, no services — so it runs on the
     # `CI_RUNNER` indirection like the other light jobs.
@@ -955,7 +976,13 @@ jobs:
     # (scripts/ops/ci-status.sh) — a draft PR is honestly unverified. Mark it
     # ready for review to get a verdict.
     # B-384 (2026-09-12): runs on a private push too — see `changes` above.
-    if: github.event.pull_request.draft != true
+    # DEPENDABOT OFF THE DEV BOX: the
+    # self-hosted runner runs as the developer, whose HOME holds the prod SSH key and the
+    # provider keys. A Dependabot PR installs new third-party package versions whose install
+    # scripts would run there unreviewed. Gated on the PR AUTHOR (not the actor, so a human
+    # re-run cannot slip it through). Nothing auto-merges here (plan limit, see
+    # .github/dependabot.yml), so a bump is reviewed, then merged and gated by hand.
+    if: github.event.pull_request.draft != true && github.event.pull_request.user.login != 'dependabot[bot]'
     name: Secret + supply-chain scan (fast)
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     env:
@@ -1052,6 +1079,9 @@ jobs:
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
           # Bench compiles in the RELEASE profile — a distinct target dir from the
           # debug jobs, so it gets its own shared cache (mixing profiles under one
           # key thrashes the hit rate). 2 caches total (rust-ci + rust-bench),

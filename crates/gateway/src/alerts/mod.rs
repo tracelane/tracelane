@@ -168,9 +168,12 @@ pub async fn create_rule(
     threshold: f64,
     window_minutes: i32,
     destination_id: Uuid,
+    actor: &crate::control_plane::ControlActor,
 ) -> Result<Uuid> {
-    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
-    let row = client
+    // OG-35: the rule and its `alert.rule.create` row commit together, or neither.
+    let mut client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let row = tx
         .query_one(
             "INSERT INTO alert_rules \
              (tenant_id, metric, comparator, threshold, window_minutes, destination_id) \
@@ -186,19 +189,84 @@ pub async fn create_rule(
         )
         .await
         .context("INSERT alert_rules failed")?;
-    Ok(row.get(0))
+    let id: Uuid = row.get(0);
+    audit(
+        &tx,
+        actor,
+        "alert.rule.create",
+        "alert_rule",
+        id,
+        None,
+        Some(serde_json::json!({
+            "metric": metric, "comparator": comparator, "threshold": threshold,
+            "window_minutes": window_minutes, "destination_id": destination_id,
+        })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// OG-35: one `admin_audit_log` row in the change's transaction.
+async fn audit(
+    tx: &deadpool_postgres::Transaction<'_>,
+    actor: &crate::control_plane::ControlActor,
+    action: &str,
+    target_type: &str,
+    id: Uuid,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+) -> Result<()> {
+    crate::db::control_audit::record(
+        tx,
+        &actor.tenant_id,
+        &actor.audit,
+        crate::db::control_audit::Change {
+            action,
+            target_type,
+            target_id: id.to_string(),
+            before,
+            after,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Delete a rule, tenant-scoped (a foreign tenant id can never match).
-pub async fn delete_rule(pool: &DbPool, tenant: Uuid, id: Uuid) -> Result<u64> {
-    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
-    client
-        .execute(
-            "DELETE FROM alert_rules WHERE id = $1 AND tenant_id = $2",
+pub async fn delete_rule(
+    pool: &DbPool,
+    tenant: Uuid,
+    id: Uuid,
+    actor: &crate::control_plane::ControlActor,
+) -> Result<u64> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let removed = tx
+        .query_opt(
+            "DELETE FROM alert_rules WHERE id = $1 AND tenant_id = $2 \
+             RETURNING metric, comparator, threshold, window_minutes, destination_id",
             &[&id, &tenant],
         )
         .await
-        .context("DELETE alert_rules failed")
+        .context("DELETE alert_rules failed")?;
+    let Some(r) = removed else { return Ok(0) };
+    audit(
+        &tx,
+        actor,
+        "alert.rule.delete",
+        "alert_rule",
+        id,
+        Some(serde_json::json!({
+            "metric": r.get::<_, String>(0), "comparator": r.get::<_, String>(1),
+            "threshold": r.get::<_, f64>(2), "window_minutes": r.get::<_, i32>(3),
+            "destination_id": r.get::<_, Uuid>(4),
+        })),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(1)
 }
 
 /// RI-04 §3 (founder default Q1, 2026-09-19) — CAS the `ok` -> `breach` edge:
@@ -299,9 +367,13 @@ pub async fn create_destination(
     name: &str,
     kind: &str,
     url: &str,
+    actor: &crate::control_plane::ControlActor,
 ) -> Result<Uuid> {
-    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
-    let row = client
+    // OG-35: the destination and its `alert.destination.create` row commit together.
+    // The URL IS the credential (B-383 d): the row carries only its redacted form.
+    let mut client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let row = tx
         .query_one(
             "INSERT INTO alert_destinations (tenant_id, name, kind, url) \
              VALUES ($1,$2,$3,$4) RETURNING id",
@@ -309,19 +381,57 @@ pub async fn create_destination(
         )
         .await
         .context("INSERT alert_destinations failed")?;
-    Ok(row.get(0))
+    let id: Uuid = row.get(0);
+    audit(
+        &tx,
+        actor,
+        "alert.destination.create",
+        "alert_destination",
+        id,
+        None,
+        Some(serde_json::json!({
+            "name": name, "kind": kind,
+            "url": routes::redact_destination_url(url),
+        })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// Delete a destination, tenant-scoped. `ON DELETE CASCADE` removes its rules.
-pub async fn delete_destination(pool: &DbPool, tenant: Uuid, id: Uuid) -> Result<u64> {
-    let client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
-    client
-        .execute(
-            "DELETE FROM alert_destinations WHERE id = $1 AND tenant_id = $2",
+pub async fn delete_destination(
+    pool: &DbPool,
+    tenant: Uuid,
+    id: Uuid,
+    actor: &crate::control_plane::ControlActor,
+) -> Result<u64> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("alerts pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let removed = tx
+        .query_opt(
+            "DELETE FROM alert_destinations WHERE id = $1 AND tenant_id = $2 \
+             RETURNING name, kind, url",
             &[&id, &tenant],
         )
         .await
-        .context("DELETE alert_destinations failed")
+        .context("DELETE alert_destinations failed")?;
+    let Some(r) = removed else { return Ok(0) };
+    audit(
+        &tx,
+        actor,
+        "alert.destination.delete",
+        "alert_destination",
+        id,
+        Some(serde_json::json!({
+            "name": r.get::<_, String>(0), "kind": r.get::<_, String>(1),
+            "url": routes::redact_destination_url(&r.get::<_, String>(2)),
+        })),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(1)
 }
 
 // ── Notifier (reuses the SSRF-guarded Slack-format path) ─────────────────────

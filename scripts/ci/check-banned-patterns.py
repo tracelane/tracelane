@@ -26,6 +26,15 @@ THE PATTERNS, each with the incident it comes from:
   7. `expose_secret().to_string()` anywhere — a `SecretString` copied into a
      `String` is no longer zeroized on drop; keep the secret typed and expose it
      at the LAST moment (`expose_secret()` as `&str`).
+  8. A credential in a URL query string (`?key={}`, `&api_key={}`, `access_token=`)
+     built in production code — ONE GATEWAY D6 (2026-10-01): the Google adapter put
+     the tenant's BYOK key in the URL, and `reqwest::Error`'s Display includes the
+     URL, so every connect/timeout error carried the key into error strings. Scanned
+     on the RAW source (the credential lives inside a string literal).
+  9. An outbound provider `.send()` whose error is not converted with
+     `.without_url()` in the same statement — the same D6 class: even with no key in
+     the URL, the URL of a customer-chosen base is not ours to log. Scoped to the
+     provider adapters and the byte-faithful relays.
 
 WHAT IS NOT SCANNED, deliberately: comments and string literals (stripped by a
 small stateful walker, so a doc comment describing a pattern cannot trip it), and
@@ -45,6 +54,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCAN_ROOTS = [ROOT / "crates", ROOT / "packages" / "verifier-rust"]
+
+
+_RAW_STR = re.compile(r'(b?)r(#*)"')
+_CHAR_LIT = re.compile(r"'(\\.|[^'\\])'")
 
 
 def strip_comments_and_strings(src: str) -> str:
@@ -78,7 +91,10 @@ def strip_comments_and_strings(src: str) -> str:
                         out.append("\n")
                     i += 1
             continue
-        m = re.match(r'(b?)r(#*)"', src[i:])
+        # `.match(src, i)`, never `re.match(…, src[i:])`: the slice copied the rest of the
+        # file for EVERY character — quadratic, ~60 s of the gate across this guard and
+        # check-image-embeds (2026-09-30). Same patterns, same positions, same result.
+        m = _RAW_STR.match(src, i) if c in "br" else None
         if m:
             hashes = m.group(2)
             end = src.find('"' + hashes, i + len(m.group(0)))
@@ -98,7 +114,7 @@ def strip_comments_and_strings(src: str) -> str:
             out.append(" ")
             i = j + 1
             continue
-        cm = re.match(r"'(\\.|[^'\\])'", src[i : i + 4]) if c == "'" else None
+        cm = _CHAR_LIT.match(src, i, i + 4) if c == "'" else None
         if cm:
             i += len(cm.group(0))
             out.append(" ")
@@ -204,6 +220,28 @@ PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         "`expose_secret()` copied into a plain String is no longer zeroized on drop; keep it typed and expose at the last moment",
     ),
 ]
+# 8: checked on RAW lines (the credential sits inside a string literal), production
+# lines only. `{` or `{name}` right after `=` is a format placeholder being filled.
+CREDENTIAL_IN_URL = re.compile(
+    r"[?&](key|api_key|apikey|api-key|access_token|token|secret)=\{", re.IGNORECASE
+)
+# 9: the provider-call sites. A new relay module joins this list or is not scanned —
+# the list is the scope, said here so a reviewer can see it.
+SEND_SCOPE = (
+    "/providers/",
+    "crates/gateway/src/anthropic_messages.rs",
+    "crates/gateway/src/openai_responses.rs",
+    "crates/gateway/src/gemini_native.rs",
+    "crates/gateway/src/passthrough.rs",
+    "crates/gateway/src/realtime.rs",
+    "crates/gateway/src/server/dispatch.rs",
+    # OG-06: the media / files / batch relay. `media_common.rs` owns the one `send`;
+    # the two route modules are scanned too so a second send site cannot appear unseen.
+    "crates/gateway/src/media_common.rs",
+    "crates/gateway/src/media_routes.rs",
+    "crates/gateway/src/files_batches.rs",
+)
+SEND_CALL = re.compile(r"\.send\(\)")
 BARE_BUILDER = re.compile(r"reqwest::Client::builder\(\)")
 SSRF_MARKER = re.compile(r"\bvalidate_url\(")
 # A site that genuinely MUST hand a secret to an API that only takes an owned
@@ -243,6 +281,20 @@ def scan_source(path: str, src: str, allowed: set[int] | None = None) -> list[st
         for ln_no, line in enumerate(lines, 1):
             if rx.search(line) and ln_no not in allowed:
                 findings.append(f"{path}:{ln_no}: [{label}] {why}")
+    # 9: an outbound `.send()` on a provider path must strip the URL from its error
+    # within the same statement (up to its `;`).
+    if any(scope in path for scope in SEND_SCOPE):
+        for idx, line in enumerate(lines):
+            if not SEND_CALL.search(line) or (idx + 1) in allowed:
+                continue
+            stmt = "\n".join(lines[idx : idx + 10])
+            stmt = stmt.split(";", 1)[0]
+            if "without_url" not in stmt:
+                findings.append(
+                    f"{path}:{idx + 1}: [9 provider send without .without_url()] a reqwest "
+                    "error renders the request URL; convert it with `.without_url()` before "
+                    "it becomes a string or an anyhow chain (ONE GATEWAY D6)"
+                )
     # 6: a bare builder is banned only in a module that contacts customer/operator
     # URLs — the ones that call validate_url at all.
     if SSRF_MARKER.search(src):
@@ -256,6 +308,43 @@ def scan_source(path: str, src: str, allowed: set[int] | None = None) -> list[st
     return findings
 
 
+def test_lines(stripped: str) -> set[int]:
+    """1-based line numbers inside `#[cfg(test)]` items (the regions
+    [`production_part`] blanks), so a RAW-source rule can skip the same code."""
+    blanked = production_part(stripped)
+    out: set[int] = set()
+    for n, (a, b) in enumerate(zip(stripped.splitlines(), blanked.splitlines()), 1):
+        if a.strip() and not b.strip():
+            out.add(n)
+    # a line that is ONLY a string literal strips to blank in both; attribute it to
+    # its neighbourhood: inside a test region iff the previous line was.
+    lines = stripped.splitlines()
+    for n in range(1, len(lines) + 1):
+        if not lines[n - 1].strip() and (n - 1) in out:
+            out.add(n)
+    return out
+
+
+def scan_raw(
+    path: str, raw: str, allowed: set[int] | None = None, tests: set[int] | None = None
+) -> list[str]:
+    """Rule 8 on the unstripped source, production lines only."""
+    allowed = allowed or set()
+    tests = tests or set()
+    findings: list[str] = []
+    for n, line in enumerate(raw.splitlines(), 1):
+        if n in allowed or n in tests:
+            continue
+        if line.lstrip().startswith("//"):
+            continue
+        if CREDENTIAL_IN_URL.search(line):
+            findings.append(
+                f"{path}:{n}: [8 credential in a URL] send it in a header — a URL is "
+                "rendered into reqwest errors, access logs and proxies (ONE GATEWAY D6)"
+            )
+    return findings
+
+
 def scan_tree() -> list[str]:
     findings: list[str] = []
     for root in SCAN_ROOTS:
@@ -266,8 +355,11 @@ def scan_tree() -> list[str]:
                 continue
             rel = str(p.relative_to(ROOT))
             raw = p.read_text(encoding="utf-8")
-            src = production_part(strip_comments_and_strings(raw))
-            findings.extend(scan_source(rel, src, allowed_lines(raw)))
+            stripped = strip_comments_and_strings(raw)
+            src = production_part(stripped)
+            allowed = allowed_lines(raw)
+            findings.extend(scan_source(rel, src, allowed))
+            findings.extend(scan_raw(rel, raw, allowed, test_lines(stripped)))
     return findings
 
 
@@ -396,12 +488,66 @@ def selftest() -> int:
             'impl X {\n    #[cfg(test)]\n    fn t() { unsafe { std::env::set_var("A", "b") }; }\n    fn p() { let _ = 1; }\n}\n',
             False,
         ),
+        (
+            "8 a key in a provider URL query BLOCKS (the D6 shape)",
+            "crates/x/src/providers/google.rs",
+            'fn u() { let url = format!("{}/v1beta/models/{}:x?alt=sse&key={}", b, m, k); }\n',
+            True,
+        ),
+        (
+            "8 a key in a URL inside the test module passes",
+            "crates/x/src/providers/google.rs",
+            'fn u() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        let url = format!("http://x/?key={}", k);\n    }\n}\n',
+            False,
+        ),
+        (
+            "8 the key in a header passes",
+            "crates/x/src/providers/google.rs",
+            'fn u() { let r = c.post(url).header("x-goog-api-key", k); }\n',
+            False,
+        ),
+        (
+            "9 a provider send whose error keeps the URL BLOCKS",
+            "crates/x/src/providers/foo.rs",
+            'async fn s() { let r = c.post(u).send().await.context("send")?; }\n',
+            True,
+        ),
+        (
+            "9 a provider send with .without_url() in the statement passes",
+            "crates/x/src/providers/foo.rs",
+            'async fn s() {\n    let r = c\n        .post(u)\n        .send()\n        .await\n        .map_err(|e| e.without_url())\n        .context("send")?;\n}\n',
+            False,
+        ),
+        (
+            "9 OG-06: a send in media_routes.rs that keeps the URL BLOCKS",
+            "crates/gateway/src/media_routes.rs",
+            'async fn s() { let r = c.post(u).send().await.context("send")?; }\n',
+            True,
+        ),
+        (
+            "9 OG-06: a send in files_batches.rs that keeps the URL BLOCKS",
+            "crates/gateway/src/files_batches.rs",
+            'async fn s() { let r = c.post(u).send().await.context("send")?; }\n',
+            True,
+        ),
+        (
+            "9 OG-06: a send in media_common.rs with .without_url() passes",
+            "crates/gateway/src/media_common.rs",
+            "async fn s() { let r = c.post(u).send().await.map_err(reqwest::Error::without_url)?; }\n",
+            False,
+        ),
+        (
+            "9 a send outside the provider scope is not this rule's business",
+            "crates/x/src/alerts/mod.rs",
+            "async fn s() { let r = c.post(u).send().await?; }\n",
+            False,
+        ),
     ]
     rc = 0
     for label, path, src, want_hit in cases:
-        hits = scan_source(
-            path, production_part(strip_comments_and_strings(src)), allowed_lines(src)
-        )
+        stripped = strip_comments_and_strings(src)
+        hits = scan_source(path, production_part(stripped), allowed_lines(src))
+        hits += scan_raw(path, src, allowed_lines(src), test_lines(stripped))
         ok = bool(hits) == want_hit
         print(f"  {'✔' if ok else '✗'} {label}: {'blocked' if hits else 'passed'}")
         if not ok:
@@ -425,9 +571,7 @@ def main(argv: list[str]) -> int:
             print(f"  ✗ {f}")
         print("→ .claude/rules/security.md names each pattern and its incident.")
         return 1
-    print(
-        "banned patterns: OK — none of the seven security.md patterns in production code."
-    )
+    print("banned patterns: OK — none of the nine banned patterns in production code.")
     return 0
 
 

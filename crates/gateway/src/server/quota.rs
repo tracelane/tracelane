@@ -17,8 +17,6 @@
 
 use tracelane_shared::TenantId;
 
-use super::AppState;
-
 /// Current UTC calendar month as `YYYYMM` (e.g. `202607`) — the seed key for
 /// the durable monthly spend counters' month-boundary reset.
 pub(crate) fn current_year_month() -> u32 {
@@ -84,12 +82,15 @@ pub const WORKSPACE_SPEND_THIS_MONTH_SQL: &str = "SELECT toFloat64(sum(cost_usd)
           AND cost_usd_present = 1 \
           AND start_time >= toStartOfMonth(now())";
 
+/// `OG-22`: `None` = the read FAILED — the workspace's spend is UNKNOWN and a hard budget
+/// refuses (fail-CLOSED; this used to seed `0`, the absorbed fail-open). No ClickHouse
+/// configured ⇒ `Some(0.0)`: no durable source, the in-process counter is the accounting.
 pub(crate) async fn workspace_spend_baseline_from_clickhouse(
-    state: &AppState,
+    src: crate::budgets::SpendSource<'_>,
     tenant_id: &TenantId,
-) -> f64 {
-    let Some(url) = state.quota_ch_url.clone() else {
-        return 0.0;
+) -> Option<f64> {
+    let Some(url) = src.quota_ch_url else {
+        return Some(0.0);
     };
     #[derive(serde::Deserialize, clickhouse::Row)]
     struct SumRow {
@@ -99,10 +100,9 @@ pub(crate) async fn workspace_spend_baseline_from_clickhouse(
     // hot-path reads, surfaced when B-385's split let `check-ch-reads-capped.py`
     // see this code for the first time). One warm entitlement-cache read —
     // admission just resolved the same tenant. A tenant whose monthly aggregate
-    // exceeds its tier's row/time cap lands in the `Err` arm below (fail-open,
-    // seed 0, logged), which is the existing posture, now bounded.
-    let tier =
-        crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), tenant_id).await;
+    // exceeds its tier's row/time cap lands in the `Err` arm below: UNKNOWN (OG-22,
+    // fail-closed for a hard budget), counted.
+    let tier = crate::clickhouse_query::tier_for_tenant(src.entitlements, tenant_id).await;
     let sql = crate::clickhouse_query::TenantQuery::new(WORKSPACE_SPEND_THIS_MONTH_SQL, tier)
         .sql_with_settings();
     match crate::clickhouse_query::ch_client(url)
@@ -111,27 +111,34 @@ pub(crate) async fn workspace_spend_baseline_from_clickhouse(
         .fetch_one::<SumRow>()
         .await
     {
-        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => row.usd,
-        Ok(_) => 0.0,
+        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => Some(row.usd),
+        Ok(_) => Some(0.0),
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                tenant_id = %tenant_id,
-                "workspace spend baseline ClickHouse read failed; seeding 0 (fail-open)"
-            );
-            0.0
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::BudgetSpendUnknown,
+            ) == 1
+            {
+                tracing::warn!(
+                    error = %e,
+                    tenant_id = %tenant_id,
+                    "workspace spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (OG-22 fail-closed)"
+                );
+            }
+            None
         }
     }
 }
 
+/// `OG-22`: as [`workspace_spend_baseline_from_clickhouse`] — `None` = UNKNOWN (the key's
+/// hard budget refuses), `Some(0.0)` with no ClickHouse configured.
 pub(crate) async fn spend_baseline_from_clickhouse(
-    state: &AppState,
+    src: crate::budgets::SpendSource<'_>,
     tenant_id: &TenantId,
     api_key_id: &str,
     cadence: crate::spend::BudgetReset,
-) -> f64 {
-    let Some(url) = state.quota_ch_url.clone() else {
-        return 0.0;
+) -> Option<f64> {
+    let Some(url) = src.quota_ch_url else {
+        return Some(0.0);
     };
     #[derive(serde::Deserialize, clickhouse::Row)]
     struct SumRow {
@@ -143,8 +150,7 @@ pub(crate) async fn spend_baseline_from_clickhouse(
     // admission just resolved the same tenant. A tenant whose monthly aggregate
     // exceeds its tier's row/time cap lands in the `Err` arm below (fail-open,
     // seed 0, logged), which is the existing posture, now bounded.
-    let tier =
-        crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), tenant_id).await;
+    let tier = crate::clickhouse_query::tier_for_tenant(src.entitlements, tenant_id).await;
     // BILL-01 A3: same ONE query either way — `key_spend_sql` only picks which
     // window's WHERE clause it reads, keyed on the key's own `budget_reset`.
     let sql =
@@ -156,21 +162,24 @@ pub(crate) async fn spend_baseline_from_clickhouse(
         .fetch_one::<SumRow>()
         .await
     {
-        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => row.usd,
-        Ok(_) => 0.0,
+        Ok(row) if row.usd.is_finite() && row.usd > 0.0 => Some(row.usd),
+        Ok(_) => Some(0.0),
         Err(e) => {
-            // Fail OPEN, and say so. A control-plane read failure must not stop a
-            // customer's production traffic — the same choice
-            // `workspace_spend_baseline_from_clickhouse` makes. The cost is that a
-            // restart during a ClickHouse outage forgives that key's accrued spend
-            // until the next month rolls; that is stated in `spend.rs`'s module
-            // docs rather than left for an operator to discover.
-            tracing::warn!(
-                error = %e,
-                tenant_id = %tenant_id,
-                "per-key spend baseline ClickHouse read failed; seeding 0 (fail-open)"
-            );
-            0.0
+            // OG-22 (2026-10-04): fail CLOSED. Until this change a failed read seeded 0,
+            // so a restart during a ClickHouse outage forgave the key's accrued spend and
+            // its HARD cap let traffic through. Now the spend is UNKNOWN: the caller
+            // refuses `503 budget_spend_unknown` and retries the read after the backoff.
+            if tracelane_shared::degradation::note(
+                tracelane_shared::degradation::Degradation::BudgetSpendUnknown,
+            ) == 1
+            {
+                tracing::warn!(
+                    error = %e,
+                    tenant_id = %tenant_id,
+                    "per-key spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (OG-22 fail-closed)"
+                );
+            }
+            None
         }
     }
 }

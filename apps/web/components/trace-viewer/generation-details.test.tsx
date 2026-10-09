@@ -60,10 +60,10 @@ it("puts an issue on its child row, rolls it up as one of three spans, and prese
 	const child = container.querySelector(
 		'[data-span-row="flagged-child"]',
 	) as HTMLElement;
-	expect(within(child).getByText("Truncated")).toBeTruthy();
+	expect(within(child).getByText("Hit token limit")).toBeTruthy();
 	expect(
 		container.querySelector('[data-span-row="clean-child"]')?.textContent,
-	).not.toContain("Truncated");
+	).not.toContain("Hit token limit");
 	fireEvent.click(screen.getByRole("button", { name: "flagged-child" }));
 	expect(screen.getByText("Generation issues")).toBeTruthy();
 	expect(screen.getByText(/Not recorded:.*gen_ai_response_model/)).toBeTruthy();

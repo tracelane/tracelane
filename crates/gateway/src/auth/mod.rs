@@ -16,6 +16,8 @@
 //! SPIFFE mTLS for ingest workers lives in `crates/ingest/src/auth.rs`.
 
 pub mod api_key;
+/// OG-34 — the ONE role × capability matrix (`Claims::can`).
+pub mod capability;
 pub mod jwks;
 mod org_tenant_cache;
 /// API-key capability model. Defined in `tracelane_shared` (see that module's
@@ -83,7 +85,7 @@ pub struct Claims {
     /// (IDENTITY_TEAM_SPEC §1). `None` means the slug was **absent or
     /// unrecognised** — on a JWT that is a denial (PL-9); off a JWT (API keys,
     /// service tokens, mTLS) there is no role system to read and authority is
-    /// unchanged. See [`Claims::can_admin`] / [`Claims::has_no_role_system`].
+    /// unchanged. See [`Claims::can`] and `capability::MATRIX`.
     pub role: Option<Role>,
     /// A13 — what this credential is allowed to DO, resolved once at auth time.
     ///
@@ -117,6 +119,13 @@ pub struct Claims {
     /// `admission::run`'s `KeyBudget` step reads it only when a key budget is
     /// actually being enforced.
     pub budget_reset: crate::spend::BudgetReset,
+    /// `OG-20` / `OG-23` — the key's project, environment and policy layers, resolved
+    /// in the SAME SELECT that authenticated it and cached with it. `None` for every
+    /// non-API-key credential (a session is not governed by a key policy; `OG-36` is the
+    /// admin-plane control) and for a key with no project and no policy — today's
+    /// behaviour. The `source_ips` half is enforced at authentication
+    /// (`api_key::validate`), the rest at `admission`'s `Step::Policy`.
+    pub governance: Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
 }
 
 impl Claims {
@@ -124,24 +133,56 @@ impl Claims {
     ///
     /// The ONE place a route asks the scope question. A route that compares
     /// slugs itself will drift from the vocabulary; call this.
+    ///
+    /// **OG-34: a human session's ROLE caps the `read` scope.** A WorkOS JWT is
+    /// `LegacyFullSurface` (it has no scope system), so before OG-34 every role read
+    /// recorded content. The `billing` role must not, so for a JWT `read` also
+    /// requires [`capability::Capability::ReadTraces`]. Nothing else changes: an
+    /// API key is still governed by its scopes alone, and the other scopes are not
+    /// role-capped. Spend reads that the billing role needs use
+    /// [`Self::allows_spend_read`] instead.
     #[must_use]
     pub fn allows_scope(&self, needed: scope::Scope) -> bool {
-        self.key_scope.allows(needed)
+        if !self.key_scope.allows(needed) {
+            return false;
+        }
+        if matches!(self.auth_method, AuthMethod::JwtBearer) && needed == scope::Scope::Read {
+            return self.can(capability::Capability::ReadTraces);
+        }
+        true
+    }
+
+    /// OG-34: may this caller read SPEND (usage, cost aggregates)? The `read` scope
+    /// for a key, and [`capability::Capability::ViewSpend`] for the role — which,
+    /// unlike recorded content, the `billing` role holds.
+    #[must_use]
+    pub fn allows_spend_read(&self) -> bool {
+        self.key_scope.allows(scope::Scope::Read) && self.can(capability::Capability::ViewSpend)
     }
 }
 
-/// The three org roles (IDENTITY_TEAM_SPEC §1). Read from the WorkOS session
-/// JWT `role` claim; never stored in a Tracelane role table.
+/// The four org roles (IDENTITY_TEAM_SPEC §1, OG-34). Read from the WorkOS session
+/// JWT `role` claim; never stored in a Tracelane role table. What each may DO is
+/// [`capability::MATRIX`], not anything on this enum.
 ///
 /// Every slug that grants anything is named here. WorkOS's built-in `admin` is
 /// mapped to [`Role::Owner`] **explicitly**, so org full access is a decision
 /// rather than a fallthrough; any other slug, and an absent slug, are
-/// unrecognised and grant nothing on a JWT (PL-9).
+/// unrecognised and resolve to the matrix's `unrecognised` column (PL-9).
+///
+/// **Names (OG-34).** The product roles are admin / developer / viewer / billing.
+/// `Owner` IS the admin role and `Member` IS the developer role — the variant names
+/// predate OG-34 and are kept so concurrent branches compile;
+/// [`Role::product_name`] is the name the API and the audit trail use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// The admin role (slugs `owner`, `admin`).
     Owner,
+    /// The developer role (slugs `developer`, legacy `member`).
     Member,
     Viewer,
+    /// OG-34: spend, budgets and billing — and no recorded content.
+    Billing,
 }
 
 impl Role {
@@ -154,8 +195,11 @@ impl Role {
             // reached full access through the `_` arm below, which made the
             // WorkOS DEFAULT role indistinguishable from a typo.
             "owner" | "admin" => Some(Self::Owner),
-            "member" => Some(Self::Member),
+            // OG-34: `developer` is the product name; `member` is the slug every
+            // workspace provisioned before OG-34 carries. Same role.
+            "developer" | "member" => Some(Self::Member),
             "viewer" => Some(Self::Viewer),
+            "billing" => Some(Self::Billing),
             _ => None,
         }
     }
@@ -173,13 +217,11 @@ impl Claims {
     /// May this caller mint/revoke API keys? `owner` and `member` may
     /// (IDENTITY_TEAM_SPEC §1: members mint their own keys); `viewer` may not,
     /// and neither may a JWT whose role slug is unrecognised or absent — see
-    /// [`Self::has_no_role_system`].
+    /// the matrix's `unrecognised` column (`capability.rs`).
+    ///
+    /// OG-34: the [`capability::Capability::MintKeys`] row of the matrix.
     pub fn can_mint_keys(&self) -> bool {
-        match self.role {
-            Some(Role::Owner | Role::Member) => true,
-            Some(Role::Viewer) => false,
-            None => self.has_no_role_system(),
-        }
+        self.can(capability::Capability::MintKeys)
     }
 
     /// May this caller perform an owner-scoped action that can WEAKEN a
@@ -197,9 +239,12 @@ impl Claims {
     /// Use this for actions whose misuse is silent and damaging — moving
     /// guardrail capabilities, revoking or replacing provider credentials. Use
     /// `can_admin` for owner-scoped actions that are merely sensitive to read.
+    ///
+    /// OG-34: the [`capability::Capability::EditPolicies`] row of the matrix (admin
+    /// on a WorkOS session, and nobody else). New code names the capability.
     #[must_use]
     pub fn is_verified_owner(&self) -> bool {
-        matches!(self.auth_method, AuthMethod::JwtBearer) && self.can_admin()
+        self.can(capability::Capability::EditPolicies)
     }
 
     /// May this caller perform owner-scoped actions — billing, BYOK provider /
@@ -208,7 +253,7 @@ impl Claims {
     /// `owner` (and the WorkOS built-in `admin`, which maps to it) may.
     /// `member` and `viewer` are denied. A JWT carrying an unrecognised or
     /// absent slug is **denied** — that is PL-9; see
-    /// [`Self::has_no_role_system`] for why non-JWT principals differ.
+    /// the matrix's `api_key` / `master` columns for why non-JWT principals differ.
     /// The `api_keys.id` that authorised this request, if a `tlane_` API key did.
     ///
     /// `sub` is `"apikey:<uuid>"` for an API key and a WorkOS user id for a
@@ -227,12 +272,11 @@ impl Claims {
         self.sub.strip_prefix("apikey:")
     }
 
+    ///
+    /// OG-34: the [`capability::Capability::ViewPolicies`] row of the matrix (admin,
+    /// and the self-host operator). New code names the capability.
     pub fn can_admin(&self) -> bool {
-        match self.role {
-            Some(Role::Owner) => true,
-            Some(Role::Member | Role::Viewer) => false,
-            None => self.has_no_role_system(),
-        }
+        self.can(capability::Capability::ViewPolicies)
     }
 
     /// May this caller CHANGE what prompt runs in production?
@@ -253,49 +297,41 @@ impl Claims {
     ///
     /// `None` + `JwtBearer` is **denied** — an absent or unrecognised role slug on a
     /// human token is the PL-9 shape and fails closed.
+    ///
+    /// OG-34: the [`capability::Capability::WritePrompts`] row of the matrix — admin,
+    /// a tenant API key (the automation path) and the self-host operator.
     pub fn can_write_prompts(&self) -> bool {
-        match self.role {
-            // `admin` maps to Owner in `Role::from_slug`; both are full org access.
-            Some(Role::Owner) => true,
-            Some(Role::Member | Role::Viewer) => false,
-            // Machine credentials: a tenant API key is the automation path, and the
-            // self-host master key is the operator's only credential.
-            None => matches!(
-                self.auth_method,
-                AuthMethod::ApiKey | AuthMethod::SelfHostMasterKey
-            ),
-        }
+        self.can(capability::Capability::WritePrompts)
     }
 
-    /// `role == None` means the WorkOS `role` claim was **absent or carried a
-    /// slug we do not recognise**. What that resolves to depends entirely on
-    /// how the caller authenticated, and conflating the two is PL-9.
-    ///
-    /// **On a JWT it is a denial.** WorkOS's default org role is `admin`, so
-    /// before this fix the default role, a renamed role and an outright typo
-    /// all landed on the same "grant everything" branch — privilege escalation
-    /// by default, and silent. A JWT is exactly the case where a role system
-    /// exists and we failed to read a role from it, so it fails CLOSED.
-    ///
-    /// **Off a JWT, exactly ONE principal is privileged without a slug: the
-    /// self-host master key** ([`AuthMethod::SelfHostMasterKey`],
-    /// `sub = "self-host"`). It is the operator of a single-tenant deployment
-    /// and its only credential — there is no role system to consult and nobody
-    /// else to ask.
-    ///
-    /// **Everything else is denied (PL-9b).** A tenant API key used to land here
-    /// too, and that was a live escalation: [`Self::can_mint_keys`] deliberately
-    /// lets a *member* mint a key, so member → mint → owner-only surface.
-    /// A and closed the two worst surfaces one at a time with
-    /// [`Self::is_verified_owner`]; six others stayed open until this. `Mtls` is
-    /// ingest's service identity and never needed admin either.
-    ///
-    /// The reason this took a second commit is that the operator and the tenant
-    /// machine credential **shared one `AuthMethod` variant**, so demoting one
-    /// demoted the other. They are different principals; now they say so.
-    fn has_no_role_system(&self) -> bool {
-        matches!(self.auth_method, AuthMethod::SelfHostMasterKey)
-    }
+    // ── `role == None` (PL-9 / PL-9b) — now the matrix's `unrecognised`, `api_key`
+    // and `master` columns (OG-34, `capability.rs`). The reasoning, kept:
+    // `role == None` means the WorkOS `role` claim was **absent or carried a
+    // slug we do not recognise**. What that resolves to depends entirely on
+    // how the caller authenticated, and conflating the two is PL-9.
+    //
+    // **On a JWT it is a denial.** WorkOS's default org role is `admin`, so
+    // before this fix the default role, a renamed role and an outright typo
+    // all landed on the same "grant everything" branch — privilege escalation
+    // by default, and silent. A JWT is exactly the case where a role system
+    // exists and we failed to read a role from it, so it fails CLOSED.
+    //
+    // **Off a JWT, exactly ONE principal is privileged without a slug: the
+    // self-host master key** ([`AuthMethod::SelfHostMasterKey`],
+    // `sub = "self-host"`). It is the operator of a single-tenant deployment
+    // and its only credential — there is no role system to consult and nobody
+    // else to ask.
+    //
+    // **Everything else is denied (PL-9b).** A tenant API key used to land here
+    // too, and that was a live escalation: [`Self::can_mint_keys`] deliberately
+    // lets a *member* mint a key, so member → mint → owner-only surface.
+    // A and closed the two worst surfaces one at a time with
+    // [`Self::is_verified_owner`]; six others stayed open until this. `Mtls` is
+    // ingest's service identity and never needed admin either.
+    //
+    // The reason this took a second commit is that the operator and the tenant
+    // machine credential **shared one `AuthMethod` variant**, so demoting one
+    // demoted the other. They are different principals; now they say so.
 }
 
 /// Typed `403 role_forbidden` JSON body (shape: `{"error",...}` +
@@ -400,19 +436,21 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
         // BILL-01 A3: no per-key budget on this credential either; `Monthly`
         // is inert here (see the field doc) rather than meaningful.
         budget_reset: crate::spend::BudgetReset::Monthly,
+        governance: None,
     })
 }
 
 /// Constant-time byte-slice equality. A length mismatch returns early — that
 /// reveals only the length, and the per-byte comparison over the shared length
 /// is branch-free.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut diff: u8 = 0;
     for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+        // `black_box` keeps the optimiser from turning the fold into an early exit.
+        diff |= std::hint::black_box(x ^ y);
     }
     diff == 0
 }
@@ -447,6 +485,13 @@ struct WorkOsClaims {
     /// `viewer`). Absent on service tokens and pre-role-config JWTs.
     #[serde(default)]
     role: Option<String>,
+    /// OG-36: the WorkOS session id. AuthKit access tokens carry it
+    /// (`@workos-inc/authkit-nextjs` 4.0.1 `types/interfaces.d.ts:54-62`, `sid: string`);
+    /// they do NOT carry the authentication method, which is why SSO-required
+    /// resolves `sid` → `auth_method` through the WorkOS sessions API
+    /// (`control_plane::sso`). Read only by [`verified_session`].
+    #[serde(default)]
+    sid: Option<String>,
 }
 
 /// B-391 (c): the credential could not be CHECKED — as distinct from checked
@@ -495,12 +540,46 @@ pub fn is_store_unavailable(err: &anyhow::Error) -> bool {
         .any(|c| c.downcast_ref::<AuthStoreUnavailable>().is_some())
 }
 
+/// B-594: true when the cold key lookup was refused by the source's
+/// failed-lookup budget ([`crate::db::api_keys::AuthThrottled`]) — 429, before
+/// the store, distinct from both an outage and a wrong key.
+#[must_use]
+pub fn is_throttled(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<crate::db::api_keys::AuthThrottled>()
+            .is_some()
+    })
+}
+
+/// `OG-20`: the key authenticated, and its policy refuses this request at the
+/// authentication stage — a `source_ips` rule the request's address is outside, or a
+/// stored policy that does not parse (fail-CLOSED). Typed so every route answers 403
+/// with the policy's own code, never the 401 a wrong key gets: the credential is GOOD,
+/// and a customer must not rotate it.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", .0.message)]
+pub struct PolicyRefused(pub tracelane_shared::key_policy::Denial);
+
+/// The policy refusal carried by a failed [`validate_authorization`], if that is what
+/// it was.
+#[must_use]
+pub fn policy_refusal(err: &anyhow::Error) -> Option<&tracelane_shared::key_policy::Denial> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<PolicyRefused>())
+        .map(|p| &p.0)
+}
+
 /// The status for a failed [`validate_authorization`]. ONE place, so the 28
 /// route families that authenticate cannot disagree about what an outage
-/// looks like: 503 when the store was unreachable, 401 otherwise.
+/// looks like: 503 when the store was unreachable, 429 when the source was
+/// throttled before it (B-594), 401 otherwise.
 #[must_use]
 pub fn failure_status(err: &anyhow::Error) -> StatusCode {
-    if is_store_unavailable(err) {
+    if policy_refusal(err).is_some() {
+        StatusCode::FORBIDDEN
+    } else if is_throttled(err) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if is_store_unavailable(err) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::UNAUTHORIZED
@@ -511,7 +590,26 @@ pub fn failure_status(err: &anyhow::Error) -> StatusCode {
 /// sentence rather than the error's own text.
 #[must_use]
 pub fn failure(err: &anyhow::Error) -> (StatusCode, &'static str) {
-    if is_store_unavailable(err) {
+    if let Some(d) = policy_refusal(err) {
+        // OG-20: static wording per code (the full text rides `PolicyRefused`, which
+        // admission renders with its code, rule and layer).
+        let message = if d.code == "policy_ip_denied" {
+            "this API key's policy does not allow requests from this network address"
+        } else if d.origin == tracelane_shared::key_policy::Origin::Workspace {
+            // rev6 N4: an unparseable WORKSPACE policy refuses every key at authentication.
+            "this workspace's policy could not be read, so every API key is refused — a \
+             workspace owner must correct or clear it"
+        } else {
+            "this API key's policy could not be read, so every request on it is refused — a \
+             workspace owner must correct or clear it"
+        };
+        (StatusCode::FORBIDDEN, message)
+    } else if is_throttled(err) {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed authentications from this source — retry shortly",
+        )
+    } else if is_store_unavailable(err) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "authentication temporarily unavailable — retry",
@@ -525,7 +623,11 @@ pub fn failure(err: &anyhow::Error) -> (StatusCode, &'static str) {
 /// [`failure`].
 #[must_use]
 pub fn failure_code(err: &anyhow::Error) -> &'static str {
-    if is_store_unavailable(err) {
+    if let Some(d) = policy_refusal(err) {
+        d.code
+    } else if is_throttled(err) {
+        "auth_throttled"
+    } else if is_store_unavailable(err) {
         "auth_unavailable"
     } else {
         "unauthorized"
@@ -691,9 +793,73 @@ async fn validate_jwt(token: &str) -> Result<(Claims, AuthPath)> {
             rate_limit_rpm: None,
             // BILL-01 A3: a JWT carries no per-key budget cadence either.
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         },
         path,
     ))
+}
+
+/// The `exp` (unix seconds) in a bearer JWT's payload — **read, NOT verified**.
+///
+/// For a token [`validate_jwt`] has ALREADY verified (signature, `exp`, `iss`, `aud`) on the
+/// request being served, whose holder wants to know WHEN that verification stops being true:
+/// a long-lived connection (a realtime session) re-checks it against the clock. It can only
+/// ever be used to END something sooner; never to admit, never on a token that has not been
+/// through admission. `None` (not a three-part token, an undecodable payload, no numeric
+/// `exp`) is the caller's to treat as fail-CLOSED.
+#[must_use]
+pub(crate) fn jwt_exp(authorization: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let token = authorization.trim().strip_prefix("Bearer ")?.trim();
+    let mut parts = token.split('.');
+    let (_header, payload, _sig) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+/// OG-36: the WorkOS session id (`sid`) of a bearer JWT — **re-verified**, not
+/// merely decoded: the same signature, expiry, issuer and audience checks as
+/// [`validate_jwt`], against the same cached JWKS (a warm cache costs no network) —
+/// with (rev5 L3) the WorkOS organization the token was issued for (`org_id`), which is
+/// the workspace the request acts on. `Ok(None)` for a credential that is not a WorkOS
+/// JWT (an API key, the self-host master key, the debug dev stub) or a JWT with no `sid`.
+///
+/// # Errors
+/// Fail-CLOSED: a malformed or unverifiable token is `Err`, and the caller
+/// (SSO-required) refuses rather than treating it as "no session".
+pub async fn verified_session(authorization: &str) -> Result<Option<(String, Option<String>)>> {
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .context("Authorization header must use Bearer scheme")?;
+    if token.starts_with("tlane_") || SELF_HOST_AUTH.get().is_some() {
+        return Ok(None);
+    }
+    if std::env::var("WORKOS_CLIENT_ID").is_err() {
+        // The debug dev stub authenticates without a real JWT; there is no session.
+        return Ok(None);
+    }
+    let header = jsonwebtoken::decode_header(token).context("failed to decode JWT header")?;
+    let kid = header
+        .kid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("JWT missing `kid` in header"))?;
+    let jwks_cache = jwks::get_cached_with_refresh_on_miss(&kid)
+        .await
+        .map_err(|e| AuthStoreUnavailable::new(format!("JWKS: {e:#}")))?;
+    let decoding_key = jwks_cache
+        .lookup(&kid)
+        .ok_or_else(|| anyhow::anyhow!("no JWKS entry for kid={kid}"))?;
+    let claims = decode_and_validate(token, decoding_key, header.alg)?;
+    let org = claims.org_id.filter(|o| !o.is_empty());
+    Ok(claims.sid.filter(|s| !s.is_empty()).map(|sid| (sid, org)))
 }
 
 /// Resolve a `TenantId` from validated WorkOS claims.
@@ -908,6 +1074,7 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
         budget_usd_monthly: None,
         rate_limit_rpm: None,
         budget_reset: crate::spend::BudgetReset::Monthly,
+        governance: None,
     }
 }
 
@@ -1257,6 +1424,7 @@ mod tests {
             tenant_id: tenant_id.map(str::to_string),
             org_id: org_id.map(str::to_string),
             role: None,
+            sid: None,
         }
     }
 
@@ -1271,6 +1439,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
 
@@ -1286,6 +1455,45 @@ mod tests {
         assert_eq!(Role::from_slug("Owner"), None); // case-sensitive slug
         assert_eq!(Role::from_slug(""), None);
         assert_eq!(Role::from_slug("administrator"), None);
+    }
+
+    /// OG-34: the two new product slugs resolve; their near-misses do not.
+    #[test]
+    fn og34_developer_and_billing_slugs_resolve_and_near_misses_do_not() {
+        assert_eq!(Role::from_slug("developer"), Some(Role::Member));
+        assert_eq!(Role::from_slug("billing"), Some(Role::Billing));
+        assert_eq!(Role::from_slug("Developer"), None);
+        assert_eq!(Role::from_slug("billing-admin"), None);
+        assert_eq!(Role::from_slug("finance"), None);
+    }
+
+    /// OG-34: a WorkOS session's role caps the `read` scope — `billing` reads spend,
+    /// not recorded content; every other role (and an unrecognised slug, PL-9 as
+    /// shipped) still reads; an API key is governed by its scopes alone.
+    #[test]
+    fn og34_the_billing_role_reads_spend_but_not_recorded_content() {
+        use scope::Scope;
+        let billing = claims_with_role(Some(Role::Billing));
+        assert!(!billing.allows_scope(Scope::Read));
+        assert!(billing.allows_spend_read());
+        assert!(
+            billing.allows_scope(Scope::Chat),
+            "only `read` is role-capped"
+        );
+        for role in [
+            Some(Role::Owner),
+            Some(Role::Member),
+            Some(Role::Viewer),
+            None,
+        ] {
+            let c = claims_with_role(role);
+            assert!(c.allows_scope(Scope::Read), "{role:?} still reads");
+            assert!(c.allows_spend_read());
+        }
+        let mut key = claims_with_role(None);
+        key.auth_method = AuthMethod::ApiKey;
+        key.role = Some(Role::Billing); // impossible on a key; proves the column is by principal
+        assert!(key.allows_scope(Scope::Read));
     }
 
     /// PL-9, DRIVEN — the two shapes the founder named, pushed through the same
@@ -1317,6 +1525,7 @@ mod tests {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
+                governance: None,
             };
             assert_eq!(claims.role, None, "{raw:?} must not resolve to a role");
             assert!(
@@ -1345,6 +1554,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         };
         assert_eq!(admin.role, Some(Role::Owner));
         assert!(admin.can_admin() && admin.can_mint_keys() && admin.is_verified_owner());
@@ -1587,6 +1797,44 @@ mod tests {
             rt().block_on(resolve_tenant_id(&claims(Some(""), Some(""))))
                 .is_err()
         );
+    }
+
+    /// rev6 M1-low-a: the expiry reader wants a three-part token with a numeric `exp` — and
+    /// nothing else yields a value (the caller treats `None` as fail-CLOSED).
+    #[test]
+    fn jwt_exp_reads_only_a_three_part_token_with_a_numeric_exp() {
+        use base64::Engine as _;
+        let seg = |v: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        let token = |payload: serde_json::Value| {
+            format!(
+                "Bearer {}.{}.c2ln",
+                seg(serde_json::json!({"alg": "RS256"})),
+                seg(payload)
+            )
+        };
+        assert_eq!(
+            jwt_exp(&token(
+                serde_json::json!({"sub": "u", "exp": 1_900_000_000u64})
+            )),
+            Some(1_900_000_000)
+        );
+        assert_eq!(
+            jwt_exp(&token(serde_json::json!({"sub": "u"}))),
+            None,
+            "no exp"
+        );
+        assert_eq!(
+            jwt_exp(&token(serde_json::json!({"exp": "soon"}))),
+            None,
+            "a non-numeric exp"
+        );
+        assert_eq!(jwt_exp("Bearer a.b"), None, "two parts");
+        assert_eq!(jwt_exp("Bearer a.b.c.d"), None, "four parts");
+        assert_eq!(jwt_exp("Bearer tlane_abc"), None, "an API key");
+        assert_eq!(jwt_exp("Bearer a.!!!.c"), None, "an undecodable payload");
+        assert_eq!(jwt_exp("a.b.c"), None, "not a Bearer credential");
     }
 
     // Pre-existing rejection tests (expired, bad-signature, non-uuid)

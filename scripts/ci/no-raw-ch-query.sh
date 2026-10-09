@@ -125,6 +125,23 @@ scan_tree() {
             # If the first ever exceeds the second by more than three, this
             # entry is a lie and the file is silently uncapped again.
             crates/gateway/src/audit_export.rs) continue ;;
+            # A+C release (2026-10-01) — COMPLIANT, NOT EXEMPT; verified at merge,
+            # re-checkable by count (the audit_export.rs pattern above):
+            #  · workspace_glance.rs — every read is `capped_sql(tier, tenant, …)`,
+            #    i.e. `TenantQuery::new(…, tier).sql_with_settings()` at the tenant's
+            #    own tier; the only other `.query(` is one #[cfg(test)] INSERT:
+            #      grep -c '\.query(' …/workspace_glance.rs    # 12
+            #      grep -c 'capped_sql(' …/workspace_glance.rs  # 12 (11 calls + the fn)
+            #  · outcome_routes.rs — the 3 reads are `TenantQuery::new(…, PlanTier::Free)
+            #    .sql_with_settings()`; the 4th `.query(` is the outcome INSERT (a write):
+            #      grep -c '\.query(' …/outcome_routes.rs       # 4
+            #      grep -c 'sql_with_settings' …/outcome_routes.rs  # 3
+            #  · agent_loops.rs — builds SQL only; production reads run through
+            #    trace_reads.rs (TenantQuery). Its one `.query(` is inside #[cfg(test)].
+            # If any count moves, re-verify before trusting this entry.
+            crates/gateway/src/workspace_glance.rs) continue ;;
+            crates/gateway/src/outcome_routes.rs) continue ;;
+            crates/gateway/src/agent_loops.rs) continue ;;
             # ClickHouseEvalGate: single-row tenant-scoped PK lookup against
             # eval_runs, internally bounded like prompt_history. V1.1 sweep
             # routes it through TenantQuery for consistency (ADR-031).
@@ -176,6 +193,16 @@ PY
             # The INSERT into `online_eval_scores` is a write, which this guard
             # does not police.
             crates/gateway/src/online_eval.rs) continue ;;
+            # OG-22 budgets (2026-10-04). COMPLIANT, NOT EXEMPT: the ONE `.query(` site
+            # (`budgets.rs`, the spend-seed helper) builds every SELECT through
+            # `TenantQuery::new(sql, tier).sql_with_settings()` with the tenant bound from the
+            # validated claim. Listed for the same reason as every entry here.
+            crates/gateway/src/budgets.rs) continue ;;
+            # OG-51 cache statistics. COMPLIANT, NOT EXEMPT: the one SELECT uses
+            # TenantQuery::new(..., tier).sql_with_settings() at the tenant's own
+            # tier and binds tenant_id first (cache_routes.rs::stats). The separate
+            # check-ch-reads-capped.py guard verifies caps at this call site.
+            crates/gateway/src/cache_routes.rs) continue ;;
             # EVL-28 item 11 — the READ side of online evals (`/v1/online-evals/
             # scores` and `/summary`). All three SELECTs are wrapped by
             # `TenantQuery` at Builder caps, and every one binds the tenant from

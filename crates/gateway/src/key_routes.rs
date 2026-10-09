@@ -90,6 +90,15 @@ pub trait KeyMinter: Send + Sync {
     ) -> Option<f64>;
 }
 
+/// OG-35: the full request actor the handler scoped
+/// (`control_audit::scoped`, after `require_control`), else the `sub` the trait
+/// passed as a system actor. Either way the store RECORDS; only the request id,
+/// role and address depend on the scope.
+pub(crate) fn audit_actor(sub: &str) -> crate::db::control_audit::Actor {
+    crate::db::control_audit::current()
+        .unwrap_or_else(|| crate::db::control_audit::Actor::system(sub))
+}
+
 /// Production minter — inserts through the shared Postgres pool.
 pub struct PgKeyMinter {
     pub pool: deadpool_postgres::Pool,
@@ -111,7 +120,8 @@ impl KeyMinter for PgKeyMinter {
         actor: &str,
         grace_hours: i64,
     ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
-        crate::db::api_keys::rotate(&self.pool, tenant, id, actor, grace_hours).await
+        let actor = audit_actor(actor);
+        crate::db::api_keys::rotate(&self.pool, tenant, id, &actor, grace_hours).await
     }
     async fn mint(
         &self,
@@ -120,7 +130,14 @@ impl KeyMinter for PgKeyMinter {
         minted_by: Option<&str>,
         opts: crate::db::api_keys::MintOptions,
     ) -> Result<MintedKey> {
-        crate::db::api_keys::mint(&self.pool, tenant, name, minted_by, opts).await
+        match crate::db::control_audit::current() {
+            Some(actor) => {
+                crate::db::api_keys::mint_as(&self.pool, tenant, name, minted_by, opts, &actor)
+                    .await
+            }
+            // No request scope: still recorded, as the minter (`mint`'s system actor).
+            None => crate::db::api_keys::mint(&self.pool, tenant, name, minted_by, opts).await,
+        }
     }
     async fn get_key(&self, tenant: &TenantId, id: uuid::Uuid) -> Result<Option<KeyRecord>> {
         crate::db::api_keys::get(&self.pool, tenant, id).await
@@ -133,7 +150,18 @@ impl KeyMinter for PgKeyMinter {
         patch: &KeyPatch,
         actor: &str,
     ) -> Result<UpdateOutcome> {
-        crate::db::api_keys::update(&self.pool, tenant, id, editor, patch, actor).await
+        let actor = audit_actor(actor);
+        let outcome =
+            crate::db::api_keys::update(&self.pool, tenant, id, editor, patch, &actor).await?;
+        // OG-51: a key's cache narrowing rides the entitlement refresh — drop this workspace's
+        // entry so the next request re-resolves inline rather than within the refresh-ahead.
+        if let UpdateOutcome::Updated { changed, .. } = &outcome
+            && changed.contains(&"cache")
+            && let Some(cache) = &self.entitlements
+        {
+            cache.invalidate(*tenant.as_uuid()).await;
+        }
+        Ok(outcome)
     }
     async fn revoke_key(
         &self,
@@ -141,7 +169,8 @@ impl KeyMinter for PgKeyMinter {
         id: uuid::Uuid,
         actor: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        crate::db::api_keys::revoke_key(&self.pool, tenant, id, actor).await
+        let actor = audit_actor(actor);
+        crate::db::api_keys::revoke_key(&self.pool, tenant, id, &actor).await
     }
     async fn recorded_spend(
         &self,
@@ -244,6 +273,15 @@ struct CreateKeyBody {
     /// `false` — a customer must ask for it.
     #[serde(default)]
     velocity_breaker: bool,
+    /// OG-23: mint the key into this project (a LIVE project of this tenant). Owner only.
+    #[serde(default)]
+    project_id: Option<String>,
+    /// OG-23: the key's environment label — one of the project's. Owner only.
+    #[serde(default)]
+    environment: Option<String>,
+    /// OG-20: the key's own policy (`specs/OG-20-per-key-policy.md` §2). Owner only.
+    #[serde(default)]
+    policy: Option<serde_json::Value>,
 }
 
 /// `POST /v1/keys` response. camelCase to match the dashboard's `CreateResult`
@@ -272,6 +310,10 @@ struct CreateKeyResponse {
     rate_limit_rpm: Option<i32>,
     budget_reset: &'static str,
     velocity_breaker: bool,
+    /// OG-23 / OG-20, as stored.
+    project_id: Option<String>,
+    environment: Option<String>,
+    policy: Option<serde_json::Value>,
 }
 
 /// The known scope slugs, for every 400 this route emits.
@@ -308,7 +350,7 @@ pub fn routes() -> Router<KeyRoutesState> {
 /// A JSON error body: a stable `error` code, a human `message`, and the `field`
 /// when one field is at fault. Every SET-38 / B-586 refusal uses this shape, so
 /// the dashboard can put the text beside the named field.
-fn json_error(
+pub(crate) fn json_error(
     status: StatusCode,
     code: &str,
     message: impl Into<String>,
@@ -346,13 +388,24 @@ fn key_not_found() -> Response {
     )
 }
 
-fn role_forbidden(required: &str) -> Response {
+pub(crate) fn role_forbidden(required: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         crate::auth::role_forbidden_json(required),
     )
         .into_response()
+}
+
+/// `OG-23`: a read route refused for a credential without the `read` scope or a role.
+pub(crate) fn insufficient_read() -> Response {
+    json_error(
+        StatusCode::FORBIDDEN,
+        "insufficient_scope",
+        "this credential cannot read projects — it needs a workspace role, or an API key \
+         with the `read` scope",
+        None,
+    )
 }
 
 /// Who may EDIT a key's limits (spec §2 "authorization"). Fail CLOSED:
@@ -369,39 +422,63 @@ fn role_forbidden(required: &str) -> Response {
 /// member act on the workspace in general, and applied to editing it would let a
 /// member throttle an owner's production key to 1 req/min — the same ingress
 /// kill the web revoke route refuses.
+///
+/// OG-34: read from the matrix — `ManageAllKeys` edits any key, `MintKeys` only the
+/// caller's own (`auth/capability.rs`). Neither is held by an API key or mTLS.
 fn key_editor(claims: &crate::auth::Claims) -> Option<KeyEditor<'_>> {
-    use crate::auth::{AuthMethod, Role};
-    match claims.auth_method {
-        AuthMethod::SelfHostMasterKey => Some(KeyEditor::Any),
-        AuthMethod::JwtBearer => match claims.role {
-            Some(Role::Owner) => Some(KeyEditor::Any),
-            Some(Role::Member) => Some(KeyEditor::MintedBy(&claims.sub)),
-            Some(Role::Viewer) | None => None,
-        },
-        AuthMethod::ApiKey | AuthMethod::Mtls => None,
+    use crate::auth::capability::Capability;
+    if claims.can(Capability::ManageAllKeys) {
+        Some(KeyEditor::Any)
+    } else if claims.can(Capability::MintKeys) {
+        Some(KeyEditor::MintedBy(&claims.sub))
+    } else {
+        None
     }
 }
 
 /// Who may READ one key: any recognised workspace role on a human session (the
 /// dashboard's key list is visible to every role), or the self-host operator.
 /// Not an API key — a machine credential has no business enumerating keys.
+/// OG-34: the matrix's `ViewKeys` row.
 fn can_read_keys(claims: &crate::auth::Claims) -> bool {
-    use crate::auth::AuthMethod;
-    match claims.auth_method {
-        AuthMethod::SelfHostMasterKey => true,
-        AuthMethod::JwtBearer => claims.role.is_some(),
-        AuthMethod::ApiKey | AuthMethod::Mtls => false,
-    }
+    claims.can(crate::auth::capability::Capability::ViewKeys)
+}
+
+/// H1: who may GRANT `passthrough` — a verified owner (JWT `owner`/`admin`), or the
+/// single-tenant self-host master key, which IS the operator of that deployment and has
+/// no role system (`Claims::can_admin`'s `has_no_role_system` arm). A tenant `tlane_` key
+/// is neither (PL-9b), so a member-minted key still cannot self-grant.
+///
+/// **The second arm is UNREACHABLE today** (re-review L-3, settled 2026-10-03): these
+/// routes mount only with a Postgres pool (`server.rs`, `if let Some(pool) = state.pg`)
+/// and self-host refuses to boot with one (`tracelane_shared::self_host::from_env`). The
+/// master key itself is `LegacyFullSurface`, which withholds `passthrough`
+/// (`api_scope.rs`), so passthrough does not exist on self-host at all. The arm is kept
+/// so the operator is the owner if self-host ever gains a control plane.
+/// OG-34: the matrix's `GrantPassthrough` row.
+///
+/// rev5 H1 — **a key never holds more than its minter's role allows.** The refusal for a
+/// (validated, canonical) scope list the caller may not put on a key, or `None`. Every
+/// scope is judged by the capability that grants it (`capability::scope_grant_capability`):
+/// `passthrough` needs `grant_passthrough` (the 2026-10-02 H1), `admin` needs
+/// `grant_admin_scope` — an `admin` key holds the matrix's `api_key` column
+/// (`edit_budgets`, `write_prompts`), which a developer does not, so a developer minting
+/// one (or adding it to their own key) was a privilege escalation. Checked on mint and
+/// PATCH, before the store, so a refusal creates and changes nothing. An unknown slug
+/// never reaches here (`validate_scope` refuses it).
+fn scope_refusal(claims: &crate::auth::Claims, scope: &[String]) -> Option<Response> {
+    let refused = scope
+        .iter()
+        .filter_map(|s| tracelane_shared::api_scope::Scope::from_slug(s))
+        .any(|s| !claims.can(crate::auth::capability::scope_grant_capability(s)));
+    refused.then(|| role_forbidden("owner"))
 }
 
 /// Who may REVOKE: a verified owner (as the web revoke's `requireOrgAdmin`, and as
 /// rotate) or the self-host operator. Never a member, never a key.
+/// OG-34: the matrix's `ManageAllKeys` row.
 fn can_revoke_keys(claims: &crate::auth::Claims) -> bool {
-    claims.is_verified_owner()
-        || matches!(
-            claims.auth_method,
-            crate::auth::AuthMethod::SelfHostMasterKey
-        )
+    claims.can(crate::auth::capability::Capability::ManageAllKeys)
 }
 
 /// A key as the settings surface sees it: the create response without `rawKey`,
@@ -424,6 +501,13 @@ struct KeyView {
     velocity_breaker: bool,
     /// A future value: the key is retiring (rotated, in its grace window).
     revoked_at: Option<String>,
+    /// OG-23: the key's project and environment label.
+    project_id: Option<String>,
+    environment: Option<String>,
+    /// OG-20: the key's own policy (its project's is on `GET /v1/projects/{id}`).
+    policy: Option<serde_json::Value>,
+    /// OG-51: the key's own cache narrowing, if any.
+    cache: Option<serde_json::Value>,
 }
 
 impl From<KeyRecord> for KeyView {
@@ -442,6 +526,10 @@ impl From<KeyRecord> for KeyView {
             budget_reset: r.budget_reset.as_str(),
             velocity_breaker: r.velocity_breaker,
             revoked_at: r.revoked_at.map(|t| t.to_rfc3339()),
+            project_id: r.project_id.map(|p| p.to_string()),
+            environment: r.environment,
+            policy: r.policy,
+            cache: r.cache,
         }
     }
 }
@@ -549,7 +637,7 @@ async fn get_key_handler(
 /// Present-and-null vs absent — the JSON Merge Patch distinction. With
 /// `#[serde(default)]`, an absent field stays `None`; a present one (including
 /// `null`) becomes `Some(..)`.
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -579,6 +667,18 @@ struct PatchKeyBody {
     budget_reset: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     velocity_breaker: Option<Option<bool>>,
+    /// OG-23: `null` takes the key out of its project.
+    #[serde(default, deserialize_with = "present")]
+    project_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    environment: Option<Option<String>>,
+    /// OG-20: `null` clears the key's own policy (its project's still applies).
+    #[serde(default, deserialize_with = "present")]
+    policy: Option<Option<serde_json::Value>>,
+    /// OG-51: the key's own cache narrowing — `{"mode":"off"?,"namespace_by"?}`; `null`
+    /// clears it (which widens: owner only).
+    #[serde(default, deserialize_with = "present")]
+    cache: Option<Option<serde_json::Value>>,
 }
 
 fn cannot_clear(field: &'static str) -> Box<Response> {
@@ -656,16 +756,90 @@ fn validate_patch(
         Some(None) => return Err(cannot_clear("velocity_breaker")),
         Some(Some(v)) => patch.velocity_breaker = Some(v),
     }
+    match body.project_id {
+        None => {}
+        Some(None) => patch.project_id = Some(None),
+        Some(Some(raw)) => {
+            patch.project_id = Some(Some(validate_project_id(&raw).map_err(field_error)?));
+        }
+    }
+    match body.environment {
+        None => {}
+        Some(None) => patch.environment = Some(None),
+        Some(Some(raw)) => {
+            patch.environment = Some(Some(validate_environment(&raw).map_err(field_error)?));
+        }
+    }
+    match body.policy {
+        None => {}
+        Some(None) => patch.policy = Some(None),
+        Some(Some(v)) => {
+            patch.policy = Some(Some(
+                crate::project_routes::validate_policy(&v).map_err(|e| Box::new(e.response()))?,
+            ));
+        }
+    }
+    match body.cache {
+        None => {}
+        Some(None) => patch.cache = Some(None),
+        Some(Some(v)) => {
+            let k = crate::db::cache_settings::KeyCache::parse_strict(&v).map_err(
+                |(field, message)| {
+                    Box::new(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_field",
+                        message,
+                        Some(field.as_str()),
+                    ))
+                },
+            )?;
+            patch.cache = Some(Some(k.to_json()));
+        }
+    }
     if patch == KeyPatch::default() {
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
             "nothing_to_change",
             "the patch names no field — send at least one of name, scope, expires_at, \
-             budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker",
+             budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker, project_id, \
+             environment, policy, cache",
             None,
         )));
     }
     Ok(patch)
+}
+
+/// OG-23: a project id in a body — a UUID (anything else names no project: the same
+/// 404 an absent or foreign one gets, decided by the store).
+fn validate_project_id(raw: &str) -> Result<uuid::Uuid, FieldError> {
+    uuid::Uuid::parse_str(raw.trim())
+        .map_err(|_| FieldError::new("project_id", "project_id must be a project's id (a UUID)"))
+}
+
+/// OG-23: an environment label — the migration's slug CHECK, said as a 400.
+fn validate_environment(raw: &str) -> Result<String, FieldError> {
+    let e = raw.trim();
+    if crate::project_routes::valid_environment(e) {
+        Ok(e.to_owned())
+    } else {
+        Err(FieldError::new(
+            "environment",
+            "environment must be lower-case letters, digits, `_` and `-`, starting with a \
+             letter or digit, at most 32",
+        ))
+    }
+}
+
+/// OG-20 / OG-23: does this patch touch the key's governance (project, environment or
+/// policy)? Those are owner decisions — a member must not lift a restriction an owner
+/// put on a key, even one they minted.
+fn touches_governance(patch: &KeyPatch) -> bool {
+    patch.project_id.is_some()
+        || patch.environment.is_some()
+        || patch.policy.is_some()
+        // OG-51: removing a cache narrowing WIDENS the cache, so a key's cache document is an
+        // owner decision like its policy — a member must not undo what an owner set.
+        || patch.cache.is_some()
 }
 
 /// `PATCH /v1/keys/{id}` — edit a key's limits in place (SET-38). Order: auth →
@@ -684,6 +858,17 @@ async fn update_key_handler(
     };
     let Some(editor) = key_editor(&claims) else {
         return role_forbidden("member");
+    };
+    // OG-36: allowlist + SSO-required; the actor is the OG-35 audit row's.
+    let control = match crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::MintKeys,
+        &headers,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(r) => return r.into_response(),
     };
     tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
     let id = match parse_key_id(&id) {
@@ -715,10 +900,25 @@ async fn update_key_handler(
         Ok(p) => p,
         Err(r) => return *r,
     };
-    match state
-        .minter
-        .update_key(&claims.tenant_id, id, editor, &patch, &claims.sub)
-        .await
+    // H1 (security review 2026-10-02): `passthrough` forwards raw, unscanned bodies to a
+    // provider, so only a verified owner may put it in a key's scope set — never a member,
+    // even on a key they minted. Checked before the store, so a refusal changes nothing.
+    // Fail-CLOSED: any scope edit naming `passthrough` needs the owner, whether or not the
+    // key already had it.
+    if let Some(refused) = patch.scope.as_ref().and_then(|s| scope_refusal(&claims, s)) {
+        return refused;
+    }
+    // OG-20 / OG-23: a key's project, environment and policy are owner decisions.
+    if touches_governance(&patch) && !crate::project_routes::may_manage_governance(&claims) {
+        return role_forbidden("owner");
+    }
+    match crate::db::control_audit::scoped(
+        control.audit.clone(),
+        state
+            .minter
+            .update_key(&claims.tenant_id, id, editor, &patch, &claims.sub),
+    )
+    .await
     {
         Ok(UpdateOutcome::Updated { record, changed }) => (
             StatusCode::OK,
@@ -732,6 +932,11 @@ async fn update_key_handler(
         Ok(UpdateOutcome::NotFound) => key_not_found(),
         // A member on a key someone else minted: only an owner may.
         Ok(UpdateOutcome::Forbidden) => role_forbidden("owner"),
+        Ok(UpdateOutcome::ProjectNotFound) => project_not_found(),
+        Ok(UpdateOutcome::EnvironmentNotInProject { environment }) => {
+            environment_not_in_project(&environment)
+        }
+        Ok(UpdateOutcome::EnvironmentNeedsProject) => environment_needs_project(),
         Ok(UpdateOutcome::Retiring { revoked_at }) => {
             let mut resp = json_error(
                 StatusCode::CONFLICT,
@@ -762,6 +967,36 @@ async fn update_key_handler(
     }
 }
 
+fn project_not_found() -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "project_not_found",
+        "project not found",
+        Some("project_id"),
+    )
+}
+
+fn environment_not_in_project(environment: &str) -> Response {
+    json_error(
+        StatusCode::CONFLICT,
+        "environment_not_in_project",
+        format!(
+            "`{environment}` is not one of the project's environments — add it to the project \
+             first, or choose one of its environments"
+        ),
+        Some("environment"),
+    )
+}
+
+fn environment_needs_project() -> Response {
+    json_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_field",
+        "an environment label needs a project — set project_id too",
+        Some("environment"),
+    )
+}
+
 /// `DELETE /v1/keys/{id}` — B-586: revoke through the gateway so the in-process
 /// auth cache is invalidated in the same step. 204 on success; 404 when the key
 /// is not in this tenant or already revoked.
@@ -778,15 +1013,28 @@ async fn revoke_key_handler(
     if !can_revoke_keys(&claims) {
         return role_forbidden("owner");
     }
+    // OG-36: allowlist + SSO-required; the actor is the OG-35 audit row's. rev6 N1:
+    // revoking a key is an incident control — its own per-principal bucket.
+    let control = match crate::control_plane::require_control(
+        &claims,
+        crate::control_plane::incident(crate::auth::capability::Capability::ManageAllKeys),
+        &headers,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(r) => return r.into_response(),
+    };
     tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
     let id = match parse_key_id(&id) {
         Ok(id) => id,
         Err(r) => return *r,
     };
-    match state
-        .minter
-        .revoke_key(&claims.tenant_id, id, &claims.sub)
-        .await
+    match crate::db::control_audit::scoped(
+        control.audit.clone(),
+        state.minter.revoke_key(&claims.tenant_id, id, &claims.sub),
+    )
+    .await
     {
         Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(None) => json_error(
@@ -856,6 +1104,14 @@ async fn rotate_key_handler(
             crate::auth::role_forbidden_json("owner"),
         ));
     }
+    // OG-36: allowlist + SSO-required; the actor is the OG-35 audit row's.
+    let control = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageAllKeys,
+        &headers,
+    )
+    .await
+    .map_err(crate::control_plane::ControlRefusal::into_pair)?;
     tracing::Span::current().record("tenant_id", claims.tenant_id.to_string());
     let grace = match body.grace_hours {
         Some(hours) => hours,
@@ -872,20 +1128,23 @@ async fn rotate_key_handler(
             "grace_hours must be a non-negative whole number within the timestamp range".into(),
         ));
     }
-    let result = state
-        .minter
-        .rotate(&claims.tenant_id, id, &claims.sub, grace)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to rotate API key".into(),
-            )
-        })?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "key not found, expired, or already rotated/revoked".into(),
-        ))?;
+    let result = crate::db::control_audit::scoped(
+        control.audit.clone(),
+        state
+            .minter
+            .rotate(&claims.tenant_id, id, &claims.sub, grace),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to rotate API key".into(),
+        )
+    })?
+    .ok_or((
+        StatusCode::NOT_FOUND,
+        "key not found, expired, or already rotated/revoked".into(),
+    ))?;
     let minted = result.minted;
     Ok((
         StatusCode::CREATED,
@@ -908,6 +1167,9 @@ async fn rotate_key_handler(
                 .unwrap_or(crate::spend::BudgetReset::Monthly)
                 .as_str(),
             velocity_breaker: result.options.velocity_breaker,
+            project_id: result.options.project_id.map(|p| p.to_string()),
+            environment: result.options.environment,
+            policy: result.options.policy,
         }),
     )
         .into_response())
@@ -1123,7 +1385,15 @@ async fn create_key_handler(
             crate::auth::role_forbidden_json("member"),
         ));
     }
-    let tenant = claims.tenant_id;
+    // OG-36: allowlist + SSO-required; the actor is the OG-35 audit row's.
+    let control = crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::MintKeys,
+        &headers,
+    )
+    .await
+    .map_err(crate::control_plane::ControlRefusal::into_pair)?;
+    let tenant = claims.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tenant.to_string());
 
     // ── A13: validate every field BEFORE minting ────────────────────────────
@@ -1132,7 +1402,16 @@ async fn create_key_handler(
     // goes through ONE shared validator, which `PATCH /v1/keys/{id}` calls too, so
     // create and edit cannot disagree about what a valid value is.
     let name = validate_name(&body.name).map_err(bad_request)?;
-    let scope = Some(validate_scope(body.scope).map_err(bad_request)?);
+    let scope = validate_scope(body.scope).map_err(bad_request)?;
+    // H1 (security review 2026-10-02): minting a `passthrough` key is an owner decision —
+    // the scope sends raw, unscanned bodies upstream. Before minting, so nothing exists.
+    if scope_refusal(&claims, &scope).is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        ));
+    }
+    let scope = Some(scope);
     let expires_at = body
         .expires_at
         .as_deref()
@@ -1154,6 +1433,37 @@ async fn create_key_handler(
         .transpose()
         .map_err(bad_request)?;
 
+    // OG-20 / OG-23: a project, an environment or a policy at mint is an owner
+    // decision (as on edit). Validated before minting, so a refusal creates nothing.
+    let project_id = body
+        .project_id
+        .as_deref()
+        .map(validate_project_id)
+        .transpose()
+        .map_err(bad_request)?;
+    let environment = body
+        .environment
+        .as_deref()
+        .map(validate_environment)
+        .transpose()
+        .map_err(bad_request)?;
+    let policy = match &body.policy {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(crate::project_routes::validate_policy(v).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("{}: {}", e.field, e.message),
+            )
+        })?),
+    };
+    if (project_id.is_some() || environment.is_some() || policy.is_some())
+        && !crate::project_routes::may_manage_governance(&claims)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        ));
+    }
     let opts = crate::db::api_keys::MintOptions {
         scope,
         expires_at,
@@ -1161,34 +1471,53 @@ async fn create_key_handler(
         rate_limit_rpm,
         budget_reset,
         velocity_breaker: body.velocity_breaker,
+        project_id,
+        environment: environment.clone(),
+        policy: policy.clone(),
     };
 
     // Record the minting user (WorkOS `sub`) so §3 member-removal can revoke
     // exactly this user's keys. API-key / dev auth has an `apikey:`/`dev-stub`
     // sub — harmless to store; it just won't match a WorkOS user_id on removal.
     let minted_by = claims.sub.clone();
-    let minted = state
-        .minter
-        .mint(&tenant, name, Some(&minted_by), opts)
-        .await
-        .map_err(|err| {
-            // The error chain can reference internal state (pool, pepper); log it,
-            // return a terse message. Never surface the raw key or key material.
-            //
-            // `{err:#}` — the ALTERNATE form — not `%err`. anyhow's plain Display
-            // prints ONLY the outermost `.context()` string, so this line logged
-            // `INSERT INTO api_keys failed` and discarded the cause. On 2026-08-14
-            // that cause was `error serializing parameter 8` and recovering it
-            // took four independent probes (schema replay, prepared-statement type
-            // inspection, a scratch-table trigger falsification, and a standalone
-            // tokio-postgres binding probe) against one line of output. `{:#}`
-            // walks the chain and would have printed it first time.
-            tracing::error!(error = %format!("{err:#}"), "API key mint failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to create API key".into(),
-            )
-        })?;
+    let minted = crate::db::control_audit::scoped(
+        control.audit.clone(),
+        state.minter.mint(&tenant, name, Some(&minted_by), opts),
+    )
+    .await
+    .map_err(|err| {
+        // OG-23: an assignment the store refused is the caller's to fix, not a 500.
+        if let Some(a) = err.downcast_ref::<crate::db::api_keys::AssignmentError>() {
+            use crate::db::api_keys::AssignmentError as A;
+            return match a {
+                A::ProjectNotFound => (StatusCode::NOT_FOUND, "project not found".into()),
+                A::EnvironmentNotInProject(e) => (
+                    StatusCode::CONFLICT,
+                    format!("`{e}` is not one of the project's environments"),
+                ),
+                A::EnvironmentNeedsProject => (
+                    StatusCode::BAD_REQUEST,
+                    "an environment label needs a project — set project_id too".into(),
+                ),
+            };
+        }
+        // The error chain can reference internal state (pool, pepper); log it,
+        // return a terse message. Never surface the raw key or key material.
+        //
+        // `{err:#}` — the ALTERNATE form — not `%err`. anyhow's plain Display
+        // prints ONLY the outermost `.context()` string, so this line logged
+        // `INSERT INTO api_keys failed` and discarded the cause. On 2026-08-14
+        // that cause was `error serializing parameter 8` and recovering it
+        // took four independent probes (schema replay, prepared-statement type
+        // inspection, a scratch-table trigger falsification, and a standalone
+        // tokio-postgres binding probe) against one line of output. `{:#}`
+        // walks the chain and would have printed it first time.
+        tracing::error!(error = %format!("{err:#}"), "API key mint failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to create API key".into(),
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1208,6 +1537,9 @@ async fn create_key_handler(
                 .unwrap_or(crate::spend::BudgetReset::Monthly)
                 .as_str(),
             velocity_breaker: body.velocity_breaker,
+            project_id: project_id.map(|p| p.to_string()),
+            environment,
+            policy,
         }),
     ))
 }
@@ -1399,6 +1731,9 @@ mod tests {
             rate_limit_rpm: None,
             budget_reset: None,
             velocity_breaker: false,
+            project_id: None,
+            environment: None,
+            policy: None,
         }
     }
 
@@ -1772,6 +2107,9 @@ mod tests {
                 rate_limit_rpm: None,
                 budget_reset: None,
                 velocity_breaker: false,
+                project_id: None,
+                environment: None,
+                policy: None,
             }),
         )
         .await
@@ -1800,6 +2138,9 @@ mod tests {
                 rate_limit_rpm: None,
                 budget_reset: None,
                 velocity_breaker: false,
+                project_id: None,
+                environment: None,
+                policy: None,
             }),
         )
         .await
@@ -1827,6 +2168,9 @@ mod tests {
                 rate_limit_rpm: None,
                 budget_reset: None,
                 velocity_breaker: false,
+                project_id: None,
+                environment: None,
+                policy: None,
             }),
         )
         .await
@@ -1858,6 +2202,8 @@ mod set38_tests {
 
     /// What the store was asked to do.
     #[derive(Debug, Clone, PartialEq)]
+    // `KeyPatch` grows with the key's editable columns; boxing it would only obscure the asserts.
+    #[allow(clippy::large_enum_variant)]
     enum Call {
         Get(String, Uuid),
         Update(String, Uuid, String, KeyPatch, String),
@@ -1888,6 +2234,10 @@ mod set38_tests {
             budget_reset: crate::spend::BudgetReset::Weekly,
             velocity_breaker: false,
             revoked_at: None,
+            project_id: None,
+            environment: None,
+            policy: None,
+            cache: None,
         }
     }
 
@@ -2004,6 +2354,7 @@ mod set38_tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
     fn owner() -> Claims {
@@ -2147,6 +2498,283 @@ mod set38_tests {
             assert_eq!(ed, &editor);
             assert_eq!(actor, &sub);
             assert_eq!(patch.rate_limit_rpm, Some(Some(2)));
+        }
+    }
+
+    /// H1 (security review 2026-10-02): `passthrough` sends raw, unscanned bodies to a
+    /// provider, so granting it is an OWNER decision. A member could previously mint a
+    /// passthrough key for themselves, or add the scope to their own key by PATCH.
+    #[tokio::test]
+    async fn h1_a_member_cannot_grant_passthrough_on_create_or_edit() {
+        // PATCH: refused before the store is reached.
+        let (m, calls) = mock();
+        let (s, body) = send(
+            m,
+            Some(member()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat","passthrough"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "role_forbidden");
+        assert_eq!(body["required_role"], "owner");
+        assert!(calls.lock().unwrap().is_empty(), "never reaches the store");
+        // POST: refused before minting.
+        let (m, calls) = mock();
+        let (s, body) = send(
+            m,
+            Some(member()),
+            "POST",
+            "/v1/keys",
+            r#"{"name":"k","scope":["passthrough"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert!(calls.lock().unwrap().is_empty());
+        // Must ACCEPT: a member's scope edit without passthrough still reaches the store,
+        // and an owner may grant passthrough.
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(member()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(updates(&calls).len(), 1);
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(owner()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat","passthrough"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(updates(&calls).len(), 1);
+        // The self-host operator (master key) IS the deployment's owner and has no role
+        // system. Unreachable in a real self-host today (no Postgres ⇒ no key routes; see
+        // `scope_refusal`); pinned so the arm stays owner-equivalent.
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(operator()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat","passthrough"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(updates(&calls).len(), 1);
+        // ...and a tenant `tlane_` key (PL-9b: never admin) still cannot self-grant.
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(api_key_itself()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat","passthrough"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// rev5 H1: an `admin`-scoped key holds the matrix's `api_key` column (`edit_budgets`,
+    /// `write_prompts`), which a developer does not — so a developer may not mint one, nor
+    /// add the scope to their own key. A key never holds more than its minter's role allows.
+    #[tokio::test]
+    async fn rev5_h1_a_developer_cannot_grant_the_admin_scope_on_create_or_edit() {
+        for body in [r#"{"scope":["chat","admin"]}"#, r#"{"scope":["admin"]}"#] {
+            let (m, calls) = mock();
+            let (s, j) = send(m, Some(member()), "PATCH", &key_path(), body).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "PATCH {body}: {j}");
+            assert_eq!(j["error"], "role_forbidden");
+            assert!(calls.lock().unwrap().is_empty(), "never reaches the store");
+            let mint = format!(r#"{{"name":"k",{}"#, &body[1..]);
+            let (m, calls) = mock();
+            let (s, j) = send(m, Some(member()), "POST", "/v1/keys", &mint).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "POST {mint}: {j}");
+            assert!(calls.lock().unwrap().is_empty(), "nothing minted");
+        }
+        // Must ACCEPT: an admin (and the operator) may grant it; a developer may still
+        // mint and edit within the developer's own reach.
+        for who in [owner(), operator()] {
+            let (m, calls) = mock();
+            let (s, _) = send(m, Some(who), "PATCH", &key_path(), r#"{"scope":["admin"]}"#).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(updates(&calls).len(), 1);
+        }
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(member()),
+            "PATCH",
+            &key_path(),
+            r#"{"scope":["chat","read","ingest"]}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(updates(&calls).len(), 1);
+    }
+
+    /// rev5 H1, the property: EVERY scope set a developer is allowed to mint yields a key
+    /// that the budget and prompt / dataset / experiment / online-eval write gates refuse.
+    /// The mintable sets are derived from the mint gate itself (every subset of every
+    /// scope), so a scope added later is covered without editing this test.
+    #[test]
+    fn rev5_h1_no_key_a_developer_can_mint_reaches_budgets_or_prompt_writes() {
+        use tracelane_shared::api_scope::Scope;
+        let all = Scope::all();
+        let dev = member();
+        let mut mintable = 0;
+        for mask in 1u32..(1 << all.len()) {
+            let set: std::collections::BTreeSet<Scope> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, s)| *s)
+                .collect();
+            let slugs: Vec<String> = set.iter().map(|s| s.as_slug().to_owned()).collect();
+            if scope_refusal(&dev, &slugs).is_some() {
+                continue;
+            }
+            mintable += 1;
+            let key = crate::auth::Claims {
+                key_scope: crate::auth::scope::KeyScope::Scoped(set.clone()),
+                ..claims(AuthMethod::ApiKey, None, "apikey:dev-minted")
+            };
+            assert!(
+                crate::billing::usage::authorize_budget_edit(&key).is_err(),
+                "{slugs:?}: a developer-minted key moved a budget"
+            );
+            assert!(
+                crate::prompt_routes::authorize_write(&key).is_err(),
+                "{slugs:?}: a developer-minted key promoted a prompt"
+            );
+            assert!(
+                crate::dataset_routes::authorize_write(&key).is_err(),
+                "{slugs:?}: a developer-minted key wrote a dataset"
+            );
+            assert!(
+                crate::experiment_routes::authorize_write(&key).is_err(),
+                "{slugs:?}: a developer-minted key started an experiment"
+            );
+            assert!(
+                crate::online_eval_routes::require_writer(&key).is_err(),
+                "{slugs:?}: a developer-minted key changed the online-eval policy"
+            );
+        }
+        assert_eq!(mintable, 7, "chat/read/ingest and their non-empty subsets");
+        // ...and an admin may mint an `admin` key (the gate is the minter's role).
+        assert!(scope_refusal(&owner(), &["admin".to_owned()]).is_none());
+    }
+
+    /// OG-20 / OG-23: a key's project, environment and policy are OWNER decisions — a
+    /// member must not lift a restriction on a key they minted — and an invalid policy is a
+    /// 400 naming the entry, never stored. Refused before the store on every path.
+    #[tokio::test]
+    async fn og20_only_an_owner_sets_a_keys_policy_project_or_environment() {
+        let project = "00000000-0000-0000-0000-0000000000aa";
+        for body in [
+            r#"{"policy":{"models":{"allow":["gpt-4o"]}}}"#.to_owned(),
+            r#"{"policy":null}"#.to_owned(),
+            format!(r#"{{"project_id":"{project}"}}"#),
+            r#"{"environment":"staging"}"#.to_owned(),
+        ] {
+            for who in [member(), api_key_itself(), viewer()] {
+                let (m, calls) = mock();
+                let (s, j) = send(m, Some(who), "PATCH", &key_path(), &body).await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{body}: {j}");
+                assert!(calls.lock().unwrap().is_empty(), "never reaches the store");
+            }
+            // POST with the same field (a value, not a clear) is refused for a member too.
+            if body.contains("null") {
+                continue;
+            }
+            let (m, _) = mock();
+            let post = body.replacen('{', r#"{"name":"k","scope":["chat"],"#, 1);
+            let (s, j) = send(m, Some(member()), "POST", "/v1/keys", &post).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{post}: {j}");
+        }
+        // An owner reaches the store, with the policy CANONICAL (lower-cased).
+        let (m, calls) = mock();
+        let (s, _) = send(
+            m,
+            Some(owner()),
+            "PATCH",
+            &key_path(),
+            r#"{"policy":{"models":{"allow":["GPT-4o"]}},"environment":"staging"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let ups = updates(&calls);
+        assert_eq!(ups.len(), 1);
+        let Call::Update(_, _, _, patch, _) = &ups[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            patch.policy,
+            Some(Some(serde_json::json!({"models": {"allow": ["gpt-4o"]}})))
+        );
+        assert_eq!(patch.environment, Some(Some("staging".to_owned())));
+        // Invalid entries are 400s naming the field, before the store.
+        for (body, field) in [
+            (
+                r#"{"policy":{"models":{"allow":["has space"]}}}"#,
+                "policy.models.allow",
+            ),
+            (r#"{"policy":{"unknown_rule":1}}"#, "policy"),
+            (r#"{"policy":{}}"#, "policy"),
+            (r#"{"environment":"Prod"}"#, "environment"),
+            (r#"{"project_id":"not-a-uuid"}"#, "project_id"),
+        ] {
+            let (m, calls) = mock();
+            let (s, j) = send(m, Some(owner()), "PATCH", &key_path(), body).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {j}");
+            assert_eq!(j["field"], field, "{body}: {j}");
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    /// OG-23: the store's assignment refusals reach the caller as 404 / 409 / 400 — another
+    /// tenant's project is exactly an absent one.
+    #[tokio::test]
+    async fn og23_assignment_refusals_map_to_their_codes() {
+        for (outcome, status, code) in [
+            (
+                UpdateOutcome::ProjectNotFound,
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+            ),
+            (
+                UpdateOutcome::EnvironmentNotInProject {
+                    environment: "qa".into(),
+                },
+                StatusCode::CONFLICT,
+                "environment_not_in_project",
+            ),
+            (
+                UpdateOutcome::EnvironmentNeedsProject,
+                StatusCode::BAD_REQUEST,
+                "invalid_field",
+            ),
+        ] {
+            let (m, _) = mock();
+            *m.update.lock().unwrap() = Some(Ok(outcome));
+            let (s, j) = send(
+                m,
+                Some(owner()),
+                "PATCH",
+                &key_path(),
+                r#"{"project_id":"00000000-0000-0000-0000-0000000000aa"}"#,
+            )
+            .await;
+            assert_eq!((s, j["error"].as_str()), (status, Some(code)), "{j}");
         }
     }
 
@@ -2347,6 +2975,10 @@ mod set38_tests {
                 rate_limit_rpm: Some(None),
                 budget_reset: Some(crate::spend::BudgetReset::Daily),
                 velocity_breaker: Some(true),
+                project_id: None,
+                environment: None,
+                policy: None,
+                cache: None,
             }
         );
         // An absent field stays absent.

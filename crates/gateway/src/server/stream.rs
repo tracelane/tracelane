@@ -70,7 +70,7 @@ fn estimate_tokens(bytes: usize) -> Option<u32> {
 /// model's conclusion. Uses the SAME visible marker `truncate_utf8`
 /// (`server/spans.rs`) does, so a reader cannot mistake a cut stream for a
 /// complete short one.
-fn ring_push(buf: &mut String, delta: &str, cap: usize) {
+pub(crate) fn ring_push(buf: &mut String, delta: &str, cap: usize) {
     if delta.is_empty() {
         return;
     }
@@ -264,6 +264,8 @@ impl StreamFinalizer {
         // RI-05 / M19: the CALLED tool names — ungated, like the OFFERED names.
         // `None` when no tool was called.
         span.attributes.tracelane_response_tool_names = self.tool_calls.response_tool_names();
+        span.attributes.tracelane_response_tool_arg_fps =
+            self.tool_calls.response_tool_arg_fps(&self.tenant_id);
         span.attributes.tracelane_response_tool_arg_bytes =
             self.tool_calls.response_tool_arg_bytes();
         // OBS-51 / GWY-45 amendment: the ring buffer holds the (capped, most
@@ -626,6 +628,11 @@ pub(super) fn provider_stream_to_sse(
                     // read as a success and the error-rate metric missed it. Record
                     // the failure so status = Error (countIf(status_code = 2)).
                     fin.stream_error = Some("provider_stream_error");
+                    if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+                        fin.stream_error = Some("upstream_timeout");
+                        timeout.record_attempt(&mut fin.dispatch_attempts);
+                        yield Ok(Event::default().data(serde_json::json!({"error": timeout.error_json()}).to_string()));
+                    }
                     crate::otlp_emit::emit_operation_exception(
                         &fin.tenant_id,
                         provider_name_from_model(&fin.model_name),
@@ -693,6 +700,16 @@ pub(super) fn provider_stream_to_sse(
                         }
                     }
                     ProviderEvent::ToolCallDelta { index, id, name, input_delta } => {
+                        if let Some(reason_code) = guard.refuse_unscanned_output().await {
+                            fin.guard_blocked = true;
+                            yield Ok(Event::default().data(serde_json::json!({
+                                "id": completion_id, "object": "chat.completion.chunk", "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "content_filter"}],
+                                "tracelane_guardrail": {"reason_code": reason_code}
+                            }).to_string()));
+                            yield Ok(Event::default().data("[DONE]"));
+                            break;
+                        }
                         fin.saw_tool_call = true;
                         // RI-05 / M19: accumulate the SAME way the buffered
                         // path's `BufferedToolState` does, purely for the
@@ -963,8 +980,11 @@ pub(crate) mod tests {
 
     fn e2e_inputs() -> crate::guardrail::ResponseInputs {
         crate::guardrail::ResponseInputs {
+            hooks: None,
+            hook_events: Default::default(),
             tenant_id: tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(0xE2E)),
             api_key_id: None,
+            project_id: None,
             correlation_id: ulid::Ulid::from_parts(1, 1),
             system_prompt: Some("a benign system prompt".to_string()),
             model: "claude-sonnet-4-6".to_string(),

@@ -10,6 +10,8 @@
  *            2. last owner WITH other members → 409 (transfer ownership first).
  *            3. otherwise → remove own membership, delete the WorkOS user,
  *               tombstone the mirror row (kept for ledger FK integrity).
+ *            In every deleting case the sign-up list row (`signups`, SET-60) is
+ *            hard-deleted too.
  *
  * Requires a type-your-email confirmation on DELETE (compensating control for
  * no re-auth at launch, §6). WorkOS is the identity system of record.
@@ -18,7 +20,12 @@
 import { db } from "@/db";
 import { apiKeys, tenants, users } from "@/db/schema";
 import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
-import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
+import {
+	isPrivilegedRole,
+	listMemberships,
+	listUserMemberships,
+} from "@/lib/workos-org";
+import { withAuth } from "@workos-inc/authkit-nextjs";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -88,12 +95,40 @@ interface DeleteBody {
 	confirmEmail: string;
 }
 
-/** Tombstone a mirror row without dropping it (ledger FK integrity, §5/GDPR). */
-async function tombstoneMirror(workosUserId: string): Promise<void> {
-	await db
-		.update(users)
-		.set({ email: `deleted-${workosUserId}@tombstone.invalid`, name: null })
-		.where(eq(users.workosUserId, workosUserId));
+/** Fail closed before deleting WorkOS or archiving the org, so a failure is retryable. */
+async function eraseLocalIdentity(
+	userId: string,
+): Promise<NextResponse | null> {
+	try {
+		await db.execute(sql`SELECT erase_account_pii(${userId})`);
+		return null;
+	} catch {
+		console.error("[account/delete] local erasure failed");
+		return NextResponse.json(
+			{ error: "local_erasure_failed" },
+			{ status: 503 },
+		);
+	}
+}
+
+async function deleteWorkosIdentity(
+	key: string,
+	userId: string,
+	orgDeleted: boolean,
+): Promise<NextResponse> {
+	const del = await fetch(
+		`${WORKOS}/user_management/users/${encodeURIComponent(userId)}`,
+		{
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${key}` },
+		},
+	);
+	if (!del.ok)
+		return NextResponse.json(
+			{ error: "workos_user_delete_failed" },
+			{ status: 502 },
+		);
+	return NextResponse.json({ deleted: true, orgDeleted }, { status: 200 });
 }
 
 export async function DELETE(request: NextRequest): Promise<NextResponse> {
@@ -104,7 +139,15 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 			{ status: 501 },
 		);
 	}
-	const session = await requireSession();
+	const auth = await withAuth().catch(() => null);
+	if (!auth?.user) {
+		return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
+	}
+	const session = {
+		userId: auth.user.id,
+		email: auth.user.email,
+		tenantId: auth.organizationId,
+	};
 
 	let body: DeleteBody;
 	try {
@@ -120,8 +163,40 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	return withOwnerMutation(session.tenantId, async () => {
-		const members = await listMemberships(key, session.tenantId);
+	// A missing selected org can also be a stale session after provisioning.
+	// Verify actual memberships before deciding that no workspace safeguards apply.
+	let orgId = session.tenantId;
+	if (!orgId) {
+		const memberships = await listUserMemberships(key, session.userId);
+		if (
+			memberships === null ||
+			memberships.some(
+				(m) => !m.organization_id || m.user_id !== session.userId,
+			)
+		) {
+			return NextResponse.json(
+				{ error: "could not verify membership" },
+				{ status: 502 },
+			);
+		}
+		const orgs = [...new Set(memberships.map((m) => m.organization_id))];
+		if (orgs.length > 1) {
+			return NextResponse.json(
+				{ error: "organization_selection_required" },
+				{ status: 409 },
+			);
+		}
+		orgId = orgs[0];
+	}
+	if (!orgId) {
+		const erasureError = await eraseLocalIdentity(session.userId);
+		if (erasureError) return erasureError;
+		return deleteWorkosIdentity(key, session.userId, false);
+	}
+
+	const verifiedOrgId = orgId;
+	return withOwnerMutation(verifiedOrgId, async () => {
+		const members = await listMemberships(key, verifiedOrgId);
 		if (members === null) {
 			return NextResponse.json(
 				{ error: "could not verify membership" },
@@ -149,8 +224,11 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		const [t] = await db
 			.select({ id: tenants.id })
 			.from(tenants)
-			.where(eq(tenants.workosOrgId, session.tenantId))
+			.where(eq(tenants.workosOrgId, verifiedOrgId))
 			.limit(1);
+
+		const erasureError = await eraseLocalIdentity(session.userId);
+		if (erasureError) return erasureError;
 
 		if (soleUser) {
 			// Case 1: sole user → this IS org deletion. Soft-delete + revoke all keys.
@@ -163,7 +241,7 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 					// B-361: same-isolate immediacy for the acting user; see the
 					// function doc on `invalidateOrgArchivedCache` for the
 					// cross-isolate staleness this deliberately accepts.
-					invalidateOrgArchivedCache(session.tenantId);
+					invalidateOrgArchivedCache(verifiedOrgId);
 					await db
 						.update(apiKeys)
 						.set({ revokedAt: new Date() })
@@ -182,28 +260,6 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 			}
 		}
 
-		// Delete the WorkOS user (cascades their memberships + revokes their sessions).
-		const del = await fetch(
-			`${WORKOS}/user_management/users/${encodeURIComponent(session.userId)}`,
-			{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
-		);
-		if (!del.ok) {
-			return NextResponse.json(
-				{ error: "workos_user_delete_failed" },
-				{ status: 502 },
-			);
-		}
-
-		// Tombstone the mirror row (keep for ledger FK integrity; email anonymized).
-		try {
-			await tombstoneMirror(session.userId);
-		} catch {
-			console.error("[account/delete] mirror tombstone failed");
-		}
-
-		return NextResponse.json(
-			{ deleted: true, orgDeleted: soleUser },
-			{ status: 200 },
-		);
+		return deleteWorkosIdentity(key, session.userId, soleUser);
 	});
 }

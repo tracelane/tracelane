@@ -253,8 +253,82 @@ pub fn render() -> String {
     counter(
         &mut out,
         "tracelane_gateway_auth_throttled_total",
-        "Requests refused with 429 before authentication because their source exceeded the failed-auth budget.",
+        "API-key lookups refused with 429 before the store because their source's failed-lookup bucket was empty.",
         crate::preauth_limiter::AUTH_THROTTLED_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_failures_charged_total",
+        "Store-reaching API-key lookups that found no valid key; each spent its source's token.",
+        crate::preauth_limiter::AUTH_FAILURES_CHARGED_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_throttle_overflow_total",
+        "Store-reaching API-key lookups charged to the shared overflow bucket because the source map was full.",
+        crate::preauth_limiter::AUTH_THROTTLE_OVERFLOW_TOTAL.load(Ordering::Relaxed),
+    );
+    // rev4 (2026-10-03): the detail `/health` no longer shows (L3) lives here, on
+    // the loopback-only listener — plus the new bounds' own counters.
+    gauge(
+        &mut out,
+        "tracelane_gateway_auth_throttle_sources_tracked",
+        "Per-source buckets held at the last insert or sweep.",
+        crate::preauth_limiter::SOURCES_TRACKED.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_cold_saturated_total",
+        "Cold API-key lookups refused 429 because every cold-lookup slot stayed busy for the whole wait (rev4 H1a).",
+        crate::db::api_keys::AUTH_COLD_SATURATED_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_ungated_cold_lookups_total",
+        "Cold API-key lookups that ran with no request scope, so no per-source bucket could bound them (rev4 L4).",
+        crate::db::api_keys::AUTH_UNGATED_COLD_LOOKUPS_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_known_key_rejected_total",
+        "API keys refused 401 by the valid-key set with no per-key Postgres lookup (rev4 H1d).",
+        crate::db::api_keys::AUTH_KNOWN_KEY_REJECTED_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_known_keys_reads_total",
+        "Reads of the valid-key set (full or delta) that succeeded (rev4 H1d).",
+        crate::db::api_keys::KNOWN_KEYS_READS_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_auth_known_keys_read_failed_total",
+        "Reads of the valid-key set that failed; lookups fell back to the per-source gate (rev4 H1d).",
+        crate::db::api_keys::KNOWN_KEYS_READ_FAILED_TOTAL.load(Ordering::Relaxed),
+    );
+    gauge(
+        &mut out,
+        "tracelane_gateway_auth_known_keys",
+        "Digests in the valid-key set; 0 when it is not loaded (rev4 H1d).",
+        crate::db::api_keys::known_keys().map_or(0, |k| k.digest_count() as u64),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_allowance_row_missing_total",
+        "Entitlement resolves with neither a pinned nor a current plan_allowances row — the deny floor.",
+        crate::entitlement_cache::ALLOWANCE_ROW_MISSING_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_allowance_pin_fallback_total",
+        "Entitlement resolves whose pinned plan_allowances row was missing and that read the plan's current row (rev4 M3).",
+        crate::entitlement_cache::ALLOWANCE_PIN_FALLBACK_TOTAL.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_allowance_actions_skipped_total",
+        "Tenants whose usage warnings and AUTO-AGE the metering job skipped because their allowances were not a real row (rev4 M3).",
+        crate::billing::metering_job::ALLOWANCE_ACTIONS_SKIPPED_TOTAL.load(Ordering::Relaxed),
     );
     counter(
         &mut out,

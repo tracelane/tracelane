@@ -124,7 +124,12 @@ pub(super) fn apply(attrs: &[KeyValue], out: &mut SpanAttributes, caps: &OtlpCap
                     .or_else(|| any_value_u32(av));
             }
             "llm.cost.total" => {
-                out.gen_ai_usage_cost = out.gen_ai_usage_cost.or_else(|| any_value_f64(av));
+                out.gen_ai_usage_cost = out
+                    .gen_ai_usage_cost
+                    .or_else(|| any_value_f64(av).filter(|v| v.is_finite() && *v >= 0.0));
+                if out.gen_ai_usage_cost.is_some() {
+                    out.tracelane_usage_cost_origin = Some("provider_reported".to_string());
+                }
             }
             "input.value" => out.input_value = any_value_string(av),
             "output.value" => out.output_value = any_value_string(av),

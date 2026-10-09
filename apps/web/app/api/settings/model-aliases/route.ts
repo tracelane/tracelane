@@ -15,7 +15,7 @@
  */
 
 import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
 const PASS_THROUGH = new Set([400, 404, 409, 503]);
@@ -54,16 +54,14 @@ async function relay(upstream: Response): Promise<NextResponse> {
 }
 
 export async function GET(): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
-	const upstream = await fetch(`${gatewayBaseUrl()}/v1/model-aliases`, {
-		headers: { authorization: `Bearer ${token}` },
-		cache: "no-store",
-	});
+	const upstream = await gatewayResponse("/v1/model-aliases");
 	return relay(upstream);
 }
 
 export async function PUT(req: NextRequest): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
+	// Auth first (unchanged order): an unauthenticated caller is redirected
+	// before any body validation. `gatewayResponse` reuses the memoized token.
+	await requireGatewayToken();
 	let body: { alias?: unknown; target_model?: unknown; create?: unknown };
 	try {
 		body = (await req.json()) as typeof body;
@@ -79,35 +77,29 @@ export async function PUT(req: NextRequest): Promise<NextResponse> {
 			{ status: 400 },
 		);
 	}
-	const upstream = await fetch(`${gatewayBaseUrl()}/v1/model-aliases`, {
+	const upstream = await gatewayResponse("/v1/model-aliases", {
 		method: "PUT",
-		headers: {
-			authorization: `Bearer ${token}`,
-			"content-type": "application/json",
-		},
+		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
 			alias,
 			target_model: target,
 			create: body.create === true,
 		}),
-		cache: "no-store",
 	});
 	return relay(upstream);
 }
 
 export async function DELETE(req: NextRequest): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
+	// Auth first (unchanged order): an unauthenticated caller is redirected
+	// before any body validation. `gatewayResponse` reuses the memoized token.
+	await requireGatewayToken();
 	const alias = req.nextUrl.searchParams.get("alias")?.trim() ?? "";
 	if (!alias) {
 		return NextResponse.json({ error: "invalid_query" }, { status: 400 });
 	}
-	const upstream = await fetch(
-		`${gatewayBaseUrl()}/v1/model-aliases?alias=${encodeURIComponent(alias)}`,
-		{
-			method: "DELETE",
-			headers: { authorization: `Bearer ${token}` },
-			cache: "no-store",
-		},
+	const upstream = await gatewayResponse(
+		`/v1/model-aliases?alias=${encodeURIComponent(alias)}`,
+		{ method: "DELETE" },
 	);
 	return relay(upstream);
 }

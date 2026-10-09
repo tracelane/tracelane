@@ -745,6 +745,11 @@ async fn flush_ingest_meter(
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::MeterFlushFailed,
         );
+    } else {
+        // Every pending retry and new batch was accepted; the sink is healthy again.
+        tracelane_shared::degradation::resolve(
+            tracelane_shared::degradation::Degradation::MeterFlushFailed,
+        );
     }
 }
 
@@ -831,6 +836,9 @@ async fn flush_blobs(
             return Err(e);
         }
     }
+    tracelane_shared::degradation::resolve(
+        tracelane_shared::degradation::Degradation::BlobStoreFailed,
+    );
     Ok(())
 }
 
@@ -1062,6 +1070,56 @@ mod tests {
     use super::*;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn recovered_ingest_meter_flush_closes_episode_after_pending_batch_lands() {
+        use tracelane_shared::degradation::{Degradation, is_open, note, resolve};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        let mut pending = VecDeque::from([IngestMeterBatch {
+            token: "b602-retry".into(),
+            day: 1,
+            rows: vec![("00000000-0000-0000-0000-000000000001".into(), 42.0)],
+        }]);
+        let mut buffer = HashMap::new();
+        let kind = Degradation::MeterFlushFailed;
+        resolve(kind);
+        note(kind);
+        flush_ingest_meter(&client, &mut buffer, &mut pending).await;
+        assert!(pending.is_empty(), "the pending batch reached ClickHouse");
+        assert!(
+            !is_open(kind),
+            "accepted pending batch closes the meter episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_blob_flush_closes_episode_after_retry_lands() {
+        use tracelane_shared::degradation::{Degradation, is_open, note, resolve};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        let kind = Degradation::BlobStoreFailed;
+        resolve(kind);
+        note(kind);
+        let blob = PendingBlob {
+            tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+            hash: [7u8; 32],
+            bytes: "retry".into(),
+            size: 5,
+        };
+        flush_blobs(&client, vec![blob], vec![]).await.unwrap();
+        assert!(!is_open(kind), "the retried blob write closes the episode");
+    }
 
     fn sample_row() -> SpanRow {
         SpanRow {

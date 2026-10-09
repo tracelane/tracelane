@@ -8,23 +8,21 @@
  * error bodies are not echoed.
  */
 
-import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { NextResponse } from "next/server";
 
 export async function DELETE(
-	_req: Request,
+	req: Request,
 	{ params }: { params: Promise<{ providerId: string }> },
 ): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
 	const { providerId } = await params;
+	// OG-11: `?label=` names one key of the provider's pool; absent = `default`.
+	const label = new URL(req.url).searchParams.get("label");
+	const query = label ? `?label=${encodeURIComponent(label)}` : "";
 
-	const upstream = await fetch(
-		`${gatewayBaseUrl()}/v1/byok/provider-keys/${encodeURIComponent(providerId)}`,
-		{
-			method: "DELETE",
-			headers: { authorization: `Bearer ${token}` },
-		},
+	const upstream = await gatewayResponse(
+		`/v1/byok/provider-keys/${encodeURIComponent(providerId)}${query}`,
+		{ method: "DELETE" },
 	);
 
 	if (!upstream.ok) {

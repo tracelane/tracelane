@@ -98,7 +98,7 @@ should be one number. We're not asserting which is "the" real count; we're repor
 the vendor's own marketing disagrees with itself. Read their repository yourself before
 treating any of the three as ground truth: `github.com/portkey-ai/gateway/tree/main/src/providers`.
 
-For our own "191 providers" claim: it is the count of `crates/gateway/providers.tsv`
+For our own "205 providers" claim: it is the count of `crates/gateway/providers.tsv`
 rows (185) plus the 6 native adapters, held to that file by a guard in CI — count it
 yourself.
 
@@ -135,7 +135,7 @@ None of these are silent gaps — every one is stated as a limit in a public Tra
 
 - **[T1]** `crates/gateway/src/admission.rs` + `crates/gateway/src/server/chat.rs` — the Rust gateway hot path
 - **[T2]** [`/benchmarks`](/benchmarks) — AIGatewayBench CCX23, 2026-09-07: Tracelane 2/4/5 ms, Portkey 3–4/5–7/8–9 ms, Bifrost 2/2/3 ms, LiteLLM Python 14–15/34–36/47–52 ms
-- **[T3]** [`/pricing`](/pricing) — 191 providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
+- **[T3]** [`/pricing`](/pricing) — 205 providers, BYOK 0%, plan limits, Apache 2.0, Docker Compose, free-tier limits
 - **[T4]** exact-match caching built and proven; the semantic tier is built but not enabled on the hosted product
 - **[T5]** `crates/gateway/src/guardrail/rails/` (`r1_cost.rs` … `r8_injection.rs`) + [`/pricing`](/pricing) FAQ ("What inline guardrails run on every request?") for the free-vs-Team+ split
 - **[T6]** `crates/gateway/src/providers/mod.rs` — model→provider routing fails closed to `unroutable_model`

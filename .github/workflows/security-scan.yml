@@ -55,6 +55,10 @@ jobs:
 
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
@@ -187,6 +191,10 @@ jobs:
 
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
 
       - name: Check openssl not in dependency tree
         run: |
@@ -218,6 +226,10 @@ jobs:
 
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
+          # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
+          cache-bin: "false"
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version 0.19.8

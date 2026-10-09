@@ -124,7 +124,7 @@ Routes to the right upstream provider based on the `model` prefix:
 | `grok*`, `xai/*` | xAI |
 | `vertex/*` | Google Vertex (service-account OAuth, not an API key) |
 | `together/*`, `fireworks/*`, `openrouter/*`, `ai21/*`, `@cf/*`, … | explicit-prefix aggregators + regional hosts |
-| ... | 191 routable providers in total — 6 native adapters plus every row of the OpenAI-compatible catalog `crates/gateway/providers.tsv`; see [providers.md](providers.md) |
+| ... | 205 routable providers in total — 6 native adapters plus every row of the OpenAI-compatible catalog `crates/gateway/providers.tsv`; see [providers.md](providers.md) |
 
 **The map fails closed.** An unmatched model does not fall back to a default
 provider — it returns `400 unroutable_model`. That is deliberate: defaulting

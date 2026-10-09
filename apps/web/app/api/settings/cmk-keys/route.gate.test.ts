@@ -21,6 +21,33 @@ const h = vi.hoisted(() => ({
 	recordAdminAction: vi.fn(async (_entry: unknown) => undefined),
 }));
 
+const ctl = vi.hoisted(() => ({
+	record: vi.fn(
+		async (
+			..._a: unknown[]
+		): Promise<{ ok: true } | { ok: false; response: Response }> => ({
+			ok: true,
+		}),
+	),
+	failed: vi.fn(async (..._a: unknown[]) => undefined),
+}));
+const refused = (status: number, error: string) => ({
+	ok: false as const,
+	response: Response.json({ error }, { status }),
+});
+
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: ctl.record,
+	recordControlChangeFailed: ctl.failed,
+	redactEmail: (e: string) => `${e[0]}***${e.slice(e.indexOf("@"))}`,
+}));
+
+beforeEach(() => {
+	ctl.record.mockReset();
+	ctl.record.mockResolvedValue({ ok: true });
+	ctl.failed.mockReset();
+});
+
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -136,5 +163,40 @@ describe("/api/settings/cmk-keys role gate", () => {
 		]);
 		const res = await GET(req({}));
 		expect(res.status).toBe(200);
+	});
+});
+
+describe("POST /api/settings/cmk-keys — control-change recording", () => {
+	beforeEach(() => {
+		h.isAdmin = true;
+		h.byokCmk = true;
+		vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_unit_only");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("REJECT: recording refused -> 503 returned and NOTHING is written", async () => {
+		ctl.record.mockResolvedValue(refused(503, "control_audit_unavailable"));
+		const m = setDb([
+			[{ id: "tenant-db-uuid", plan: "business" }],
+			[{ id: "tenant-db-uuid" }],
+		]);
+		const res = await POST(req({ alias: "prod", publicKeyPem: PEM }));
+		expect(res.status).toBe(503);
+		expect(m.db.insert).not.toHaveBeenCalled();
+		expect(h.recordAdminAction).not.toHaveBeenCalled();
+	});
+
+	it("HAPPY: records cmk.register with fingerprint only (no PEM) before the insert", async () => {
+		setDb([
+			[{ id: "tenant-db-uuid", plan: "business" }],
+			[{ id: "tenant-db-uuid" }],
+			[{ id: "cmk-1", fingerprint: "ab".repeat(32) }],
+		]);
+		expect((await POST(req({ alias: "prod", publicKeyPem: PEM }))).status).toBe(
+			201,
+		);
+		const call = ctl.record.mock.calls[0] as unknown[];
+		expect(call[0]).toBe("cmk.register");
+		expect(JSON.stringify(call)).not.toContain("BEGIN PUBLIC KEY");
 	});
 });

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::errors::{DispatchFailure, classify_dispatch_error};
-use super::spans::{CallerIdentity, SpanUsageMeta, build_gateway_span};
+use super::spans::{CallerIdentity, CapturedInput, SpanUsageMeta, build_gateway_span};
 
 /// Breaker outcome for a dispatch result, or `None` to feed the breaker NOTHING.
 ///
@@ -25,14 +25,54 @@ use super::spans::{CallerIdentity, SpanUsageMeta, build_gateway_span};
 /// SUCCESS would reset `consecutive_failures` and could hold a breaker closed over a
 /// genuinely dead upstream. Same posture as the cache-hit skip above — feeding the
 /// breaker an observation that did not happen is worse than feeding it nothing.
-pub(super) fn breaker_outcome<T>(result: &anyhow::Result<T>) -> Option<bool> {
+///
+/// SB (security re-review round 2, 2026-10-05): every error that was not a
+/// `ProviderHttpError` used to count as a provider failure — so a tenant's poisoned
+/// Vertex service account or a key with a control byte opened the SHARED tier. Only
+/// proven upstream evidence is [`Outcome::UpstreamFault`]; everything else is
+/// [`Outcome::CredentialFault`] (that credential only). See [`transport_outcome`].
+pub(super) fn breaker_outcome<T>(
+    result: &anyhow::Result<T>,
+) -> Option<crate::circuit_breaker::Outcome> {
+    use crate::circuit_breaker::Outcome;
     match result {
-        Ok(_) => Some(true),
-        Err(err) => match err.downcast_ref::<crate::providers::ProviderHttpError>() {
-            Some(http) if !http.is_upstream_fault() => None,
-            _ => Some(false),
-        },
+        Ok(_) => Some(Outcome::Success),
+        Err(err) if err.is::<crate::routing::attempt::Denied>() => None,
+        Err(err) => transport_outcome(err),
     }
+}
+
+/// The breaker outcome of a failed dispatch (SB). In order:
+/// - credential-derived ([`crate::providers::CredentialDerived`] anywhere in the chain:
+///   a credential parse or token exchange) → `CredentialFault`;
+/// - a provider HTTP status → `UpstreamFault` for 5xx, nothing for any 4xx (F4);
+/// - a workspace deadline → `CredentialFault` (the workspace's bound, S1);
+/// - a reqwest error that is a CONNECT or TIMEOUT error and not a builder error →
+///   `UpstreamFault` (the adapter ceiling timeout is a reqwest timeout);
+/// - anything else → `CredentialFault`. Unknown is never provider evidence.
+pub(crate) fn transport_outcome(err: &anyhow::Error) -> Option<crate::circuit_breaker::Outcome> {
+    use crate::circuit_breaker::Outcome;
+    if err
+        .downcast_ref::<crate::providers::CredentialDerived>()
+        .is_some()
+    {
+        return Some(Outcome::CredentialFault);
+    }
+    if let Some(http) = err.downcast_ref::<crate::providers::ProviderHttpError>() {
+        return http.is_upstream_fault().then_some(Outcome::UpstreamFault);
+    }
+    if crate::routing::deadlines::Timeout::find(err.as_ref()).is_some() {
+        return Some(Outcome::CredentialFault);
+    }
+    let upstream = err
+        .chain()
+        .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+        .any(|e| !e.is_builder() && (e.is_connect() || e.is_timeout()));
+    Some(if upstream {
+        Outcome::UpstreamFault
+    } else {
+        Outcome::CredentialFault
+    })
 }
 
 /// R13 — emit the error-status span for a request that ALREADY HAS A LEDGER ROW.
@@ -80,7 +120,8 @@ pub(crate) fn emit_post_ledger_error_span(
     // the providers the constraint left standing (EMPTY on a `zdr_unsatisfiable`
     // refusal). On the error span too, so an auditor filtering
     // `tracelane_zdr_required = true` sees the refusals, not only the served requests.
-    zdr_eligible: Option<Vec<String>>,
+    zdr_eligible: Option<Vec<String>>, // The error span also carries policy-safe input.
+    captured_input: Option<CapturedInput>,
 ) {
     let mut span = build_error_span(
         tenant_id,
@@ -95,7 +136,12 @@ pub(crate) fn emit_post_ledger_error_span(
     );
     if let Some(eligible) = zdr_eligible {
         span.attributes.tracelane_zdr_required = Some(true);
-        span.attributes.tracelane_zdr_eligible_providers = Some(eligible);
+        span.attributes
+            .tracelane_zdr_eligible_providers
+            .replace(eligible);
+    }
+    if let Some(captured) = captured_input {
+        captured.apply(&mut span.attributes);
     }
     // Test seam (B-385 2c): observable to a test whether or not NATS is wired.
     #[cfg(test)]
@@ -202,6 +248,18 @@ pub(crate) fn provider_name_from_model(model: &str) -> &'static str {
     }
 }
 
+/// The inverse of [`provider_name_from_model`]'s renames: the provider ID a breaker /
+/// span name stands for. LOW round 2 (2026-10-05): the deadline budget resolves rules by
+/// provider ID while chat/embeddings key the breaker by this name, so the legacy record
+/// must translate back — or a `vertex` rule double-records and a timeout is counted twice.
+pub(crate) fn provider_id_from_name(name: &str) -> &str {
+    match name {
+        "gcp_vertex_ai" => "vertex",
+        "aws_bedrock" => "bedrock",
+        other => other,
+    }
+}
+
 /// Outcome of resolving a provider key. Distinguishes "the tenant never added
 /// one" from "one exists but we cannot use it" — the two need OPPOSITE user
 /// actions (add a key vs rotate an existing one), and collapsing them into a
@@ -229,6 +287,8 @@ pub(crate) enum ProviderKey {
     /// tenant would have spent whatever `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` the
     /// operator's container carried. Fail-CLOSED on a credential path (§10).
     LookupFailed,
+    KmsUnavailable,
+    KmsDenied,
 }
 
 /// B-380: may a tenant's provider key come from the process ENVIRONMENT?
@@ -245,11 +305,56 @@ pub(crate) fn env_fallback_allowed(has_control_plane: bool, has_master_key: bool
     !(has_control_plane && has_master_key)
 }
 
+/// `OG-13`: the circuit-breaker credential of a dispatch made with `tenant_id`'s key
+/// `label` for `provider_id`. The operator's environment credential exactly when the key
+/// came (or would come) from the process environment ([`env_fallback_allowed`]) or the
+/// provider takes no key at all (Ollama — every caller shares that upstream); otherwise
+/// the tenant's own BYOK credential, so its failures open ITS breaker and nobody else's.
+/// One decision for every wire — a call site never builds a credential itself.
+pub(crate) fn breaker_cred(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    routing: Option<&crate::routing::RoutingState>,
+) -> crate::circuit_breaker::Cred {
+    let mut cred = breaker_cred_with(
+        env_fallback_allowed(
+            crate::db::global_pool().is_some(),
+            crate::byok::master_key().is_some(),
+        ),
+        tenant_id,
+        provider_id,
+        label,
+    );
+    if let Some(routing) = routing {
+        crate::routing::deadlines::tune(&mut cred, routing);
+    }
+    cred
+}
+
+/// [`breaker_cred`] with the environment decision passed in — pure, so both answers are
+/// asserted without a control plane.
+pub(crate) fn breaker_cred_with(
+    env_key: bool,
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+) -> crate::circuit_breaker::Cred {
+    let keyless =
+        crate::providers::ProviderRegistry::env_var_for_provider_id(provider_id).is_empty();
+    if env_key || keyless {
+        crate::circuit_breaker::Cred::env()
+    } else {
+        crate::circuit_breaker::Cred::byok(tenant_id.as_uuid(), provider_id, label)
+    }
+}
+
 /// One read of a `(tenant, provider)` BYOK row, decrypted under its AAD. Shared
 /// by the inline path and the B-568 F2 background refresh, so the two can never
 /// disagree about what "usable" means.
 enum ByokFetch {
-    Key(std::sync::Arc<secrecy::SecretString>),
+    Key(crate::kms::vault::Opened),
+    Kms(crate::kms::KmsError),
     NoRow,
     Undecryptable(anyhow::Error),
     LookupError(anyhow::Error),
@@ -260,13 +365,57 @@ async fn fetch_byok(
     master: &crate::byok::ByokMasterKey,
     tenant_id: &TenantId,
     provider_id: &str,
+    label: &str,
 ) -> ByokFetch {
-    match crate::db::provider_keys::get(pool, tenant_id, provider_id).await {
+    match crate::db::provider_keys::get(pool, tenant_id, provider_id, label).await {
         Ok(Some(row)) => {
-            let aad = crate::byok::provider_key_aad(tenant_id, provider_id);
-            match master.decrypt_with_context(&row.ciphertext_b64, &aad) {
-                Ok(plaintext) => ByokFetch::Key(std::sync::Arc::new(plaintext)),
-                Err(e) => ByokFetch::Undecryptable(e),
+            // OG-11 + OG-37: the AAD binds the label (byte-identical to the old AAD for
+            // `default`), so a blob copied between labels fails here. The vault takes the
+            // row's AAD subject — `provider` for `default`, `provider:label` otherwise —
+            // so a customer-sealed pool key opens under the same label-bound AAD.
+            let subject = crate::db::provider_keys::target_id(provider_id, label);
+            let vault = match crate::kms::KeyVault::global() {
+                Ok(v) => v,
+                Err(e) => return ByokFetch::LookupError(e.into()),
+            };
+            // H1 round 2: the pooled connection is RELEASED before the customer-KMS await
+            // in `open` — a hanging Vault must never pin the shared Postgres pool.
+            let loaded = match pool.get().await {
+                Ok(client) => crate::kms::vault::load(&**client, tenant_id, master).await,
+                Err(e) => return ByokFetch::LookupError(e.into()),
+            };
+            let opened = match loaded {
+                Ok(config) => {
+                    vault
+                        .open(
+                            config.as_ref(),
+                            tenant_id,
+                            &subject,
+                            &row.ciphertext_b64,
+                            master,
+                        )
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match opened {
+                // SB: a key stored before upload validation existed is refused at use too —
+                // it would only fail at the header build (fail CLOSED, no dispatch).
+                Ok(key)
+                    if !crate::db::provider_keys::credential_bytes_ok(
+                        secrecy::ExposeSecret::expose_secret(&*key.secret),
+                    ) =>
+                {
+                    ByokFetch::Undecryptable(anyhow::anyhow!(
+                        "stored provider key contains whitespace or control characters"
+                    ))
+                }
+                Ok(key) => ByokFetch::Key(key),
+                Err(crate::kms::VaultError::Kms(e)) => ByokFetch::Kms(e),
+                Err(crate::kms::VaultError::Invalid) => {
+                    ByokFetch::Undecryptable(anyhow::anyhow!("invalid provider envelope"))
+                }
+                Err(e) => ByokFetch::LookupError(e.into()),
             }
         }
         Ok(None) => ByokFetch::NoRow,
@@ -280,7 +429,11 @@ async fn fetch_byok(
 fn refresh_outcome(fetch: ByokFetch) -> crate::db::provider_keys::RefreshOutcome {
     use crate::db::provider_keys::RefreshOutcome;
     match fetch {
-        ByokFetch::Key(k) => RefreshOutcome::Renewed(k),
+        ByokFetch::Key(k) => match k.expires_at {
+            Some(until) => RefreshOutcome::RenewedUntil(k.secret, Some(until)),
+            None => RefreshOutcome::Renewed(k.secret),
+        },
+        ByokFetch::Kms(_) => RefreshOutcome::Gone,
         ByokFetch::NoRow | ByokFetch::Undecryptable(_) => RefreshOutcome::Gone,
         ByokFetch::LookupError(_) => RefreshOutcome::Failed,
     }
@@ -294,14 +447,27 @@ fn refresh_outcome(fetch: ByokFetch) -> crate::db::provider_keys::RefreshOutcome
 fn spawn_byok_refresh(
     tenant_id: &TenantId,
     provider_id: &str,
+    label: &str,
     served: std::sync::Arc<secrecy::SecretString>,
 ) {
     let tenant = tenant_id.clone();
     let provider = provider_id.to_owned();
+    let label = label.to_owned();
     tokio::spawn(async move {
         let outcome = match (crate::db::global_pool(), crate::byok::master_key()) {
             (Some(pool), Some(master)) => {
-                let fetch = fetch_byok(pool, master, &tenant, &provider).await;
+                let Some(_fill) = cold_fill_flight(&tenant, &provider, &label).await else {
+                    // This key's other fill is still running: keep the bound, retry later.
+                    crate::db::provider_keys::complete_refresh_labeled(
+                        &tenant,
+                        &provider,
+                        &label,
+                        &served,
+                        crate::db::provider_keys::RefreshOutcome::Failed,
+                    );
+                    return;
+                };
+                let fetch = fetch_byok(pool, master, &tenant, &provider, &label).await;
                 if let ByokFetch::LookupError(ref e) | ByokFetch::Undecryptable(ref e) = fetch {
                     tracing::debug!(error = %e, provider_id = %provider, "BYOK off-path re-check did not renew the key");
                 }
@@ -311,8 +477,36 @@ fn spawn_byok_refresh(
             // "cannot tell" either way — keep the bound, release the claim.
             _ => crate::db::provider_keys::RefreshOutcome::Failed,
         };
-        crate::db::provider_keys::complete_refresh(&tenant, &provider, &served, outcome);
+        crate::db::provider_keys::complete_refresh_labeled(
+            &tenant, &provider, &label, &served, outcome,
+        );
     });
+}
+
+/// H1 (security review, 2026-10-05): ONE cold fill per `(tenant, provider, label)` at a
+/// time, so concurrent first requests share one read (a second `begin_cold_fill` would
+/// fence the first). It replaced the KMS tenant lock on this path: a tenant without
+/// customer KMS takes no KMS lock at all, and nobody waits on another tenant. The wait
+/// is bounded by `kms.lock_wait_ms`; `None` = fail CLOSED for this key only.
+async fn cold_fill_flight(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+) -> Option<crate::kms::vault::KeyedPermit> {
+    static FILLS: std::sync::OnceLock<crate::kms::vault::KeyedLocks<(uuid::Uuid, String, String)>> =
+        std::sync::OnceLock::new();
+    let wait = std::time::Duration::from_millis(crate::kms::limits()?.lock_wait_ms);
+    FILLS
+        .get_or_init(Default::default)
+        .acquire(
+            (
+                *tenant_id.as_uuid(),
+                provider_id.to_owned(),
+                label.to_owned(),
+            ),
+            wait,
+        )
+        .await
 }
 
 /// A4: resolve the provider-API plaintext key. Order:
@@ -350,14 +544,37 @@ pub(crate) async fn resolve_provider_key_traced(
     provider_id: &str,
     env_var: &str,
 ) -> (ProviderKey, bool) {
+    resolve_provider_key_labeled(
+        tenant_id,
+        provider_id,
+        crate::db::provider_keys::DEFAULT_LABEL,
+        env_var,
+    )
+    .await
+}
+
+/// `OG-11`: [`resolve_provider_key_traced`] for one key-pool `label`. The SAME tenant's
+/// key only — `(tenant, provider, label)` is the cache key, the row key and the AAD.
+/// The process environment is a fallback for the `default` label ONLY: a named pool key
+/// that is absent is `NotConfigured`, never the operator's key (B-380's rule, kept).
+pub(crate) async fn resolve_provider_key_labeled(
+    tenant_id: &TenantId,
+    provider_id: &str,
+    label: &str,
+    env_var: &str,
+) -> (ProviderKey, bool) {
     use crate::db::provider_keys::CachedLookup;
     use std::sync::Arc;
+    #[cfg(test)]
+    if let Ok(error) = crate::kms::wire_tests::FAILURE.try_with(|e| *e) {
+        return (kms_failure(error), true);
+    }
 
-    match crate::db::provider_keys::lookup_swr(tenant_id, provider_id) {
+    match crate::db::provider_keys::lookup_swr_labeled(tenant_id, provider_id, label) {
         CachedLookup::Fresh(secret) => return (ProviderKey::Found(secret), false),
         CachedLookup::Stale { secret, refresh } => {
             if refresh {
-                spawn_byok_refresh(tenant_id, provider_id, Arc::clone(&secret));
+                spawn_byok_refresh(tenant_id, provider_id, label, Arc::clone(&secret));
             }
             return (ProviderKey::Found(secret), false);
         }
@@ -367,15 +584,31 @@ pub(crate) async fn resolve_provider_key_traced(
     let pool = crate::db::global_pool();
     let master = crate::byok::master_key();
     if let (Some(pool), Some(master)) = (pool, master) {
-        let key = match fetch_byok(pool, master, tenant_id, provider_id).await {
-            ByokFetch::Key(secret) => {
-                crate::db::provider_keys::cache_decrypted(
-                    tenant_id,
-                    provider_id,
-                    Arc::clone(&secret),
-                );
-                ProviderKey::Found(secret)
+        if crate::kms::KeyVault::global().is_err() {
+            return (ProviderKey::KmsUnavailable, true);
+        }
+        let Some(_fill) = cold_fill_flight(tenant_id, provider_id, label).await else {
+            return (ProviderKey::LookupFailed, true);
+        };
+        if let CachedLookup::Fresh(secret) =
+            crate::db::provider_keys::lookup_swr_labeled(tenant_id, provider_id, label)
+        {
+            return (ProviderKey::Found(secret), false);
+        };
+        let Some(fill) = crate::db::provider_keys::begin_cold_fill(tenant_id, provider_id, label)
+        else {
+            return (ProviderKey::LookupFailed, false);
+        };
+        let key = match fetch_byok(pool, master, tenant_id, provider_id, label).await {
+            ByokFetch::Key(opened) => {
+                let secret = opened.secret;
+                if fill.publish(Arc::clone(&secret), opened.expires_at) {
+                    ProviderKey::Found(secret)
+                } else {
+                    ProviderKey::LookupFailed
+                }
             }
+            ByokFetch::Kms(error) => kms_failure(error),
             ByokFetch::Undecryptable(e) => {
                 tracing::error!(
                     error = %e,
@@ -414,6 +647,10 @@ pub(crate) async fn resolve_provider_key_traced(
         env_fallback_allowed(pool.is_some(), master.is_some()),
         "env fallback reached with a control plane and a master key present"
     );
+    // OG-11: a named pool key never resolves to the environment.
+    if label != crate::db::provider_keys::DEFAULT_LABEL {
+        return (ProviderKey::NotConfigured, false);
+    }
 
     if env_var.is_empty() {
         return (
@@ -426,6 +663,73 @@ pub(crate) async fn resolve_provider_key_traced(
         Err(_) => ProviderKey::NotConfigured,
     };
     (key, false)
+}
+
+/// `OG-11`: walks one provider's key POOL in order, resolving each label's key only
+/// when it is reached — the first usable key costs one lookup, exactly as the single
+/// `default` key did. The tenant's own keys only (`(tenant, provider, label)`).
+pub(crate) struct KeyCursor {
+    labels: Vec<String>,
+    next: usize,
+    /// Why labels did not resolve — the refusal when none does. `LookupFailed` wins
+    /// (the store could not be read: 503, never "add a key").
+    failure: Option<ProviderKey>,
+    /// A control-plane read happened on the request path (B-568 I5).
+    pub(crate) cold: bool,
+}
+
+impl KeyCursor {
+    pub(crate) fn new(labels: Vec<String>) -> Self {
+        Self {
+            labels,
+            next: 0,
+            failure: None,
+            cold: false,
+        }
+    }
+
+    /// The next label whose key resolves, or `None` when the pool is spent.
+    pub(crate) async fn next_key(
+        &mut self,
+        tenant_id: &TenantId,
+        provider_id: &str,
+        env_var: &str,
+    ) -> Option<(String, Arc<secrecy::SecretString>)> {
+        while self.next < self.labels.len() {
+            let label = self.labels[self.next].clone();
+            self.next += 1;
+            let (key, cold) =
+                resolve_provider_key_labeled(tenant_id, provider_id, &label, env_var).await;
+            self.cold |= cold;
+            match key {
+                ProviderKey::Found(k) => return Some((label, k)),
+                ProviderKey::LookupFailed => self.failure = Some(ProviderKey::LookupFailed),
+                // OG-37: a customer-key-service refusal is the answer to give (503/403, never
+                // "add a key"), so it outranks the pool's plain misses — but not `LookupFailed`.
+                other @ (ProviderKey::KmsUnavailable | ProviderKey::KmsDenied) => {
+                    if !matches!(self.failure, Some(ProviderKey::LookupFailed)) {
+                        self.failure = Some(other);
+                    }
+                }
+                other => {
+                    if self.failure.is_none() {
+                        self.failure = Some(other);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Labels not yet tried remain.
+    pub(crate) fn has_more(&self) -> bool {
+        self.next < self.labels.len()
+    }
+
+    /// The refusal for a pool none of whose keys resolved.
+    pub(crate) fn into_failure(self) -> ProviderKey {
+        self.failure.unwrap_or(ProviderKey::NotConfigured)
+    }
 }
 
 /// True for the reserved benchmark-only model names that, when
@@ -485,6 +789,7 @@ pub(crate) fn bench_mock_active(flag: bool, model: &str) -> bool {
 /// one call). The caller (`server/chat.rs`) merges it into the request's full
 /// dispatch sequence via `tracelane_shared::span::extend_dispatch_attempts`,
 /// which renumbers on merge.
+#[allow(clippy::too_many_arguments)] // dispatch identity plus the request's retry and deadline policies
 pub(super) async fn dispatch_with_retry(
     registry: &crate::providers::ProviderRegistry,
     chat_request: &tracelane_shared::ChatRequest,
@@ -503,19 +808,20 @@ pub(super) async fn dispatch_with_retry(
     // the caller from `AppState::failover` (read once at boot), not from a
     // process global here.
     policy: crate::providers::failover::RetryPolicy,
+    deadlines: crate::routing::deadlines::Budget,
 ) -> (
     anyhow::Result<crate::providers::ProviderStream>,
     Vec<DispatchAttempt>,
 ) {
     let budget = std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS);
     retry_loop(policy, budget, provider, model, || {
-        dispatch_to_provider(
+        deadlines.clone().scope(dispatch_to_provider(
             registry,
             chat_request.clone(),
             provider_key,
             model,
             tenant_id,
-        )
+        ))
     })
     .await
 }
@@ -538,6 +844,12 @@ const TRANSPORT_RETRY_CUTOFF: std::time::Duration = std::time::Duration::from_se
 /// - no upstream status (transport) → yes iff the attempt failed within
 ///   [`TRANSPORT_RETRY_CUTOFF`]
 fn retry_worthwhile(err: &anyhow::Error, attempt_took: std::time::Duration) -> bool {
+    if err.is::<crate::routing::attempt::Denied>() {
+        return false;
+    }
+    if crate::routing::deadlines::Timeout::find(err.as_ref()).is_some() {
+        return false;
+    }
     match err.downcast_ref::<crate::providers::ProviderHttpError>() {
         Some(_) => matches!(
             classify_dispatch_error(err),
@@ -575,8 +887,21 @@ fn dispatch_attempt_for_error(
     err: &anyhow::Error,
     took_ms: u32,
 ) -> DispatchAttempt {
+    if let Some(denied) = err.downcast_ref::<crate::routing::attempt::Denied>() {
+        return DispatchAttempt {
+            key_label: None,
+            attempt,
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            outcome: "skipped".to_owned(),
+            status: None,
+            reason: Some(denied.code().to_owned()),
+            took_ms,
+        };
+    }
     let http = err.downcast_ref::<crate::providers::ProviderHttpError>();
-    DispatchAttempt {
+    let mut attempt = DispatchAttempt {
+        key_label: None,
         attempt,
         provider: provider.to_string(),
         model: model.to_string(),
@@ -586,13 +911,63 @@ fn dispatch_attempt_for_error(
             .and_then(|e| e.reason.clone())
             .or_else(|| Some(classify_dispatch_error(err).reason().to_string())),
         took_ms,
+    };
+    if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+        timeout.record_attempt(std::slice::from_mut(&mut attempt));
     }
+    attempt
+}
+
+/// OG-10: one pause drawn by FULL JITTER — `uniform(0, min(remaining, backoff × 2^attempt))`.
+///
+/// Pure, so the bound is property-tested: the result is always `<= remaining` and
+/// `<= backoff × 2^attempt`. `sample` is a uniform `u64`; the pause is
+/// `cap × sample / 2^64`, so `sample = 0` gives 0 and `u64::MAX` approaches the cap
+/// (never reaches it). The exponent is capped at 2^16 — far past any budget — so the
+/// shift cannot overflow however many attempts a future policy allows.
+fn jitter_pause(
+    backoff: std::time::Duration,
+    attempt: u32,
+    remaining: std::time::Duration,
+    sample: u64,
+) -> std::time::Duration {
+    let cap = backoff
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(remaining);
+    let picked = cap.as_nanos() * u128::from(sample) / (u128::from(u64::MAX) + 1);
+    std::time::Duration::from_nanos(u64::try_from(picked).unwrap_or(u64::MAX))
+}
+
+/// A uniform `u64` for the jitter. Not security-sensitive (it spreads retries, it
+/// guards nothing), but `ring` is already a dependency of this crate, so no new crate
+/// is needed. **Fail-OPEN** (fault-tolerance path): if the OS source errors, fall back
+/// to the clock's sub-second nanos mixed with a golden-ratio constant — still enough
+/// spread to de-synchronise retries, and a retry is never refused over it.
+fn random_u64() -> u64 {
+    use ring::rand::SecureRandom as _;
+    let mut b = [0u8; 8];
+    if ring::rand::SystemRandom::new().fill(&mut b).is_ok() {
+        return u64::from_le_bytes(b);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// The retry loop, generic over the attempt so it can be driven by a closure
 /// in tests. `budget` bounds the SUM of backoff pauses (see
 /// [`dispatch_with_retry`]); each attempt's own duration is bounded by the
 /// adapter's client timeout, not by this loop.
+///
+/// **OG-10 — how long to wait.** For a [`retry_worthwhile`] failure:
+/// - the upstream said `Retry-After` and it fits in the remaining budget → sleep
+///   EXACTLY that long, then retry;
+/// - it said `Retry-After` and it does NOT fit → **do not retry this provider** (a
+///   retry would be refused again and spend a call); the typed error, carrying the
+///   hint, goes back so the handler can relay it and the CLIENT's backoff can work.
+///   A cross-provider failover, if the caller opted in, proceeds as before;
+/// - it said nothing → full-jitter exponential ([`jitter_pause`]).
 ///
 /// RI-05 M1: also returns the per-attempt ledger — one element per attempt
 /// THIS call made, numbered locally (0, 1, … within this call only; see
@@ -602,6 +977,22 @@ async fn retry_loop<T, F, Fut>(
     budget: std::time::Duration,
     provider: &str,
     model: &str,
+    attempt_fn: F,
+) -> (anyhow::Result<T>, Vec<DispatchAttempt>)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    retry_loop_with(policy, budget, provider, model, random_u64, attempt_fn).await
+}
+
+/// [`retry_loop`] with the jitter source injected, so a test can pin it.
+async fn retry_loop_with<T, F, Fut>(
+    policy: crate::providers::failover::RetryPolicy,
+    budget: std::time::Duration,
+    provider: &str,
+    model: &str,
+    mut sampler: impl FnMut() -> u64,
     mut attempt_fn: F,
 ) -> (anyhow::Result<T>, Vec<DispatchAttempt>)
 where
@@ -620,6 +1011,7 @@ where
         match attempt_fn().await {
             Ok(s) => {
                 ledger.push(DispatchAttempt {
+                    key_label: None,
                     attempt,
                     provider: provider.to_string(),
                     model: model.to_string(),
@@ -667,29 +1059,47 @@ where
                     );
                     return (Err(give_up(err, first_err)), ledger);
                 }
-                // Out of backoff budget. Checked BEFORE sleeping, so the sleep
-                // itself can never be what breaches the ceiling.
-                if backoff_spent + backoff > budget {
-                    tracing::warn!(
-                        error = %err,
-                        attempt,
-                        "provider failed; retry budget exhausted, no further attempt"
-                    );
-                    return (Err(give_up(err, first_err)), ledger);
-                }
+                // How long to wait. Decided BEFORE sleeping, so the sleep itself can
+                // never be what breaches the budget.
+                let remaining = budget.saturating_sub(backoff_spent);
+                let upstream_hint = err
+                    .downcast_ref::<crate::providers::ProviderHttpError>()
+                    .and_then(|e| e.retry_after);
+                let pause = match upstream_hint {
+                    Some(asked) if asked <= remaining => asked,
+                    Some(asked) => {
+                        tracing::warn!(
+                            error = %err,
+                            attempt,
+                            retry_after_ms = asked.as_millis(),
+                            "provider asked for a longer wait than the retry budget — not retrying it"
+                        );
+                        return (Err(give_up(err, first_err)), ledger);
+                    }
+                    None if remaining.is_zero() => {
+                        tracing::warn!(
+                            error = %err,
+                            attempt,
+                            "provider failed; retry budget exhausted, no further attempt"
+                        );
+                        return (Err(give_up(err, first_err)), ledger);
+                    }
+                    None => jitter_pause(backoff, attempt, remaining, sampler()),
+                };
                 tracing::warn!(
                     error = %err,
                     model = %model,
                     attempt,
-                    backoff_ms = policy.backoff_ms,
+                    pause_ms = pause.as_millis(),
+                    honouring_retry_after = upstream_hint.is_some(),
                     "provider attempt failed — retrying"
                 );
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
                 attempt += 1;
-                backoff_spent += backoff;
-                tokio::time::sleep(backoff).await;
+                backoff_spent += pause;
+                tokio::time::sleep(pause).await;
             }
         }
     }
@@ -780,7 +1190,8 @@ pub(crate) struct DispatchGuard {
     dispatch_attempts: Vec<DispatchAttempt>,
     /// GWY-49: the ZDR constraint's outcome so far, for the terminal error span —
     /// `None` until the handler judged the constraint (or when there was none).
-    zdr_eligible: Option<Vec<String>>,
+    zdr_eligible: Option<Vec<String>>, // Capture is cleared on unsafe redaction.
+    captured_input: Option<CapturedInput>,
 }
 
 impl DispatchGuard {
@@ -793,6 +1204,26 @@ impl DispatchGuard {
     /// ends in a refusal, a dispatch failure or a client cancellation.
     pub(crate) fn record_zdr(&mut self, eligible: Vec<String>) {
         self.zdr_eligible = Some(eligible);
+    }
+
+    /// `OG-11`/`OG-12`: how the request was routed, for the terminal error span.
+    pub(crate) fn record_route(&mut self, route: super::spans::RouteMeta) {
+        self.identity.route = route;
+    }
+
+    pub(crate) fn record_timeout(
+        &mut self,
+        timeout: crate::routing::deadlines::Timeout,
+        provider: &str,
+    ) {
+        let mut attempt = timeout.attempt(provider, &self.model);
+        attempt.took_ms = u32::try_from(
+            (chrono::Utc::now() - self.request_start)
+                .num_milliseconds()
+                .max(0),
+        )
+        .unwrap_or(u32::MAX);
+        self.dispatch_attempts = vec![attempt];
     }
 
     /// RI-05 M1: attach the attempt ledger so the terminal error span carries it.
@@ -819,7 +1250,8 @@ impl DispatchGuard {
             identity: identity.clone(),
             request_start,
             dispatch_attempts: Vec::new(),
-            zdr_eligible: None,
+            zdr_eligible: None, // The request's capture decision arrives later.
+            captured_input: None,
         }
     }
 
@@ -846,7 +1278,8 @@ impl DispatchGuard {
             reason,
             aft_id,
             std::mem::take(&mut self.dispatch_attempts),
-            self.zdr_eligible.take(),
+            self.zdr_eligible.take(), // Give the error span the final safe input.
+            self.captured_input.take(),
         );
         self.armed = false;
     }
@@ -871,7 +1304,8 @@ impl Drop for DispatchGuard {
             "client_cancelled",
             None,
             std::mem::take(&mut self.dispatch_attempts),
-            self.zdr_eligible.take(),
+            self.zdr_eligible.take(), // Give the cancellation span the safe input.
+            self.captured_input.take(),
         );
     }
 }
@@ -902,7 +1336,7 @@ mod tests {
         ));
         let k = std::sync::Arc::new(secrecy::SecretString::from("sk-x".to_string()));
         assert!(matches!(
-            refresh_outcome(ByokFetch::Key(k)),
+            refresh_outcome(ByokFetch::Key(crate::kms::vault::Opened { secret:k, expires_at:None })),
             RefreshOutcome::Renewed(ref s) if s.expose_secret() == "sk-x"
         ));
     }
@@ -999,7 +1433,7 @@ mod tests {
     fn provider_name_from_model_matches_dispatch_not_unknown() {
         // Groq-family (the trigger) + other previously-"unknown" providers.
         assert_eq!(provider_name_from_model("llama-3.3-70b-versatile"), "groq");
-        assert_eq!(provider_name_from_model("qwen-2.5-32b"), "groq");
+        assert_eq!(provider_name_from_model("qwen/qwen3-32b"), "groq");
         assert_eq!(provider_name_from_model("mistral-large-latest"), "mistral");
         assert_eq!(provider_name_from_model("grok-2"), "xai");
         assert_eq!(
@@ -1308,6 +1742,8 @@ mod tests {
             provider: "test",
             status,
             reason: None,
+            message: None,
+            retry_after: None,
         }
         .into()
     }
@@ -1345,6 +1781,8 @@ mod tests {
             provider: "google",
             status: 429,
             reason: Some("RESOURCE_EXHAUSTED".to_string()),
+            message: None,
+            retry_after: None,
         }
         .into();
         let a = dispatch_attempt_for_error(0, "google", "gemini-1.5-pro", &err, 12);
@@ -1388,6 +1826,8 @@ mod tests {
             provider: "openai",
             status: 429,
             reason: None, // OpenAI-shape bodies never pass `safe_reason`
+            message: None,
+            retry_after: None,
         }
         .into();
         let b = dispatch_attempt_for_error(1, "openai", "gpt-4o", &http_err, 5);
@@ -1401,6 +1841,7 @@ mod tests {
     fn dispatch_attempts_worth_recording_matches_the_write_rule() {
         use tracelane_shared::span::dispatch_attempts_worth_recording as worth;
         let ok = |attempt: u32| DispatchAttempt {
+            key_label: None,
             attempt,
             provider: "openai".to_string(),
             model: "gpt-4o".to_string(),
@@ -1415,6 +1856,7 @@ mod tests {
         );
         assert!(!worth(&[]), "an empty ledger is never worth recording");
         let err = DispatchAttempt {
+            key_label: None,
             outcome: "error".to_string(),
             status: Some(429),
             reason: Some("provider_rate_limited".to_string()),
@@ -1428,6 +1870,7 @@ mod tests {
         // Verifier finding (2026-09-20): a lone `skipped` is unreachable today but
         // must never be dropped silently if a future path produces one.
         let skipped = DispatchAttempt {
+            key_label: None,
             outcome: "skipped".to_string(),
             reason: Some("breaker_open".to_string()),
             ..ok(0)
@@ -1447,6 +1890,7 @@ mod tests {
             TenantId::from_jwt_claim("0e57f1c7-0000-4000-8000-00000000c0de".parse().unwrap());
         let ledger = vec![
             DispatchAttempt {
+                key_label: None,
                 attempt: 0,
                 provider: "anthropic".to_string(),
                 model: "claude-haiku-4-5".to_string(),
@@ -1456,6 +1900,7 @@ mod tests {
                 took_ms: 12,
             },
             DispatchAttempt {
+                key_label: None,
                 attempt: 1,
                 provider: "anthropic".to_string(),
                 model: "claude-haiku-4-5".to_string(),
@@ -1569,20 +2014,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_loop_stops_when_the_backoff_budget_is_spent() {
-        // retries=5 but each backoff is 150 ms against a 200 ms budget: the
-        // first pause fits (150 ≤ 200), the second would not (300 > 200).
+    async fn the_sum_of_pauses_never_exceeds_the_budget() {
+        // OG-10: retries=5, backoff 150 ms, budget 200 ms, sampler pinned to the top of the
+        // range (the worst case for time). The first pause draws up to 150, the next is
+        // capped by what is left of the budget — so the TOTAL sleep stays inside 200 ms
+        // however many of the 5 retries fire. (The pre-OG-10 loop stopped after one retry
+        // because its fixed 150 ms pause could not be repeated; jitter spends the remainder.)
         use std::sync::atomic::{AtomicU32, Ordering};
         let calls = AtomicU32::new(0);
         let policy = crate::providers::failover::RetryPolicy {
             retries: 5,
             backoff_ms: 150,
         };
-        let (out, ledger): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop(
+        let started = std::time::Instant::now();
+        let (out, ledger): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop_with(
             policy,
             std::time::Duration::from_millis(200),
             "test-provider",
             "m",
+            || u64::MAX,
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async { Err(http_err(503)) }
@@ -1590,9 +2040,229 @@ mod tests {
         )
         .await;
         assert!(out.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(ledger.len(), 2, "one element per attempt made, both errors");
+        let n = calls.load(Ordering::SeqCst);
+        assert!((2..=6).contains(&n), "attempts bounded by retries: {n}");
+        assert_eq!(ledger.len() as u32, n);
         assert!(ledger.iter().all(|a| a.outcome == "error"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "pauses are bounded by the 200 ms budget (plus scheduler slack): {:?}",
+            started.elapsed()
+        );
+    }
+
+    // ── OG-10: honour the upstream `Retry-After`; full-jitter backoff otherwise ──
+
+    fn http_err_after(status: u16, retry_after: std::time::Duration) -> anyhow::Error {
+        crate::providers::ProviderHttpError {
+            provider: "test",
+            status,
+            reason: None,
+            message: None,
+            retry_after: Some(retry_after),
+        }
+        .into()
+    }
+
+    /// **OG-10 proof 2, at the loop.** A provider that says "wait 20 s" must not be
+    /// re-hit after our 200 ms budget: ONE call, no sleep, and the typed error — with
+    /// its `retry_after` — survives for the handler to relay.
+    #[tokio::test]
+    async fn retry_after_beyond_the_budget_means_no_same_provider_retry() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let (out, ledger): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop(
+            crate::providers::failover::RetryPolicy::BUILTIN,
+            std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS),
+            "test-provider",
+            "m",
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_err_after(429, std::time::Duration::from_secs(20))) }
+            },
+        )
+        .await;
+        let err = out.expect_err("a 429 that outlasts the budget stays an error");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "retrying a provider that said 'wait 20 s' spends a call to be refused again"
+        );
+        assert_eq!(ledger.len(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "no pause may precede giving up"
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::providers::ProviderHttpError>()
+                .and_then(|h| h.retry_after),
+            Some(std::time::Duration::from_secs(20)),
+            "the hint must reach the handler so the client learns how long to wait"
+        );
+    }
+
+    /// In-budget honour: the pause is EXACTLY the provider's value, not our backoff.
+    /// The built-in 100 ms backoff would fail the upper bound; a `0` would fail the lower.
+    #[tokio::test]
+    async fn retry_after_inside_the_budget_is_slept_exactly() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let (out, ledger): (anyhow::Result<&'static str>, Vec<DispatchAttempt>) = retry_loop(
+            crate::providers::failover::RetryPolicy {
+                retries: 1,
+                backoff_ms: 150,
+            },
+            std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS),
+            "test-provider",
+            "m",
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(http_err_after(429, std::time::Duration::from_millis(30)))
+                    } else {
+                        Ok("served")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.expect("the retry fires and succeeds"), "served");
+        let took = started.elapsed();
+        assert!(
+            took >= std::time::Duration::from_millis(30),
+            "must wait what the provider asked: {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(120),
+            "must NOT wait our own backoff instead: {took:?}"
+        );
+        assert_eq!(ledger.len(), 2);
+    }
+
+    /// `Retry-After: 0` is "retry now" — honoured as zero, not replaced by a jittered guess.
+    #[tokio::test]
+    async fn retry_after_zero_retries_immediately() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let (out, _ledger): (anyhow::Result<&'static str>, Vec<DispatchAttempt>) = retry_loop(
+            crate::providers::failover::RetryPolicy {
+                retries: 1,
+                backoff_ms: 150,
+            },
+            std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS),
+            "test-provider",
+            "m",
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(http_err_after(429, std::time::Duration::ZERO))
+                    } else {
+                        Ok("served")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.expect("served"), "served");
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A 4xx that is not transient ignores a `Retry-After` it carries: the same request
+    /// gets the same answer (the classifier still runs first).
+    #[tokio::test]
+    async fn retry_after_on_a_non_transient_error_does_not_create_a_retry() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let (out, _): (anyhow::Result<()>, Vec<DispatchAttempt>) = retry_loop(
+            crate::providers::failover::RetryPolicy::BUILTIN,
+            std::time::Duration::from_millis(200),
+            "test-provider",
+            "m",
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_err_after(400, std::time::Duration::ZERO)) }
+            },
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// **OG-10 proof 4.** Every computed pause is ≤ the remaining budget AND ≤
+    /// `backoff × 2^n`, across the whole sample range and a spread of parameters — and the
+    /// two bounds are each the binding one somewhere, so neither is vacuous.
+    #[test]
+    fn jitter_never_exceeds_the_remaining_budget_or_the_exponential_cap() {
+        use std::time::Duration;
+        let mut cap_binds = false;
+        let mut budget_binds = false;
+        for backoff_ms in [0u64, 1, 10, 100, 199] {
+            for attempt in [0u32, 1, 2, 3, 5, 10, 40, 200] {
+                for remaining_ms in [0u64, 1, 7, 100, 200] {
+                    for sample in [0u64, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+                        let backoff = Duration::from_millis(backoff_ms);
+                        let remaining = Duration::from_millis(remaining_ms);
+                        let pause = jitter_pause(backoff, attempt, remaining, sample);
+                        let cap = backoff.saturating_mul(2u32.saturating_pow(attempt.min(30)));
+                        assert!(pause <= remaining, "{pause:?} > remaining {remaining:?}");
+                        assert!(pause <= cap, "{pause:?} > cap {cap:?}");
+                        cap_binds |= remaining > cap && pause > Duration::ZERO;
+                        budget_binds |= cap > remaining && pause > Duration::ZERO;
+                    }
+                }
+            }
+        }
+        assert!(cap_binds && budget_binds, "both bounds must be exercised");
+        // Full jitter spans the interval: the lowest sample is 0 and the highest approaches the cap.
+        let b = Duration::from_millis(100);
+        let big = Duration::from_secs(10);
+        assert_eq!(jitter_pause(b, 0, big, 0), Duration::ZERO);
+        assert!(jitter_pause(b, 0, big, u64::MAX) >= Duration::from_millis(99));
+        assert!(jitter_pause(b, 2, big, u64::MAX) >= Duration::from_millis(399));
+    }
+
+    /// With no `Retry-After`, the loop retries on a jittered pause bounded by the budget:
+    /// a sampler pinned to the top of the range makes the bound observable in total time.
+    #[tokio::test]
+    async fn a_503_without_retry_after_retries_on_a_jittered_pause_within_the_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let (out, _): (anyhow::Result<&'static str>, Vec<DispatchAttempt>) = retry_loop_with(
+            crate::providers::failover::RetryPolicy {
+                retries: 3,
+                backoff_ms: 40,
+            },
+            std::time::Duration::from_millis(200),
+            "test-provider",
+            "m",
+            || u64::MAX,
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 3 {
+                        Err(http_err(503))
+                    } else {
+                        Ok("served")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.expect("served on the last retry"), "served");
+        // Pauses at the top of the range: ~40 + ~80 + (200-120)=80 capped → total ≤ 200 ms.
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(400),
+            "the sum of pauses is bounded by the 200 ms budget: {took:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -1628,13 +2298,18 @@ mod breaker_trip_inputs {
             provider: "openai",
             status,
             reason: None,
+            message: None,
+            retry_after: None,
         }
         .into())
     }
 
     #[test]
     fn breaker_ignores_a_caller_blaming_upstream_4xx() {
-        for status in [400u16, 401, 403, 404] {
+        // F4 (2026-10-03): 429 joins this list. Under BYOK a 429 is ONE tenant's account
+        // quota — observed live: a free-tier Mistral key's 429s opened `mistral` for the
+        // whole process (`503 upstream_circuit_open`).
+        for status in [400u16, 401, 403, 404, 429] {
             assert_eq!(
                 super::breaker_outcome(&http_err(status)),
                 None,
@@ -1647,16 +2322,415 @@ mod breaker_trip_inputs {
 
     #[test]
     fn breaker_still_trips_on_a_real_upstream_fault() {
-        for status in [429u16, 500, 502, 503] {
+        for status in [500u16, 502, 503] {
             assert_eq!(
                 super::breaker_outcome(&http_err(status)),
-                Some(false),
-                "{status} is an upstream fault — ADR-036 names exactly these as trip inputs"
+                Some(crate::circuit_breaker::Outcome::UpstreamFault),
+                "{status} is an upstream fault — ADR-036 (as amended 2026-10-03) trips on 5xx"
             );
         }
         assert_eq!(
             super::breaker_outcome(&Ok::<(), anyhow::Error>(())),
-            Some(true)
+            Some(crate::circuit_breaker::Outcome::Success)
         );
+    }
+
+    /// `OG-13` proof 4: 429 / 401 / 403 / 404 feed NEITHER tier on any wire. Chat and
+    /// embeddings feed through `breaker_outcome`; every relay wire (messages, responses,
+    /// gemini, media, files, batches, realtime, passthrough) through
+    /// `openai_responses::breaker_observation`. Both predicates are driven into a real
+    /// breaker exactly as the call sites do, a hundred times, and both tiers stay Closed.
+    #[test]
+    fn og13_proof4_caller_blaming_4xx_feed_neither_tier_on_any_wire() {
+        use crate::circuit_breaker::{CircuitBreaker, Cred, State};
+        let cb = CircuitBreaker::default();
+        let tenant = uuid::Uuid::from_u128(4);
+        let cred = Cred::byok(&tenant, "openai", "default");
+        for status in [401u16, 403, 404, 429] {
+            for _ in 0..100 {
+                if let Some(ok) = super::breaker_outcome(&http_err(status)) {
+                    cb.record("openai", "default", &cred, ok);
+                }
+                if let Some(ok) = crate::openai_responses::breaker_observation(Some(status)) {
+                    cb.record("openai", "default", &cred, ok);
+                }
+            }
+        }
+        assert_eq!(cb.state("openai", "default", &cred.id), State::Closed);
+        assert!(
+            cb.outcomes("openai", "default", &cred.id).is_empty(),
+            "fed nothing"
+        );
+        let other = Cred::byok(&uuid::Uuid::from_u128(5), "openai", "default");
+        assert!(
+            cb.allow("openai", "default", &other),
+            "provider-wide tier Closed"
+        );
+    }
+
+    /// `OG-13`: the credential decision. With a control plane and a master key a tenant's
+    /// dispatch is ITS credential (two tenants never share one); otherwise — and for a
+    /// provider that takes no key — it is the operator's environment credential.
+    #[test]
+    fn og13_breaker_cred_is_per_tenant_under_byok_and_env_otherwise() {
+        use crate::circuit_breaker::Credential;
+        let a = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(1));
+        let b = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(2));
+        let ca = super::breaker_cred_with(false, &a, "openai", "default");
+        let cb = super::breaker_cred_with(false, &b, "openai", "default");
+        assert!(matches!(ca.id, Credential::Byok(_)));
+        assert_ne!(ca.id, cb.id, "two tenants never share a credential breaker");
+        assert_ne!(
+            ca.id,
+            super::breaker_cred_with(false, &a, "openai", "team-b").id,
+            "two labels of one tenant are two credentials"
+        );
+        assert_eq!(
+            super::breaker_cred_with(true, &a, "openai", "default").id,
+            Credential::Env,
+            "no control plane: the operator's environment key, shared"
+        );
+        assert_eq!(
+            super::breaker_cred_with(false, &a, "ollama", "default").id,
+            Credential::Env,
+            "a keyless provider has no tenant credential"
+        );
+    }
+    fn pem() -> String {
+        use aws_lc_rs::encoding::AsDer as _;
+        use base64::Engine as _;
+        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+            .expect("generate a test RSA key");
+        let der = key.as_der().expect("PKCS#8 DER");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+        let body: String = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|l| format!("{}\n", std::str::from_utf8(l).expect("ascii")))
+            .collect();
+        format!("-----BEGIN PRIVATE KEY-----\n{body}-----END PRIVATE KEY-----\n")
+    }
+
+    /// The three tenant-controlled failure shapes the round-2 review named, produced by
+    /// the REAL code paths: a Vertex service account whose `token_uri` is the tenant's
+    /// own host answering 500, a malformed service-account JSON, and a key with an
+    /// interior control byte (a reqwest builder error at header build).
+    async fn tenant_made_failures() -> Vec<anyhow::Error> {
+        let _bypass = crate::handler_harness::LoopbackBypassGuard::new();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let req = || -> tracelane_shared::ChatRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "vertex/gemini-2.5-pro",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let vertex = crate::providers::VertexProvider::new().unwrap();
+        let poisoned_sa = serde_json::json!({
+            "client_email": "sb@example.test",
+            "project_id": "sb-project",
+            "private_key": pem(),
+            "token_uri": format!("{}/token", server.uri()),
+        })
+        .to_string();
+        let mut out = Vec::new();
+        out.push(
+            vertex
+                .chat(req(), &poisoned_sa, &tenant)
+                .await
+                .err()
+                .unwrap(),
+        );
+        out.push(
+            vertex
+                .chat(req(), "{\"client_email\":", &tenant)
+                .await
+                .err()
+                .unwrap(),
+        );
+        let client = crate::ssrf_guard::safe_client_builder().build().unwrap();
+        out.push(
+            client
+                .post(format!("{}/v1/chat/completions", server.uri()))
+                .header("authorization", "Bearer sk-ab\u{1}cd")
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .map(|_| ())
+                .err()
+                .map(anyhow::Error::from)
+                .expect("an interior control byte is a builder error"),
+        );
+        out
+    }
+
+    /// SB (security re-review round 2, 2026-10-05): `breaker_outcome` counted EVERY
+    /// non-`ProviderHttpError` error as a provider failure under default tuning, so three
+    /// free workspaces with poisoned credentials opened the SHARED provider tier for
+    /// everyone. A credential-derived failure may only affect its own credential.
+    #[tokio::test]
+    async fn sb_credential_derived_failures_never_open_the_provider_tier() {
+        use crate::circuit_breaker::{CircuitBreaker, Cred};
+        let cb = CircuitBreaker::default();
+        let creds: Vec<Cred> = (0..3u128)
+            .map(|n| Cred::byok(&uuid::Uuid::from_u128(0x5b00 + n), "openai", "default"))
+            .collect();
+        for _round in 0..6 {
+            for (cred, err) in creds.iter().zip(tenant_made_failures().await) {
+                if let Some(ok) = super::breaker_outcome(&Err::<(), _>(err)) {
+                    cb.record("openai", "default", cred, ok);
+                }
+            }
+        }
+        let healthy = Cred::byok(&uuid::Uuid::from_u128(0x5b99), "openai", "default");
+        assert!(
+            cb.allow("openai", "default", &healthy),
+            "three tenants' credential-derived failures must not shed a healthy fourth tenant"
+        );
+        // The protection kept: real upstream 5xx from three tenants under defaults.
+        for n in 0..3u128 {
+            let cred = Cred::byok(&uuid::Uuid::from_u128(0x5c00 + n), "openai", "default");
+            for _ in 0..10 {
+                if let Some(ok) = super::breaker_outcome(&http_err(503)) {
+                    cb.record("openai", "default", &cred, ok);
+                }
+            }
+        }
+        assert!(
+            !cb.allow("openai", "default", &healthy),
+            "a real outage still opens it"
+        );
+    }
+}
+
+/// `OG-10` end to end: the REAL chat handler, a wiremock upstream, and what the CLIENT sees.
+/// The hammer proofs count requests at the upstream — a 429 that is retried after our
+/// 100 ms instead of the provider's 20 s is invisible in a status code.
+#[cfg(all(test, debug_assertions))]
+mod og10_handler_tests {
+    use crate::handler_harness::{
+        LoopbackBypassGuard, authed, body_json, chat_ok_body, registry_pointing_ollama_at,
+        test_state,
+    };
+    use crate::server::chat_completions_handler;
+    use axum::extract::{Json, State};
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn call(server: &MockServer) -> axum::response::Response {
+        let state = test_state(registry_pointing_ollama_at(server.uri()));
+        chat_completions_handler(
+            State(state),
+            authed(),
+            Json(json!({
+                "model": "ollama/llama3",
+                "messages": [{"role": "user", "content": "hi"}],
+            })),
+        )
+        .await
+    }
+
+    fn retry_after(resp: &axum::response::Response) -> Option<&str> {
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// **OG-10 proof 2.** A 429 that says "wait 20 s": exactly ONE upstream request, and the
+    /// client gets 429 with the provider's `Retry-After: 20` (header AND body).
+    #[tokio::test]
+    async fn a_429_with_retry_after_20_is_not_hammered_and_the_client_is_told_20() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "20")
+                    .set_body_string(r#"{"error":{"message":"slow down"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            retry_after(&resp),
+            Some("20"),
+            "the provider's value, not the gateway's 60 s guess"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["retry_after_secs"], 20);
+        assert_eq!(
+            server.received_requests().await.map(|r| r.len()),
+            Some(1),
+            "exactly one upstream request — the hammer is stopped"
+        );
+    }
+
+    /// Without an upstream hint the pre-OG-10 behaviour stands: the gateway's 60 s guess in
+    /// the header only, no `retry_after_secs` in the body (a guess is not the provider's word).
+    #[tokio::test]
+    async fn a_429_without_retry_after_keeps_the_header_guess_and_no_body_field() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after(&resp), Some("60"));
+        assert!(body_json(resp).await.get("retry_after_secs").is_none());
+    }
+
+    /// **OG-10 proof 3.** `Retry-After: 0` then 200: two requests, success.
+    #[tokio::test]
+    async fn a_429_with_retry_after_0_is_retried_once_and_succeeds() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(server.received_requests().await.map(|r| r.len()), Some(2));
+    }
+
+    /// A 503 with no header: jittered retry, then success.
+    #[tokio::test]
+    async fn a_503_without_retry_after_is_retried_on_a_jittered_pause() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(server.received_requests().await.map(|r| r.len()), Some(2));
+    }
+
+    /// A 503 that says "wait 20 s": no retry, the status keeps its existing mapping (502),
+    /// and the provider's `Retry-After` reaches the client.
+    #[tokio::test]
+    async fn a_503_with_retry_after_surfaces_it_on_the_existing_502() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "20"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(retry_after(&resp), Some("20"));
+        assert_eq!(body_json(resp).await["retry_after_secs"], 20);
+        assert_eq!(server.received_requests().await.map(|r| r.len()), Some(1));
+    }
+
+    /// The upstream's `Retry-After` is clamped by the reference table before anyone sees it.
+    #[tokio::test]
+    async fn a_huge_retry_after_is_clamped_to_the_table_ceiling() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "9999999"))
+            .mount(&server)
+            .await;
+        let resp = call(&server).await;
+        assert_eq!(retry_after(&resp), Some("3600"));
+    }
+}
+
+#[cfg(test)]
+mod capture_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_guardrail_error_span_replaces_raw_input_with_the_redacted_form() {
+        let state =
+            crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
+        let tenant = crate::handler_harness::dev_tenant();
+        let trace = Uuid::new_v4();
+        let mut guard = DispatchGuard::arm(
+            &state,
+            &tenant,
+            trace,
+            None,
+            "ollama/llama3",
+            &CallerIdentity::default(),
+            chrono::Utc::now(),
+        );
+        let capture = crate::server::config::ContentCapture {
+            input: true,
+            output: false,
+            max_field_bytes: 64 * 1024,
+        };
+        let raw: tracelane_shared::ChatRequest = serde_json::from_value(json!({
+            "model":"ollama/llama3", "messages":[{"role":"user","content":"RAW_BEFORE_GUARDRAIL"}]
+        }))
+        .unwrap();
+        let safe: tracelane_shared::ChatRequest = serde_json::from_value(json!({
+            "model":"ollama/llama3", "messages":[{"role":"user","content":"R2_SAFE_ONLY"}]
+        }))
+        .unwrap();
+        guard.record_input(CapturedInput::build(capture, &raw));
+        guard.record_input(CapturedInput::build(capture, &safe));
+        guard.abort("guardrail_block", None);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let input = spans[0]
+            .attributes
+            .gen_ai_input_messages
+            .as_ref()
+            .unwrap()
+            .to_string();
+        assert!(input.contains("R2_SAFE_ONLY"));
+        assert!(!input.contains("RAW_BEFORE_GUARDRAIL"));
+    }
+}
+
+impl DispatchGuard {
+    /// Replace request content after redaction; `None` clears unsafe raw input.
+    pub(crate) fn record_input(&mut self, captured: Option<CapturedInput>) {
+        self.captured_input = captured;
+    }
+}
+
+fn kms_failure(error: crate::kms::KmsError) -> ProviderKey {
+    match error {
+        crate::kms::KmsError::Unavailable => ProviderKey::KmsUnavailable,
+        crate::kms::KmsError::Denied => ProviderKey::KmsDenied,
     }
 }

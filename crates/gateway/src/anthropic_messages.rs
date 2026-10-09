@@ -64,6 +64,7 @@
 //! - **No bench-mock arm.** The benchmark drives `/v1/chat/completions`; adding a
 //!   second bypass site is precisely what `.claude/rules/tenancy.md` forbids.
 
+use crate::admission::Route as _;
 use std::sync::OnceLock;
 
 use axum::{
@@ -74,7 +75,7 @@ use axum::{
 };
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
-use tracelane_policy::pii::{RedactionEntry, redact_reversible_from};
+use tracelane_policy::pii::RedactionEntry;
 use tracelane_shared::{
     ChatRequest, ContentPart, Message, MessageContent, Role, TenantId, Tool, Usage,
 };
@@ -154,11 +155,14 @@ fn error_type_for(status: StatusCode) -> &'static str {
 /// OpenAI-shaped chat route returns (`unroutable_model`, `audit_unavailable`,
 /// `provider_key_rejected`, …), so a customer running both wires greps one word.
 fn coded_error(status: StatusCode, code: &str, message: &str) -> Response {
-    anthropic_error(
-        status,
-        error_type_for(status),
-        message,
-        &[("code", json!(code))],
+    crate::kms::retry_after(
+        anthropic_error(
+            status,
+            error_type_for(status),
+            message,
+            &[("code", json!(code))],
+        ),
+        code,
     )
 }
 
@@ -341,9 +345,9 @@ fn translate_content(content: Option<&Value>) -> MessageContent {
                         content: flatten_tool_result(b.get("content")),
                         cache_control,
                     }),
-                    // Images, documents, server_tool_use, and anything Anthropic
-                    // ships next. Dropped from the READ MODEL only — the original
-                    // block is still forwarded upstream byte-for-byte.
+                    Some("image") => parts.push(capture_image_part(b)),
+                    // Other blocks remain out of the read model; the original
+                    // request still goes upstream byte-for-byte.
                     _ => {}
                 }
             }
@@ -444,6 +448,7 @@ fn to_chat_request(body: &Value) -> Result<ChatRequest, String> {
         stream: body.get("stream").and_then(Value::as_bool),
         system: flatten_system(body.get("system")),
         metadata: None,
+        ..Default::default()
     })
 }
 
@@ -453,65 +458,11 @@ fn is_streaming(body: &Value) -> bool {
 }
 
 // ── R2 request-side egress redaction, on the ORIGINAL bytes ──────────────────
-
-/// Redact secrets/PII out of the OUTGOING Anthropic body in place, returning the
-/// reversible map so the relayed response can re-insert the user's own originals.
-///
-/// **Why this is not `guardrail::streaming::redact_request_in_place`.** That
-/// function rewrites a `ChatRequest`, and a `ChatRequest` is not what egresses on
-/// this route — the caller's original bytes are. Rewriting the read model would have
-/// produced a redaction that was recorded in the verdict and applied to nothing, the
-/// quietest possible failure of an egress control. This walks the same fields
-/// (`system`, every message's text / `tool_result` content) on the JSON that is
-/// actually sent, with the same `redact_reversible_from` and the same running-index
-/// discipline, so the map re-inserts correctly on the way back.
-///
-/// Call it ONLY when the request-side verdict was `Redact`; an empty map means
-/// nothing was redacted and the body is byte-unchanged.
-fn redact_body_in_place(body: &mut Value) -> Vec<RedactionEntry> {
-    let mut map: Vec<RedactionEntry> = Vec::new();
-
-    fn redact_str(s: &mut String, map: &mut Vec<RedactionEntry>) {
-        let r = redact_reversible_from(s, map.len());
-        if !r.is_clean() {
-            *s = r.redacted;
-            map.extend(r.entries);
-        }
-    }
-    fn redact_at(v: &mut Value, key: &str, map: &mut Vec<RedactionEntry>) {
-        if let Some(Value::String(s)) = v.get_mut(key) {
-            redact_str(s, map);
-        }
-    }
-    /// A `system` value or a message `content`: a bare string, or blocks.
-    fn redact_content(v: &mut Value, map: &mut Vec<RedactionEntry>) {
-        match v {
-            Value::String(s) => redact_str(s, map),
-            Value::Array(blocks) => {
-                for b in blocks.iter_mut() {
-                    redact_at(b, "text", map);
-                    // `tool_result.content` is itself a string or blocks.
-                    if let Some(c) = b.get_mut("content") {
-                        redact_content(c, map);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(sys) = body.get_mut("system") {
-        redact_content(sys, &mut map);
-    }
-    if let Some(Value::Array(messages)) = body.get_mut("messages") {
-        for m in messages.iter_mut() {
-            if let Some(c) = m.get_mut("content") {
-                redact_content(c, &mut map);
-            }
-        }
-    }
-    map
-}
+//
+// `guardrail::egress::redact_relay_body` (M-1, 2026-10-03): the ONE walk R2 scans this body
+// with also rewrites it, and anything it cannot rewrite blocks. It replaced a per-wire copy
+// here that rewrote only `system` and message text — so a secret R2 flagged in a tool
+// description was "redacted" in the verdict and still sent in the bytes.
 
 // ── Upstream client ──────────────────────────────────────────────────────────
 
@@ -565,13 +516,17 @@ fn passthrough_version_headers(
 /// Classify an upstream status into `(our status, code, message)` — the SAME
 /// vocabulary `chat_completions_handler` uses, so one grep covers both wires.
 ///
-/// The upstream BODY is never propagated: Anthropic's 401/403 bodies can echo the
-/// `x-api-key` header value, which would put the customer's BYOK key in our
-/// response and in anything that logs it (`providers/anthropic.rs` says the same at
-/// its own error site).
+/// **OG-10 §3.1 (D7): this is now the CLASSIFICATION, and the response for only
+/// 401/403/407.** Those bodies can echo the `x-api-key` header value, which would put
+/// the customer's BYOK key in our response and in anything that logs it
+/// (`providers/anthropic.rs` says the same at its own error site), so they keep
+/// the `provider_key_rejected` mapping and their body is dropped. Every OTHER error
+/// status is relayed with its original status and (scrubbed) body by
+/// [`upstream_error_response`]; the code returned here is then only the ledger / span
+/// reason (`dispatch_guard.abort`).
 fn map_upstream_status(status: u16) -> (StatusCode, &'static str, &'static str) {
     match status {
-        401 | 403 => (
+        401 | 403 | 407 => (
             StatusCode::UNAUTHORIZED,
             "provider_key_rejected",
             "the stored Anthropic key was rejected by Anthropic — verify or rotate it in Settings → LLM providers",
@@ -604,20 +559,11 @@ fn map_upstream_status(status: u16) -> (StatusCode, &'static str, &'static str) 
     }
 }
 
-/// Whether an upstream failure is an observation about ANTHROPIC's health.
-///
-/// Mirrors `server::breaker_outcome` exactly: a non-429 upstream 4xx is one
-/// tenant's dead key, and the breaker has no tenant dimension — recording it would
-/// let that tenant open the circuit for everyone. `None` feeds the breaker nothing.
-fn breaker_observation(status: Option<u16>) -> Option<bool> {
-    match status {
-        None => Some(false),
-        Some(429) => Some(false),
-        Some(s) if (400..500).contains(&s) => None,
-        Some(s) if s >= 500 => Some(false),
-        Some(_) => Some(true),
-    }
-}
+/// Whether an upstream failure is an observation about ANTHROPIC's health. Re-exported
+/// rather than restated: two copies of this rule are how a change to one (F4, 429)
+/// would have left the other tripping.
+#[cfg(test)]
+pub(crate) use crate::openai_responses::breaker_observation;
 
 // ── Usage accumulation ───────────────────────────────────────────────────────
 
@@ -629,11 +575,11 @@ fn breaker_observation(status: Option<u16>) -> Option<bool> {
 /// repeats a field; taking the max of each counter independently is what makes the
 /// two events compose into one truth.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct UsageAcc {
-    input: u32,
-    output: u32,
-    cache_read: Option<u32>,
-    cache_creation: Option<u32>,
+pub(crate) struct UsageAcc {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) cache_read: Option<u32>,
+    pub(crate) cache_creation: Option<u32>,
 }
 
 impl UsageAcc {
@@ -663,7 +609,7 @@ impl UsageAcc {
 
     /// The shared `Usage` the guardrail rails (R1's output cap) and
     /// `pricing::cost_usd` both read.
-    fn as_usage(self) -> Usage {
+    pub(crate) fn as_usage(self) -> Usage {
         Usage {
             input_tokens: self.input,
             output_tokens: self.output,
@@ -676,19 +622,19 @@ impl UsageAcc {
 // ── SSE frame splitting ──────────────────────────────────────────────────────
 
 /// One SSE frame, verbatim, plus what the relay needs to know about it.
-struct Frame {
+pub(crate) struct Frame {
     /// The frame's ORIGINAL bytes, terminator included. Relayed unchanged on the
     /// clean path — this is the byte-fidelity guarantee, held as data rather than
     /// reconstructed.
-    raw: Bytes,
+    pub(crate) raw: Bytes,
     /// `Some(text)` iff this frame is a `content_block_delta` carrying a
     /// `text_delta`. Only these go through the response seam: `thinking_delta` and
     /// `input_json_delta` are not model prose the response rails are written for,
     /// and re-chunking a partial JSON tool argument would corrupt it.
-    text: Option<String>,
+    pub(crate) text: Option<String>,
     /// `content_block` index of a text delta, so a rewritten frame lands on the
     /// same block the provider was writing into.
-    index: u64,
+    pub(crate) index: u64,
 }
 
 /// Split off the first complete SSE frame in `buf`, returning its bytes (including
@@ -698,7 +644,7 @@ struct Frame {
 /// front of a self-hosted endpoint may normalise line endings, and a splitter that
 /// only knows one of them would buffer the entire response and emit it at once —
 /// which looks exactly like a hung stream.
-fn split_frame(buf: &mut Vec<u8>) -> Option<Bytes> {
+pub(crate) fn split_frame(buf: &mut Vec<u8>) -> Option<Bytes> {
     let lf = find_sub(buf, b"\n\n");
     let crlf = find_sub(buf, b"\r\n\r\n");
     let (end, _) = match (lf, crlf) {
@@ -717,7 +663,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The `data:` payload of an SSE frame, if it has one.
-fn frame_data(raw: &[u8]) -> Option<&str> {
+pub(crate) fn frame_data(raw: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(raw).ok()?;
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -786,7 +732,7 @@ fn synth_block_error(reason_code: &str, correlation_id: &str) -> Bytes {
 /// Non-text frames (`message_start`, `content_block_start`, `thinking_delta`,
 /// `input_json_delta`, `ping`, `message_delta`, `message_stop`) queue in order
 /// behind any pending text frame, so ordering is never re-arranged.
-struct Relay {
+pub(crate) struct Relay {
     guard: crate::guardrail::ResponseGuard,
     pending: std::collections::VecDeque<Frame>,
     /// Every text delta the provider sent, concatenated.
@@ -799,10 +745,13 @@ struct Relay {
     synthesised: usize,
     rewriting: bool,
     last_index: u64,
+    /// Builds the frame that carries guard-transformed text once a rail has redacted. The
+    /// Anthropic wire's is a `content_block_delta`; `gemini_native` supplies its own.
+    synth: fn(u64, &str) -> Bytes,
 }
 
 /// What the relay wants the caller to do next.
-enum Release {
+pub(crate) enum Release {
     /// Send these bytes to the client, in order.
     Bytes(Vec<Bytes>),
     /// A rail blocked: send these bytes (the block frame) and end the stream.
@@ -810,7 +759,15 @@ enum Release {
 }
 
 impl Relay {
-    fn new(guard: crate::guardrail::ResponseGuard) -> Self {
+    pub(crate) fn new(guard: crate::guardrail::ResponseGuard) -> Self {
+        Self::with_synth(guard, synth_text_delta)
+    }
+
+    /// [`Relay::new`] for a wire with its own text-frame shape.
+    pub(crate) fn with_synth(
+        guard: crate::guardrail::ResponseGuard,
+        synth: fn(u64, &str) -> Bytes,
+    ) -> Self {
         Self {
             guard,
             pending: std::collections::VecDeque::new(),
@@ -820,11 +777,24 @@ impl Relay {
             synthesised: 0,
             rewriting: false,
             last_index: 0,
+            synth,
         }
     }
 
     /// Feed one provider frame. Returns whatever became releasable.
-    async fn push(&mut self, frame: Frame, usage: Usage) -> Release {
+    pub(crate) async fn push(&mut self, frame: Frame, usage: Usage) -> Release {
+        let scanned = frame.text.as_deref().unwrap_or("");
+        let unscanned = frame_data(&frame.raw)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .as_ref()
+            .is_some_and(|v| {
+                crate::guardrail::streaming::has_unscanned_output(v)
+                    || crate::guardrail::streaming::has_unseen_text(v, scanned)
+            });
+        if unscanned && let Some(reason) = self.guard.refuse_unscanned_output().await {
+            self.pending.clear();
+            return Release::Blocked(Vec::new(), reason);
+        }
         if let Some(text) = frame.text.clone() {
             self.last_index = frame.index;
             self.raw_text.push_str(&text);
@@ -844,7 +814,7 @@ impl Relay {
 
     /// The provider stream ended. Flush the guard's held-back tail and everything
     /// still queued.
-    async fn finish(&mut self, usage: Usage) -> Release {
+    pub(crate) async fn finish(&mut self, usage: Usage) -> Release {
         match self.guard.on_end(Some(&usage)).await {
             crate::guardrail::GuardStep::Emit(safe) => self.safe_text.push_str(&safe),
             crate::guardrail::GuardStep::Block { reason_code } => {
@@ -893,7 +863,7 @@ impl Relay {
             self.synthesised = self.released;
         }
         if self.rewriting && self.safe_text.len() > self.synthesised {
-            out.push(synth_text_delta(
+            out.push((self.synth)(
                 self.last_index,
                 &self.safe_text[self.synthesised..],
             ));
@@ -918,6 +888,25 @@ pub(crate) struct MessagesParsed {
     pub raw: Bytes,
     pub json_body: Value,
     pub chat_request: ChatRequest,
+    /// `OG-11`: the model routes nowhere by the provider map — it may be one of the
+    /// workspace's virtual models, which only the entitlement read knows. The parse
+    /// defers its `unroutable_model` refusal to `apply_route` (still before any charge).
+    pub unresolved: bool,
+    /// `OG-11`: `apply_route` rewrote `model` to a virtual model's target, so the
+    /// caller's bytes no longer egress verbatim — `json_body` is re-serialised.
+    pub rerouted: bool,
+}
+
+/// The refusal for a model this wire cannot route (a parse refusal, or one `apply_route`
+/// raises once the workspace's virtual models are known not to name it).
+fn unroutable_on_messages() -> crate::admission::Malformed {
+    crate::admission::Malformed {
+        code: "unroutable_model",
+        message: "POST /v1/messages serves Anthropic models only — use a `claude-*` \
+                  model here, or POST /v1/chat/completions for any other provider"
+            .into(),
+        detail: None,
+    }
 }
 
 impl crate::admission::Parsed for MessagesParsed {
@@ -927,6 +916,17 @@ impl crate::admission::Parsed for MessagesParsed {
     fn request_json(&self) -> &Value {
         &self.json_body
     }
+    /// `OG-20`: one generating call (`max_tokens` is required on this wire).
+    fn policy_request(&self) -> tracelane_shared::key_policy::PolicyRequest {
+        tracelane_shared::key_policy::PolicyRequest {
+            subjects: vec![crate::admission::chat_subject(
+                &self.chat_request,
+                false,
+                None,
+            )],
+            body_bytes: tracelane_shared::key_policy::Fact::Known(self.raw.len() as u64),
+        }
+    }
 }
 
 impl crate::admission::Route for Messages {
@@ -934,10 +934,38 @@ impl crate::admission::Route for Messages {
     type Parsed = MessagesParsed;
     const NAME: &'static str = "messages";
     const AUDIT_EVENT_TYPE: &'static str = "messages.request";
+    const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Refuses;
+    // OG-11 (a native relay: only Anthropic targets of a virtual model, fallthrough within Anthropic).
+    const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
+        wire: crate::routing::Wire::Messages,
+        virtual_models: crate::routing::VirtualSupport::OwnProvider(PROVIDER_ID),
+        key_pool: crate::routing::PoolSupport::Pool,
+        fallthrough: true,
+        timeouts: true,
+    };
 
     /// `Authorization` OR `x-api-key` — the two headers Anthropic's SDKs send.
     fn credential(headers: &HeaderMap) -> Option<String> {
         authorization_value(headers)
+    }
+
+    /// `OG-11`: a virtual model (Anthropic targets only — the plan refused any other)
+    /// becomes its first candidate; an unroutable name no plan resolved is refused.
+    fn apply_route(
+        parsed: &mut MessagesParsed,
+        plan: Option<&mut crate::routing::RoutePlan>,
+    ) -> Result<(), crate::admission::Malformed> {
+        match plan.and_then(|p| p.candidates.first()) {
+            Some(c) => {
+                parsed.chat_request.model.clone_from(&c.model);
+                parsed.json_body["model"] = Value::String(c.model.clone());
+                parsed.unresolved = false;
+                parsed.rerouted = true;
+                Ok(())
+            }
+            None if parsed.unresolved => Err(unroutable_on_messages()),
+            None => Ok(()),
+        }
     }
 
     /// Parse, translate, and ROUTE. ONE WIRE, ONE PROVIDER (spec §6): a `gpt-*`
@@ -947,31 +975,31 @@ impl crate::admission::Route for Messages {
     /// parse. Refused by name HERE, inside the parse step, so it sits where it
     /// always did: before any entitlement resolve, quota read or credential.
     fn parse(body: Bytes) -> Result<MessagesParsed, crate::admission::Malformed> {
-        let Ok(json_body) = serde_json::from_slice::<Value>(&body) else {
-            return Err(crate::admission::Malformed {
-                code: "invalid_request",
-                message: "request body is not valid JSON".into(),
-            });
-        };
+        // M-A: the STRICT parse — the caller's bytes are what egress, so a key repeated in
+        // any object (scanned on one copy, read by the provider on another) is refused here.
+        let json_body = crate::strict_json::from_slice(&body)
+            .map_err(|e| e.into_malformed("request body is not valid JSON"))?;
         let chat_request =
             to_chat_request(&json_body).map_err(|message| crate::admission::Malformed {
                 code: "invalid_request",
                 message,
+                detail: None,
             })?;
-        if crate::providers::ProviderRegistry::provider_id_for_model(&chat_request.model)
-            != Some(PROVIDER_ID)
-        {
-            return Err(crate::admission::Malformed {
-                code: "unroutable_model",
-                message: "POST /v1/messages serves Anthropic models only — use a `claude-*` \
-                          model here, or POST /v1/chat/completions for any other provider"
-                    .into(),
-            });
-        }
+        // A model ANOTHER provider serves is a caller mistake, refused here as always. A
+        // model nothing routes may be a workspace virtual model (OG-11): `apply_route`
+        // resolves it or refuses it with the same error, before any charge.
+        let unresolved =
+            match crate::providers::ProviderRegistry::provider_id_for_model(&chat_request.model) {
+                Some(PROVIDER_ID) => false,
+                Some(_) => return Err(unroutable_on_messages()),
+                None => true,
+            };
         Ok(MessagesParsed {
             raw: body,
             json_body,
             chat_request,
+            unresolved,
+            rerouted: false,
         })
     }
 
@@ -1012,7 +1040,7 @@ impl crate::admission::Route for Messages {
                 anthropic_error(status, kind, message, &[])
             }
             Refusal::InsufficientScope => scope_refusal_response(),
-            Refusal::Malformed(crate::admission::Malformed { code, message }) => {
+            Refusal::Malformed(crate::admission::Malformed { code, message, .. }) => {
                 coded_error(status, code, &message)
             }
             Refusal::RateLimited { retry_after_secs } => {
@@ -1050,6 +1078,22 @@ impl crate::admission::Route for Messages {
                 "audit_unavailable",
                 "the tamper-evident ledger is unavailable — this request was not served because it could not be recorded",
             ),
+            Refusal::Unpriced { code, message } => coded_error(status, code, &message),
+            Refusal::Policy(d) => {
+                let mut extra = crate::admission::policy_pairs(&d);
+                extra.push(("code", json!(d.code)));
+                anthropic_error(status, error_type_for(status), &d.message, &extra)
+            }
+            Refusal::Control(c) => {
+                let mut extra = c.detail.clone();
+                extra.push(("code", json!(c.code)));
+                c.finish(anthropic_error(
+                    status,
+                    error_type_for(status),
+                    &c.message,
+                    &extra,
+                ))
+            }
         }
     }
 }
@@ -1098,6 +1142,7 @@ async fn messages_with_labels(
                 admitted.entitlements.as_deref(),
                 state.semantic_cache.as_deref(),
                 false,
+                &crate::cache_controls::CacheCaller::default(),
             ) {
                 Ok(policy) => policy,
                 Err(err) => {
@@ -1118,7 +1163,7 @@ async fn messages_with_labels(
 /// the class `CLAUDE.md` §1 exists to stop. Production has exactly ONE path into
 /// the pipeline: [`messages_handler`] → `admission::admit`.
 #[cfg(test)]
-async fn messages_with_claims(
+pub(crate) async fn messages_with_claims(
     state: AppState,
     headers: HeaderMap,
     body: Bytes,
@@ -1141,6 +1186,7 @@ async fn messages_admitted(
     admitted: crate::admission::Admitted<Messages>,
 ) -> Response {
     let crate::admission::Admitted {
+        attempt_security,
         claims,
         mut identity,
         request_start,
@@ -1154,6 +1200,7 @@ async fn messages_admitted(
         // Code uses) had no stage breakdown anywhere until 2026-09-27.
         mut timer,
         entitlements,
+        route_plan,
         ..
     } = admitted;
     // GWY-53: the ONE capture decision (operator allowlist OR the workspace opt-in;
@@ -1168,10 +1215,24 @@ async fn messages_admitted(
         raw: body,
         mut json_body,
         chat_request,
+        rerouted,
+        ..
     } = parsed;
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
-    let model = chat_request.model.clone();
+    let mut model = chat_request.model.clone(); // Error spans retain the admitted input.
+    dispatch_guard.record_input(CapturedInput::build(capture, &chat_request));
+    // OG-11: the targets (a virtual model's Anthropic models, in plan order; else the one
+    // model asked for) and the routing facts for the span.
+    let targets: Vec<String> = route_plan
+        .as_deref()
+        .filter(|p| p.dispatches())
+        .map_or_else(
+            || vec![model.clone()],
+            |p| p.candidates.iter().map(|c| c.model.clone()).collect(),
+        );
+    identity.route = crate::server::RouteMeta::from_plan(route_plan.as_deref());
+    dispatch_guard.record_route(identity.route.clone());
     // Kept as a local because this route feeds it to the guardrail
     // `SessionState` independently of the span.
     let conversation_id = identity.conversation_id.clone();
@@ -1219,21 +1280,48 @@ async fn messages_admitted(
     };
 
     // --- Step 2: BYOK. Fail-CLOSED, and the two failures need OPPOSITE actions ---
-    let (resolved_key, byok_round_trip) = crate::server::resolve_provider_key_traced(
-        tenant_id,
+    // OG-11: from Anthropic's key POOL when the routing document gives it one (the
+    // first label whose key resolves; the rest serve a key failure), else `default`.
+    let routing_state: std::sync::Arc<crate::routing::RoutingState> = entitlements
+        .as_deref()
+        .map(|e| std::sync::Arc::clone(&e.routing))
+        .unwrap_or_default();
+    let mut route_rng = crate::routing::thread_rng;
+    let pool = crate::routing::pool_labels(
+        &Messages::ROUTING,
+        &routing_state,
         PROVIDER_ID,
-        crate::providers::ProviderRegistry::env_var_for_provider_id(PROVIDER_ID),
-    )
-    .await;
+        &mut route_rng,
+    );
+    let pooled = pool.pooled;
+    let mut key_cursor = crate::server::KeyCursor::new(pool.labels);
+    let key_env = crate::providers::ProviderRegistry::env_var_for_provider_id(PROVIDER_ID);
+    let mut first_key: Option<(String, std::sync::Arc<secrecy::SecretString>)> = None;
+    while let Some((label, k)) = key_cursor.next_key(tenant_id, PROVIDER_ID, key_env).await {
+        if !k.expose_secret().is_empty() {
+            first_key = Some((label, k));
+            break;
+        }
+    }
     // B-568 I5: a BYOK cache miss read the control plane on the request path.
-    if byok_round_trip {
+    if key_cursor.cold {
         timer.note_cold();
         identity.cold_start = true;
     }
-    let provider_key = match resolved_key {
-        ProviderKey::Found(k) if !k.expose_secret().is_empty() => k,
-        outcome => {
-            let (status, code, message) = match outcome {
+    let first_key = match first_key {
+        Some(k) => k,
+        None => {
+            let (status, code, message) = match key_cursor.into_failure() {
+                ProviderKey::KmsUnavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "kms_unavailable",
+                    "customer key service unavailable",
+                ),
+                ProviderKey::KmsDenied => (
+                    StatusCode::FORBIDDEN,
+                    "kms_access_denied",
+                    "customer key service refused access",
+                ),
                 ProviderKey::Unusable => (
                     StatusCode::BAD_GATEWAY,
                     "provider_key_unusable",
@@ -1244,9 +1332,9 @@ async fn messages_admitted(
                     "provider_key_unavailable",
                     "the key store could not be reached — nothing was sent to Anthropic; retry shortly",
                 ),
-                // `Found("")` reaches here too: Anthropic is not a no-key provider,
+                // An empty key reaches here too: Anthropic is not a no-key provider,
                 // so an empty credential is "not configured", never "use it anyway".
-                _ => (
+                ProviderKey::NotConfigured | ProviderKey::Found(_) => (
                     StatusCode::PAYMENT_REQUIRED,
                     "provider_not_configured",
                     "no Anthropic key stored for this workspace — add one in Settings → LLM providers, then retry",
@@ -1262,19 +1350,37 @@ async fn messages_admitted(
     // --- Step 3: Inline guardrails, request side. Fail-CLOSED ---
     // `correlation_id` was minted by admission; the response-side seam reuses it.
     let mut redaction_map: Vec<RedactionEntry> = Vec::new();
+    let request_hooks;
+    let mut hooks_rewrote = false;
     {
-        let gr = state
+        let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
                 tenant_id,
-                api_key_id: Some(claims.sub.as_str()),
+                api_key_id: claims.api_key_id(),
+                project_id: claims.governance.as_ref().and_then(|g| g.project_id),
                 correlation_id,
                 request: &chat_request,
                 rag_context: crate::guardrail::context::extract_rag_context(&json_body),
                 session: crate::guardrail::SessionState::fresh(conversation_id.clone()),
                 actor: claims.sub.as_str(),
+                egress_json: Some(&json_body),
             })
             .await;
+        request_hooks = gr.hooks.clone();
+        identity.hook_events.record(&gr.hook_events);
+        if !gr.is_block() && !gr.hook_redactions.is_empty() {
+            let rewritten =
+                crate::guardrail::egress::redact_hook_json(&mut json_body, &gr.hook_redactions);
+            match rewritten {
+                Ok(()) => {
+                    hooks_rewrote = true;
+                }
+                Err(_) => {
+                    crate::guardrail::hooks::block(&mut gr.outcome, "HOOK_REDACTION_UNSUPPORTED")
+                }
+            }
+        }
         if gr.audit_publish_failed {
             tracing::error!(
                 correlation_id = %correlation_id,
@@ -1319,67 +1425,68 @@ async fn messages_admitted(
                 ],
             );
         }
-        if gr.outcome.decision == crate::guardrail::Decision::Redact {
-            redaction_map = redact_body_in_place(&mut json_body);
-        }
-    }
-
-    // The bytes that actually egress. Unchanged — the SAME allocation — unless R2
-    // redacted, which is the one case where fidelity must yield to the egress rule.
-    let outbound: Bytes = if redaction_map.is_empty() {
-        body
-    } else {
-        match serde_json::to_vec(&json_body) {
-            Ok(v) => Bytes::from(v),
-            Err(err) => {
-                tracing::error!(error = %err, "redacted body failed to serialise");
-                dispatch_guard.abort("internal_error", None);
-                return coded_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "the request could not be prepared for the provider",
-                );
+        if gr.outcome.records.iter().any(|r| {
+            r.rail == "R2_secrets_pii" && r.outcome.outcome == crate::guardrail::Outcome::Redact
+        }) {
+            // M-1: the SAME walk R2 scanned the body with rewrites it; anything it cannot
+            // rewrite in place is refused, never forwarded (fail-CLOSED, §10).
+            match crate::guardrail::egress::redact_relay_body_with_policy(
+                &mut json_body,
+                gr.pii_policy.as_ref(),
+            ) {
+                Ok(map) => redaction_map = map,
+                Err(crate::guardrail::egress::Unredactable) => {
+                    tracing::warn!(correlation_id = %correlation_id, "R2 redact could not cover the egress body — blocking; raw capture cleared");
+                    dispatch_guard.record_input(None);
+                    dispatch_guard.abort("guardrail_block", None);
+                    return anthropic_error(
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        "request blocked by Tracelane inline guardrail: a secret sits where the gateway cannot redact it in place",
+                        &[
+                            ("code", json!("guardrail_block")),
+                            ("rail", json!(crate::guardrail::egress::UNREDACTABLE_RAIL)),
+                            (
+                                "reason_code",
+                                json!(crate::guardrail::egress::UNREDACTABLE_REASON),
+                            ),
+                            ("correlation_id", json!(correlation_id.to_string())),
+                        ],
+                    );
+                }
             }
         }
-    };
+    } // Capture the exact redacted request that may leave the gateway.
 
-    // --- Step 4: Breaker + kill switch (ADR-036/038) ---
-    let region = "default";
+    let captured_input = if redaction_map.is_empty() {
+        CapturedInput::build(capture, &chat_request)
+    } else {
+        to_chat_request(&json_body)
+            .ok()
+            .and_then(|safe| CapturedInput::build(capture, &safe))
+    };
+    dispatch_guard.record_input(captured_input.clone());
+
+    // --- Step 4: kill switch (ADR-038) — provider-wide, before any attempt ---
+    // OG-13: the adapter's region; each pool key is its own breaker credential, checked
+    // per attempt inside the relay loop.
+    let region = state.providers.upstream_region(PROVIDER_ID).to_owned();
     let killed = state.kill_switch.upstream_killed(PROVIDER_ID);
-    if killed || !state.circuit_breaker.allow(PROVIDER_ID, region) {
+    if killed {
         tracing::warn!(
             provider = PROVIDER_ID,
             killed,
-            "upstream unavailable (circuit open or killed) — short-circuiting with 503"
+            "upstream unavailable (killed) — short-circuiting with 503"
         );
-        dispatch_guard.abort(
-            if killed {
-                "upstream_killed"
-            } else {
-                "upstream_circuit_open"
-            },
-            None,
-        );
-        let mut resp = anthropic_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            "Anthropic is temporarily unavailable through this gateway",
-            &[
-                ("code", json!("upstream_circuit_open")),
-                ("provider", json!(PROVIDER_ID)),
-            ],
-        );
-        resp.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from_static("10"),
-        );
-        return resp;
+        dispatch_guard.abort("upstream_killed", None);
+        return overloaded_response();
     }
 
-    // --- Step 5: Forward. NO retry, NO failover (spec §6) ---
-    // B-568 I2: guardrails + the egress body + the breaker, then the dispatch
-    // boundary — emitted against the same `dispatch_ts - request_start` the span's
-    // overhead number opens with, exactly as the chat route does.
+    // --- Step 5: Forward. Same-provider only: a virtual model's NEXT Anthropic target
+    // on a 5xx / transport failure, the NEXT pool key on a 401/403/429 (OG-11) ---
+    // B-568 I2: guardrails + the egress body, then the dispatch boundary — emitted
+    // against the same `dispatch_ts - request_start` the span's overhead number opens
+    // with, exactly as the chat route does.
     timer.mark("guardrails");
     let dispatch_ts = chrono::Utc::now();
     timer.emit_if_slow(
@@ -1391,25 +1498,97 @@ async fn messages_admitted(
         )
         .unwrap_or(0),
     );
-    let upstream = match forward(
+    // The bytes that actually egress. Unchanged — the SAME allocation — unless R2
+    // redacted, or a virtual model's target replaced `model` (OG-11): the two cases
+    // where fidelity must yield.
+    let redacted = !redaction_map.is_empty() || hooks_rewrote;
+    let original_model = model.clone();
+    let outbound_for = |target: &str| -> Option<Bytes> {
+        if !redacted && !rerouted && target == original_model {
+            return Some(body.clone());
+        }
+        let mut v = json_body.clone();
+        v["model"] = Value::String(target.to_owned());
+        serde_json::to_vec(&v).ok().map(Bytes::from)
+    };
+    let routed = route_plan.as_ref().is_some_and(|p| p.dispatches()) || pooled;
+    let mut ledger: Vec<tracelane_shared::DispatchAttempt> = route_plan
+        .as_deref()
+        .map_or_else(Vec::new, crate::routing::RoutePlan::skipped_attempts);
+    let outcome = crate::routing::relay::run(
         &state,
-        &headers,
-        &outbound,
-        provider_key.expose_secret(),
-        false,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(error = %err, provider = PROVIDER_ID, "messages dispatch failed");
-            if let Some(ok) = breaker_observation(None) {
-                state.circuit_breaker.record(PROVIDER_ID, region, ok);
+        crate::routing::relay::RelayPlan {
+            attempt_security: &attempt_security,
+            entitlements: entitlements.as_deref(),
+            request_start,
+            tenant_id,
+            provider_id: PROVIDER_ID,
+            family: PROVIDER_ID,
+            region: &region,
+            targets: &targets,
+            pooled,
+            fallthrough: Messages::ROUTING.fallthrough,
+            max_attempts: if routed {
+                crate::routing::limits().max_attempts
+            } else {
+                1
+            },
+        },
+        first_key,
+        &mut key_cursor,
+        &mut ledger,
+        |ti, key| {
+            let outbound = outbound_for(&targets[ti]);
+            let state = &state;
+            let headers = &headers;
+            async move {
+                let outbound =
+                    outbound.ok_or_else(|| anyhow::anyhow!("the request could not be prepared"))?;
+                forward(state, headers, &outbound, key.expose_secret(), false).await
             }
+        },
+    )
+    .await;
+    dispatch_guard.record_attempts(ledger.clone());
+    let (upstream, provider_key) = match outcome {
+        crate::routing::relay::RelayOutcome::Served {
+            upstream,
+            target,
+            label,
+            key,
+        } => {
+            model.clone_from(&targets[target]);
+            if let Some(p) = route_plan.as_deref().filter(|p| p.dispatches()) {
+                identity.route.target_index = p.candidates.get(target).map(|c| c.target_index);
+            }
+            if pooled {
+                identity.route.key_label = Some(label);
+            }
+            dispatch_guard.record_route(identity.route.clone());
+            (upstream, key)
+        }
+        crate::routing::relay::RelayOutcome::Refused(denied) => {
+            dispatch_guard.abort(denied.code(), None);
+            return Messages::refuse(denied.0);
+        }
+        crate::routing::relay::RelayOutcome::BreakerOpen => {
+            tracing::warn!(
+                provider = PROVIDER_ID,
+                "upstream unavailable (circuit open) — short-circuiting with 503"
+            );
+            dispatch_guard.abort("upstream_circuit_open", None);
+            return overloaded_response();
+        }
+        crate::routing::relay::RelayOutcome::Timeout(timeout) => {
+            dispatch_guard.abort("upstream_timeout", None);
+            return timeout.response();
+        }
+        crate::routing::relay::RelayOutcome::Transport => {
+            tracing::warn!(provider = PROVIDER_ID, "messages dispatch failed");
             crate::otlp_emit::emit_operation_exception(
                 tenant_id,
                 PROVIDER_ID,
-                region,
+                &region,
                 "dispatch_failed",
                 None,
             );
@@ -1420,35 +1599,31 @@ async fn messages_admitted(
                 "Anthropic did not serve this request",
             );
         }
-    };
-
-    let status = upstream.status().as_u16();
-    if let Some(ok) = breaker_observation(Some(status)) {
-        state.circuit_breaker.record(PROVIDER_ID, region, ok);
-    }
-    if !upstream.status().is_success() {
-        // SECURITY: the upstream body is DROPPED, never relayed. Anthropic's
-        // 401/403 bodies can echo the `x-api-key` value.
-        let _ = upstream.bytes().await;
-        let (our_status, code, message) = map_upstream_status(status);
-        tracing::warn!(provider = PROVIDER_ID, status, code, "Anthropic API error");
-        crate::otlp_emit::emit_operation_exception(
-            tenant_id,
-            PROVIDER_ID,
-            region,
-            "dispatch_failed",
-            Some(status),
-        );
-        dispatch_guard.abort(code, None);
-        let mut resp = coded_error(our_status, code, message);
-        if our_status == StatusCode::TOO_MANY_REQUESTS {
-            resp.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("60"),
+        crate::routing::relay::RelayOutcome::Status { upstream, key } => {
+            let status = upstream.status().as_u16();
+            let (our_status, code, message) = map_upstream_status(status);
+            tracing::warn!(provider = PROVIDER_ID, status, code, "Anthropic API error");
+            crate::otlp_emit::emit_operation_exception(
+                tenant_id,
+                PROVIDER_ID,
+                &region,
+                "dispatch_failed",
+                Some(status),
             );
+            // OG-10 D7: relay the provider's own status + body (scrubbed) and its retry
+            // headers, except for the key-rejection statuses whose bodies echo the key.
+            let resp = upstream_error_response(
+                upstream,
+                (our_status, code, message),
+                correlation_id,
+                key.expose_secret(),
+            )
+            .await;
+            dispatch_guard.abort(code, None);
+            return resp;
         }
-        return resp;
-    }
+    };
+    let _ = &provider_key;
 
     // --- Step 6: Relay + span ---
     let span_ctx = SpanContext {
@@ -1460,12 +1635,12 @@ async fn messages_admitted(
         request_start,
         dispatch_ts,
         api_key_id: claims.api_key_id().map(str::to_owned),
-        captured_input: CapturedInput::build(capture, &chat_request),
-        // GWY-48, span site 4 of 4. Built from the SAME converted `ChatRequest`
-        // the chat route uses, so an Anthropic-native call and an OpenAI-shaped
-        // one land identical attributes for identical settings — the property
-        // that makes a cross-route query over `gen_ai_request_temperature` mean
-        // anything.
+        captured_input,
+        capture,
+        // GWY-48: both wires use the converted ChatRequest for request settings.
+        // This keeps gen_ai_request_temperature comparable across routes.
+        // The capture decision above governs input and output together.
+        // The original Anthropic body remains the upstream source.
         request_config: {
             let rc = crate::server::RequestConfig::build(&chat_request).with_policy_flags();
             match &zdr_eligible {
@@ -1474,10 +1649,15 @@ async fn messages_admitted(
             }
         },
         aft_id: warn_aft_id,
+        // OG-11: the attempts of a routed request (pool keys, targets); empty otherwise.
+        dispatch_attempts: ledger,
     };
     let response_inputs = crate::guardrail::ResponseInputs {
+        hooks: Some(request_hooks.clone()),
+        hook_events: span_ctx.identity.hook_events.clone(),
         tenant_id: tenant_id.clone(),
-        api_key_id: Some(claims.sub.clone()),
+        api_key_id: claims.api_key_id().map(str::to_owned),
+        project_id: claims.governance.as_ref().and_then(|g| g.project_id),
         correlation_id,
         system_prompt: chat_request.system.clone(),
         model: model.clone(),
@@ -1486,7 +1666,14 @@ async fn messages_admitted(
         // Anthropic Messages has no `response_format`, so R5 is not applicable —
         // stating that here rather than letting `extract_expected_format` read an
         // OpenAI field off a body that never carries one.
-        expected_format: None,
+        expected_format: json_body.pointer("/output_config/format").and_then(|f| {
+            (f.get("type").and_then(Value::as_str) == Some("json_schema")).then(|| {
+                crate::guardrail::context::ExpectedFormat {
+                    json: true,
+                    schema: f.get("schema").cloned(),
+                }
+            })
+        }),
     };
     let guard = crate::guardrail::ResponseGuard::new(
         state.guardrail.clone(),
@@ -1516,6 +1703,24 @@ async fn messages_admitted(
         dispatch_guard.disarm();
         resp
     }
+}
+
+/// The 503 every "Anthropic is not reachable through this gateway" exit renders.
+fn overloaded_response() -> Response {
+    let mut resp = anthropic_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "overloaded_error",
+        "Anthropic is temporarily unavailable through this gateway",
+        &[
+            ("code", json!("upstream_circuit_open")),
+            ("provider", json!(PROVIDER_ID)),
+        ],
+    );
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("10"),
+    );
+    resp
 }
 
 /// Both budget refusals in one shape. **402, not 429** — a 429 says "retry later"
@@ -1566,30 +1771,161 @@ async fn forward(
         .header("x-api-key", api_key)
         .header("content-type", "application/json")
         .body(body.clone());
-    Ok(passthrough_version_headers(headers, req).send().await?)
+    // OG-02 D6 sweep: a `reqwest::Error` prints its URL; strip it before it becomes an
+    // `anyhow` chain that something logs.
+    crate::routing::deadlines::send(passthrough_version_headers(headers, req)).await
+}
+
+// ── Upstream error relay (OG-10 §3.1 / D7) ───────────────────────────────────
+
+/// The most of an upstream error body this route will hold and relay.
+const RELAY_ERROR_BODY_CAP: usize = 64 * 1024;
+
+/// Upstream response headers forwarded on a relayed error: exactly these, never a
+/// blanket copy. `retry-after` is handled separately (normalised to integer seconds).
+fn forwarded_error_header(name: &str) -> bool {
+    matches!(name, "x-should-retry" | "request-id")
+        || name.starts_with("anthropic-ratelimit-unified-")
+}
+
+/// Read at most [`RELAY_ERROR_BODY_CAP`] bytes of an error body. The `bool` is `true`
+/// when the body was longer (or the read failed part-way), i.e. what is returned is
+/// NOT the whole body and must not be relayed as one.
+async fn read_error_body_capped(
+    upstream: reqwest::Response,
+) -> Result<(Vec<u8>, bool), crate::routing::deadlines::Timeout> {
+    use futures::StreamExt as _;
+    let mut stream = upstream.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                if let Some(timeout) = crate::routing::deadlines::Timeout::find(&err) {
+                    return Err(timeout);
+                }
+                return Ok((out, true));
+            }
+        };
+        if out.len() + chunk.len() > RELAY_ERROR_BODY_CAP {
+            return Ok((out, true));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok((out, false))
+}
+
+/// The client response for a non-2xx upstream status.
+///
+/// **Relayed with the provider's own status and body** — Claude Code's context-overflow
+/// recovery matches on Anthropic's wording and its retry logic on the status and
+/// `retry-after` (`code.claude.com/docs/en/llm-gateway-protocol`: "forward upstream error
+/// bodies unmodified") — **except**:
+/// - `mapped` says the status is a key rejection (401/403/407): the body can echo
+///   `x-api-key`, so the response is our own `provider_key_rejected` and the body is dropped;
+/// - the body is not JSON, or was longer than [`RELAY_ERROR_BODY_CAP`], or did not stay JSON
+///   after scrubbing: the ORIGINAL status survives in an Anthropic-shaped error of ours, so
+///   the client still sees the right class and never a truncated or foreign body.
+///
+/// Before relaying, the body has the tenant's own key removed verbatim and goes through
+/// `tracelane_shared::redact::scrub`. Our `correlation_id` is added as the
+/// `x-tracelane-correlation-id` HEADER — never injected into the body, so the bytes stay
+/// the provider's.
+///
+/// Fail-CLOSED on the leak question: anything uncertain is answered with our own body.
+async fn upstream_error_response(
+    upstream: reqwest::Response,
+    mapped: (StatusCode, &'static str, &'static str),
+    correlation_id: ulid::Ulid,
+    api_key: &str,
+) -> Response {
+    let (our_status, code, message) = mapped;
+    let status = upstream.status().as_u16();
+    let headers = upstream.headers().clone();
+    let key_rejected = matches!(status, 401 | 403 | 407);
+    let relayable = (400..600).contains(&status) && !key_rejected;
+
+    let mut resp = if relayable {
+        let (body, truncated) = match read_error_body_capped(upstream).await {
+            Ok(body) => body,
+            Err(timeout) => return timeout.response(),
+        };
+        let text = String::from_utf8_lossy(&body);
+        let text = if api_key.is_empty() {
+            text.into_owned()
+        } else {
+            text.replace(api_key, "[REDACTED]")
+        };
+        let scrubbed = tracelane_shared::redact::scrub(text.as_bytes());
+        let relayed_status = StatusCode::from_u16(status).unwrap_or(our_status);
+        if !truncated && serde_json::from_slice::<Value>(&scrubbed).is_ok() {
+            let mut r = (relayed_status, scrubbed).into_response();
+            r.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            r
+        } else {
+            anthropic_error(
+                relayed_status,
+                error_type_for(relayed_status),
+                "the provider returned an error whose body could not be relayed as JSON",
+                &[
+                    ("code", json!("provider_error_not_relayable")),
+                    ("upstream_status", json!(status)),
+                ],
+            )
+        }
+    } else {
+        // Discard without waiting for a body that may echo the key.
+        drop(upstream);
+        coded_error(our_status, code, message)
+    };
+
+    for (name, value) in &headers {
+        if forwarded_error_header(name.as_str()) {
+            resp.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+    // Normalised: delta-seconds or an HTTP-date in, whole seconds out, clamped by the
+    // reference table. Garbage is dropped rather than forwarded.
+    if relayable && let Some(wait) = crate::providers::retry_after_from(&headers) {
+        let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+        if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&correlation_id.to_string()) {
+        resp.headers_mut().insert("x-tracelane-correlation-id", v);
+    }
+    resp
 }
 
 // ── Span plumbing ────────────────────────────────────────────────────────────
 
 /// Everything the completion span needs, carried across the `'static` stream
 /// boundary. Owned because an SSE body outlives the handler frame.
-struct SpanContext {
-    tenant_id: TenantId,
-    trace_id: Uuid,
-    parent_span_id: Option<Uuid>,
-    model: String,
+pub(crate) struct SpanContext {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) trace_id: Uuid,
+    pub(crate) parent_span_id: Option<Uuid>,
+    pub(crate) model: String,
     // `conversation_id: Option<String>` (deleted 2026-09-12, B-390) — never
     // read after construction; the span builder below reads
     // `ctx.identity.conversation_id` instead (`CallerIdentity` already
     // carries its own copy, `server.rs:4142`), so this was a redundant
     // duplicate, not the real source.
-    identity: crate::server::CallerIdentity,
-    request_start: chrono::DateTime<chrono::Utc>,
-    dispatch_ts: chrono::DateTime<chrono::Utc>,
-    api_key_id: Option<String>,
-    captured_input: Option<CapturedInput>,
-    request_config: crate::server::RequestConfig,
-    aft_id: Option<&'static str>,
+    pub(crate) identity: crate::server::CallerIdentity,
+    pub(crate) request_start: chrono::DateTime<chrono::Utc>,
+    pub(crate) dispatch_ts: chrono::DateTime<chrono::Utc>,
+    pub(crate) api_key_id: Option<String>,
+    pub(crate) captured_input: Option<CapturedInput>,
+    pub(crate) capture: crate::server::config::ContentCapture,
+    pub(crate) request_config: crate::server::RequestConfig,
+    pub(crate) aft_id: Option<&'static str>,
+    /// `OG-11`: the attempt ledger of a routed request; empty = absent on the span.
+    pub(crate) dispatch_attempts: Vec<tracelane_shared::DispatchAttempt>,
 }
 
 /// Build and publish the completion span, meter the tokens, record the spend.
@@ -1601,17 +1937,32 @@ struct SpanContext {
 /// How a relayed request ended — the half of the span `finish_span` cannot read
 /// off the context: whether it streamed, when the provider finished, and why it
 /// stopped (`error_reason`), including the one reason only a `Drop` can know.
-struct FinishOutcome<'a> {
-    stream: bool,
-    ttft_us: Option<u32>,
-    provider_complete_ts: chrono::DateTime<chrono::Utc>,
-    error_reason: Option<&'a str>,
+pub(crate) struct FinishOutcome<'a> {
+    pub(crate) tool_calls: Option<&'a crate::server::ToolCallAccumulator>,
+    pub(crate) output_tool_calls: Option<&'a crate::server::ToolCallAccumulator>,
+    pub(crate) output_text: Option<&'a str>,
+    pub(crate) served: crate::server::ServedMeta,
+    pub(crate) finish_reason: Option<crate::providers::FinishReason>,
+    pub(crate) stream: bool,
+    pub(crate) ttft_us: Option<u32>,
+    pub(crate) provider_complete_ts: chrono::DateTime<chrono::Utc>,
+    pub(crate) error_reason: Option<&'a str>,
     /// B-375 (c): the client hung up mid-stream; the span says so.
-    cancelled: bool,
+    pub(crate) cancelled: bool,
 }
 
-fn finish_span(state: &AppState, ctx: SpanContext, usage: UsageAcc, outcome: FinishOutcome<'_>) {
+pub(crate) fn finish_span(
+    state: &AppState,
+    ctx: SpanContext,
+    usage: UsageAcc,
+    outcome: FinishOutcome<'_>,
+) {
     let FinishOutcome {
+        tool_calls,
+        output_tool_calls,
+        output_text,
+        served,
+        finish_reason,
         stream,
         ttft_us,
         provider_complete_ts,
@@ -1636,12 +1987,11 @@ fn finish_span(state: &AppState, ctx: SpanContext, usage: UsageAcc, outcome: Fin
             // `build_gateway_span` derives it from `pricing::cost_usd`. An unknown
             // model yields `None`, never a fabricated zero (ADR-055).
             cost_usd: None,
-            served: crate::server::ServedMeta::default(),
-            finish_reason: None,
-            // RI-05: this route dispatches directly to the Anthropic adapter
-            // with no retry loop and no failover (see the comment two lines
-            // below) — there is no ledger to build.
-            dispatch_attempts: Vec::new(),
+            served,
+            finish_reason,
+            // RI-05: no retry loop and no cross-provider failover on this route; OG-11
+            // adds pool keys and same-provider targets, whose attempts ride here.
+            dispatch_attempts: ctx.dispatch_attempts.clone(),
             // RI-05 / M11: Anthropic has no reasoning-token field on the wire.
             reasoning_output_tokens: None,
         },
@@ -1655,8 +2005,23 @@ fn finish_span(state: &AppState, ctx: SpanContext, usage: UsageAcc, outcome: Fin
         error_reason,
         ctx.api_key_id.as_deref(),
     );
+    if let Some(calls) = tool_calls {
+        span.attributes.tracelane_response_tool_names = calls.response_tool_names();
+        span.attributes.tracelane_response_tool_arg_bytes = calls.response_tool_arg_bytes();
+        span.attributes.tracelane_response_tool_arg_fps =
+            calls.response_tool_arg_fps(&ctx.tenant_id);
+    }
     if let Some(captured) = ctx.captured_input {
         captured.apply(&mut span.attributes);
+    }
+    if error_reason != Some("guardrail_block")
+        && let Some(output) = crate::server::CapturedOutput::build(
+            ctx.capture,
+            output_text.unwrap_or_default(),
+            &output_tool_calls.map_or_else(Vec::new, |calls| calls.for_span()),
+        )
+    {
+        output.apply(&mut span.attributes);
     }
     // GWY-48: unconditional — there is no content here to gate.
     ctx.request_config.apply(&mut span.attributes);
@@ -1687,17 +2052,61 @@ use crate::otlp_emit::test_sink as span_capture;
 /// `Drop` when hyper discards the generator because the client hung up. The
 /// span then carries the usage seen so far and `tracelane.stream.cancelled`,
 /// the same shape `server::StreamFinalizer` gives the OpenAI SSE path.
-struct RelayFinalizer {
-    state: AppState,
-    ctx: Option<SpanContext>,
-    usage: UsageAcc,
-    first_byte_ts: Option<chrono::DateTime<chrono::Utc>>,
-    error_reason: Option<&'static str>,
-    finished: bool,
+pub(crate) struct RelayFinalizer {
+    pub(crate) tool_calls: crate::server::ToolCallAccumulator,
+    pub(crate) delivered_tool_calls: crate::server::ToolCallAccumulator,
+    pub(crate) output_ring: Option<String>,
+    pub(crate) output_cap: usize,
+    pub(crate) served: crate::server::ServedMeta,
+    pub(crate) finish_reason: Option<crate::providers::FinishReason>,
+    pub(crate) state: AppState,
+    pub(crate) ctx: Option<SpanContext>,
+    pub(crate) usage: UsageAcc,
+    pub(crate) first_byte_ts: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) error_reason: Option<&'static str>,
+    pub(crate) finished: bool,
 }
 
 impl RelayFinalizer {
-    fn finish(&mut self, cancelled: bool) {
+    fn observe_metadata(&mut self, frame: &Bytes) {
+        let Some(v) = frame_data(frame).and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+            return;
+        };
+        match v["type"].as_str() {
+            Some("message_start") => self.served.absorb(
+                v["message"]["id"].as_str().map(str::to_owned),
+                v["message"]["model"].as_str().map(str::to_owned),
+                None,
+            ),
+            Some("message_delta") => {
+                self.finish_reason = v["delta"]["stop_reason"]
+                    .as_str()
+                    .and_then(crate::providers::FinishReason::from_anthropic_stop_reason);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_delivered(&mut self, frame: &Bytes) {
+        let Some(v) = frame_data(frame).and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+            return;
+        };
+        self.delivered_tool_calls.absorb_anthropic(&v);
+        let text = match v["type"].as_str() {
+            Some("content_block_start") if v["content_block"]["type"] == "text" => {
+                v["content_block"]["text"].as_str()
+            }
+            Some("content_block_delta") if v["delta"]["type"] == "text_delta" => {
+                v["delta"]["text"].as_str()
+            }
+            _ => None,
+        };
+        if let (Some(buf), Some(text)) = (&mut self.output_ring, text) {
+            crate::server::ring_push(buf, text, self.output_cap);
+        }
+    }
+
+    pub(crate) fn finish(&mut self, cancelled: bool) {
         if self.finished {
             return;
         }
@@ -1720,6 +2129,11 @@ impl RelayFinalizer {
             ctx,
             std::mem::take(&mut self.usage),
             FinishOutcome {
+                tool_calls: Some(&self.tool_calls),
+                output_tool_calls: Some(&self.delivered_tool_calls),
+                output_text: self.output_ring.as_deref(),
+                served: std::mem::take(&mut self.served),
+                finish_reason: self.finish_reason,
                 stream: true,
                 ttft_us,
                 provider_complete_ts: chrono::Utc::now(),
@@ -1768,7 +2182,14 @@ fn stream_response(
         // `tracelane.stream.cancelled = true` instead. Every counter the tail
         // used to keep as a local lives on it.
         let tenant_for_exception = ctx.tenant_id.clone();
+        let capture = ctx.capture;
         let mut fin = RelayFinalizer {
+            tool_calls: crate::server::ToolCallAccumulator::default(),
+            delivered_tool_calls: crate::server::ToolCallAccumulator::default(),
+            output_ring: capture.output.then(String::new),
+            output_cap: capture.max_field_bytes,
+            served: crate::server::ServedMeta::default(),
+            finish_reason: None,
             state: state.clone(),
             ctx: Some(ctx),
             usage: UsageAcc::default(),
@@ -1786,10 +2207,17 @@ fn stream_response(
             let chunk = match bytes.next().await {
                 Some(Ok(c)) => c,
                 Some(Err(err)) => {
+                    if let Some(timeout) = crate::routing::deadlines::Timeout::find(&err) {
+                        fin.error_reason = Some("upstream_timeout");
+                        if let Some(ctx) = &mut fin.ctx { timeout.record_attempt(&mut ctx.dispatch_attempts); }
+                        yield Ok(timeout.event("messages"));
+                        blocked = true;
+                        break 'outer;
+                    }
                     // A transport-level failure mid-response. Record it so the span
                     // carries status Error — a mid-stream failure that reads as a
                     // success is how an error-rate metric pins itself at 0%.
-                    tracing::warn!(error = %err, "Anthropic SSE stream error");
+                    tracing::warn!(error = %err.without_url(), "Anthropic SSE stream error");
                     fin.error_reason = Some("provider_stream_error");
                     crate::otlp_emit::emit_operation_exception(
                         &tenant_for_exception,
@@ -1808,10 +2236,15 @@ fn stream_response(
             buf.extend_from_slice(&chunk);
 
             while let Some(raw) = split_frame(&mut buf) {
+                fin.observe_metadata(&raw);
+                if let Some(value) = frame_data(&raw).and_then(|data| serde_json::from_str(data).ok()) {
+                    fin.tool_calls.absorb_anthropic(&value);
+                }
                 let frame = classify_frame(raw, &mut fin.usage, &mut fin.error_reason);
                 match relay.push(frame, fin.usage.as_usage()).await {
                     Release::Bytes(out) => {
                         for b in out {
+                            fin.record_delivered(&b);
                             yield Ok::<Bytes, std::convert::Infallible>(b);
                         }
                     }
@@ -1831,9 +2264,11 @@ fn stream_response(
         // A trailing frame with no blank-line terminator (a truncated response).
         if !blocked && !buf.is_empty() {
             let raw = Bytes::from(std::mem::take(&mut buf));
+            fin.observe_metadata(&raw);
             let frame = classify_frame(raw, &mut fin.usage, &mut fin.error_reason);
             if let Release::Bytes(out) = relay.push(frame, fin.usage.as_usage()).await {
                 for b in out {
+                    fin.record_delivered(&b);
                     yield Ok(b);
                 }
             }
@@ -1843,6 +2278,7 @@ fn stream_response(
             match relay.finish(fin.usage.as_usage()).await {
                 Release::Bytes(out) => {
                     for b in out {
+                        fin.record_delivered(&b);
                         yield Ok(b);
                     }
                 }
@@ -1952,19 +2388,36 @@ async fn buffered_response(
     let raw = match upstream.bytes().await {
         Ok(b) => b,
         Err(err) => {
-            tracing::warn!(error = %err, "reading the Anthropic response body failed");
+            let timeout = crate::routing::deadlines::Timeout::find(&err);
+            let mut ctx = ctx;
+            if let Some(t) = timeout {
+                t.record_attempt(&mut ctx.dispatch_attempts);
+            }
+            tracing::warn!(error = %err.without_url(), "reading the Anthropic response body failed");
             finish_span(
                 &state,
                 ctx,
                 UsageAcc::default(),
                 FinishOutcome {
+                    tool_calls: None,
+                    output_tool_calls: None,
+                    output_text: None,
+                    served: crate::server::ServedMeta::default(),
+                    finish_reason: None,
                     stream: false,
                     ttft_us: None,
                     provider_complete_ts: chrono::Utc::now(),
-                    error_reason: Some("provider_stream_error"),
+                    error_reason: Some(if timeout.is_some() {
+                        "upstream_timeout"
+                    } else {
+                        "provider_stream_error"
+                    }),
                     cancelled: false,
                 },
             );
+            if let Some(t) = timeout {
+                return t.response();
+            }
             return coded_error(
                 StatusCode::BAD_GATEWAY,
                 "provider_unavailable",
@@ -1975,6 +2428,17 @@ async fn buffered_response(
     let provider_complete_ts = chrono::Utc::now();
 
     let parsed: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    let mut served = crate::server::ServedMeta::default();
+    served.absorb(
+        parsed["id"].as_str().map(str::to_owned),
+        parsed["model"].as_str().map(str::to_owned),
+        None,
+    );
+    let finish_reason = parsed["stop_reason"]
+        .as_str()
+        .and_then(crate::providers::FinishReason::from_anthropic_stop_reason);
+    let mut tool_calls = crate::server::ToolCallAccumulator::default();
+    tool_calls.absorb_anthropic(&parsed);
     let mut usage = UsageAcc::default();
     if let Some(u) = parsed.get("usage") {
         usage.merge(u);
@@ -1995,8 +2459,14 @@ async fn buffered_response(
         .unwrap_or_default();
 
     let mut safe = String::new();
-    let mut blocked: Option<&'static str> = None;
-    if !text.is_empty() {
+    let mut blocked = if parsed.get("content").and_then(Value::as_array).is_none()
+        || crate::guardrail::streaming::has_unscanned_output(&parsed)
+    {
+        guard.refuse_unscanned_output().await
+    } else {
+        None
+    };
+    if blocked.is_none() && !text.is_empty() {
         match guard.on_delta(&text, Some(&usage.as_usage())).await {
             crate::guardrail::GuardStep::Emit(s) => safe.push_str(&s),
             crate::guardrail::GuardStep::Block { reason_code } => blocked = Some(reason_code),
@@ -2016,6 +2486,11 @@ async fn buffered_response(
         ctx,
         usage,
         FinishOutcome {
+            tool_calls: Some(&tool_calls),
+            output_tool_calls: Some(&tool_calls),
+            output_text: (blocked.is_none()).then_some(safe.as_str()),
+            served,
+            finish_reason,
             stream: false,
             ttft_us: None,
             provider_complete_ts,
@@ -2113,7 +2588,7 @@ pub async fn count_tokens_handler(
 
 /// `count_tokens` from the scope gate down — split for the same reason
 /// [`messages_with_claims`] is.
-async fn count_tokens_with_claims(
+pub(crate) async fn count_tokens_with_claims(
     state: AppState,
     headers: HeaderMap,
     body: Bytes,
@@ -2125,12 +2600,16 @@ async fn count_tokens_with_claims(
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
-    let Ok(json_body) = serde_json::from_slice::<Value>(&body) else {
-        return coded_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "request body is not valid JSON",
-        );
+    // M-A: the strict parse — this body is forwarded as sent.
+    let json_body = match crate::strict_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return coded_error(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                &e.message("request body is not valid JSON"),
+            );
+        }
     };
     let Some(model) = json_body.get("model").and_then(Value::as_str) else {
         return coded_error(
@@ -2151,6 +2630,25 @@ async fn count_tokens_with_claims(
         Some(cache) => Some(cache.resolved(*tenant_id.as_uuid()).await),
         None => None,
     };
+    if let Some(response) = crate::routing::deadlines::invalid_document(entitlements.as_deref()) {
+        return response;
+    }
+    // rev6: this forwards the caller's prompt with the tenant's key, so the pause, the
+    // blocks and the workspace / key model-provider rules apply before anything leaves.
+    if let Some(r) = crate::controls::companion_refusal(
+        &claims,
+        entitlements.as_deref().map(|e| &*e.controls),
+        model,
+        PROVIDER_ID,
+    ) {
+        let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::FORBIDDEN);
+        return anthropic_error(
+            status,
+            error_type_for(status),
+            &r.message,
+            &[("code", json!(r.code))],
+        );
+    }
     let rpm = entitlements
         .as_ref()
         .map_or(state.no_control_plane_rate_limit_rpm, |e| e.rate_limit_rpm);
@@ -2178,14 +2676,35 @@ async fn count_tokens_with_claims(
         );
     }
 
-    let provider_key = match crate::server::resolve_provider_key(
+    // OG-11: count_tokens takes the first usable key of Anthropic's pool.
+    let routing_state: std::sync::Arc<crate::routing::RoutingState> = entitlements
+        .as_deref()
+        .map(|e| std::sync::Arc::clone(&e.routing))
+        .unwrap_or_default();
+    let provider_key = match crate::routing::first_pool_key(
+        &Messages::ROUTING,
+        &routing_state,
         tenant_id,
         PROVIDER_ID,
-        crate::providers::ProviderRegistry::env_var_for_provider_id(PROVIDER_ID),
     )
     .await
+    .0
     {
         ProviderKey::Found(k) if !k.expose_secret().is_empty() => k,
+        ProviderKey::KmsUnavailable => {
+            return coded_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "kms_unavailable",
+                "customer key service unavailable",
+            );
+        }
+        ProviderKey::KmsDenied => {
+            return coded_error(
+                StatusCode::FORBIDDEN,
+                "kms_access_denied",
+                "customer key service refused access",
+            );
+        }
         ProviderKey::Unusable => {
             return coded_error(
                 StatusCode::BAD_GATEWAY,
@@ -2200,7 +2719,7 @@ async fn count_tokens_with_claims(
                 "the key store could not be reached — nothing was sent to Anthropic; retry shortly",
             );
         }
-        _ => {
+        ProviderKey::Found(_) | ProviderKey::NotConfigured => {
             return coded_error(
                 StatusCode::PAYMENT_REQUIRED,
                 "provider_not_configured",
@@ -2209,10 +2728,72 @@ async fn count_tokens_with_claims(
         }
     };
 
-    let upstream = match forward(&state, &headers, &body, provider_key.expose_secret(), true).await
+    // M-E (security re-review 2026-10-03): this forwards the WHOLE prompt, so R2 runs over
+    // exactly what it forwards, the main route's way — redact in place, refuse what cannot be
+    // rewritten. The original bytes go out unless R2 rewrote them.
+    let deadlines = crate::routing::deadlines::Budget::for_request(
+        entitlements.as_deref(),
+        PROVIDER_ID,
+        model,
+        chrono::Utc::now(),
+    );
+    let mut json_body = json_body;
+    let outbound: Bytes = match state
+        .guardrail
+        .companion_r2(
+            tenant_id,
+            claims.api_key_id(),
+            claims.governance.as_ref().and_then(|g| g.project_id),
+            &mut json_body,
+        )
+        .await
+    {
+        Ok(false) => body,
+        Ok(true) => match serde_json::to_vec(&json_body) {
+            Ok(v) => Bytes::from(v),
+            Err(err) => {
+                tracing::error!(error = %err, "redacted count_tokens body failed to serialise");
+                return coded_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "the request could not be prepared for the provider",
+                );
+            }
+        },
+        Err(block) => {
+            tracing::warn!(
+                rail = block.rail,
+                reason_code = block.reason_code,
+                "count_tokens blocked by inline guardrail"
+            );
+            return anthropic_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "request blocked by Tracelane inline guardrail",
+                &[
+                    ("code", json!("guardrail_block")),
+                    ("rail", json!(block.rail)),
+                    ("reason_code", json!(block.reason_code)),
+                ],
+            );
+        }
+    };
+
+    let upstream = match deadlines
+        .scope(forward(
+            &state,
+            &headers,
+            &outbound,
+            provider_key.expose_secret(),
+            true,
+        ))
+        .await
     {
         Ok(r) => r,
         Err(err) => {
+            if let Some(timeout) = crate::routing::deadlines::Timeout::find(err.as_ref()) {
+                return timeout.response();
+            }
             tracing::warn!(error = %err, "count_tokens dispatch failed");
             return coded_error(
                 StatusCode::BAD_GATEWAY,
@@ -2223,9 +2804,15 @@ async fn count_tokens_with_claims(
     };
     let status = upstream.status();
     if !status.is_success() {
-        let _ = upstream.bytes().await; // credential echo — never relayed
-        let (our_status, code, message) = map_upstream_status(status.as_u16());
-        return coded_error(our_status, code, message);
+        // OG-10 D7: same rule as `/v1/messages` — 401/403/407 keep the key-rejected
+        // mapping, everything else is the provider's own status and scrubbed body.
+        return upstream_error_response(
+            upstream,
+            map_upstream_status(status.as_u16()),
+            ulid::Ulid::new(),
+            provider_key.expose_secret(),
+        )
+        .await;
     }
     match upstream.bytes().await {
         Ok(bytes) => {
@@ -2237,13 +2824,41 @@ async fn count_tokens_with_claims(
             resp
         }
         Err(err) => {
-            tracing::warn!(error = %err, "reading the count_tokens response failed");
+            if let Some(timeout) = crate::routing::deadlines::Timeout::find(&err) {
+                return timeout.response();
+            }
+            tracing::warn!(error = %err.without_url(), "reading the count_tokens response failed");
             coded_error(
                 StatusCode::BAD_GATEWAY,
                 "provider_unavailable",
                 "Anthropic did not serve this request",
             )
         }
+    }
+}
+
+/// The read model keeps an image marker, never its base64 payload. The original
+/// Anthropic block is forwarded separately; CapturedInput caps this marker again.
+fn capture_image_part(block: &Value) -> ContentPart {
+    let source = &block["source"];
+    let url = if source["type"] == "url" {
+        let supplied = source["url"].as_str().unwrap_or_default();
+        if supplied.starts_with("data:") {
+            supplied
+                .split_once(',')
+                .map(|(prefix, _)| format!("{prefix},…[omitted]"))
+                .unwrap_or_default()
+        } else {
+            supplied.to_owned()
+        }
+    } else {
+        let media_type = source["media_type"]
+            .as_str()
+            .unwrap_or("application/octet-stream");
+        format!("data:{media_type};base64,…[omitted]")
+    };
+    ContentPart::ImageUrl {
+        image_url: tracelane_shared::ImageUrl { url, detail: None },
     }
 }
 
@@ -2256,6 +2871,145 @@ async fn count_tokens_with_claims(
 /// guard blocks loopback in release, so these are debug-only by construction.
 #[cfg(all(test, debug_assertions))]
 mod tests {
+    #[tokio::test]
+    async fn og30_messages_and_count_tokens_honour_policy_before_upstream() {
+        let _bypass = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        let t = tenant();
+        install_byok(&t);
+        let state = crate::guardrail::policy_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            crate::guardrail::policy_tests::input_cap(),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6","max_tokens":64,
+            "messages":[{"role":"user","content":"a longer harmless request"}]})
+            .to_string(),
+        );
+        let response = messages_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = body_json(response).await;
+        assert_eq!(value["error"]["reason_code"], "INPUT_TOKEN_CAP", "{value}");
+        let state = crate::guardrail::policy_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            json!({"rails":{"R2_secrets_pii":{"mode":"block"}}}),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"person@example.com"}]})
+            .to_string(),
+        );
+        let response =
+            count_tokens_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn og33_messages_and_count_tokens_honour_policy_before_upstream() {
+        let _bypass = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        let t = tenant();
+        install_byok(&t);
+        let state = crate::guardrail::policy_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            crate::guardrail::policy_tests::pii_block(),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6","max_tokens":64,
+            "messages":[{"role":"user","content":"person@example.com"}]})
+            .to_string(),
+        );
+        let response = messages_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = body_json(response).await;
+        assert_eq!(value["error"]["reason_code"], "PII_EMAIL", "{value}");
+        let state = crate::guardrail::policy_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            json!({"rails":{"R2_secrets_pii":{"mode":"block"}}}),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"person@example.com"}]})
+            .to_string(),
+        );
+        let response =
+            count_tokens_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn og31_messages_and_count_tokens_honour_policy_before_upstream() {
+        let _bypass = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        let t = tenant();
+        install_byok(&t);
+        let state = crate::guardrail::hook_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            crate::guardrail::policy_tests::pii_block(),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6","max_tokens":64,
+            "messages":[{"role":"user","content":"person@example.com"}]})
+            .to_string(),
+        );
+        let response = messages_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = body_json(response).await;
+        assert_eq!(value["error"]["reason_code"], "HOOK_DENY", "{value}");
+        let state = crate::guardrail::hook_tests::state(
+            state_for(&upstream.uri(), in_memory_chain()),
+            json!({"rails":{"R2_secrets_pii":{"mode":"block"}}}),
+        );
+        let body = Bytes::from(
+            json!({"model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"person@example.com"}]})
+            .to_string(),
+        );
+        let response =
+            count_tokens_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn og32_messages_and_count_tokens_honour_policy_before_upstream() {
+        for hook in crate::guardrail::adapter_tests::fixtures() {
+            let _bypass = LoopbackBypassGuard::new();
+            let upstream = MockServer::start().await;
+            let t = tenant();
+            install_byok(&t);
+            let state = crate::guardrail::hook_tests::state_with_hook(
+                state_for(&upstream.uri(), in_memory_chain()),
+                hook.clone(),
+            );
+            let body = Bytes::from(
+                json!({"model":"claude-sonnet-4-6","max_tokens":64,
+            "messages":[{"role":"user","content":"person@example.com"}]})
+                .to_string(),
+            );
+            let response =
+                messages_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let value = body_json(response).await;
+            assert_eq!(value["error"]["reason_code"], "HOOK_DENY", "{value}");
+            let state = crate::guardrail::hook_tests::state_with_hook(
+                state_for(&upstream.uri(), in_memory_chain()),
+                hook.clone(),
+            );
+            let body = Bytes::from(
+                json!({"model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"person@example.com"}]})
+                .to_string(),
+            );
+            let response =
+                count_tokens_with_claims(state, HeaderMap::new(), body, claims_for(&t)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+    }
+
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -2350,6 +3104,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            governance: None,
         }
     }
 
@@ -2486,6 +3241,7 @@ mod tests {
     /// rebuild, a normalised terminator, a dropped `event:` line — fails here.
     #[tokio::test]
     async fn streaming_sse_round_trips_byte_identical_and_the_span_has_the_usage() {
+        crate::tool_fingerprint::init_from_existing_pepper(&"07".repeat(32)).unwrap();
         let _bypass = LoopbackBypassGuard::new();
         let server = sse_mock().await;
         let t = tenant();
@@ -2529,6 +3285,22 @@ mod tests {
         assert_eq!(a.gen_ai_usage_cache_read_input_tokens, Some(300));
         assert_eq!(a.gen_ai_usage_cache_creation_input_tokens, Some(12));
         assert_eq!(a.gen_ai_request_stream, Some(true));
+        assert_eq!(
+            a.tracelane_response_tool_names.as_ref().unwrap(),
+            &["get_weather"]
+        );
+        let key = crate::tool_fingerprint::workspace_key(&t).unwrap();
+        assert_eq!(
+            a.tracelane_response_tool_arg_fps.as_ref().unwrap(),
+            &[crate::tool_fingerprint::with_key(
+                &key,
+                r#"{"city":"Paris"}"#
+            )]
+        );
+        assert!(
+            a.gen_ai_output_messages.is_none(),
+            "capture off must not retain argument text"
+        );
         assert_eq!(a.gen_ai_provider_name.as_deref(), Some("anthropic"));
         assert!(
             a.gen_ai_usage_cost.is_some_and(|c| c > 0.0),
@@ -2902,6 +3674,229 @@ mod tests {
         );
     }
 
+    // ── OG-10 §3.1 / D7: error fidelity on the byte-faithful relay ───────────
+
+    const PROMPT_TOO_LONG: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+
+    async fn upstream_error(template: ResponseTemplate) -> (MockServer, Response, Uuid) {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let t = tenant();
+        install_byok(&t);
+        let trace_id = Uuid::new_v4();
+        let state = state_for(&server.uri(), in_memory_chain());
+        let resp = messages_with_claims(
+            state,
+            headers_with_trace(trace_id),
+            stream_request("claude-sonnet-4-6"),
+            claims_for(&t),
+        )
+        .await;
+        (server, resp, trace_id)
+    }
+
+    fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// **OG-10 proof 4b.** Claude Code's recovery matches on Anthropic's own wording
+    /// ("prompt is too long…" → auto-compaction), so a 400 reaches it byte-for-byte.
+    #[tokio::test]
+    async fn an_upstream_400_is_relayed_with_its_status_and_exact_body() {
+        let (_server, resp, _) = upstream_error(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/json")
+                .set_body_string(PROMPT_TOO_LONG),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(header(&resp, "content-type"), Some("application/json"));
+        assert!(
+            header(&resp, "x-tracelane-correlation-id").is_some_and(|c| c.len() == 26),
+            "our correlation id rides as a HEADER (a ULID), never injected into the body"
+        );
+        assert_eq!(
+            std::str::from_utf8(&body_bytes(resp).await).expect("utf8"),
+            PROMPT_TOO_LONG,
+            "the provider's bytes, so recovery that matches on wording still matches"
+        );
+    }
+
+    /// 529 `overloaded_error` stays 529 (not our 502), and the headers Claude Code's
+    /// retry logic reads are forwarded.
+    #[tokio::test]
+    async fn a_529_is_relayed_as_529_with_the_retry_headers() {
+        const OVERLOADED: &str =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let (_server, resp, _) = upstream_error(
+            ResponseTemplate::new(529)
+                .insert_header("retry-after", "7")
+                .insert_header("x-should-retry", "true")
+                .insert_header("request-id", "req_011FIXTURE")
+                .insert_header("anthropic-ratelimit-unified-status", "allowed_warning")
+                .insert_header("anthropic-ratelimit-unified-reset", "1759329600")
+                .insert_header("x-unrelated-upstream-header", "must-not-leak")
+                .set_body_string(OVERLOADED),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 529);
+        assert_eq!(header(&resp, "retry-after"), Some("7"));
+        assert_eq!(header(&resp, "x-should-retry"), Some("true"));
+        assert_eq!(header(&resp, "request-id"), Some("req_011FIXTURE"));
+        assert_eq!(
+            header(&resp, "anthropic-ratelimit-unified-status"),
+            Some("allowed_warning")
+        );
+        assert_eq!(
+            header(&resp, "anthropic-ratelimit-unified-reset"),
+            Some("1759329600")
+        );
+        assert!(
+            header(&resp, "x-unrelated-upstream-header").is_none(),
+            "the forwarded set is an ALLOWLIST"
+        );
+        assert_eq!(
+            std::str::from_utf8(&body_bytes(resp).await).expect("utf8"),
+            OVERLOADED
+        );
+    }
+
+    /// An HTTP-date `Retry-After` is re-emitted as integer seconds (what the protocol wants).
+    #[tokio::test]
+    async fn a_date_valued_retry_after_is_forwarded_as_integer_seconds() {
+        let at = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc2822();
+        let (_server, resp, _) = upstream_error(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", at.replace("+0000", "GMT").as_str())
+                .set_body_string(
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}"#,
+                ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let secs: u64 = header(&resp, "retry-after")
+            .and_then(|v| v.parse().ok())
+            .expect("integer seconds");
+        assert!((85..=91).contains(&secs), "{secs}");
+    }
+
+    /// 401 / 403 / 407 keep the key-rejected mapping — those bodies echo `x-api-key`.
+    #[tokio::test]
+    async fn a_401_403_407_body_that_echoes_the_key_is_never_relayed() {
+        for status in [401u16, 403, 407] {
+            let (_server, resp, _) = upstream_error(
+                ResponseTemplate::new(status).set_body_string(
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key: sk-ant-api03-LEAKEDLEAKEDLEAKEDLEAKED0000"}}"#,
+                ),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{status}");
+            let raw = body_bytes(resp).await;
+            let text = String::from_utf8_lossy(&raw);
+            assert!(text.contains("provider_key_rejected"), "{status}: {text}");
+            assert!(!text.contains("LEAKED"), "{status}: {text}");
+        }
+    }
+
+    /// A 4xx body is scrubbed on the way out, and what leaves is still JSON.
+    #[tokio::test]
+    async fn a_relayed_error_body_is_scrubbed_and_stays_json() {
+        let (_server, resp, _) = upstream_error(ResponseTemplate::new(400).set_body_string(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad value sk-ant-api03-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ and the unit-test-anthropic-key-do-not-use-in-prod"}}"#,
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let raw = body_bytes(resp).await;
+        let v: Value = serde_json::from_slice(&raw).expect("still JSON");
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(msg.starts_with("bad value"), "{msg}");
+        assert!(!msg.contains("ZZZZ"), "a key shape must be scrubbed: {msg}");
+        assert!(
+            !msg.contains("unit-test-anthropic-key"),
+            "the tenant's own key verbatim must be removed: {msg}"
+        );
+    }
+
+    /// The 64 KiB cap: an oversized body is NOT relayed truncated (that would be broken
+    /// JSON); the original status survives in an Anthropic-shaped error of our own.
+    #[tokio::test]
+    async fn an_oversized_error_body_keeps_its_status_and_stays_json() {
+        let big = format!(
+            r#"{{"type":"error","error":{{"type":"api_error","message":"{}"}}}}"#,
+            "x".repeat(70 * 1024)
+        );
+        let (_server, resp, _) =
+            upstream_error(ResponseTemplate::new(500).set_body_string(big)).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let raw = body_bytes(resp).await;
+        assert!(raw.len() < 4096, "the oversized body is not relayed");
+        let v: Value = serde_json::from_slice(&raw).expect("JSON");
+        assert_eq!(v["type"], "error");
+    }
+
+    /// A non-JSON error body (a proxy's HTML page) is not relayed as if it were Anthropic's.
+    #[tokio::test]
+    async fn a_non_json_error_body_keeps_its_status_in_our_own_json() {
+        let (_server, resp, _) = upstream_error(
+            ResponseTemplate::new(502).set_body_string("<html><body>Bad gateway</body></html>"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let raw = body_bytes(resp).await;
+        let v: Value = serde_json::from_slice(&raw).expect("JSON");
+        assert_eq!(v["type"], "error");
+        assert!(!String::from_utf8_lossy(&raw).contains("<html>"));
+    }
+
+    /// `count_tokens` follows the same rule.
+    #[tokio::test]
+    async fn count_tokens_relays_an_upstream_400_unmodified() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(PROMPT_TOO_LONG))
+            .mount(&server)
+            .await;
+        let t = tenant();
+        install_byok(&t);
+        let resp = count_tokens_with_claims(
+            state_for(&server.uri(), in_memory_chain()),
+            HeaderMap::new(),
+            Bytes::from(
+                json!({"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]})
+                    .to_string(),
+            ),
+            claims_for(&t),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(header(&resp, "x-tracelane-correlation-id").is_some());
+        assert_eq!(
+            std::str::from_utf8(&body_bytes(resp).await).expect("utf8"),
+            PROMPT_TOO_LONG
+        );
+    }
+
+    /// The error span still records an error, with the gateway's own classification.
+    #[tokio::test]
+    async fn a_relayed_error_still_records_an_error_span() {
+        let (_server, resp, trace_id) =
+            upstream_error(ResponseTemplate::new(529).set_body_string(PROMPT_TOO_LONG)).await;
+        assert_eq!(resp.status().as_u16(), 529);
+        let spans = span_capture::for_trace(trace_id);
+        assert_eq!(spans.len(), 1, "one error span per failed request");
+        assert_eq!(
+            spans[0].status.code,
+            tracelane_shared::span::SpanStatusCode::Error
+        );
+    }
+
     // ── count_tokens ─────────────────────────────────────────────────────────
 
     /// `count_tokens` forwards and relays verbatim — and emits NO span.
@@ -3125,7 +4120,8 @@ mod tests {
             }]
         });
         let before = body.clone();
-        let map = redact_body_in_place(&mut body);
+        let map =
+            crate::guardrail::egress::redact_relay_body(&mut body).expect("redactable in place");
         assert!(
             !map.is_empty(),
             "the fixture must actually contain something to redact"
@@ -3140,16 +4136,21 @@ mod tests {
     /// the circuit for everyone.
     #[test]
     fn the_breaker_is_fed_only_real_upstream_faults() {
-        assert_eq!(breaker_observation(Some(200)), Some(true));
+        use crate::circuit_breaker::Outcome;
+        assert_eq!(breaker_observation(Some(200)), Some(Outcome::Success));
         assert_eq!(breaker_observation(Some(401)), None);
         assert_eq!(breaker_observation(Some(404)), None);
         assert_eq!(breaker_observation(Some(400)), None);
-        assert_eq!(breaker_observation(Some(429)), Some(false));
-        assert_eq!(breaker_observation(Some(500)), Some(false));
+        assert_eq!(
+            breaker_observation(Some(429)),
+            None,
+            "F4: a 429 is one tenant's quota under BYOK"
+        );
+        assert_eq!(breaker_observation(Some(500)), Some(Outcome::UpstreamFault));
         assert_eq!(
             breaker_observation(None),
-            Some(false),
-            "a transport failure"
+            Some(Outcome::CredentialFault),
+            "SB: a status-less failure nobody classified is never provider evidence"
         );
     }
 
@@ -3269,5 +4270,293 @@ mod tests {
         let stored = serde_json::to_string(&spans[0]).unwrap();
         assert!(!stored.contains("claude-cli/"));
         assert!(!stored.contains("private-machine-metadata"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_buffered_and_sse_spans_record_response_identity() {
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(JSON_FIXTURE, "application/json"))
+            .mount(&server)
+            .await;
+        let t = tenant();
+        install_byok(&t);
+        let trace = Uuid::new_v4();
+        let body = Bytes::from(
+            json!({
+                "model":"claude-sonnet-4-6", "max_tokens": 8,
+                "messages":[{"role":"user","content":"weather?"}]
+            })
+            .to_string(),
+        );
+        let resp = messages_with_claims(
+            state_for(&server.uri(), in_memory_chain()),
+            headers_with_trace(trace),
+            body,
+            claims_for(&t),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_bytes(resp).await;
+        let spans = span_capture::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].attributes.gen_ai_response_id.as_deref(),
+            Some("msg_01FIXJ")
+        );
+        assert_eq!(
+            spans[0].attributes.gen_ai_response_finish_reasons,
+            Some(vec!["tool_calls".into()])
+        );
+
+        let sse = sse_mock().await;
+        let trace = Uuid::new_v4();
+        let resp = messages_with_claims(
+            state_for(&sse.uri(), in_memory_chain()),
+            headers_with_trace(trace),
+            stream_request("claude-sonnet-4-6"),
+            claims_for(&t),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_bytes(resp).await;
+        let spans = span_capture::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].attributes.gen_ai_response_id.as_deref(),
+            Some("msg_01FIX")
+        );
+        assert_eq!(
+            spans[0].attributes.gen_ai_response_finish_reasons,
+            Some(vec!["tool_calls".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_finish_span_captures_text_and_tool_use_under_the_output_policy() {
+        let t = tenant();
+        let trace = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let parsed: Value = serde_json::from_str(JSON_FIXTURE).unwrap();
+        let mut calls = crate::server::ToolCallAccumulator::default();
+        calls.absorb_anthropic(&parsed);
+        let mut served = crate::server::ServedMeta::default();
+        served.absorb(
+            Some("msg_01FIXJ".into()),
+            Some("claude-sonnet-4-6".into()),
+            None,
+        );
+        let ctx = SpanContext {
+            tenant_id: t,
+            trace_id: trace,
+            parent_span_id: None,
+            model: "claude-sonnet-4-6".into(),
+            identity: crate::server::CallerIdentity::default(),
+            request_start: now,
+            dispatch_ts: now,
+            api_key_id: None,
+            captured_input: None,
+            capture: crate::server::config::ContentCapture {
+                input: false,
+                output: true,
+                max_field_bytes: 64 * 1024,
+            },
+            request_config: crate::server::RequestConfig::default(),
+            aft_id: None,
+            dispatch_attempts: Vec::new(),
+        };
+        let long_text = "x".repeat(70_000);
+        finish_span(
+            &state_for("http://127.0.0.1:1", in_memory_chain()),
+            ctx,
+            UsageAcc::default(),
+            FinishOutcome {
+                tool_calls: Some(&calls),
+                output_tool_calls: Some(&calls),
+                output_text: Some(&long_text),
+                served,
+                finish_reason: Some(crate::providers::FinishReason::ToolCalls),
+                stream: false,
+                ttft_us: None,
+                provider_complete_ts: now,
+                error_reason: None,
+                cancelled: false,
+            },
+        );
+        let spans = span_capture::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let a = &spans[0].attributes;
+        assert_eq!(a.gen_ai_response_id.as_deref(), Some("msg_01FIXJ"));
+        assert_eq!(
+            a.gen_ai_response_finish_reasons,
+            Some(vec!["tool_calls".into()])
+        );
+        let output = a.gen_ai_output_messages.as_ref().unwrap();
+        let text = output[0]["content"].as_str().unwrap();
+        assert!(text.len() <= 64 * 1024);
+        assert!(text.ends_with("…[truncated]"));
+        assert_eq!(output[0]["tool_calls"][0]["name"], "get_weather");
+        assert_eq!(output[0]["tool_calls"][0]["input"], r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn anthropic_released_sse_frames_accumulate_only_delivered_text_and_tools() {
+        let mut fin = RelayFinalizer {
+            tool_calls: crate::server::ToolCallAccumulator::default(),
+            delivered_tool_calls: crate::server::ToolCallAccumulator::default(),
+            output_ring: Some(String::new()),
+            output_cap: 64 * 1024,
+            served: crate::server::ServedMeta::default(),
+            finish_reason: None,
+            state: state_for("http://127.0.0.1:1", in_memory_chain()),
+            ctx: None,
+            usage: UsageAcc::default(),
+            first_byte_ts: None,
+            error_reason: None,
+            finished: true,
+        };
+        let mut frames = SSE_FIXTURE.as_bytes().to_vec();
+        while let Some(raw) = split_frame(&mut frames) {
+            fin.observe_metadata(&raw);
+            fin.record_delivered(&raw);
+        }
+        assert_eq!(fin.served.id.as_deref(), Some("msg_01FIX"));
+        assert_eq!(
+            fin.finish_reason,
+            Some(crate::providers::FinishReason::ToolCalls)
+        );
+        assert_eq!(
+            fin.output_ring.as_deref(),
+            Some("Checking the weather for you.")
+        );
+        let calls = fin.delivered_tool_calls.for_span();
+        assert_eq!(calls[0].1.as_deref(), Some("get_weather"));
+        assert_eq!(calls[0].2, r#"{"city":"Paris"}"#);
+    }
+
+    #[tokio::test]
+    async fn messages_provider_not_configured_error_span_keeps_captured_input() {
+        let t = tenant();
+        let mut state = state_for("http://127.0.0.1:1", in_memory_chain());
+        let mut grant = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+        grant.content_capture = crate::db::workspace_capture::WorkspaceCapture {
+            input: true,
+            output: true,
+        };
+        state.entitlements = Some(Arc::new(crate::entitlement_cache::EntitlementCache::new(
+            Arc::new(move |_| {
+                let resolved = grant.clone();
+                Box::pin(async move { Ok(resolved) })
+            }),
+        )));
+        let trace = Uuid::new_v4();
+        let body = Bytes::from(
+            json!({
+                "model":"claude-sonnet-4-6", "max_tokens":8,
+                "messages":[{"role":"user","content":"CANARY_MESSAGES_ERROR"}]
+            })
+            .to_string(),
+        );
+        let resp =
+            messages_with_claims(state, headers_with_trace(trace), body, claims_for(&t)).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let spans = span_capture::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        let input = spans[0]
+            .attributes
+            .gen_ai_input_messages
+            .as_ref()
+            .expect("error span input");
+        assert!(input.to_string().contains("CANARY_MESSAGES_ERROR"));
+    }
+}
+
+#[cfg(test)]
+mod capture_image_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_image_is_marked_and_captured_without_bytes() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 8,
+            "messages": [{"role":"user", "content":[
+                {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"SECRET_IMAGE_BYTES"}}
+            ]}]
+        });
+        let req = to_chat_request(&body).unwrap();
+        assert_eq!(crate::request_support::non_text_part_count(&req), 1);
+        let capture = crate::server::config::ContentCapture {
+            input: true,
+            output: false,
+            max_field_bytes: 64 * 1024,
+        };
+        let mut attrs = tracelane_shared::SpanAttributes::default();
+        CapturedInput::build(capture, &req)
+            .unwrap()
+            .apply(&mut attrs);
+        crate::server::RequestConfig::build(&req).apply(&mut attrs);
+        assert_eq!(attrs.tracelane_request_non_text_parts, Some(1));
+        let recorded = attrs.gen_ai_input_messages.unwrap().to_string();
+        assert!(recorded.contains("image/png"));
+        assert!(!recorded.contains("SECRET_IMAGE_BYTES"));
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn og30_native_initial_text_and_tool_frames_are_refused_before_yield() {
+    for value in [
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"person@example.com"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"person@example.com"}}),
+    ] {
+        let raw = Bytes::from(format!("data: {value}\n\n"));
+        let frame = classify_frame(raw, &mut UsageAcc::default(), &mut None);
+        let mut relay = Relay::new(crate::guardrail::policy_tests::output_guard());
+        assert!(matches!(
+            relay
+                .push(
+                    frame,
+                    Usage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_input_tokens: None,
+                        cache_creation_input_tokens: None
+                    }
+                )
+                .await,
+            Release::Blocked(_, "OUTPUT_POLICY_UNSCANNABLE")
+        ));
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn og30_redacted_delta_does_not_clear_raw_initial_text() {
+    let mut relay = Relay::new(crate::guardrail::policy_tests::output_guard_mode("redact"));
+    let mut usage = UsageAcc::default();
+    let mut error = None;
+    for (value, blocked) in [
+        (
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"person@example.com"}}),
+            false,
+        ),
+        (
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":"person@example.com"}}),
+            true,
+        ),
+    ] {
+        let frame = classify_frame(
+            Bytes::from(format!("data: {value}\n\n")),
+            &mut usage,
+            &mut error,
+        );
+        let result = relay.push(frame, usage.as_usage()).await;
+        assert_eq!(matches!(result, Release::Blocked(_, _)), blocked);
+        if let Release::Bytes(frames) = result {
+            assert!(frames.is_empty());
+        }
     }
 }

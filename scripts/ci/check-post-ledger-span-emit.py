@@ -73,6 +73,14 @@ EMITS = ("emit_post_ledger_error_span" + "(", "dispatch_guard" + ".abort(")
 # reason is not accepted: the reason is the part a human reads.
 ALLOWLIST: list[tuple[str, str]] = [
     (
+        "routed_refusal(",
+        (
+            "OG-11 exhausted routing delegates to routed_refusal, which records "
+            "the skipped attempts and calls guard.abort on every response path "
+            "(ZDR refusal, circuit refusal, and the final typed refusal)."
+        ),
+    ),
+    (
         "dispatch_result",
         (
             "the SUCCESS return — the normal gateway span is built and published on "
@@ -327,6 +335,19 @@ def selftest() -> int:
         False,
     )
     expect("a NEW unguarded post-ledger return BLOCKS", SELFTEST_DIRTY, True)
+    routed = SELFTEST_DIRTY.replace(
+        "five_oh_three()",
+        "routed_refusal(&mut dispatch_guard, skips, model, false, state)",
+    )
+    expect("the span-recording routing refusal helper passes", routed, False)
+    expect(
+        "a routing helper does not excuse a neighbouring silent return",
+        routed.replace(
+            "    return dispatch_result;",
+            "    if another_failure {\n        return oops();\n    }\n    return dispatch_result;",
+        ),
+        True,
+    )
     expect("a bare disarm() before a return BLOCKS", SELFTEST_DISARM_ONLY, True)
     expect(
         "an emit that exists only in a COMMENT still BLOCKS",

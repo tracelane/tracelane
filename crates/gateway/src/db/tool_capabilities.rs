@@ -14,6 +14,7 @@ use anyhow::{Result, anyhow};
 use tracelane_shared::TenantId;
 
 use crate::db::DbPool as Pool;
+use crate::db::control_audit::Actor;
 
 /// One pinned tool as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,26 +35,90 @@ pub struct ToolPin {
 /// # Errors
 /// Fails CLOSED: any pool/statement error propagates. A failed pin must not be
 /// reported as success, or a tenant believes a tool is protected when it is not.
+///
+/// OG-35: every write here commits together with its `admin_audit_log` row
+/// (`guardrail.tool_pin.*`, before/after `{caps, def_hash}`) — or not at all.
 pub async fn upsert(
     pool: &Pool,
     tenant_id: &TenantId,
     tool_name: &str,
     caps: i16,
     def_hash: Option<&str>,
+    actor: &Actor,
 ) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    tx.execute(
+        "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (tenant_id, tool_name) DO UPDATE
                SET caps = EXCLUDED.caps,
                    def_hash = EXCLUDED.def_hash,
                    updated_at = NOW()",
-            &[tenant_id.as_uuid(), &tool_name, &caps, &def_hash],
+        &[tenant_id.as_uuid(), &tool_name, &caps, &def_hash],
+    )
+    .await
+    .map_err(|e| anyhow!("tool_capabilities upsert: {e}"))?;
+    let after = pin_state(&tx, tenant_id, tool_name).await?;
+    audit(
+        &tx,
+        tenant_id,
+        actor,
+        "guardrail.tool_pin.set",
+        tool_name,
+        before,
+        after,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The audited shape of one pin (`None` = not pinned).
+async fn pin_state(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    tool_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    Ok(tx
+        .query_opt(
+            "SELECT caps, def_hash FROM tool_capabilities
+             WHERE tenant_id = $1 AND tool_name = $2 FOR UPDATE",
+            &[tenant_id.as_uuid(), &tool_name],
         )
         .await
-        .map_err(|e| anyhow!("tool_capabilities upsert: {e}"))?;
+        .map_err(|e| anyhow!("tool_capabilities read: {e}"))?
+        .map(|r| {
+            serde_json::json!({
+                "caps": r.get::<_, i16>(0),
+                "def_hash": r.get::<_, Option<String>>(1),
+            })
+        }))
+}
+
+pub(crate) async fn audit(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    actor: &Actor,
+    action: &str,
+    tool_name: &str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+) -> Result<()> {
+    crate::db::control_audit::record(
+        tx,
+        tenant_id,
+        actor,
+        crate::db::control_audit::Change {
+            action,
+            target_type: "tool_pin",
+            target_id: tool_name.to_owned(),
+            before,
+            after,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -76,19 +141,33 @@ pub async fn upsert_definition_only(
     tenant_id: &TenantId,
     tool_name: &str,
     def_hash: &str,
+    actor: &Actor,
 ) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    tx.execute(
+        "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
              VALUES ($1, $2, 0, $3)
              ON CONFLICT (tenant_id, tool_name) DO UPDATE
                SET def_hash = EXCLUDED.def_hash,
                    updated_at = NOW()",
-            &[tenant_id.as_uuid(), &tool_name, &def_hash],
-        )
-        .await
-        .map_err(|e| anyhow!("tool_capabilities upsert_definition_only: {e}"))?;
+        &[tenant_id.as_uuid(), &tool_name, &def_hash],
+    )
+    .await
+    .map_err(|e| anyhow!("tool_capabilities upsert_definition_only: {e}"))?;
+    let after = pin_state(&tx, tenant_id, tool_name).await?;
+    audit(
+        &tx,
+        tenant_id,
+        actor,
+        "guardrail.tool_pin.set",
+        tool_name,
+        before,
+        after,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -121,14 +200,34 @@ pub async fn list(pool: &Pool, tenant_id: &TenantId) -> Result<Vec<ToolPin>> {
 ///
 /// # Errors
 /// Propagates pool/statement errors.
-pub async fn delete(pool: &Pool, tenant_id: &TenantId, tool_name: &str) -> Result<bool> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    let n = client
-        .execute(
-            "DELETE FROM tool_capabilities WHERE tenant_id = $1 AND tool_name = $2",
-            &[tenant_id.as_uuid(), &tool_name],
-        )
-        .await
-        .map_err(|e| anyhow!("tool_capabilities delete: {e}"))?;
-    Ok(n > 0)
+pub async fn delete(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    tool_name: &str,
+    actor: &Actor,
+) -> Result<bool> {
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    if before.is_none() {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM tool_capabilities WHERE tenant_id = $1 AND tool_name = $2",
+        &[tenant_id.as_uuid(), &tool_name],
+    )
+    .await
+    .map_err(|e| anyhow!("tool_capabilities delete: {e}"))?;
+    audit(
+        &tx,
+        tenant_id,
+        actor,
+        "guardrail.tool_pin.delete",
+        tool_name,
+        before,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }

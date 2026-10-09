@@ -4,9 +4,10 @@
 //! the three CRUD endpoints customers need to actually upload their
 //! per-provider keys:
 //!
-//!   - `POST   /v1/byok/provider-keys`        — upload / overwrite
-//!   - `GET    /v1/byok/provider-keys`        — list (returns last4 only)
-//!   - `DELETE /v1/byok/provider-keys/:provider_id` — revoke
+//!   - `POST   /v1/byok/provider-keys`        — upload / overwrite (`label`, OG-11)
+//!   - `GET    /v1/byok/provider-keys`        — list (returns last4 + label only)
+//!   - `DELETE /v1/byok/provider-keys/:provider_id?label=` — revoke one key (`409
+//!     key_in_use_by_routing` while the routing document's key pool names it)
 //!
 //! Hot path lookup happens in `db::provider_keys::get_decrypted`. This
 //! module owns the management surface only.
@@ -30,6 +31,10 @@ use crate::server::AppState;
 #[derive(Debug, Deserialize)]
 pub struct UploadRequest {
     pub provider_id: String,
+    /// `OG-11`: the key's name within the provider's pool. Absent = `default` — the one
+    /// key every workspace had before pools, so an old client keeps working unchanged.
+    #[serde(default)]
+    pub label: Option<String>,
     /// Raw API key. Wire it once — the gateway encrypts before persisting
     /// and never returns the plaintext. `secrecy::SecretString` would be
     /// nice here but axum's body extractors only handle plain `String`;
@@ -40,6 +45,8 @@ pub struct UploadRequest {
 #[derive(Debug, Serialize)]
 pub struct ProviderKeySummary {
     pub provider_id: String,
+    /// `OG-11`: the key's pool label (`default` for the pre-pool key).
+    pub label: String,
     pub last4: String,
     pub saved_at: chrono::DateTime<chrono::Utc>,
     pub last_validation: Option<crate::db::provider_keys::KeyValidation>,
@@ -50,7 +57,15 @@ pub struct ProviderKeySummary {
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     pub provider_id: String,
+    pub label: String,
     pub last4: String,
+}
+
+/// `?label=` on the revoke route; absent = `default` (OG-11).
+#[derive(Debug, Deserialize)]
+pub struct LabelQuery {
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -63,15 +78,32 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// A credential MUTATION: the verified-owner role answer ([`authenticate_with`]),
+/// then the admin-plane gate — OG-36's allowlist and SSO-required — which yields the
+/// actor the store's OG-35 audit row carries.
+async fn authenticate_mutate(
+    headers: &HeaderMap,
+) -> Result<crate::control_plane::ControlActor, axum::response::Response> {
+    let claims = authenticate_with(headers, Access::Mutate).await?;
+    crate::control_plane::require_control(
+        &claims,
+        crate::auth::capability::Capability::ManageProviderKeys,
+        headers,
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
 async fn upload(
     headers: HeaderMap,
     State(_state): State<AppState>,
     Json(mut req): Json<UploadRequest>,
 ) -> impl IntoResponse {
-    let tenant = match authenticate_with(&headers, Access::Mutate).await {
-        Ok(t) => t,
+    let actor = match authenticate_mutate(&headers).await {
+        Ok(a) => a,
         Err(e) => return e,
     };
+    let tenant = actor.tenant_id.clone();
 
     // Trim copy-paste whitespace (a leading/trailing space or newline)
     // before storing. A mangled key was previously stored verbatim, then
@@ -86,8 +118,25 @@ async fn upload(
     if !is_known_provider(&req.provider_id) {
         return error(StatusCode::BAD_REQUEST, "unknown provider_id");
     }
+    let label = req
+        .label
+        .take()
+        .unwrap_or_else(|| crate::db::provider_keys::DEFAULT_LABEL.to_owned());
+    if !crate::db::provider_keys::valid_label(&label) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "label must start with a letter or digit and use only letters, digits and . _ - (max 64)",
+        );
+    }
     if req.plaintext.is_empty() || req.plaintext.len() > 4_096 {
         return error(StatusCode::BAD_REQUEST, "plaintext empty or too large");
+    }
+    // SB: interior whitespace / control bytes cannot be sent in a header.
+    if !crate::db::provider_keys::credential_bytes_ok(&req.plaintext) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "plaintext contains whitespace or control characters — paste the key exactly",
+        );
     }
 
     let pool = match crate::db::global_pool() {
@@ -108,22 +157,87 @@ async fn upload(
     // credential's tail is just its closing brace. `fingerprint_of` knows which.
     let last4 = crate::db::provider_keys::fingerprint_of(&req.provider_id, &req.plaintext);
     let secret = SecretString::from(std::mem::take(&mut req.plaintext));
-    let aad = crate::byok::provider_key_aad(&tenant, &req.provider_id);
-    let ciphertext = match master.encrypt_with_context(&secret, &aad) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "BYOK encrypt failed during upload");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "encrypt failed");
-        }
+    let vault = match crate::kms::KeyVault::global() {
+        Ok(v) => v,
+        Err(e) => return crate::kms::failure_response(e),
     };
-
-    if let Err(e) =
-        crate::db::provider_keys::upsert(pool, &tenant, &req.provider_id, &ciphertext, &last4).await
+    // H1: seal (a customer-KMS unwrap for a KMS tenant) BEFORE taking the tenant's
+    // fence, then re-check under it that the configuration used is still current.
+    // Round 2: no pooled connection is held across the seal's KMS await — read, release,
+    // seal, re-acquire, re-check.
+    let config = match pool.get().await {
+        Ok(client) => match crate::kms::vault::load(&**client, &tenant, master).await {
+            Ok(c) => c,
+            Err(e) => return crate::kms::failure_response(e),
+        },
+        Err(_) => return crate::kms::failure_response(crate::kms::VaultError::Lookup),
+    };
+    let ciphertext = match vault
+        // OG-11 + OG-37: the AAD subject carries the label (`provider` for `default`).
+        .seal(
+            config.as_ref(),
+            &tenant,
+            &crate::db::provider_keys::target_id(&req.provider_id, &label),
+            &secret,
+            master,
+        )
+        .await
     {
+        Ok(c) => c,
+        Err(e) => return crate::kms::failure_response(e),
+    };
+    let _lock = match vault.lock(&tenant).await {
+        Ok(l) => l,
+        Err(e) => return crate::kms::failure_response(e.into()),
+    };
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(_) => return crate::kms::failure_response(crate::kms::VaultError::Lookup),
+    };
+    match crate::kms::vault::load(&**client, &tenant, master).await {
+        Ok(now) if now.as_ref().map(|c| c.id) == config.as_ref().map(|c| c.id) => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "kms_conflict",
+                    "message": "the workspace key configuration changed while this key was being sealed — retry"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return crate::kms::failure_response(e),
+    }
+    drop(client);
+
+    if let Err(e) = crate::db::provider_keys::upsert(
+        pool,
+        &tenant,
+        &req.provider_id,
+        &label,
+        &ciphertext,
+        &last4,
+        &actor.audit,
+    )
+    .await
+    {
+        if e.is::<crate::db::provider_keys::LabelsUnavailable>() {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": "key_labels_unavailable",
+                "message": "Named keys are unavailable until the gateway key-label rollout is complete."
+            }))).into_response();
+        }
         tracing::error!(error = %e, "provider_keys upsert failed");
         return error(StatusCode::INTERNAL_SERVER_ERROR, "persist failed");
     }
-    crate::db::provider_keys::invalidate(&tenant, &req.provider_id);
+    crate::db::provider_keys::invalidate(&tenant, &req.provider_id, &label);
+    // OG-13: the old key's outcomes say nothing about the new one — reset THIS
+    // credential's breakers (every region); other labels and tenants are untouched.
+    crate::circuit_breaker::global_reset(&crate::circuit_breaker::Credential::byok(
+        tenant.as_uuid(),
+        &req.provider_id,
+        &label,
+    ));
 
     // Touch the plaintext through `expose_secret` exactly once to mute
     // the `SecretString` linter — and immediately drop it.
@@ -133,6 +247,7 @@ async fn upload(
         StatusCode::OK,
         Json(UploadResponse {
             provider_id: req.provider_id,
+            label,
             last4,
         }),
     )
@@ -141,7 +256,7 @@ async fn upload(
 
 async fn list(headers: HeaderMap, State(state): State<AppState>) -> impl IntoResponse {
     let tenant = match authenticate_with(&headers, Access::Read).await {
-        Ok(t) => t,
+        Ok(c) => c.tenant_id,
         Err(e) => return e,
     };
     let pool = match crate::db::global_pool() {
@@ -174,6 +289,7 @@ async fn list(headers: HeaderMap, State(state): State<AppState>) -> impl IntoRes
                 .and_then(|history| crate::provider_key_validate::last_rejected(&r, history));
             ProviderKeySummary {
                 provider_id: r.provider_id,
+                label: r.label,
                 last4: r.last4,
                 saved_at: r.saved_at,
                 last_validation: r.last_validation,
@@ -187,25 +303,67 @@ async fn list(headers: HeaderMap, State(state): State<AppState>) -> impl IntoRes
 
 async fn revoke(
     Path(provider_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LabelQuery>,
     headers: HeaderMap,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let tenant = match authenticate_with(&headers, Access::Mutate).await {
-        Ok(t) => t,
+    let actor = match authenticate_mutate(&headers).await {
+        Ok(a) => a,
         Err(e) => return e,
     };
+    let tenant = actor.tenant_id.clone();
     if !is_known_provider(&provider_id) {
         return error(StatusCode::BAD_REQUEST, "unknown provider_id");
+    }
+    let label = q
+        .label
+        .unwrap_or_else(|| crate::db::provider_keys::DEFAULT_LABEL.to_owned());
+    if !crate::db::provider_keys::valid_label(&label) {
+        return error(StatusCode::BAD_REQUEST, "invalid label");
     }
     let pool = match crate::db::global_pool() {
         Some(p) => p,
         None => return error(StatusCode::SERVICE_UNAVAILABLE, "database not configured"),
     };
-    if let Err(e) = crate::db::provider_keys::delete(pool, &tenant, &provider_id).await {
-        tracing::error!(error = %e, "provider_keys delete failed");
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "delete failed");
+    let vault = match crate::kms::KeyVault::global() {
+        Ok(v) => v,
+        Err(e) => return crate::kms::failure_response(e),
+    };
+    let _lock = match vault.lock(&tenant).await {
+        Ok(l) => l,
+        Err(e) => return crate::kms::failure_response(e.into()),
+    };
+    match crate::db::provider_keys::delete(pool, &tenant, &provider_id, &label, &actor.audit).await
+    {
+        Ok(crate::db::provider_keys::DeleteOutcome::InUseByRouting) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "key_in_use_by_routing",
+                    "message": "this key is named in a key pool of the workspace routing document — remove it from the pool (PUT /v1/routing) first",
+                    "provider_id": provider_id,
+                    "label": label,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "provider_keys delete failed");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "delete failed");
+        }
     }
-    crate::db::provider_keys::invalidate(&tenant, &provider_id);
+    crate::db::provider_keys::invalidate(&tenant, &provider_id, &label);
+    // OG-13: a removed key's breaker state must not outlive it.
+    crate::circuit_breaker::global_reset(&crate::circuit_breaker::Credential::byok(
+        tenant.as_uuid(),
+        &provider_id,
+        &label,
+    ));
+    // The key set the entitlement-cached routing document was validated against changed.
+    if let Some(cache) = state.entitlements.as_ref() {
+        cache.invalidate(*tenant.as_uuid()).await;
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -225,7 +383,7 @@ enum Access {
 async fn authenticate_with(
     headers: &HeaderMap,
     need: Access,
-) -> Result<tracelane_shared::TenantId, axum::response::Response> {
+) -> Result<crate::auth::Claims, axum::response::Response> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -267,7 +425,7 @@ async fn authenticate_with(
                 )
                     .into_response());
             }
-            Ok(claims.tenant_id)
+            Ok(claims)
         }
         Err(err) => {
             tracing::warn!(error = %err, "byok auth failed");
@@ -298,6 +456,12 @@ fn is_known_provider(p: &str) -> bool {
     ) || crate::providers::catalog::by_id(p).is_some()
 }
 
+/// `OG-11`: the routing writer's "is this a provider" check — the SAME allowlist a key
+/// upload uses, so a pool can only name a provider a key can be stored for.
+pub(crate) fn known_provider(p: &str) -> bool {
+    is_known_provider(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +470,7 @@ mod tests {
     fn provider_summary_exposes_saved_timestamp_without_ciphertext() {
         let summary = ProviderKeySummary {
             provider_id: "anthropic".into(),
+            label: "default".into(),
             last4: "test".into(),
             saved_at: chrono::Utc::now(),
             last_validation: None,

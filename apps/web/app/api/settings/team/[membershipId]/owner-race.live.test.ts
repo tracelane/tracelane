@@ -13,6 +13,12 @@ import {
 } from "vitest";
 
 const h = vi.hoisted(() => ({ sessions: [] as string[] }));
+vi.mock("@workos-inc/authkit-nextjs", () => ({
+	withAuth: async () => ({
+		user: { id: h.sessions.shift(), email: "unit-test@example.invalid" },
+		organizationId: "org_OWNER_RACE_TEST",
+	}),
+}));
 vi.mock("@/lib/auth", () => ({
 	requireSession: vi.fn(async () => ({
 		tenantId: "org_OWNER_RACE_TEST",
@@ -22,6 +28,7 @@ vi.mock("@/lib/auth", () => ({
 }));
 vi.mock("@/db", () => ({
 	db: {
+		execute: async () => undefined,
 		update: () => ({ set: () => ({ where: async () => undefined }) }),
 		select: () => ({
 			from: () => ({ where: () => ({ limit: async () => [] }) }),

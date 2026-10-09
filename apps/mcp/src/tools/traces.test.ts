@@ -283,7 +283,12 @@ describe("search_traces (newly implemented)", () => {
 		expect(q.query).toContain("FROM tracelane.spans FINAL");
 		expect(q.query).toContain("WHERE tenant_id = {tenantId: String}");
 		expect(q.query).toContain("position(lower(name), {needle: String})");
-		expect(q.query).toContain("position(lower(attributes), {needle: String})");
+		expect(q.query).not.toContain(
+			"position(lower(attributes), {needle: String})",
+		);
+		expect(q.query).toContain("JSONExtractKeysAndValuesRaw(attributes)");
+		expect(q.query).toContain("gen_ai_tool_call_arg_fp");
+		expect(q.query).toContain("tracelane_response_tool_arg_fps");
 		expect(q.query).toContain("AND status_code = 2");
 		expect(q.query).toContain("GROUP BY trace_id");
 		expect(q.query).toContain("LIMIT {limit: UInt32}");

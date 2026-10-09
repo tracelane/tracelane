@@ -53,19 +53,19 @@ For the reviewer-runnable verifier, see [`/audit/verifier-cli`](/audit/verifier-
 
 ### Article 12(2)(a) — automatic log generation
 
-**Exactly five runtime events are written into the per-tenant
-tamper-evident ledger**, and it is worth being precise about which. The three
-request events are published by one shared admission pipeline
-(`crates/gateway/src/admission.rs:759-765`), each route contributing its own
-event type:
+The per-tenant tamper-evident ledger records gateway request and control
+events. The request routes below share an admission pipeline. These are the
+event types relevant to this mapping:
 
 | Event type | Emitted by | What it records |
 |---|---|---|
-| `chat.completions.request` | the `Chat` route, `crates/gateway/src/admission.rs:825` | every `/v1/chat/completions` call proxied by the gateway |
-| `embeddings.request` | the `Embeddings` route, `crates/gateway/src/admission.rs:901` | every `/v1/embeddings` call proxied by the gateway |
+| `chat.completions.request` | the `Chat` route, `crates/gateway/src/admission.rs:2260` | gateway-admitted `/v1/chat/completions` calls |
+| `embeddings.request` | the `Embeddings` route, `crates/gateway/src/admission.rs:2372` | gateway-admitted `/v1/embeddings` calls |
 | `messages.request` | the `Messages` route, `crates/gateway/src/anthropic_messages.rs:936` | every `/v1/messages` (Anthropic-native) call proxied by the gateway |
-| `guardrail.verdict` | `crates/gateway/src/guardrail/recorder.rs:107-115` | every guardrail-layer decision |
-| `eval.verdict` | `crates/gateway/src/prompt_routes.rs:96` | prompt promotion / rollback decisions |
+| `guardrail.verdict` | `crates/gateway/src/guardrail/recorder.rs:103-115` | recorded guardrail-layer decisions |
+| `eval.verdict` | `crates/gateway/src/prompt_routes.rs:89-110` | prompt promotion / rollback decisions |
+| `prompt.canary` | `crates/gateway/src/prompt_routes.rs:702-709` | canary control changes |
+| `workspace.content_capture.set` | `crates/gateway/src/workspace_capture_routes.rs:33-39` | workspace capture-setting changes |
 
 Tool invocations, agent-to-agent handoffs and MCP invocations are
 **captured as spans but are not chained** — they are not in the ledger

@@ -28,8 +28,15 @@ import { formatDateTimeUtc } from "@/lib/format-date";
 import { extractToolCalls, formatBytes } from "@/lib/tool-calls";
 import { extractGenAi } from "@/lib/trace-tree";
 import { fmtDur } from "@tracelanedev/ui";
+import { CachePanel } from "./CachePanel";
+import { ConversationPanel } from "./ConversationPanel";
 import { CopyButton } from "./CopyButton";
 import { GenerationEvidence } from "./GenerationEvidence";
+import { LabelsPanel } from "./LabelsPanel";
+import { OtlpDetails } from "./OtlpDetails";
+import { RequestConfigPanel } from "./RequestConfigPanel";
+import { ResponseIdentityPanel } from "./ResponseIdentityPanel";
+import { UsagePanel } from "./UsagePanel";
 import type { Span } from "./types";
 
 const STATUS_LABELS: Record<number, string> = {
@@ -129,7 +136,22 @@ const fmt = (n: number | undefined): string =>
 export function SpanInspector({
 	span,
 	traceId,
-}: { span: Span | null; traceId?: string }) {
+	previousToolHash,
+	toolPreviewLimit,
+	conversationLimit,
+	minGenerationMs,
+	llmSpans,
+	onSelectSpan,
+}: {
+	span: Span | null;
+	traceId?: string;
+	previousToolHash?: string;
+	toolPreviewLimit?: number;
+	conversationLimit?: number;
+	minGenerationMs?: number;
+	llmSpans?: Span[];
+	onSelectSpan?: (id: string) => void;
+}) {
 	if (!span) {
 		return (
 			<div className="flex h-full min-h-64 flex-col items-center justify-center gap-3 p-8 text-center">
@@ -149,9 +171,11 @@ export function SpanInspector({
 	}
 
 	let attrs: Record<string, unknown> = {};
+	let readable = true;
 	try {
 		attrs = JSON.parse(span.attributes) as Record<string, unknown>;
 	} catch {
+		readable = false;
 		attrs = { raw: span.attributes };
 	}
 
@@ -266,6 +290,33 @@ export function SpanInspector({
 			</div>
 
 			<GenerationEvidence evidence={span} attributes={attrs} />
+			<RequestConfigPanel
+				attrs={attrs}
+				previousToolHash={previousToolHash}
+				toolPreviewLimit={toolPreviewLimit}
+			/>
+			<UsagePanel usage={span.usage} />
+			<LabelsPanel
+				attrs={attrs}
+				durationUs={span.duration_us}
+				minGenerationMs={minGenerationMs}
+			/>
+			<CachePanel
+				attrs={attrs}
+				enabled={
+					hasSummary || typeof attrs.tracelane_semantic_cache_hit === "boolean"
+				}
+			/>
+			<ResponseIdentityPanel attrs={attrs} caps={span.caps} />
+			<ConversationPanel
+				span={span}
+				attrs={attrs}
+				readable={readable}
+				llmSpans={llmSpans}
+				onSelectSpan={onSelectSpan}
+				conversationLimit={conversationLimit}
+			/>
+			<OtlpDetails attrs={attrs} />
 			{businessRef && (
 				<div className="rounded-card border border-line bg-surface-2 p-3">
 					<div className="mb-1 flex items-center justify-between gap-2">
@@ -320,8 +371,7 @@ export function SpanInspector({
 									</pre>
 								) : (
 									<div className="mt-1 text-ink-3">
-										— arguments not captured (content capture is off for this
-										workspace)
+										— arguments not recorded
 									</div>
 								)}
 							</li>

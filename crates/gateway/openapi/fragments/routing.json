@@ -1,0 +1,90 @@
+{
+  "module": "crates/gateway/src/routing/routes.rs",
+  "operations": {
+    "GET /v1/routing": {
+      "summary": "The workspace routing document (virtual models, key pools, conditional rules, timeouts, breaker overrides), its version and the limits.",
+      "tags": [
+        "routing"
+      ],
+      "responses": {
+        "200": {
+          "description": "`doc`, `version`, `limits`, `can_edit`.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "no_control_plane",
+        "read_failed"
+      ]
+    },
+    "PUT /v1/routing": {
+      "summary": "Replace the routing document (optimistic concurrency: send the current `version` in `If-Match`).",
+      "tags": [
+        "routing"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "The stored document and its new version.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_body / invalid_field (names `field`).",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "version_conflict",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "428": {
+          "description": "if_match_required",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_body",
+        "invalid_field",
+        "if_match_required",
+        "version_conflict",
+        "no_control_plane",
+        "write_failed"
+      ]
+    },
+    "POST /v1/routing/simulate": {
+      "summary": "A dry run of the dispatch plan for a model and condition inputs \u2014 nothing is written.",
+      "tags": [
+        "routing"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "The candidate plan, skipped targets and the reason for each.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_body",
+        "invalid_field",
+        "no_control_plane",
+        "read_failed"
+      ]
+    }
+  }
+}

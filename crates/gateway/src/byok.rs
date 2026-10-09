@@ -144,6 +144,12 @@ impl std::fmt::Debug for ByokMasterKey {
 }
 
 impl ByokMasterKey {
+    /// Version inspection only; platform rotation must never reinterpret a customer DEK as a KEK.
+    pub fn is_customer_envelope(blob: &str) -> bool {
+        B64.decode(blob)
+            .is_ok_and(|raw| raw.len() >= 45 && raw[0] == 4)
+    }
+
     /// Load the ring from the environment (`TRACELANE_BYOK_MASTER_KEY` as KEK 0,
     /// `TRACELANE_BYOK_MASTER_KEYS` as `id:base64,…`, `TRACELANE_BYOK_ACTIVE_KEK`).
     /// `None` when neither key variable is set (dev only).
@@ -398,6 +404,16 @@ impl ByokMasterKey {
     }
 }
 
+/// Platform encryption context for a customer's KMS authentication material.
+pub(crate) fn kms_config_aad(tenant: &uuid::Uuid) -> Vec<u8> {
+    format!("kms-config:{tenant}").into_bytes()
+}
+
+/// Tenant and hook-identity binding shared by the store and credential re-wrap.
+pub(crate) fn guardrail_hook_aad(tenant: &uuid::Uuid, key: &str) -> Vec<u8> {
+    format!("guardrail-hook:{tenant}:{key}").into_bytes()
+}
+
 /// Build an AAD context string for a provider-key ciphertext. Caller
 /// is `crates/gateway/src/db/provider_keys.rs` (when wired).
 ///
@@ -406,6 +422,23 @@ impl ByokMasterKey {
 /// rows won't decrypt under the new context format.
 pub fn provider_key_aad(tenant_id: &tracelane_shared::TenantId, provider_id: &str) -> Vec<u8> {
     format!("provider-key:{tenant_id}:{provider_id}").into_bytes()
+}
+
+/// `OG-11`: the AAD of one POOL key. The `default` label's AAD is BYTE-IDENTICAL to
+/// [`provider_key_aad`] — every blob stored before key pools still opens — and any
+/// other label binds `:<label>` too, so a ciphertext cannot be swapped between two
+/// labels of one provider (or onto the default key). A label cannot contain `:`
+/// (`db::provider_keys::valid_label`), so no two `(provider, label)` pairs share an AAD.
+pub fn provider_key_aad_labeled(
+    tenant_id: &tracelane_shared::TenantId,
+    provider_id: &str,
+    label: &str,
+) -> Vec<u8> {
+    if label == "default" {
+        provider_key_aad(tenant_id, provider_id)
+    } else {
+        format!("provider-key:{tenant_id}:{provider_id}:{label}").into_bytes()
+    }
 }
 
 /// Build an AAD context string for a tenant audit signing keypair.
@@ -656,6 +689,48 @@ mod tests {
         let ct_a = k.encrypt_with_context(&pk, &aad_a).unwrap();
         let result = k.decrypt_with_context(&ct_a, &aad_b);
         assert!(result.is_err(), "decrypt with wrong tenant AAD MUST fail");
+    }
+
+    /// `OG-11` proof 3 (crypto half): the `default` label's AAD equals the pre-pool
+    /// golden bytes (every stored blob still opens), and a blob swapped between two
+    /// labels — or from a label onto the default key — fails the GCM tag.
+    #[test]
+    fn og11_default_label_aad_is_the_golden_and_labels_cannot_swap() {
+        assert_eq!(
+            provider_key_aad_labeled(&tenant_a(), "openai", "default"),
+            b"provider-key:00000000-0000-0000-0000-000000000001:openai".to_vec(),
+            "byte-identical to the pre-OG-11 AAD"
+        );
+        assert_eq!(
+            provider_key_aad_labeled(&tenant_a(), "openai", "default"),
+            provider_key_aad(&tenant_a(), "openai")
+        );
+        let k = test_key();
+        let pk = SecretString::from("sk-team-a".to_string());
+        let aad_a = provider_key_aad_labeled(&tenant_a(), "openai", "team-a");
+        let ct = k.encrypt_with_context(&pk, &aad_a).unwrap();
+        assert!(k.decrypt_with_context(&ct, &aad_a).is_ok());
+        assert!(
+            k.decrypt_with_context(
+                &ct,
+                &provider_key_aad_labeled(&tenant_a(), "openai", "team-b")
+            )
+            .is_err(),
+            "label → label swap MUST fail"
+        );
+        assert!(
+            k.decrypt_with_context(&ct, &provider_key_aad(&tenant_a(), "openai"))
+                .is_err(),
+            "label → default swap MUST fail"
+        );
+        assert!(
+            k.decrypt_with_context(
+                &ct,
+                &provider_key_aad_labeled(&tenant_b(), "openai", "team-a")
+            )
+            .is_err(),
+            "cross-tenant swap of a pool key MUST fail"
+        );
     }
 
     #[test]

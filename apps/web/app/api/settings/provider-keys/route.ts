@@ -19,11 +19,13 @@
  */
 
 import { requireGatewayToken } from "@/lib/auth";
-import { gatewayBaseUrl } from "@/lib/gateway";
+import { gatewayResponse } from "@/lib/gateway";
 import { type NextRequest, NextResponse } from "next/server";
 
 interface ProviderKeySummary {
 	provider_id: string;
+	/** OG-11: the key's pool label (`default` for the one pre-pool key). */
+	label: string;
 	last4: string;
 	saved_at: string;
 }
@@ -41,12 +43,7 @@ function roleForbidden(): NextResponse {
 }
 
 export async function GET(): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
-
-	const upstream = await fetch(`${gatewayBaseUrl()}/v1/byok/provider-keys`, {
-		headers: { authorization: `Bearer ${token}` },
-		cache: "no-store",
-	});
+	const upstream = await gatewayResponse("/v1/byok/provider-keys");
 
 	if (!upstream.ok) {
 		// 403 is not a failure — it is the gateway's owner-only gate on BYOK
@@ -68,11 +65,14 @@ export async function GET(): Promise<NextResponse> {
 interface UploadBody {
 	provider_id: string;
 	plaintext: string;
+	/** OG-11: optional pool label; absent = `default`. Validated by the gateway. */
+	label?: string;
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-	const { token } = await requireGatewayToken();
-
+	// Auth first (unchanged order): an unauthenticated caller is redirected
+	// before any body validation. `gatewayResponse` reuses the memoized token.
+	await requireGatewayToken();
 	let body: UploadBody;
 	try {
 		body = (await req.json()) as UploadBody;
@@ -92,15 +92,16 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	const upstream = await fetch(`${gatewayBaseUrl()}/v1/byok/provider-keys`, {
+	const upstream = await gatewayResponse("/v1/byok/provider-keys", {
 		method: "POST",
-		headers: {
-			authorization: `Bearer ${token}`,
-			"content-type": "application/json",
-		},
+		headers: { "content-type": "application/json" },
 		// tenant is NEVER sent in the body — the gateway derives it from the
 		// JWT. Only the provider id + the key plaintext cross the wire.
-		body: JSON.stringify({ provider_id: providerId, plaintext }),
+		body: JSON.stringify(
+			body.label?.trim()
+				? { provider_id: providerId, plaintext, label: body.label.trim() }
+				: { provider_id: providerId, plaintext },
+		),
 	});
 
 	if (!upstream.ok) {

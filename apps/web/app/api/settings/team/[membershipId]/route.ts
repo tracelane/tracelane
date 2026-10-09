@@ -4,7 +4,7 @@
  *   DELETE — remove the member (owner-only). WorkOS revokes their sessions; we
  *            additionally revoke their `tlane_` API keys so their next gateway
  *            request 401s. Mirror row is left for audit-trail integrity.
- *   PATCH  — change the member's role (owner-only): { role: owner|member|viewer }.
+ *   PATCH  — change the member's role (owner-only): { role: owner|member|developer|billing|viewer }.
  *
  * Guards (all server-side — the UI hides the controls but these are the real
  * gates): owner-only caller, target must belong to the caller's org (tenant
@@ -17,6 +17,10 @@
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
@@ -24,7 +28,13 @@ import { type NextRequest, NextResponse } from "next/server";
 import { withOwnerMutation } from "../owner-lock";
 
 const WORKOS = "https://api.workos.com";
-const ASSIGNABLE_ROLES = new Set(["owner", "member", "viewer"]);
+const ASSIGNABLE_ROLES = new Set([
+	"owner",
+	"member",
+	"developer",
+	"billing",
+	"viewer",
+]);
 
 export async function DELETE(
 	_req: NextRequest,
@@ -94,11 +104,22 @@ export async function DELETE(
 			);
 		}
 
+		// Record in the gateway control-change audit BEFORE acting; refuse if it
+		// cannot be recorded (fail-closed).
+		const before = { user_id: target.user_id, role: target.role.slug };
+		const rec = await recordControlChange(
+			"member.remove",
+			membershipId,
+			before,
+		);
+		if (!rec.ok) return rec.response;
+
 		const del = await fetch(
 			`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
 			{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
 		);
 		if (!del.ok) {
+			await recordControlChangeFailed("member.remove", membershipId, before);
 			return NextResponse.json(
 				{ error: "WorkOS removal failed" },
 				{ status: 502 },
@@ -163,7 +184,7 @@ export async function PATCH(
 	}
 	if (!ASSIGNABLE_ROLES.has(body.role)) {
 		return NextResponse.json(
-			{ error: "role must be owner, member, or viewer" },
+			{ error: "role must be owner, member, developer, billing, or viewer" },
 			{ status: 422 },
 		);
 	}
@@ -213,6 +234,16 @@ export async function PATCH(
 			);
 		}
 
+		const before = { role: target.role.slug };
+		const after = { role: body.role };
+		const rec = await recordControlChange(
+			"member.role_change",
+			membershipId,
+			before,
+			after,
+		);
+		if (!rec.ok) return rec.response;
+
 		const res = await fetch(
 			`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
 			{
@@ -225,6 +256,12 @@ export async function PATCH(
 			},
 		);
 		if (!res.ok) {
+			await recordControlChangeFailed(
+				"member.role_change",
+				membershipId,
+				before,
+				after,
+			);
 			console.error(`[team/role] WorkOS role change failed: ${res.status}`);
 			return NextResponse.json(
 				{ error: "workos_role_change_failed" },

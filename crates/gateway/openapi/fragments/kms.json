@@ -1,0 +1,130 @@
+{
+  "module": "crates/gateway/src/kms/api.rs",
+  "operations": {
+    "GET /v1/security/kms": {
+      "summary": "The workspace's customer-managed key (BYOK) configuration and its live unwrap status.",
+      "tags": [
+        "security"
+      ],
+      "responses": {
+        "200": {
+          "description": "`configured`, `backend`, `key_ref`, `dek_id`, `last_unwrap_ok_at`, `last_unwrap_error`, `rows_on_platform_kek`.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "kms_not_configured"
+      ]
+    },
+    "PUT /v1/security/kms": {
+      "summary": "Configure or rotate the customer-managed key (a probe wraps and unwraps a fresh data key first).",
+      "tags": [
+        "security"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "The configuration and its status.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_field (names `field`).",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "kms_probe_failed",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "kms_probe_failed",
+        "kms_backend_unavailable",
+        "kms_access_denied",
+        "kms_unavailable",
+        "ssrf_blocked",
+        "byok_cmk_required",
+        "provider_key_unusable",
+        "kms_conflict"
+      ]
+    },
+    "DELETE /v1/security/kms": {
+      "summary": "Remove the customer-managed key: `unseal` re-seals provider keys under the platform key, `abandon` deletes them (needs `confirm`).",
+      "tags": [
+        "security"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "What was done to the stored provider keys.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "confirmation_required",
+        "kms_not_configured",
+        "kms_access_denied",
+        "kms_unavailable",
+        "provider_key_unusable",
+        "kms_conflict"
+      ]
+    },
+    "POST /v1/security/kms/migrate": {
+      "summary": "Re-seal every provider key still on the platform key under the customer-managed key.",
+      "tags": [
+        "security"
+      ],
+      "responses": {
+        "200": {
+          "description": "`migrated` count.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "kms_not_configured",
+        "kms_access_denied",
+        "kms_unavailable",
+        "provider_key_unusable",
+        "kms_conflict"
+      ]
+    },
+    "POST /v1/security/kms/rewrap": {
+      "summary": "Rotate the data key and re-seal every provider key under it, atomically.",
+      "tags": [
+        "security"
+      ],
+      "responses": {
+        "200": {
+          "description": "`rotated` count.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "kms_not_configured",
+        "kms_probe_failed",
+        "kms_access_denied",
+        "kms_unavailable",
+        "provider_key_unusable",
+        "kms_conflict"
+      ]
+    }
+  }
+}

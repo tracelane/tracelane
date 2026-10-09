@@ -226,8 +226,11 @@ impl Default for ResponseBuffer {
 /// driven; [`GuardrailContext::from_response`] borrows from it per evaluation.
 #[derive(Debug, Clone)]
 pub struct ResponseInputs {
+    pub hooks: Option<Vec<super::hooks::Hook>>,
+    pub hook_events: super::hooks::Events,
     pub tenant_id: TenantId,
     pub api_key_id: Option<String>,
+    pub project_id: Option<uuid::Uuid>,
     pub correlation_id: Ulid,
     /// The request's system prompt — R6 compares the response against it.
     pub system_prompt: Option<String>,
@@ -276,6 +279,7 @@ pub fn extract_expected_format(body: &serde_json::Value) -> Option<ExpectedForma
 /// The single context every rail reads (§2.1). Lifetime `'r` is the per-request
 /// scope — the parsed `ChatRequest` and raw body outlive the context.
 pub struct GuardrailContext<'r> {
+    pub policy: super::policy::Policy,
     // ── identity (resolved, never org_id) ──────────────────────────────────
     /// Resolved internal `tenants.id` UUID. In V1 the spec's `workspace_id`
     /// collapses to the tenant (one workspace per tenant; entitlements key on
@@ -300,6 +304,22 @@ pub struct GuardrailContext<'r> {
     pub tool_calls: Vec<ProposedToolCall<'r>>,
     pub tool_results: Vec<IncomingToolResult<'r>>,
     pub rag_context: Vec<RetrievedChunk<'r>>,
+    /// `M-1` (security re-review 2026-10-02): every forwarded text of the request that is
+    /// neither message text, the system prompt nor a tool definition — the assistant
+    /// tool-call history, `response_format`, `user`, `metadata`, `stop`, the C1 allowlisted
+    /// extras (`guardrail::egress::side_text`). They egress with the request, so the text
+    /// rails (R2, R8) read them like message text. Empty response-side.
+    pub extra_text: Vec<&'r str>,
+    /// `M-1`: the text of the tool DEFINITIONS — names, descriptions, every text leaf of the
+    /// parameter schemas (`guardrail::egress::tool_def_text`). R8 reads it for tool poisoning,
+    /// R2 for secrets. Empty response-side.
+    pub tool_def_text: Vec<&'r str>,
+    /// `M-1`: on a RELAY wire (`/v1/messages`, Responses mode N, Gemini-native, a batch line,
+    /// a realtime client event) the caller's own JSON is what egresses, not the read model.
+    /// R2 then scans THIS — every text leaf minus the anchored opaque allowlist — so what it
+    /// judges is exactly what is sent, and R8 reads every leaf of it too (`M-C`). `None` where
+    /// a `ChatRequest` egresses (chat, Responses mode T). Set via [`Self::attach_relay_body`].
+    pub egress_json: Option<&'r serde_json::Value>,
     /// The capability registry's posture for this request (permissive vs
     /// enforcing). Recorded in the R4 verdict; drives the safe-default for
     /// tools referenced but not declared in the request.
@@ -353,6 +373,7 @@ impl<'r> GuardrailContext<'r> {
             .map(|t| registry.tool_def(t))
             .collect();
         Self {
+            policy: super::policy::Policy::default(),
             tenant_id,
             correlation_id,
             #[cfg(test)]
@@ -363,6 +384,9 @@ impl<'r> GuardrailContext<'r> {
             tool_calls: collect_tool_calls(&request.messages),
             tool_results: collect_tool_results(&request.messages),
             rag_context,
+            extra_text: crate::guardrail::egress::side_text(request),
+            tool_def_text: crate::guardrail::egress::tool_def_text(request),
+            egress_json: None,
             registry_posture: registry.posture(),
             est_input_tokens: estimate_input_tokens(request),
             #[cfg(test)]
@@ -416,6 +440,7 @@ impl<'r> GuardrailContext<'r> {
         #[cfg(not(test))]
         let _ = (api_key_id, model, provider);
         Self {
+            policy: super::policy::Policy::default(),
             tenant_id: &inputs.tenant_id,
             correlation_id: inputs.correlation_id,
             #[cfg(test)]
@@ -426,6 +451,9 @@ impl<'r> GuardrailContext<'r> {
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             rag_context: Vec::new(),
+            extra_text: Vec::new(),
+            tool_def_text: Vec::new(),
+            egress_json: None,
             // No tools evaluated response-side (R4 is request-side).
             registry_posture: RegistryPosture::Permissive,
             est_input_tokens: 0,
@@ -439,6 +467,14 @@ impl<'r> GuardrailContext<'r> {
             usage,
             expected_format: inputs.expected_format.as_ref(),
         }
+    }
+
+    /// `M-1`: this request egresses as the caller's own JSON `body` (a relay wire). R2 scans
+    /// `body` whole ([`Self::egress_json`]), and so does R8 (`M-C`, security re-review
+    /// 2026-10-03: every leaf, attributed by position — not the read model's subset plus a
+    /// list of "unmodelled" keys, which is what let dropped blocks through).
+    pub fn attach_relay_body(&mut self, body: &'r serde_json::Value) {
+        self.egress_json = Some(body);
     }
 
     /// The workspace scope for entitlement checks. V1: equals the tenant
@@ -590,7 +626,11 @@ fn content_char_len(content: &MessageContent) -> usize {
                 ContentPart::Text { text, .. } => text.len(),
                 ContentPart::ToolResult { content, .. } => content.len(),
                 ContentPart::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
-                ContentPart::ImageUrl { .. } => 0,
+                // Not text: nothing for a text-length estimate to count (OG-03 adds the
+                // audio and file parts to the image's treatment).
+                ContentPart::ImageUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::File { .. } => 0,
             })
             .sum(),
     }
@@ -680,6 +720,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -779,8 +820,11 @@ mod tests {
     #[test]
     fn from_response_builds_response_context() {
         let inputs = ResponseInputs {
+            hooks: None,
+            hook_events: Default::default(),
             tenant_id: TenantId::from_jwt_claim(Uuid::from_u128(0x5)),
             api_key_id: Some("apikey:r".to_string()),
+            project_id: None,
             correlation_id: fixed_ulid(),
             system_prompt: Some("You are helpful.".to_string()),
             model: "claude-sonnet-4-6".to_string(),
@@ -960,6 +1004,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         };
         let big = representative_request();
         assert!(estimate_input_tokens(&big) > estimate_input_tokens(&small));

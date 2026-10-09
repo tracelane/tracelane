@@ -65,6 +65,27 @@ export interface SpanLike {
 	intervention: number;
 }
 
+/** Server-only equality evidence never crosses the MCP tool boundary. */
+function publicSpan(span: SpanLike): SpanLike {
+	let attributes = "{}";
+	try {
+		const parsed: unknown = JSON.parse(span.attributes);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			const attrs = parsed as Record<string, unknown>;
+			attrs.gen_ai_tool_call_arg_fp = undefined;
+			attrs.tracelane_response_tool_arg_fps = undefined;
+			attributes = JSON.stringify(attrs);
+		}
+	} catch {
+		/* Malformed attributes fail closed. */
+	}
+	return { ...span, attributes };
+}
+
+// Same projection as the gateway: private equality evidence cannot become a search oracle.
+const SEARCHABLE_ATTRIBUTES_SQL =
+	"concat('{', arrayStringConcat(arrayMap(kv -> concat(toJSONString(kv.1), ':', kv.2), arrayFilter(kv -> kv.1 NOT IN ('gen_ai_tool_call_arg_fp', 'tracelane_response_tool_arg_fps'), JSONExtractKeysAndValuesRaw(attributes))), ','), '}')";
+
 /** ClickHouse-mode `search_traces` row — one per matched trace (unchanged shape). */
 export interface SearchMatchRow {
 	trace_id: string;
@@ -325,9 +346,11 @@ export class GatewayReader implements TraceReader {
 	}
 
 	async getTraceSpans(traceId: string): Promise<SpanLike[]> {
-		return this.getJson<SpanLike[]>(
-			`v1/traces/${encodeURIComponent(traceId)}/spans`,
-		);
+		return (
+			await this.getJson<SpanLike[]>(
+				`v1/traces/${encodeURIComponent(traceId)}/spans`,
+			)
+		).map(publicSpan);
 	}
 
 	async getSpan(args: GetSpanArgs): Promise<SpanLike | null> {
@@ -446,7 +469,7 @@ export class ClickHouseReader implements TraceReader {
 			query_params: { tenantId, trace_id: traceId },
 			format: "JSONEachRow",
 		});
-		return result.json<SpanLike>();
+		return (await result.json<SpanLike>()).map(publicSpan);
 	}
 
 	async getSpan(args: GetSpanArgs): Promise<SpanLike | null> {
@@ -481,7 +504,7 @@ export class ClickHouseReader implements TraceReader {
 			format: "JSONEachRow",
 		});
 		const rows = await result.json<SpanLike>();
-		return rows[0] ?? null;
+		return rows[0] ? publicSpan(rows[0]) : null;
 	}
 
 	async searchTraces(args: SearchTracesArgs): Promise<SearchTracesResult> {
@@ -501,12 +524,10 @@ export class ClickHouseReader implements TraceReader {
 			limit: args.limit,
 		};
 
-		where +=
-			" AND (position(lower(name), {needle: String}) > 0" +
-			" OR position(lower(attributes), {needle: String}) > 0)";
+		where += ` AND (position(lower(name), {needle: String}) > 0 OR position(lower(${SEARCHABLE_ATTRIBUTES_SQL}), {needle: String}) > 0)`;
 
 		if (args.modelFilter) {
-			where += " AND position(lower(attributes), {model: String}) > 0";
+			where += ` AND position(lower(${SEARCHABLE_ATTRIBUTES_SQL}), {model: String}) > 0`;
 			params.model = args.modelFilter.toLowerCase();
 		}
 		if (args.hasError === true) {

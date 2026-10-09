@@ -1,49 +1,56 @@
 ---
 title: BYOK — Bring Your Own Key
-description: Envelope-encrypt provider API keys with AES-256-GCM, AAD bound to tenant and provider, decrypted in-memory only at gateway request dispatch time.
+description: Envelope-encrypt provider API keys with AES-256-GCM, bound to tenant and provider, with optional customer KMS wrapping for the tenant data key.
 classification: PUBLIC
 ---
 
-BYOK envelope-encrypts your provider API keys at rest with **AES-256-GCM**. On
-self-hosted deployments you supply the 32-byte envelope master key
-(`TRACELANE_BYOK_MASTER_KEY`). Registering your own Customer-Managed Key (CMK)
-**public-key fingerprint** for audit and labeling. Tracelane holds the
-ciphertext and decrypts it in-memory only at request dispatch.
+BYOK envelope-encrypts provider API keys at rest with **AES-256-GCM**. A
+deployment can use its platform master key; on self-hosted deployments you
+supply that key as `TRACELANE_BYOK_MASTER_KEY`. Entitled workspaces can instead
+configure a customer KMS through the gateway's security API. The dashboard's
+**BYOK Keys** page is a separate public-key fingerprint registry; registering
+a fingerprint does not activate customer KMS encryption. Provider keys are
+decrypted in memory when needed for dispatch.
 
-Available on **Business $799/mo and above** (read-only key list on Team $229+).
+Setting a customer KMS configuration and registering a dashboard fingerprint
+require **Business $799/mo or above**. An organisation admin can rotate or
+remove registered fingerprints.
+Viewing KMS status or registered fingerprints has separate read access. Gateway
+BYOK provider keys are available separately from those controls.
 
 ## How envelope encryption works
 
-Provider keys are sealed with **AES-256-GCM** (ring AEAD) under Tracelane's
-envelope master key. Each ciphertext is bound with Additional Authenticated
-Data (AAD) = `provider-key:<tenant_id>:<provider_id>`, so a ciphertext from one
-tenant/provider cannot be replayed under another — a mismatched context fails
-the GCM authentication tag.
+Provider keys are sealed with **AES-256-GCM** (ring AEAD). Without a customer
+KMS configuration, the deployment master key protects the envelope. With a
+customer KMS configuration, the gateway uses a tenant data key wrapped by that
+KMS for provider-key envelopes. Each ciphertext is bound to its tenant and
+provider; a mismatched context fails authentication.
 
 ```
 Provider key (plaintext)
-   │  AES-256-GCM seal, AAD = provider-key:<tenant>:<provider>
+   │  AES-256-GCM seal, bound to tenant and provider
    ▼
 Ciphertext + 16-byte GCM tag  ──►  stored in Postgres
-   │  decrypted in-memory just-in-time on dispatch, then zeroed
-   ▼  never written to logs, spans, or errors
+   │  decrypted in memory for dispatch; may remain in a bounded cache
+   ▼  cache value zeroized on drop; never written to logs, spans, or errors
 ```
 
-On self-hosted deployments the master key is `TRACELANE_BYOK_MASTER_KEY` (32 bytes, base64-encoded).
-KMS-backed master-key management is not available.
+On self-hosted deployments the platform master key is `TRACELANE_BYOK_MASTER_KEY`
+(32 bytes, base64-encoded). Customer KMS integration uses a wrapped tenant data
+key for provider-key envelopes; it does not cover trace payloads.
 
 ## Public-key fingerprint (audit)
 
 You may register a Customer-Managed Key **public-key fingerprint** for audit
-and labeling. It is recorded but does not itself wrap provider keys in V1 —
-provider keys are sealed with the symmetric master key above.
+and labeling. This registry does not configure the gateway's customer KMS or
+change how provider keys are encrypted.
 
 | Accepted public-key format | Key size |
 |---|---|
 | Ed25519 | 256-bit |
 | RSA-4096 | 4096-bit |
 
-## Register a key
+## Register a dashboard fingerprint
 
 ### Dashboard (Settings → BYOK Keys)
 
@@ -64,7 +71,7 @@ openssl rsa -in cmk-private.pem -pubout -out cmk-public.pem
 4. Store `cmk-private.pem` in your secrets manager (AWS Secrets Manager, Vault, etc.)
    — never commit it to source control.
 
-### API
+### Fingerprint registry API
 
 ```bash
 curl -X POST https://app.tracelane.dev/api/settings/cmk-keys \
@@ -90,14 +97,30 @@ and the first-party SDK provider adapters do not send message bodies. OpenTeleme
 half is enabled; sending them does not override the workspace decision. Recorded text is not encrypted under your key
 today — the `trace-payload` scope above is not available.
 
-## Rotate & revoke
+## Customer KMS API
+
+The gateway exposes `GET`, `PUT`, and `DELETE /v1/security/kms`, plus
+`POST /v1/security/kms/migrate` and `POST /v1/security/kms/rewrap`.
+Reading status requires settings-view access. Configuration changes require
+the security-management capability; setting a new configuration also checks
+the customer KMS entitlement. A `PUT` tests a wrap/unwrap round trip before
+storing the configuration. Existing provider
+keys sealed under the platform master key require an explicit migration:
+**after KMS is configured, those keys cannot be used until they are migrated**.
+Plan the configuration and migration together before sending provider traffic;
+configuring KMS does not silently move the old ciphertext. The rewrap route
+changes the KMS wrapping key for the tenant data key. Supported backends are
+AWS KMS, Vault Transit, GCP KMS,
+and Azure Key Vault. The dashboard fingerprint registry does not call these
+endpoints.
+
+## Rotate & revoke dashboard fingerprints
 
 Registering, listing, rotating, and removing CMK **fingerprints** is available
-today via the dashboard (**Settings → BYOK Keys**) and the API. Rotation is a
-registry operation only: it records the replacement fingerprint and marks the
-previous one `rotating`. No ciphertext is re-encrypted and no key is
-automatically revoked — provider-key ciphertext stays sealed under the
-deployment envelope master key (`TRACELANE_BYOK_MASTER_KEY`).
+via the dashboard (**Settings → BYOK Keys**) and its API. Rotation here is a
+registry operation: it records a replacement fingerprint and marks the previous
+one `rotating`. It does not rotate a gateway KMS configuration or re-encrypt
+provider-key ciphertext.
 
 Removing or replacing a provider key through the dashboard or API takes effect on
 the next request the gateway instance serves: it evicts its cached copy of that

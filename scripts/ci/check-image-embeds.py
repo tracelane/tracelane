@@ -34,6 +34,7 @@ import fnmatch
 import importlib.util
 import os
 import re
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -160,14 +161,21 @@ def check(root: Path) -> list[str]:
         (
             l
             for l in (root / DEPLOY_SCRIPT).read_text().splitlines()
-            if "tar czf" in l and "gw-src" in l
+            if re.match(r'\s*tar czf (?:/tmp/gw-src\.tgz|"\$1") ', l)
         ),
         "",
     )
-    tar_sources = tar_line.split("gw-src.tgz", 1)[1].split() if tar_line else []
+    # source_archive takes its output path as an argument; its excludes array
+    # removes env secrets. Keep checking the literal build inputs after it.
+    tar_sources = shlex.split(tar_line.split(" || ", 1)[0])[3:] if tar_line else []
+    tar_sources = [
+        s
+        for s in tar_sources
+        if s != "${excludes[@]}" and not s.startswith("--exclude=")
+    ]
     if not tar_sources:
         failures.append(
-            f"{DEPLOY_SCRIPT}: could not find the `tar czf …gw-src.tgz` source list — refusing to assume it is complete"
+            f"{DEPLOY_SCRIPT}: could not find the deploy `tar czf` source list — refusing to assume it is complete"
         )
     all_embeds: dict[str, str] = {}
     for df in DOCKERFILES:
@@ -302,6 +310,19 @@ def selftest() -> int:
             print(
                 f"selftest: {'✓' if ok else '✗'} {name}"
                 + ("" if ok else f"  (got {f})")
+            )
+            bad += 0 if ok else 1
+            deploy = root / DEPLOY_SCRIPT
+            deploy.write_text(
+                deploy.read_text().replace("/tmp/gw-src.tgz", '"$1" "${excludes[@]}"')
+            )
+            f = check(root)
+            ok = (1 if f else 0) == want_fail and (
+                needle is None or any(needle in x for x in f)
+            )
+            print(
+                f"selftest: {'✓' if ok else '✗'} archive function: {name}"
+                + ("" if ok else f" (got {f})")
             )
             bad += 0 if ok else 1
     return 1 if bad else 0

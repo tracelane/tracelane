@@ -41,7 +41,8 @@ export type MetricFamily =
 	| "evals"
 	| "audit"
 	| "kya"
-	| "gateway-process";
+	| "gateway-process"
+	| "workspace";
 
 export type WindowKind =
 	| "windowed"
@@ -51,6 +52,7 @@ export type WindowKind =
 	| "entity";
 
 export type DedupClass =
+	| "spend_hourly MV (not deduplicated)"
 	| "spans FINAL"
 	| "trace_summaries FINAL"
 	| "spans FINAL ≤ 24 h · slo MV (not deduplicated) above"
@@ -87,6 +89,411 @@ const NO_VERDICTS = "no verdicts in this window";
 
 /** `satisfies` keeps the ids literal AND checks every entry against MetricDef. */
 export const METRICS = {
+	glance_traces: {
+		id: "glance_traces",
+		label: "Traces · last",
+		kind: "count",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · volume.traces",
+		numerator: "Merged trace summaries within the glance volume window.",
+		denominator: null,
+		dedup: "trace_summaries FINAL",
+	},
+	glance_spans: {
+		id: "glance_spans",
+		label: "Spans",
+		kind: "count",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · volume.spans",
+		numerator: "Sum of span_count on merged trace summaries.",
+		denominator: null,
+		dedup: "trace_summaries FINAL",
+	},
+	glance_ingested_total: {
+		id: "glance_ingested_total",
+		label: "Ingested since metering began",
+		kind: "count",
+		family: "workspace",
+		window: "lifetime",
+		source: "GET /v1/workspace/glance · ingest.total_bytes",
+		numerator: "Metered ingest bytes since first reading.",
+		denominator: null,
+		dedup: "none",
+	},
+	glance_ingested_period: {
+		id: "glance_ingested_period",
+		label: "Ingested this billing period",
+		kind: "count",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · ingest.period_bytes",
+		numerator: "Metered ingest bytes in tenant billing period.",
+		denominator: null,
+		dedup: "none",
+	},
+	glance_stored: {
+		id: "glance_stored",
+		label: "Stored (logical, within retention)",
+		kind: "count",
+		family: "workspace",
+		window: "entity",
+		source: "GET /v1/workspace/glance · stored.bytes",
+		numerator: "Latest hot resident byte gauge or self-host span bytes.",
+		denominator: null,
+		dedup: "none",
+	},
+	glance_agents: {
+		id: "glance_agents",
+		label: "Active agents",
+		kind: "count",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · agents.active",
+		numerator:
+			"Distinct named agent keys with at least one call; excludes direct calls.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+	glance_spend_period: {
+		id: "glance_spend_period",
+		label: "Spend this billing period",
+		kind: "currency",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · spend.usd",
+		numerator: "Sum of recorded priced request costs this billing period.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+	glance_providers: {
+		id: "glance_providers",
+		label: "Providers",
+		kind: "count",
+		family: "workspace",
+		window: "windowed",
+		source: "GET /v1/workspace/glance · providers.count",
+		numerator: "Distinct recorded provider ids in the activity window.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+	loop_repeat_unpriced: {
+		id: "loop_repeat_unpriced",
+		label: "Unpriced repeat spans",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/agent-loops · instances[].repeat_unpriced",
+		numerator: "Distinct unpriced spans carrying calls after the first.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	loop_groups: {
+		id: "loop_groups",
+		label: "Groups with loops",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/gateway/stats · agent_loops.groups",
+		numerator: "Distinct session or trace groups containing a loop.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	loop_uncompared: {
+		id: "loop_uncompared",
+		label: "Uncompared tool calls",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/gateway/stats · agent_loops.unfingerprinted_tool_calls",
+		numerator: "Stored tool calls without an argument fingerprint.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_contributor_requests: {
+		id: "spend_contributor_requests",
+		label: "Contributor requests",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].requests",
+		numerator: "Span count for the selected dimension; tags may overlap.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_contributor_unpriced: {
+		id: "spend_contributor_unpriced",
+		label: "Unpriced contributor requests",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].unpriced_requests",
+		numerator: "Unpriced spans for the selected dimension; tags may overlap.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_contributor_baseline: {
+		id: "spend_contributor_baseline",
+		label: "Contributor baseline",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].baseline_usd",
+		numerator:
+			"Median trailing per-dimension bucket cost when enough history exists.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	spend_series_total: {
+		id: "spend_series_total",
+		label: "Series total",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · bucket.cost_usd_series",
+		numerator:
+			"Aggregate cost for the selected bucket, including insert redeliveries.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	spend_contributor_cost: {
+		id: "spend_contributor_cost",
+		label: "Contributor cost",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].cost_usd",
+		numerator:
+			"Finite recorded cost on raw spans with this dimension; tags can overlap.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_contributor_share: {
+		id: "spend_contributor_share",
+		label: "Contributor share",
+		kind: "percent",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].share_pct",
+		numerator: "Dimension cost divided by the bucket raw-span cost.",
+		denominator: "bucket.cost_usd_spans",
+		dedup: "spans FINAL",
+		floor: 1,
+		zeroCopy: "No priced raw spend in this bucket.",
+	},
+
+	spend_contributor_excess: {
+		id: "spend_contributor_excess",
+		label: "Excess",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · rows[].excess_usd",
+		numerator:
+			"Dimension cost minus its own trailing median; unavailable for provider, user or tag.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_unlabelled: {
+		id: "spend_unlabelled",
+		label: "Unlabelled spend",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · unattributed.unlabelled_cost_usd",
+		numerator: "Finite recorded cost on spans without the selected dimension.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_raw_total: {
+		id: "spend_raw_total",
+		label: "Raw spans total",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/spike-causes · bucket.cost_usd_spans",
+		numerator: "Finite recorded cost of distinct spans in the bucket.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	spend_bucket_cost: {
+		id: "spend_bucket_cost",
+		label: "Bucket cost",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/series · buckets[].cost_usd",
+		numerator: "Sum of finite recorded costs in the time bucket.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	spend_bucket_unpriced: {
+		id: "spend_bucket_unpriced",
+		label: "Unpriced bucket requests",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/series · buckets[].unpriced_requests",
+		numerator: "Requests without a finite recorded price in the bucket.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	spend_baseline: {
+		id: "spend_baseline",
+		label: "Baseline",
+		kind: "currency",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/series · spikes[].baseline_usd",
+		numerator: "Median trailing bucket cost, excluding the current bucket.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	spend_spike_ratio: {
+		id: "spend_spike_ratio",
+		label: "Spike ratio",
+		kind: "ratio",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/spend/series · spikes[].ratio",
+		numerator:
+			"Bucket cost divided by positive baseline; absent for a zero baseline.",
+		denominator: null,
+		dedup: "spend_hourly MV (not deduplicated)",
+	},
+
+	agent_loops: {
+		id: "agent_loops",
+		label: "Agent loops",
+		kind: "count",
+		family: "spans",
+		window: "windowed",
+		source: "GET /v1/gateway/stats · agent_loops.instances",
+		numerator:
+			"Tool and argument matches meeting the stored repeat threshold within a session or trace.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	rescued_failover: {
+		id: "rescued_failover",
+		label: "Rescued by failover",
+		kind: "count",
+		family: "spans",
+		window: "windowed",
+		source: "GET /v1/gateway/stats · rescued_by_failover",
+		numerator:
+			"Failed attempt followed by final successful dispatch on a different provider.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	rescued_retry: {
+		id: "rescued_retry",
+		label: "Rescued by retry",
+		kind: "count",
+		family: "spans",
+		window: "windowed",
+		source: "GET /v1/gateway/stats · rescued_by_retry",
+		numerator:
+			"Failed attempt followed by final successful dispatch on the same provider.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	rescue_rate: {
+		id: "rescue_rate",
+		label: "Rescue rate",
+		kind: "percent",
+		family: "spans",
+		window: "windowed",
+		source: "GET /v1/gateway/stats · rescue_rate_pct",
+		numerator: "Requests rescued by failover or retry.",
+		denominator: "requests_with_failed_attempt",
+		dedup: "spans FINAL",
+		floor: 1,
+		zeroCopy: "No provider failures in this range — nothing needed rescuing",
+	},
+
+	rescue_latency: {
+		id: "rescue_latency",
+		label: "Added latency p50",
+		kind: "duration_ms",
+		family: "spans",
+		window: "windowed",
+		source: "GET /v1/gateway/stats · rescue_added_ms_p50",
+		numerator: "Median sum of error-attempt latency over rescued dispatches.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	rescued_served: {
+		id: "rescued_served",
+		label: "Rescued (served)",
+		kind: "count",
+		family: "spans",
+		window: "entity",
+		source: "GET /v1/gateway/stats · providers[].rescued_by_failover",
+		numerator:
+			"Requests this provider served after a failed attempt on another provider.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	loop_repeated_calls: {
+		id: "loop_repeated_calls",
+		label: "Repeated tool calls",
+		kind: "count",
+		family: "tools",
+		window: "entity",
+		source: "GET /v1/agent-loops · instances[].calls",
+		numerator:
+			"Every call with identical tool and fingerprint in a matching group.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	loop_repeat_spend: {
+		id: "loop_repeat_spend",
+		label: "Spend on the repeats",
+		kind: "currency",
+		family: "tools",
+		window: "entity",
+		source: "GET /v1/agent-loops · instances[].repeat_cost_usd",
+		numerator:
+			"Sum over distinct spans carrying calls after the first; whole spans count.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
+	loop_repeat_tokens: {
+		id: "loop_repeat_tokens",
+		label: "Repeat output tokens",
+		kind: "tokens",
+		family: "tools",
+		window: "entity",
+		source: "GET /v1/agent-loops · instances[].repeat_output_tokens",
+		numerator:
+			"Output tokens on distinct spans carrying calls after the first.",
+		denominator: null,
+		dedup: "spans FINAL",
+	},
+
 	kya_calls: {
 		id: "kya_calls",
 		label: "Calls",

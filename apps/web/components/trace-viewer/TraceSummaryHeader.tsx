@@ -1,6 +1,5 @@
 import type { IssueChip as RecordedIssue } from "@/lib/generation-issues";
 import { fmtCompact, fmtCount, fmtUsd } from "@/lib/metrics/format";
-import { StatusBadge } from "@tracelanedev/ui";
 import { IssueChip } from "./IssueChip";
 /**
  * TraceSummaryHeader — the at-a-glance rollup strip above the span view. Every
@@ -11,7 +10,6 @@ import { IssueChip } from "./IssueChip";
  * Layout grammar:
  *  - Duration + error-state are the lead metrics (larger value, prominent).
  *  - Secondary stats (spans, tokens, cost, model, provider) are smaller.
- *  - The "loop detected" badge uses a warn-tone Badge + SVG glyph (no raw emoji).
  *
  * The grammar above used to cite ADR-053 ("Tinted Slate + Lava"). That palette is
  * retired and its successor superseded in turn; the LAYOUT rule survived the
@@ -24,36 +22,15 @@ import type { Span } from "@/components/trace-viewer/types";
 import { type IdentityRef, spanIdentity } from "@/lib/kya/identity";
 
 import { isRedactedEndUser } from "@/lib/end-user";
-import { countToolCallSpans, detectToolLoop } from "@/lib/tool-loop";
+import { countToolCallSpans } from "@/lib/tool-loop";
 import { computeTraceSummary } from "@/lib/trace-summary";
-import { Badge, StatCard, fmtDur } from "@tracelanedev/ui";
+import { StatCard, fmtDur } from "@tracelanedev/ui";
 
 const fmtInt = fmtCount;
 
 const fmtTokens = fmtCompact;
 
 const fmtCost = fmtUsd;
-
-/** Warn triangle SVG — consistent with the app's glyph style; replaces raw ⚠ emoji. */
-function WarnTriangle() {
-	return (
-		<svg
-			viewBox="0 0 16 16"
-			width="11"
-			height="11"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth="1.6"
-			strokeLinecap="round"
-			strokeLinejoin="round"
-			aria-hidden="true"
-		>
-			<path d="M8 2 1.5 13.5h13L8 2Z" />
-			<line x1="8" y1="7" x2="8" y2="10" />
-			<circle cx="8" cy="12.5" r="0.5" fill="currentColor" />
-		</svg>
-	);
-}
 
 export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 	const s = computeTraceSummary(spans);
@@ -71,7 +48,6 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 			issues.set(issue.kind, entry);
 		}
 	const toolCount = countToolCallSpans(spans);
-	const loop = detectToolLoop(spans);
 
 	const tokens =
 		s.inputTokens !== undefined && s.outputTokens !== undefined
@@ -218,27 +194,6 @@ export function TraceSummaryHeader({ spans }: { spans: Span[] }) {
 					/>
 				)}
 			</div>
-
-			{/* Loop badge — ADR-023: no raw emoji; AFT-1 title tooltip carries the
-			    taxonomy reference ("agent entered a tool call loop with no circuit
-			    breaker — AFT-1 category G-3, pre-flight guardrail: loop-depth cap").
-			    Badge tone=warn (not danger) — a loop is an at-risk state, not a
-			    runtime error per se. Sits below the tile grid rather than inside it. */}
-			{loop && (
-				<div className="flex items-center gap-2 px-1">
-					<StatusBadge
-						status="loop"
-						tone="warn"
-						title={`Tool call loop detected (AFT-1 G-3): "${loop.toolName}" called ${loop.count} times with no circuit breaker. This pattern is a pre-flight guardrail target — apply a loop-depth cap or deduplicate the tool inputs.`}
-						label={
-							<>
-								<WarnTriangle />
-								loop — {loop.toolName} ×{loop.count}
-							</>
-						}
-					/>
-				</div>
-			)}
 		</div>
 	);
 }

@@ -99,6 +99,7 @@ pub fn routes() -> Router<PubkeyState> {
     Router::new()
         .route("/v1/audit/pubkey", get(handler))
         .route("/v1/audit/platform-pubkey", get(platform_handler))
+        .route("/v1/openapi.json", get(openapi_handler))
 }
 
 /// AUD-29 — `GET /v1/audit/platform-pubkey`: Tracelane's shared PLATFORM Ed25519
@@ -251,6 +252,13 @@ fn internal() -> Response {
         Json(serde_json::json!({ "error": "internal" })),
     )
         .into_response()
+}
+
+/// OG-60 — `GET /v1/openapi.json`: the control API's OpenAPI description. Mounted here so it
+/// shares this module's public-by-design posture AND its process-global rate bucket (a route
+/// of route shapes holds no tenant data); the body and its throttle live in `openapi_route`.
+async fn openapi_handler(State(state): State<PubkeyState>) -> Response {
+    crate::openapi_route::respond(&state.rate)
 }
 
 #[cfg(test)]

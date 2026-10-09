@@ -21,11 +21,11 @@
   <!-- ── SECTION LABELS ─────────────────────────────────────── -->
   <text x="126" y="52" text-anchor="middle" font-size="9.5" font-weight="600" letter-spacing="0.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">EVENTS  (NDJSON)</text>
   <text x="400" y="52" text-anchor="middle" font-size="9.5" font-weight="600" letter-spacing="0.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">BATCH HEADER</text>
-  <text x="736" y="52" text-anchor="middle" font-size="9.5" font-weight="600" letter-spacing="0.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">SIGSTORE REKOR</text>
+  <text x="736" y="52" text-anchor="middle" font-size="9.5" font-weight="600" letter-spacing="0.5" fill="#9CA3AF" font-family="'Inter',system-ui,sans-serif">SIGSTORE REKOR · best-effort</text>
 
   <!-- ── 3 EVENT BOXES ──────────────────────────────────────── -->
   <rect x="24"  y="64" width="204" height="56" rx="6" fill="white" stroke="#D1D5DB" stroke-width="1.5"/>
-  <text x="34"  y="84"  font-size="10"   fill="#6B7280" font-family="'Inter',system-ui,sans-serif" font-family="'Roboto Mono',monospace,sans-serif">event_id: 019f…</text>
+  <text x="34"  y="84"  font-size="10"   fill="#6B7280" font-family="'Roboto Mono',monospace,sans-serif">event_id: 019f…</text>
   <text x="34"  y="100" font-size="10"   fill="#6B7280" font-family="'Inter',system-ui,sans-serif">kind: llm_request</text>
   <text x="34"  y="113" font-size="9.5"  fill="#0F62FE" font-family="'Inter',system-ui,sans-serif" font-weight="500">sha256: a3f1c8…</text>
 

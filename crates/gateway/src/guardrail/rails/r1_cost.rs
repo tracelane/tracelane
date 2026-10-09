@@ -375,7 +375,25 @@ impl Rail for R1Cost {
     }
 
     fn evaluate<'a>(&'a self, ctx: &'a GuardrailContext<'a>) -> RailFuture<'a> {
-        Box::pin(async move { Ok::<_, RailError>(self.evaluate_sync(ctx)) })
+        Box::pin(async move {
+            let mut config = self.config;
+            for (key, cap) in [
+                ("max_input_tokens", &mut config.max_input_tokens),
+                ("max_output_tokens", &mut config.max_output_tokens),
+                ("max_steps_per_run", &mut config.max_steps_per_run),
+                (
+                    "max_identical_tool_calls",
+                    &mut config.max_identical_tool_calls,
+                ),
+                ("max_subagent_depth", &mut config.max_subagent_depth),
+            ] {
+                if let Some(value) = ctx.policy.threshold("R1_cost", key) {
+                    let value = value as u32; // validated integral u32 at the policy boundary
+                    *cap = Some(cap.map_or(value, |default| default.min(value)));
+                }
+            }
+            Ok::<_, RailError>(Self { config }.evaluate_sync(ctx))
+        })
     }
 }
 
@@ -409,6 +427,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -628,6 +647,7 @@ mod tests {
             temperature: None,
             stream: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

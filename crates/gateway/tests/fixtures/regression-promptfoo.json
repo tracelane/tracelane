@@ -1,0 +1,31 @@
+{
+  "description": "expected_output is null: output_not_captured. Recorded mode is inspection only. Mocked mode uses recorded tool messages as fixed context; no tools execute. Live mode is not supported. Choose assertions before running a model. Configure a provider to replay the model call.",
+  "prompts": [
+    "{{ input | dump }}"
+  ],
+  "providers": [],
+  "tests": [
+    {
+      "vars": {
+        "input": [
+          {
+            "role": "user",
+            "content": "test question"
+          }
+        ],
+        "system": null
+      },
+      "assert": [],
+      "metadata": {
+        "mode": "recorded",
+        "source_trace_id": "trace",
+        "source_span_id": "span",
+        "expected_output_reason": "output_not_captured",
+        "contains_redactions": false,
+        "truncated": false,
+        "limits": "expected_output is null: output_not_captured. Recorded mode is inspection only. Mocked mode uses recorded tool messages as fixed context; no tools execute. Live mode is not supported. Choose assertions before running a model.",
+        "assertion_required": true
+      }
+    }
+  ]
+}

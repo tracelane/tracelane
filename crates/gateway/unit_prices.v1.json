@@ -1,0 +1,35 @@
+{
+  "_what": "OG-06 §3.4 per-UNIT price table (CLAUDE.md §23): what an image, a character of speech, a second of audio or a rerank search unit costs, per (provider, model). Read by crates/gateway/src/unit_pricing.rs (include_str!, parsed once). A model with NO entry here is UNPRICED: the span carries the unit and a null cost, counted as unpriced — never 0. Add a row only with a vendor price page that says the number; do not infer one.",
+  "_sources_note": "Every entry carries its own `source` and the date it was read. Rechecked the existing unit rates and OpenAI Batch multiplier on 2026-10-08. Image generation is deliberately EMPTY: OpenAI prices gpt-image models per token and says 'use the calculator in the image generation guide' (https://developers.openai.com/api/docs/pricing, 2026-10-08); no Cohere rerank rate was newly verified in this refresh.",
+  "units": ["images_generated", "speech_characters", "transcription_seconds", "rerank_search_units"],
+  "entries": [
+    {
+      "provider": "openai",
+      "model": "tts-1",
+      "unit": "speech_characters",
+      "usd_per_unit": 0.000015,
+      "source": "https://developers.openai.com/api/docs/models/tts-1: tts-1 $15.00 / 1M characters",
+      "verified": "2026-10-08"
+    },
+    {
+      "provider": "openai",
+      "model": "tts-1-hd",
+      "unit": "speech_characters",
+      "usd_per_unit": 0.00003,
+      "source": "https://developers.openai.com/api/docs/models/tts-1: tts-1-hd $30.00 / 1M characters",
+      "verified": "2026-10-08"
+    },
+    {
+      "provider": "openai",
+      "model": "whisper-1",
+      "unit": "transcription_seconds",
+      "usd_per_unit": 0.0001,
+      "source": "https://developers.openai.com/api/docs/models/whisper-1: Whisper $0.006 / minute (= $0.0001 / second)",
+      "verified": "2026-10-08"
+    }
+  ],
+  "batch": {
+    "_what": "The Batch API's multiplier on the synchronous list price, applied when a completed batch's token usage is priced (spec OG-06 §3.2). OpenAI's official Batch guide states a 50% discount (https://developers.openai.com/api/docs/guides/batch, verified 2026-10-08). Change it here if OpenAI says otherwise.",
+    "price_multiplier": 0.5
+  }
+}

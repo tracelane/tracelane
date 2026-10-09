@@ -1,12 +1,17 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 vi.mock("@/lib/auth", () => ({
 	requireGatewayToken: vi.fn(async () => ({ token: "unit-test-owner-token" })),
 }));
-vi.mock("@/lib/gateway", () => ({
-	gatewayBaseUrl: () => "https://gateway.invalid",
-}));
 import { POST } from "./route";
-afterEach(() => vi.unstubAllGlobals());
+// The REAL `lib/gateway` helper runs (it attaches the OG-36 attestation); only
+// its base URL is pinned.
+beforeEach(() =>
+	vi.stubEnv("NEXT_PUBLIC_GATEWAY_URL", "https://gateway.invalid"),
+);
+afterEach(() => {
+	vi.unstubAllGlobals();
+	vi.unstubAllEnvs();
+});
 
 it.each([401, 403, 404, 409, 429, 503])(
 	"preserves refusal %s without exposing upstream response material",
@@ -30,11 +35,11 @@ it.each([401, 403, 404, 409, 429, 503])(
 		expect(await response.text()).not.toContain("unit-test-secret");
 		expect(fetcher).toHaveBeenCalledWith(
 			"https://gateway.invalid/v1/provider-keys/anthropic/validate",
-			expect.objectContaining({
-				method: "POST",
-				headers: { authorization: "Bearer unit-test-owner-token" },
-			}),
+			expect.objectContaining({ method: "POST" }),
 		);
+		expect(
+			new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("authorization"),
+		).toBe("Bearer unit-test-owner-token");
 		expect(fetcher.mock.calls[0]?.[1]).not.toHaveProperty("body");
 	},
 );

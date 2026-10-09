@@ -20,17 +20,25 @@
 //! Query style: raw SQL with parameter binding, never string-concat. See
 //! `tenants.rs` and `api_keys.rs` for the patterns.
 
+pub mod admin_security;
 pub mod api_keys;
 pub mod audit_chain_state;
+pub mod cache_settings;
+pub mod control_audit;
+pub mod controls;
 pub mod idle_evict;
 pub mod job_guard;
 pub mod keepalive;
 pub mod ledger;
 pub mod model_aliases;
 pub mod observed_tools;
+pub mod otel_exports;
+pub mod projects;
 pub mod provider_keys;
 pub mod quota_notifications;
+pub mod routing;
 pub mod singleton;
+pub mod spend_alerts;
 pub mod tenants;
 pub mod tool_capabilities;
 pub mod webhook_events;
@@ -437,6 +445,48 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         include_str!("../../../../apps/web/db/migrations/0051_workspace_failover.sql"),
         // GWY-53: per-workspace content capture (`crate::db::workspace_capture`).
         include_str!("../../../../apps/web/db/migrations/0052_workspace_content_capture.sql"),
+        // B-459: purged-tenant tombstones (`crate::retention_sweep`).
+        include_str!("../../../../apps/web/db/migrations/0053_purged_tenants.sql"),
+        include_str!("../../../../apps/web/db/migrations/0054_og08_passthrough_scope_comment.sql"),
+        // B-409: versioned allowances (`plan_allowances`) + `tenants.plan_version`. S2 —
+        // prod gets it by hand, then the seed, BEFORE the gateway that reads them.
+        include_str!("../../../../apps/web/db/migrations/0055_b409_plan_allowances_versioned.sql"),
+        // OG-23: `projects` + `api_keys.project_id` / `environment`. S2 — read by the
+        // API-key auth JOIN; prod gets it by hand BEFORE the gateway.
+        include_str!("../../../../apps/web/db/migrations/0056_og23_projects_environments.sql"),
+        // OG-20: `api_keys.policy` + `projects.policy`. S2, after 0056.
+        include_str!("../../../../apps/web/db/migrations/0057_og20_key_policy.sql"),
+        // OG-35: `admin_audit_log` gains request_id / actor_role / actor_auth_method and
+        // becomes append-only. S2 — before the gateway that writes the columns.
+        include_str!(
+            "../../../../apps/web/db/migrations/0058_og35_admin_audit_log_append_only.sql"
+        ),
+        // OG-36: `tenant_admin_security` (admin IP allowlist + SSO-required). S2.
+        include_str!("../../../../apps/web/db/migrations/0059_og36_tenant_admin_security.sql"),
+        // OG-25 / OG-21 / OG-22: `workspace_controls`. S2 — read by the entitlement resolve.
+        include_str!("../../../../apps/web/db/migrations/0060_og25_workspace_controls.sql"),
+        // OG-24: spend alert channels + outbox. S2.
+        include_str!("../../../../apps/web/db/migrations/0061_og24_spend_alerts.sql"),
+        // rev6 residual: `api_keys (created_at)` partial index for the valid-key-set delta
+        // read. Index only — nothing depends on it, so no serialization point.
+        include_str!("../../../../apps/web/db/migrations/0062_api_keys_created_at_idx.sql"),
+        // SET-60: `signups` (operator's sign-in list; web-written, gateway reads nothing). S2.
+        include_str!("../../../../apps/web/db/migrations/0063_signups.sql"),
+        include_str!("../../../../apps/web/db/migrations/0064_account_deletions.sql"),
+        include_str!("../../../../apps/web/db/migrations/0065_og30_guardrail_policies.sql"),
+        include_str!("../../../../apps/web/db/migrations/0066_guardrail_hooks.sql"),
+        include_str!("../../../../apps/web/db/migrations/0067_og37_tenant_kms.sql"),
+        // OG-11: `provider_keys.label` + the three-column PK, and `workspace_routing`.
+        // S2 — the gateway's boot schema check refuses to start without both.
+        include_str!("../../../../apps/web/db/migrations/0070_og11_routing.sql"),
+        // OG-51: `workspace_cache_settings`, `cache_epochs`, `api_keys.cache`. S2 — read by the
+        // entitlement resolve; prod gets it by hand BEFORE the gateway.
+        include_str!("../../../../apps/web/db/migrations/0075_og51_cache_controls.sql"),
+        // OG-50: `otel_exports` + `plan_entitlements.f_otel_export / max_exports`. S2 — the
+        // entitlement query reads the plan columns; prod gets it by hand, then the seed, BEFORE
+        // the gateway.
+        include_str!("../../../../apps/web/db/migrations/0076_og50_otel_exports.sql"),
+        include_str!("../../../../apps/web/db/migrations/0077_og11_key_labels.sql"),
     ];
     for migration in MIGRATIONS {
         client

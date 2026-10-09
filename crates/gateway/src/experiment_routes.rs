@@ -281,7 +281,7 @@ fn authorize_read(claims: &Claims) -> Result<(), ApiError> {
 /// The two really are separate: `can_write_prompts` matches the `role: None` arm
 /// for ANY `AuthMethod::ApiKey` *without reading `key_scope`*, so on its own it
 /// would let a `read`-only key start an 800-call experiment.
-fn authorize_write(claims: &Claims) -> Result<(), ApiError> {
+pub(crate) fn authorize_write(claims: &Claims) -> Result<(), ApiError> {
     if !claims.can_write_prompts() {
         return Err(api_err(
             StatusCode::FORBIDDEN,
@@ -356,14 +356,16 @@ async fn tenant_from_auth(
     Ok(claims.tenant_id)
 }
 
+/// The write gate. Returns the whole principal (rev5 H2): every arm's provider calls are
+/// checked against the caller's key policy, limits and budgets (`crate::offpath`).
 async fn actor_from_auth(
     state: &ExperimentRoutesState,
     headers: &HeaderMap,
-) -> Result<(TenantId, String), ApiError> {
+) -> Result<Claims, ApiError> {
     let claims = claims_from_auth(headers).await?;
     authorize_write(&claims)?;
     require_experiments(&state.entitlements, &claims.tenant_id).await?;
-    Ok((claims.tenant_id, claims.sub))
+    Ok(claims)
 }
 
 // ── Domain rows ──────────────────────────────────────────────────────────────
@@ -1679,7 +1681,8 @@ async fn create_experiment(
     headers: HeaderMap,
     Json(body): Json<CreateExperimentBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let (tenant, actor) = actor_from_auth(&state, &headers).await?;
+    let caller = actor_from_auth(&state, &headers).await?;
+    let (tenant, actor) = (caller.tenant_id.clone(), caller.sub.clone());
     tracing::Span::current().record("tenant_id", tenant.to_string());
 
     // ── Shape, before anything is read or spent ─────────────────────────────
@@ -1757,12 +1760,29 @@ async fn create_experiment(
                 }),
             ));
         }
-        if a.model.is_none() && v.model_pin.is_none() {
+        let Some(model) = a.model.clone().or_else(|| v.model_pin.clone()) else {
             return Err(coded_err(
                 StatusCode::BAD_REQUEST,
                 "no_model",
                 "One of the arms has no model to run against: its version has no `model_pin`, \
                  so pass `model` on the arm.",
+                serde_json::json!({ "arm_index": i }),
+            ));
+        };
+        // rev5 H2: the Wave C/D controls for this arm's model, before anything is written —
+        // a paused workspace, a blocked model, a key policy the arm cannot satisfy or a
+        // spent budget refuses here with admission's code, not as N errored items later.
+        // Each provider call is admitted (and charged) again as it is made.
+        let probe = tracelane_shared::ChatRequest {
+            model,
+            stream: Some(false),
+            ..Default::default()
+        };
+        if let Err(r) = crate::offpath::check(state.engine.offpath_env(), &caller, &probe).await {
+            return Err(coded_err(
+                r.status(),
+                crate::offpath::code(&r),
+                &crate::offpath::describe(&r),
                 serde_json::json!({ "arm_index": i }),
             ));
         }
@@ -1921,6 +1941,8 @@ async fn create_experiment(
 
     let runner = ExperimentRunner {
         state: state.clone(),
+        caller: std::sync::Arc::new(caller),
+        credential: crate::offpath::key_credential(&headers),
         tenant,
         prompt_name: body.prompt_name,
         assertions: body.assertions,
@@ -2276,6 +2298,10 @@ async fn list_run_items(
 /// drift on the first behaviour added to either.
 struct ExperimentRunner {
     state: ExperimentRoutesState,
+    /// rev5 H2: the principal every arm's calls are checked as.
+    caller: std::sync::Arc<Claims>,
+    /// rev6 H2 residual: the starting key's bearer, re-validated between every arm's chunks.
+    credential: Option<std::sync::Arc<secrecy::SecretString>>,
     tenant: TenantId,
     prompt_name: String,
     assertions: Vec<Assertion>,
@@ -2311,6 +2337,8 @@ impl ExperimentRunner {
                     experiment_id: self.experiment.experiment_id,
                     arm_id: arm.arm_id,
                 }),
+                caller: std::sync::Arc::clone(&self.caller),
+                credential: self.credential.clone(),
             };
             // Mark the arm RUNNING the moment its run id exists, before the
             // first provider call. Best-effort: a failed progress write is a
@@ -2802,7 +2830,16 @@ mod clickhouse_roundtrip {
     /// Apply migrations 18 AND 19 for real. Not a hand-written `CREATE TABLE`: a
     /// test that declares its own schema proves the code agrees with the TEST,
     /// which is the tautology B-273 already slipped through once.
+    /// Applied ONCE per test binary. Concurrent `ensure_schema` calls ran migration 19's
+    /// `ALTER TABLE experiments ADD COLUMN` in parallel and ClickHouse answered
+    /// DEADLOCK_AVOIDED after a 120 s lock wait (red in the 2026-09-30 suite, 475 s).
+    static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     async fn ensure_schema(c: &clickhouse::Client) {
+        SCHEMA.get_or_init(|| apply_schema(c)).await;
+    }
+
+    async fn apply_schema(c: &clickhouse::Client) {
         clickhouse::Client::default()
             .with_url(std::env::var("CLICKHOUSE_TEST_URL").expect("CLICKHOUSE_TEST_URL"))
             .query("CREATE DATABASE IF NOT EXISTS tracelane")

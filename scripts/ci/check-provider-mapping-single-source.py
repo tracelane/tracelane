@@ -130,7 +130,16 @@ ALLOWED_FALLBACK_LITERALS = frozenset({"", "unknown"})
 
 # `providers.tsv` column contract, exactly. An extra column is how a `default`
 # would arrive.
-TSV_HEADER = ("id", "label", "base_url", "base_url_env", "api_key_env", "prefixes")
+TSV_HEADER = (
+    "id",
+    "label",
+    "base_url",
+    "base_url_env",
+    "api_key_env",
+    "prefixes",
+    "responses_wire",  # OG-01
+    "capabilities",  # OG-06
+)
 TSV_FIELDS = len(TSV_HEADER)
 MIN_TSV_ROWS = 100  # mirrors the catalog.rs test; below this, parsing has rotted
 
@@ -142,17 +151,58 @@ WILDCARD_PREFIXES = frozenset({"", "*", "/", "**", "?", ".", ".*"})
 # Data files under crates/gateway that are allowed to exist, and why. Anything
 # else matching *.tsv/*.json is a second provider list until proven otherwise.
 KNOWN_DATA_FILES = {
+    # OG-60: control API schemas/operations, never provider-routing data.
+    "crates/gateway/openapi/control.v1.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/_shared.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/cache.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/controls.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/guardrails-hooks.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/guardrails-policy.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/keys.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/kms.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/legacy.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/meta.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/otel-export.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/projects.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/routing.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
+    "crates/gateway/openapi/fragments/security-audit.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
     "crates/gateway/providers.tsv": "the ONE provider catalog (this guard reads it)",
     "crates/gateway/model_prices.tsv": "per-model pricing, read by pricing.rs; not a routing list",
+    # 2026-10-02 (OG-06): the per-UNIT price table (images, speech characters, transcription
+    # seconds, rerank search units) read by `unit_pricing.rs`, plus the Batch API price
+    # multiplier. Rows are keyed by (provider, model) for PRICING only; nothing routes on it.
+    "crates/gateway/unit_prices.v1.json": "per-unit media prices read by unit_pricing.rs; not a routing list",
     # 2026-09-22 (B-138): a RECORDED WorkOS webhook delivery, read by exactly one
     # test (`crates/gateway/src/auth/workos_webhook.rs`) as the event body the
     # membership handler parses. It names no provider and no model, so it cannot
     # be a second routing source — the guard asks, and this is the answer.
     "crates/gateway/tests/fixtures/workos-membership-created.json": "recorded WorkOS membership event body for the provisioning test; carries no provider or model",
+    # 2026-10-03 (security re-review M-C/M-1): scrubbed captures of what two real coding
+    # agents send (Claude Code 2.1.288 on /v1/messages, Codex 0.159.2 on /v1/responses), read
+    # at run time by the R8 / egress false-positive tests. They name the model the client
+    # asked for in ONE request each; nothing routes on them. Export-denied (vendor prompts).
+    "crates/gateway/tests/fixtures/client_conformance/claude-code-2.1.288-messages.capture.json": "real-client request capture for false-positive tests; not a routing list",
+    "crates/gateway/tests/fixtures/client_conformance/codex-0.159.2-responses.capture.json": "real-client request capture for false-positive tests; not a routing list",
     # 2026-09-30 (OBS-58): the reviewed finish-reason vocabulary the generation-issue
     # classifier maps to Truncated / Filtered. Two arrays of finish-reason strings; it
     # names no provider and no model, so it cannot route anything.
+    # 2026-10-01 (EVL-40 merge): the two regression-export test fixtures. Neither is read
+    # by routing. The first is the expected exported file (its `providers` is `[]` — the
+    # customer picks a provider); the second is Promptfoo's own vendored config JSON
+    # Schema, used only to validate the exported file's SHAPE — the provider names in it
+    # are Promptfoo's examples, not ours.
+    "crates/gateway/tests/fixtures/regression-promptfoo.json": "EVL-40 expected regression export (providers: []); test-only, not a routing source",
+    "crates/gateway/tests/fixtures/promptfoo-config-schema.json": "vendored Promptfoo config JSON Schema; validates the export's shape in one test; never read by routing",
+    # 2026-10-04 (OG-35/OG-36): the admin-plane caps and windows (IP-allowlist size, SSO
+    # cache TTL, control rate limits) read by `control_plane.rs` `policy()`. Numbers only;
+    # it names no provider and no model, so it cannot route anything.
+    "crates/gateway/control_policy.v1.json": "OG-35/36 admin-plane caps and windows; carries no provider or model",
     "crates/gateway/src/generation_issues.v1.json": "OBS-58 finish-reason vocabulary (length / filtered spellings); carries no provider or model",
+    # 2026-10-01 (OG-03): request-translation limits + the reasoning_effort -> provider
+    # thinking-control table. It is consulted only AFTER `provider_id_for_model` has chosen the
+    # provider; its `model_contains` substrings select a thinking family WITHIN a provider
+    # (claude-opus-5-5 vs claude-haiku-4-5), never a provider, so it cannot route anything.
+    "crates/gateway/translation_policy.v1.json": "OG-03 translation limits + reasoning_effort mapping; keyed by an already-resolved provider, never routes",
 }
 
 # Parser floors. A guard that silently parses nothing and reports OK is the defect
@@ -318,7 +368,7 @@ def parse_tsv(text: str) -> tuple[list[list[str]], list[str], list[str]]:
 
 def check_tsv_fail_closed(rows: list[list[str]], errors: list[str]) -> None:
     """B-127 in the DATA: no row in providers.tsv may act as a default."""
-    for pid, _label, _base, _base_env, _key_env, prefixes in rows:
+    for pid, _label, _base, _base_env, _key_env, prefixes, *_rest in rows:
         if pid.strip().lower() in DEFAULTISH_IDS:
             errors.append(
                 f"providers.tsv: row id `{pid}` is a default/catch-all sentinel. "
@@ -671,11 +721,11 @@ CLEAN_TSV = (
     _TSV_HEAD
     + "".join(
         f"{pid}\t{pid.title()}\thttps://api.{pid}.example\t"
-        f"{pid.upper()}_BASE_URL\t{pid.upper()}_API_KEY\t{pid}/\n"
+        f"{pid.upper()}_BASE_URL\t{pid.upper()}_API_KEY\t{pid}/\tfalse\t\n"
         for pid in ("openai", "groq", "mistral", "perplexity", "deepseek")
     )
     + "".join(
-        f"p{i}\tP{i}\thttps://api.p{i}.example\tP{i}_BASE_URL\tP{i}_API_KEY\tp{i}/\n"
+        f"p{i}\tP{i}\thttps://api.p{i}.example\tP{i}_BASE_URL\tP{i}_API_KEY\tp{i}/\tfalse\t\n"
         for i in range(MIN_TSV_ROWS + 5)
     )
 )
@@ -854,19 +904,19 @@ def selftest() -> int:
             f"providers.tsv row with a {why} -> REFUSED",
             "wildcard/empty prefix",
             tsv=CLEAN_TSV
-            + f"wild\tWild\thttps://api.wild.example\tWILD_BASE_URL\tWILD_API_KEY\t{bad_prefix}\n",
+            + f"wild\tWild\thttps://api.wild.example\tWILD_BASE_URL\tWILD_API_KEY\t{bad_prefix}\tfalse\t\n",
         )
     case(
         "providers.tsv prefix containing a glob -> REFUSED",
         "contains a glob character",
         tsv=CLEAN_TSV
-        + "glob\tGlob\thttps://api.glob.example\tG_BASE_URL\tG_API_KEY\tgpt-*\n",
+        + "glob\tGlob\thttps://api.glob.example\tG_BASE_URL\tG_API_KEY\tgpt-*\tfalse\t\n",
     )
     case(
         "providers.tsv row whose id is `default` -> REFUSED",
         "is a default/catch-all sentinel",
         tsv=CLEAN_TSV
-        + "default\tDefault\thttps://api.d.example\tD_BASE_URL\tD_API_KEY\tzz/\n",
+        + "default\tDefault\thttps://api.d.example\tD_BASE_URL\tD_API_KEY\tzz/\tfalse\t\n",
     )
     case(
         "a `default` COLUMN added to providers.tsv -> REFUSED",

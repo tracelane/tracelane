@@ -7,6 +7,7 @@
  * fetch + auth mocked (off the network).
  */
 
+import { TRACE_EXPORT_PARAMS } from "@/app/traces/filter-registry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/auth", () => ({
@@ -36,11 +37,58 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("GET /api/traces/export", () => {
+	it.each(
+		TRACE_EXPORT_PARAMS.filter(
+			(entry) => entry.gatewayParam && entry.param !== "status",
+		),
+	)(
+		"forwards registered export param $param as $gatewayParam",
+		async ({ param, gatewayParam }) => {
+			fetchMock.mockResolvedValue({
+				ok: true,
+				status: 200,
+				text: async () => "",
+			});
+			const value =
+				(
+					{
+						sort: "duration",
+						order: "asc",
+						loop: "true",
+						rescued: "retry",
+						has_error: "true",
+						issue: "truncated",
+						failover: "true",
+						cursor: "90:t2",
+					} as Record<string, string>
+				)[param] ?? "needle";
+			await GET(req(new URLSearchParams({ [param]: value }).toString()));
+			const url = new URL(fetchMock.mock.calls[0]?.[0] as string);
+			if (!gatewayParam) throw new Error(`missing gateway param for ${param}`);
+			expect(url.searchParams.get(gatewayParam)).toBe(value);
+		},
+	);
+	it("exports the same search and failover view shown on the list", async () => {
+		fetchMock.mockResolvedValue({
+			ok: true,
+			status: 200,
+			text: async () => "trace_id\n",
+		});
+		await GET(req("q=needle&failover=true&format=csv"));
+		const params = new URL(fetchMock.mock.calls[0]?.[0] as string).searchParams;
+		expect(params.get("q")).toBe("needle");
+		expect(params.get("failover")).toBe("true");
+	});
 	it("mints the JWT, translates filters, forwards format, returns a CSV attachment", async () => {
 		fetchMock.mockResolvedValue({
 			ok: true,
 			status: 200,
 			text: async () => "trace_id,model\nt1,gpt-4o\n",
+			headers: new Headers({
+				"x-tracelane-truncated": "true",
+				"x-tracelane-row-count": "10000",
+				"x-tracelane-next-cursor": "90:t2",
+			}),
 		});
 		const res = await GET(
 			req(
@@ -64,6 +112,9 @@ describe("GET /api/traces/export", () => {
 			'attachment; filename="traces.csv"',
 		);
 		expect(res.headers.get("content-type")).toContain("text/csv");
+		expect(res.headers.get("x-tracelane-truncated")).toBe("true");
+		expect(res.headers.get("x-tracelane-row-count")).toBe("10000");
+		expect(res.headers.get("x-tracelane-next-cursor")).toBe("90:t2");
 		expect(await res.text()).toContain("t1,gpt-4o");
 	});
 

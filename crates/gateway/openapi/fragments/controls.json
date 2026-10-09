@@ -1,0 +1,468 @@
+{
+  "module": "crates/gateway/src/control_routes.rs",
+  "operations": {
+    "GET /v1/controls": {
+      "summary": "Workspace controls: paused state, block lists, workspace policy.",
+      "tags": [
+        "controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "The controls row.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlsState"
+          }
+        },
+        "401": {
+          "description": "unauthorized",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "insufficient_scope (a credential that cannot read)",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "500": {
+          "description": "unavailable",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unauthorized",
+        "insufficient_scope",
+        "unavailable"
+      ]
+    },
+    "PUT /v1/controls/policy": {
+      "summary": "Replace the WORKSPACE policy (limits, budgets, model/provider rules, source IPs); null clears it.",
+      "tags": [
+        "controls"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDocument"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The updated controls row.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlsState"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "unavailable"
+      ]
+    },
+    "POST /v1/controls/pause": {
+      "summary": "Pause the workspace: every inference route answers 423 workspace_paused until resumed. Idempotent.",
+      "tags": [
+        "controls"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The updated controls row.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlsState"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "unavailable"
+      ]
+    },
+    "POST /v1/controls/resume": {
+      "summary": "Resume a paused workspace.",
+      "tags": [
+        "controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "The updated controls row.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlsState"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unavailable"
+      ]
+    },
+    "PUT /v1/controls/blocks": {
+      "summary": "Replace the emergency block lists given (an omitted list is unchanged; [] clears it).",
+      "tags": [
+        "controls"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "endUsers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "The updated controls row.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlsState"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "invalid_body",
+        "unavailable"
+      ]
+    },
+    "POST /v1/controls/revoke-all-keys": {
+      "summary": "Revoke EVERY API key of the workspace. Irreversible; needs confirm = \"revoke all keys\".",
+      "tags": [
+        "controls"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "const": "revoke all keys"
+          }
+        },
+        "required": [
+          "confirm"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "How many keys were revoked.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "revoked": {
+                "type": "integer"
+              },
+              "keyIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "400": {
+          "description": "confirmation_required",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "confirmation_required",
+        "invalid_body",
+        "unavailable"
+      ]
+    },
+    "GET /v1/controls/budgets": {
+      "summary": "This gateway's live budget counters (every layer).",
+      "tags": [
+        "controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "Counters.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "budgets": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/BudgetCounter"
+                }
+              }
+            }
+          }
+        },
+        "403": {
+          "description": "insufficient_scope",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "insufficient_scope",
+        "unauthorized"
+      ]
+    },
+    "GET /v1/controls/alert-channels": {
+      "summary": "Spend-alert channels. A caller that cannot manage controls sees a webhook's host only.",
+      "tags": [
+        "controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "Channels.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "channels": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AlertChannel"
+                }
+              }
+            }
+          }
+        }
+      },
+      "x-error-codes": [
+        "insufficient_scope",
+        "unavailable"
+      ]
+    },
+    "POST /v1/controls/alert-channels": {
+      "summary": "Create a spend-alert channel (email, slack, webhook). A webhook's signingSecret is returned once.",
+      "tags": [
+        "controls"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": [
+              "email",
+              "slack",
+              "webhook"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "target"
+        ],
+        "additionalProperties": false
+      },
+      "responses": {
+        "201": {
+          "description": "The channel.",
+          "schema": {
+            "$ref": "#/components/schemas/AlertChannel"
+          }
+        },
+        "400": {
+          "description": "Refused: invalid_field (names `field`) or invalid_body.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "channel_limit_reached",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "encryption_unavailable",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_field",
+        "channel_limit_reached",
+        "encryption_unavailable",
+        "unavailable"
+      ]
+    },
+    "DELETE /v1/controls/alert-channels/{id}": {
+      "summary": "Delete a spend-alert channel.",
+      "tags": [
+        "controls"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "204": {
+          "description": "Deleted."
+        },
+        "404": {
+          "description": "channel_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "channel_not_found",
+        "unavailable"
+      ]
+    },
+    "POST /v1/controls/alert-channels/{id}/test": {
+      "summary": "Send one synchronous test delivery to a channel.",
+      "tags": [
+        "controls"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Delivered.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "delivered": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "404": {
+          "description": "channel_not_found",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "502": {
+          "description": "delivery_failed",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "channel_not_found",
+        "delivery_failed",
+        "unavailable"
+      ]
+    },
+    "GET /v1/controls/alert-events": {
+      "summary": "The most recent spend-alert deliveries (limit 1-200, default 50).",
+      "tags": [
+        "controls"
+      ],
+      "parameters": [
+        {
+          "name": "limit",
+          "in": "query",
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "Events.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "events": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      },
+      "x-error-codes": [
+        "insufficient_scope",
+        "unavailable"
+      ]
+    }
+  }
+}

@@ -11,6 +11,28 @@ vi.mock("@/lib/gateway", () => ({
 	gatewayGetOrNull: vi.fn(),
 }));
 import { GatewayError, gatewayGetOrNull } from "@/lib/gateway";
+// The A+C merge (2026-10-01) gave the page three new imports; stubbed like the
+// components below — this test is about the permission states, not those surfaces.
+vi.mock("@/app/providers", () => ({
+	Providers: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("@/components/trace-viewer/IncidentPanel", () => ({
+	IncidentPanel: () => null,
+}));
+vi.mock("@/lib/list-page-settings", () => ({
+	getListPageSettings: async () => ({
+		sizes: {
+			experiments: 25,
+			datasets: 100,
+			experiment_datasets: 100,
+			session_turns: 20,
+			dataset_items: 50,
+			trace_conversation_messages: 50,
+			span_tool_names_preview: 10,
+		},
+		defaulted: true,
+	}),
+}));
 vi.mock("@/components/trace-viewer/ChainStatusChip", () => ({
 	ChainStatusChip: () => null,
 }));

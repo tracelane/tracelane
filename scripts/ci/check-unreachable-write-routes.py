@@ -105,6 +105,24 @@ REASONS = {"cli", "sdk", "webhook", "mcp", "deliberate-stub", "in-app-wrapper"}
 # path, resolved relative to ROOT, and MUST exist on disk — see
 # `evidence_path()` and its use in `check()`.
 ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
+    # OG-60: useControlWrite -> controlRequest -> requestJson builds this shared
+    # proxy URL and supplies the method separately. These are real UI callers.
+    ("POST", "/api/settings/gateway-control/[...path]"): (
+        "in-app-wrapper",
+        "apps/web/components/gateway/ProjectsManager.tsx:196",
+    ),
+    ("PATCH", "/api/settings/gateway-control/[...path]"): (
+        "in-app-wrapper",
+        "apps/web/components/gateway/ProjectsManager.tsx:43",
+    ),
+    ("DELETE", "/api/settings/gateway-control/[...path]"): (
+        "in-app-wrapper",
+        "apps/web/components/gateway/ProjectsManager.tsx:119",
+    ),
+    ("PUT", "/api/settings/gateway-control/[...path]"): (
+        "in-app-wrapper",
+        "apps/web/components/gateway/EmergencyControls.tsx:72",
+    ),
     # The browser error beacon (2026-09-27). A real in-app caller exists — every page
     # mounts it via components/ErrorListener.tsx and the error boundaries — but it lives
     # in apps/web/lib/, which this guard does not scan, and sends by sendBeacon.

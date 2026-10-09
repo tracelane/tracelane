@@ -20,6 +20,7 @@
 
 /** One provider's health, as returned by `GET /v1/gateway/stats`. */
 export type GatewayProviderHealth = {
+	rescued_by_failover?: number | null;
 	provider: string;
 	requests: number;
 	errors: number;
@@ -44,6 +45,21 @@ export type GatewayProviderHealth = {
 
 /** The `GET /v1/gateway/stats` response (gateway shape). */
 export type GatewayStats = {
+	requests_with_failed_attempt?: number | null;
+	rescued_by_failover?: number | null;
+	rescued_by_retry?: number | null;
+	rescue_rate_pct?: number | null;
+	rescue_added_ms_p50?: number | null;
+	attempt_records_since?: string | null;
+	agent_loops?: {
+		instances: number;
+		groups: number;
+		tool_calls: number;
+		unfingerprinted_tool_calls: number;
+		min_repeats?: number;
+		window_secs?: number;
+	} | null;
+
 	window_hours: number;
 	total_requests: number;
 	total_errors: number;
@@ -99,7 +115,16 @@ export type CostBreakdownRow = {
 /** The `GET /v1/costs` response (gateway shape). */
 export type CostBreakdown = {
 	window_hours: number;
-	by: "key" | "model" | "provider";
+	by:
+		| "key"
+		| "model"
+		| "provider"
+		| "user"
+		| "tag"
+		| "environment"
+		| "release"
+		| "service"
+		| `meta:${string}`;
 	total_cost_usd: number;
 	total_requests: number;
 	priced_requests: number;

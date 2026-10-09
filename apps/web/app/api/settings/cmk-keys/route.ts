@@ -18,6 +18,10 @@ import { ipFromRequest, recordAdminAction } from "@/lib/admin-audit";
 import { requireOrgAdmin } from "@/lib/admin-gate";
 import { requireSession } from "@/lib/auth";
 import { sha256Fingerprint } from "@/lib/cmk-fingerprint";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { upsertTenantId } from "@/lib/tenant";
 import { eq } from "drizzle-orm";
@@ -97,18 +101,47 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
 	const fingerprint = await sha256Fingerprint(body.publicKeyPem);
 
-	const inserted = await db
-		.insert(cmkKeys)
-		.values({
-			tenantId: tenantDbId,
-			alias: body.alias.trim(),
-			fingerprint,
-			algorithm,
-			purpose: body.purpose ?? "all",
-		})
-		.returning();
+	// Gateway control-change audit BEFORE the write; refuse if not recorded.
+	// Fingerprint/alias/algorithm/purpose only — never key material. The row id
+	// does not exist yet, so the fingerprint is the target.
+	const after = {
+		alias: body.alias.trim(),
+		fingerprint,
+		algorithm,
+		purpose: body.purpose ?? "all",
+	};
+	const rec = await recordControlChange(
+		"cmk.register",
+		fingerprint,
+		undefined,
+		after,
+	);
+	if (!rec.ok) return rec.response;
 
-	// ADR-031: key-material changes leave an audit trail.
+	let inserted: (typeof cmkKeys.$inferSelect)[];
+	try {
+		inserted = await db
+			.insert(cmkKeys)
+			.values({
+				tenantId: tenantDbId,
+				alias: after.alias,
+				fingerprint,
+				algorithm,
+				purpose: after.purpose,
+			})
+			.returning();
+	} catch (err) {
+		await recordControlChangeFailed(
+			"cmk.register",
+			fingerprint,
+			undefined,
+			after,
+		);
+		throw err;
+	}
+
+	// ADR-031: local admin_audit_log row, kept alongside the gateway
+	// control-change row recorded above (which now precedes the change).
 	await recordAdminAction({
 		actorUserId: session.userId,
 		actorWorkspaceId: tenantDbId,

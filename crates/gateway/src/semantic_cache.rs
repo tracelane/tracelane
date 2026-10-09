@@ -99,12 +99,6 @@ impl CacheRefusal {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CachePolicy {
-    bypass: bool,
-    ttl_hours: Option<u32>,
-    binding: &'static str,
-}
 impl CacheControl {
     pub fn parse(headers: &axum::http::HeaderMap) -> std::result::Result<Self, CacheRefusal> {
         let bad = CacheRefusal {
@@ -135,16 +129,23 @@ impl CacheControl {
             }
         }
     }
+    /// Resolve the caller's request header against the workspace's settings.
+    ///
+    /// Order of refusals (unchanged by OG-51): the plan (`403 cache_control_not_entitled`),
+    /// the route (`409 cache_control_unsupported_route`), then whether the cache is on for
+    /// THIS request at all (`409 response_cache_disabled`: no operator block, the workspace
+    /// or the key switched it off, or — the privacy default — the workspace records no
+    /// content and never opted in). A request header can narrow or bypass; it can never turn
+    /// on a cache the workspace did not.
     pub fn resolve(
         self,
         entitlements: Option<&crate::entitlement_cache::ResolvedEntitlements>,
         cache: Option<&SemanticCache>,
         supported: bool,
+        who: &crate::cache_controls::CacheCaller<'_>,
     ) -> std::result::Result<CachePolicy, CacheRefusal> {
+        use crate::cache_controls as cc;
         use axum::http::StatusCode;
-        if self == Self::Default {
-            return Ok(CachePolicy::default());
-        }
         if self == Self::Bypass {
             return Ok(CachePolicy {
                 bypass: true,
@@ -153,49 +154,176 @@ impl CacheControl {
         }
         let plan = entitlements
             .filter(|e| e.f_cache_control && e.cache_ttl_hours > 0)
-            .ok_or(CacheRefusal {
-                status: StatusCode::FORBIDDEN,
-                code: "cache_control_not_entitled",
-            })?
-            .cache_ttl_hours;
+            .map(|e| e.cache_ttl_hours);
+        let loaded = entitlements.map(|e| &*e.cache);
+        let key_cfg = who
+            .key_id
+            .and_then(|k| loaded.and_then(|l| l.keys.get(&k)).copied());
+        let state = cc::enabled(
+            cache.is_some(),
+            loaded,
+            key_cfg.as_ref(),
+            plan.is_some(),
+            who.captured,
+        );
+        if self == Self::Default {
+            // The privacy default (and an explicit `off`): no lookup, no store, and no header —
+            // the caller asked nothing, so there is nothing to answer.
+            if !state.on || !supported {
+                return Ok(CachePolicy {
+                    bypass: !state.on,
+                    quiet: true,
+                    ..CachePolicy::default()
+                });
+            }
+            return Ok(Self::workspace_policy(
+                cache, loaded, plan, key_cfg, who, None,
+            ));
+        }
+        // `use` / `ttl=`.
+        let plan = plan.ok_or(CacheRefusal {
+            status: StatusCode::FORBIDDEN,
+            code: "cache_control_not_entitled",
+        })?;
         if !supported {
             return Err(CacheRefusal {
                 status: StatusCode::CONFLICT,
                 code: "cache_control_unsupported_route",
             });
         }
-        let operator = cache
-            .ok_or(CacheRefusal {
+        if !state.on {
+            return Err(CacheRefusal {
                 status: StatusCode::CONFLICT,
                 code: "response_cache_disabled",
-            })?
-            .config()
-            .ttl_hours();
+            });
+        }
         let requested = match self {
-            Self::Ttl(n) => n,
-            _ => plan.min(operator),
+            Self::Ttl(n) => Some(n),
+            _ => None,
         };
-        let effective = requested.min(plan).min(operator);
-        let binding = match (
-            plan <= requested && plan == effective,
-            operator <= requested && operator == effective,
-        ) {
-            (true, true) => "plan,operator",
-            (true, false) => "plan",
-            (false, true) => "operator",
-            (false, false) => "requested",
-        };
-        Ok(CachePolicy {
+        let mut policy = Self::workspace_policy(cache, loaded, Some(plan), key_cfg, who, requested);
+        if policy.ttl_hours.is_none() {
+            // `use` with no workspace TTL: the plan/operator/ceiling minimum, as before.
+            let (ttl, binding) = effective_ttl(requested, None, Some(plan), cache);
+            policy.ttl_hours = Some(ttl);
+            policy.binding = binding;
+        }
+        Ok(policy)
+    }
+
+    /// The policy of a request the cache is ON for: the effective TTL (only when a request
+    /// header or the workspace sets one), the namespace and the epochs folded into the hashes.
+    fn workspace_policy(
+        cache: Option<&SemanticCache>,
+        loaded: Option<&crate::db::cache_settings::Loaded>,
+        plan: Option<u32>,
+        key_cfg: Option<crate::db::cache_settings::KeyCache>,
+        who: &crate::cache_controls::CacheCaller<'_>,
+        requested: Option<u32>,
+    ) -> CachePolicy {
+        use crate::cache_controls as cc;
+        let ws = loaded.map(|l| l.settings).unwrap_or_default();
+        let mut policy = CachePolicy::default();
+        // The workspace TTL counts only while the plan grants cache control.
+        if let (Some(ws_ttl), Some(_)) = (ws.ttl_hours, plan) {
+            let (ttl, binding) = effective_ttl(requested, Some(ws_ttl), plan, cache);
+            policy.ttl_hours = Some(ttl);
+            policy.binding = binding;
+        } else if let Some(n) = requested {
+            let (ttl, binding) = effective_ttl(Some(n), None, plan, cache);
+            policy.ttl_hours = Some(ttl);
+            policy.binding = binding;
+        }
+        policy.semantic = ws.semantic;
+        let by = cc::effective_namespace(ws.namespace_by, key_cfg.and_then(|k| k.namespace_by));
+        let ns = cc::namespace(by, who);
+        if ns == cc::NamespaceValue::Unavailable {
+            // The namespace the workspace chose has no value for this request: never widen.
+            policy.bypass = true;
+            policy.quiet = true;
+            return policy;
+        }
+        let epochs = loaded.map_or_else(Vec::new, |l| {
+            l.applicable_epochs(who.project_id, who.key_id, who.model)
+        });
+        if let Some(fold) = cc::fold(&ns, who.namespace_header, &epochs) {
+            policy.fold = Some(fold);
+        }
+        policy
+    }
+}
+
+/// The effective TTL: the minimum of the caller's request, the workspace's own, the plan, the
+/// operator and the table's ceiling — and the name of what bound it. A tie names the
+/// non-request candidates that tie (`plan,operator`); the ceiling is named only when it
+/// alone binds.
+fn effective_ttl(
+    requested: Option<u32>,
+    workspace: Option<u32>,
+    plan: Option<u32>,
+    cache: Option<&SemanticCache>,
+) -> (u32, &'static str) {
+    let operator = cache.map(|c| c.config().ttl_hours());
+    let ceiling = crate::cache_controls::config().ttl_ceiling_hours;
+    let others = [workspace, plan, operator];
+    let floor = others.iter().flatten().copied().min().unwrap_or(ceiling);
+    let effective = requested.unwrap_or(u32::MAX).min(floor).min(ceiling);
+    let tied = |v: Option<u32>| v == Some(effective);
+    let binding = match (tied(workspace), tied(plan), tied(operator)) {
+        (true, true, true) => "workspace,plan,operator",
+        (true, true, false) => "workspace,plan",
+        (true, false, true) => "workspace,operator",
+        (true, false, false) => "workspace",
+        (false, true, true) => "plan,operator",
+        (false, true, false) => "plan",
+        (false, false, true) => "operator",
+        (false, false, false) => {
+            if ceiling == effective && requested.is_none_or(|r| r > effective) {
+                "ceiling"
+            } else {
+                "requested"
+            }
+        }
+    };
+    (effective, binding)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CachePolicy {
+    bypass: bool,
+    ttl_hours: Option<u32>,
+    binding: &'static str,
+    /// The policy decided "no cache" by SETTINGS (the privacy default, a workspace or key
+    /// `off`), not because the caller said `bypass`: the response says nothing about it.
+    quiet: bool,
+    /// `false` = the workspace turned the semantic (embedding) tier off.
+    semantic: bool,
+    /// The namespace and epochs folded into both hashes (`None` = nothing applies, so the
+    /// hashed bytes are what they were before OG-51).
+    fold: Option<crate::cache_controls::Fold>,
+}
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
             bypass: false,
-            ttl_hours: Some(effective),
-            binding,
-        })
+            ttl_hours: None,
+            binding: "",
+            quiet: false,
+            semantic: true,
+            fold: None,
+        }
     }
 }
 impl CachePolicy {
     pub fn suspend(mut self) -> Self {
         self.bypass = true;
         self
+    }
+    /// May the semantic (embedding) tier run for this request? `false` when the workspace
+    /// switched it off.
+    #[must_use]
+    pub fn semantic_allowed(self) -> bool {
+        self.semantic
     }
     pub fn key(self, mut key: RequestKey) -> RequestKey {
         key.bypass = self.bypass;
@@ -209,11 +337,22 @@ impl CachePolicy {
                 *digest = h.finalize().to_hex().to_string();
             }
         }
+        // OG-51: a namespace / an invalidation epoch moves BOTH hashes, exactly as the
+        // canary namespace does, so the semantic tier's `(tenant, model, params_hash)`
+        // prefilter separates namespaces with no schema change.
+        if let Some(fold) = self.fold {
+            for digest in [&mut key.exact_hash, &mut key.params_hash] {
+                let mut h = blake3::Hasher::new();
+                hash_field(&mut h, digest.as_bytes());
+                hash_field(&mut h, &fold.digest);
+                *digest = h.finalize().to_hex().to_string();
+            }
+        }
         key
     }
     pub fn response(self, mut response: axum::response::Response) -> axum::response::Response {
         use axum::http::HeaderValue;
-        if self.bypass {
+        if self.bypass && !self.quiet {
             response
                 .headers_mut()
                 .insert("x-tracelane-cache", HeaderValue::from_static("bypass"));
@@ -231,6 +370,19 @@ impl CachePolicy {
                 "x-tracelane-cache-bound",
                 HeaderValue::from_static(self.binding),
             );
+        }
+        // Only an 8-hex prefix of a hash — never the raw namespace, id or epoch.
+        if let Some(fold) = self.fold {
+            for (name, tag) in [
+                ("x-tracelane-cache-namespace", fold.namespace_tag),
+                ("x-tracelane-cache-epoch", fold.epoch_tag),
+            ] {
+                if let Some(tag) = tag
+                    && let Ok(v) = HeaderValue::from_bytes(&tag)
+                {
+                    response.headers_mut().insert(name, v);
+                }
+            }
         }
         response
     }
@@ -307,6 +459,27 @@ pub struct RequestKey {
     pub params_hash: String,
     /// The normalised message text that gets embedded.
     pub embed_text: String,
+    /// rev6 N3: the embedding models this REQUEST may send `embed_text` to. `None` =
+    /// the configured list (no request context — tests and tooling); `Some(list)` =
+    /// only these, in the configured order; `Some(empty)` = the semantic tier is OFF
+    /// for this request (no embedding call on lookup or store). Set by the chat
+    /// handler through [`RequestKey::restrict_semantic_tier`]: an R2-redacted request
+    /// gets an empty list, and a model the workspace blocks, the key's policy denies,
+    /// or (under ZDR-required) a non-ZDR provider would serve is left out.
+    semantic_models: Option<Vec<String>>,
+}
+
+impl RequestKey {
+    /// rev6 N3: restrict the semantic tier to `models` (empty = off). The exact tier is
+    /// unaffected — it is a hash, it sends nothing anywhere.
+    pub fn restrict_semantic_tier(&mut self, models: Vec<String>) {
+        self.semantic_models = Some(models);
+    }
+
+    /// rev6 N3: the models the semantic tier may embed with, given the configured list.
+    fn semantic_models<'a>(&'a self, configured: &'a [String]) -> &'a [String] {
+        self.semantic_models.as_deref().unwrap_or(configured)
+    }
 }
 
 /// Derive the cache identity of a request.
@@ -416,6 +589,61 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
         params.update(b"top_logprobs=");
         params.update(&[tlp]);
     }
+    // OG-03: every field that CHANGES THE ANSWER is part of the key, by the same rule as
+    // `top_p` above — two requests differing only in `stop`, `response_format`,
+    // `reasoning_effort`, the output cap named `max_completion_tokens`, a penalty, or an
+    // unmodelled `extra` field are different questions, and a shared entry would serve the
+    // second caller the first caller's answer (the B-355 class again, under new names).
+    //
+    // Each is tagged and only hashed when PRESENT, so every key written before this change is
+    // byte-identical after it. `parallel_tool_calls` is hashed because it changes which tool
+    // calls come back. DELIBERATELY NOT hashed: `user` and `service_tier` (an end-user label
+    // and a latency tier — neither changes the answer, and hashing `user` would stop one
+    // tenant's users from ever sharing an entry) and `n` (only 1 is ever served).
+    if let Some(stop) = &req.stop {
+        params.update(b"stop=");
+        let seqs = stop.sequences();
+        params.update(&(seqs.len() as u64).to_le_bytes());
+        for s in seqs {
+            hash_field(&mut params, s.as_bytes());
+        }
+    }
+    if let Some(rf) = &req.response_format {
+        params.update(b"response_format=");
+        let mut canon = String::new();
+        crate::request_support::canonical_json(rf, &mut canon);
+        hash_field(&mut params, canon.as_bytes());
+    }
+    if let Some(re) = &req.reasoning_effort {
+        params.update(b"reasoning_effort=");
+        hash_field(&mut params, re.as_bytes());
+    }
+    if let Some(m) = req.max_completion_tokens {
+        params.update(b"max_completion_tokens=");
+        params.update(&m.to_le_bytes());
+    }
+    if let Some(p) = req.presence_penalty {
+        params.update(b"presence_penalty=");
+        params.update(&p.to_le_bytes());
+    }
+    if let Some(p) = req.frequency_penalty {
+        params.update(b"frequency_penalty=");
+        params.update(&p.to_le_bytes());
+    }
+    if let Some(p) = req.parallel_tool_calls {
+        params.update(b"parallel_tool_calls=");
+        params.update(&[u8::from(p)]);
+    }
+    if !req.extra.is_empty() {
+        params.update(b"extra=");
+        // Canonical sorted JSON: key order in the body must not change the key.
+        let mut canon = String::new();
+        crate::request_support::canonical_json(
+            &serde_json::Value::Object(req.extra.clone()),
+            &mut canon,
+        );
+        hash_field(&mut params, canon.as_bytes());
+    }
     if let Some(sys) = &req.system {
         params.update(sys.as_bytes());
     }
@@ -499,6 +727,7 @@ pub fn request_key(req: &ChatRequest) -> RequestKey {
         exact_hash,
         params_hash,
         embed_text,
+        semantic_models: None,
     }
 }
 
@@ -612,7 +841,12 @@ impl SemanticCache {
         self.prompt_router = Some(router);
         self
     }
-    pub fn bind_key(&self, tenant: &TenantId, mut key: RequestKey) -> RequestKey {
+    pub fn bind_key(
+        &self,
+        tenant: &TenantId,
+        mut key: RequestKey,
+        route_namespace: Option<&str>,
+    ) -> RequestKey {
         let context = self
             .prompt_router
             .as_ref()
@@ -620,11 +854,14 @@ impl SemanticCache {
             .unwrap_or_default();
         key.canary_namespace = context.namespace;
         key.bypass |= context.suspended;
-        if !key.canary_namespace.is_empty() {
+        if !key.canary_namespace.is_empty() || route_namespace.is_some() {
             for hash in [&mut key.exact_hash, &mut key.params_hash] {
                 let mut h = blake3::Hasher::new();
                 hash_field(&mut h, hash.as_bytes());
                 hash_field(&mut h, key.canary_namespace.as_bytes());
+                if let Some(namespace) = route_namespace {
+                    hash_field(&mut h, namespace.as_bytes());
+                }
                 *hash = h.finalize().to_hex().to_string();
             }
         }
@@ -663,7 +900,11 @@ impl SemanticCache {
             return None;
         }
         let cutoff_ms = crate::clickhouse_query::datetime64_millis_now()
-            - i64::from(key.ttl_hours.unwrap_or(self.cfg.ttl_hours())) * 3_600_000;
+            - i64::from(
+                key.ttl_hours
+                    .unwrap_or(self.cfg.ttl_hours())
+                    .min(crate::cache_controls::config().ttl_ceiling_hours),
+            ) * 3_600_000;
         let started = Instant::now();
 
         // ── Tier 1: exact. No network, no embedding, no ClickHouse. ──────────
@@ -688,7 +929,12 @@ impl SemanticCache {
         if self.no_embedder.get(tenant_id).await.is_some() {
             return None;
         }
-        let embedding = match self.embed(tenant_id, &key.embed_text).await {
+        // rev6 N3: an R2-redacted request, or one whose policy admits no embedding model,
+        // sends its text to NO embedding provider.
+        if key.semantic_models(self.cfg.embedding_models()).is_empty() {
+            return None;
+        }
+        let embedding = match self.embed(tenant_id, key).await {
             Ok(v) => v,
             Err(e) => {
                 // B-347: no credential is configuration, not a degradation.
@@ -791,9 +1037,18 @@ impl SemanticCache {
     /// no OpenAI-shaped embeddings endpoint, and **Anthropic has no embeddings
     /// API at all** — so on prod today half the BYOK tenants can only embed via a
     /// second provider, and a single hardcoded model would exclude them silently.
-    async fn embed(&self, tenant_id: &TenantId, text: &str) -> Result<Vec<f32>> {
+    ///
+    /// rev6 N3: only the models `key` admits ([`RequestKey::restrict_semantic_tier`]).
+    async fn embed(&self, tenant_id: &TenantId, key: &RequestKey) -> Result<Vec<f32>> {
+        let text = key.embed_text.as_str();
+        let configured = self.cfg.embedding_models();
+        let models = key.semantic_models(configured);
+        // The negative cache records a TENANT fact ("holds no embedding credential"). A
+        // request whose policy narrowed the list proves nothing about the models it
+        // could not try, so only a walk over the whole configured list may record it.
+        let full_walk = models.len() == configured.len();
         let mut last_err: Option<anyhow::Error> = None;
-        for model in self.cfg.embedding_models() {
+        for model in models {
             let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
                 continue;
             };
@@ -807,7 +1062,11 @@ impl SemanticCache {
                 match crate::server::resolve_provider_key(tenant_id, provider_id, env_var).await {
                     crate::server::ProviderKey::Found(k) => k,
                     // No credential for THIS provider — try the next model.
-                    _ => continue,
+                    crate::server::ProviderKey::KmsUnavailable => anyhow::bail!("kms_unavailable"),
+                    crate::server::ProviderKey::KmsDenied => anyhow::bail!("kms_access_denied"),
+                    crate::server::ProviderKey::NotConfigured
+                    | crate::server::ProviderKey::Unusable
+                    | crate::server::ProviderKey::LookupFailed => continue,
                 };
             match adapter
                 .embeddings(
@@ -847,7 +1106,7 @@ impl SemanticCache {
         // lack of a usable key — a stable property of this tenant's configuration,
         // not a transient fault — so that is the case that populates the negative
         // cache. A provider OUTAGE must keep retrying, because it will come back.
-        if last_err.is_none() {
+        if last_err.is_none() && full_walk {
             self.no_embedder.insert(tenant_id.clone(), ()).await;
         }
         Err(last_err.unwrap_or_else(|| {
@@ -982,11 +1241,17 @@ impl SemanticCache {
         if self.no_embedder.get(tenant_id).await.is_some() {
             return;
         }
+        // rev6 N3: the same per-request gate as `lookup()` — and no durable row either,
+        // so an R2-redacted request's answer (which may carry the caller's re-inserted
+        // originals) never reaches ClickHouse.
+        if key.semantic_models(self.cfg.embedding_models()).is_empty() {
+            return;
+        }
 
         // The DURABLE half needs a vector, so it needs a credential. Failing here
         // costs the semantic tier and the cross-restart copy; the exact tier
         // above is already live either way.
-        let embedding = match self.embed(tenant_id, &key.embed_text).await {
+        let embedding = match self.embed(tenant_id, key).await {
             Ok(v) => v,
             Err(_) => {
                 // B-347: no credential is configuration, not a degradation.
@@ -1154,6 +1419,8 @@ mod b454_tests {
             provider: "mistral",
             status,
             reason: reason.map(str::to_owned),
+            message: None,
+            retry_after: None,
         }
         .into()
     }
@@ -1220,6 +1487,7 @@ mod tests {
             stream: None,
             system: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -1469,7 +1737,17 @@ mod tests {
 #[cfg(all(test, debug_assertions))]
 mod request_policy_tests {
     use super::*;
+    use crate::cache_controls::CacheCaller;
     use crate::entitlement_cache::ResolvedEntitlements;
+
+    /// A caller whose workspace records both prompt and response text — the privacy default
+    /// lets the cache serve it (OG-51).
+    fn captured() -> CacheCaller<'static> {
+        CacheCaller {
+            captured: true,
+            ..CacheCaller::default()
+        }
+    }
     use crate::handler_harness::{LoopbackBypassGuard, registry_pointing_ollama_at};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1485,6 +1763,28 @@ mod request_policy_tests {
             Arc::new(registry_pointing_ollama_at(url)),
             cfg.semantic_cache().unwrap().clone(),
         )
+    }
+    #[tokio::test]
+    async fn og37_kms_failure_stops_embedding_without_upstream_or_negative_configuration_cache() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let cache = cache(mock.uri());
+        let tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        for (failure, code) in [
+            (crate::kms::KmsError::Unavailable, "kms_unavailable"),
+            (crate::kms::KmsError::Denied, "kms_access_denied"),
+        ] {
+            let result = crate::kms::wire_tests::FAILURE
+                .scope(failure, cache.embed(&tenant, &key()))
+                .await;
+            assert_eq!(result.unwrap_err().to_string(), code);
+            assert!(!embed_failure_is_configuration(&cache.no_embedder, &tenant).await);
+        }
+        assert!(mock.received_requests().await.unwrap().is_empty());
     }
     fn key() -> RequestKey {
         request_key(&serde_json::from_value(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"test"}]})).unwrap())
@@ -1560,13 +1860,13 @@ mod request_policy_tests {
         assert!(CacheControl::parse(&headers).is_err());
         assert!(
             CacheControl::Bypass
-                .resolve(None, None, false)
+                .resolve(None, None, false, &CacheCaller::default())
                 .unwrap()
                 .bypass
         );
         assert_eq!(
             CacheControl::Use
-                .resolve(Some(&grant), Some(&cache), true)
+                .resolve(Some(&grant), Some(&cache), true, &CacheCaller::default())
                 .unwrap_err()
                 .code,
             "cache_control_not_entitled"
@@ -1580,7 +1880,7 @@ mod request_policy_tests {
         ] {
             grant.cache_ttl_hours = plan;
             let policy = CacheControl::Ttl(requested)
-                .resolve(Some(&grant), Some(&cache), true)
+                .resolve(Some(&grant), Some(&cache), true, &captured())
                 .unwrap();
             assert_eq!(policy.ttl_hours, Some(effective));
             assert_eq!(policy.binding, binding);
@@ -1593,19 +1893,122 @@ mod request_policy_tests {
         }
         assert_eq!(
             CacheControl::Use
-                .resolve(Some(&grant), Some(&cache), false)
+                .resolve(Some(&grant), Some(&cache), false, &CacheCaller::default())
                 .unwrap_err()
                 .code,
             "cache_control_unsupported_route"
         );
         assert_eq!(
             CacheControl::Use
-                .resolve(Some(&grant), None, true)
+                .resolve(Some(&grant), None, true, &CacheCaller::default())
                 .unwrap_err()
                 .code,
             "response_cache_disabled"
         );
     }
+    /// OG-51 / spec §7 row 5: the effective TTL is the minimum of the request, the workspace,
+    /// the plan, the operator and the table's ceiling, and `x-tracelane-cache-bound` names
+    /// the winner. Table-driven over every candidate.
+    #[test]
+    fn og51_effective_ttl_is_the_minimum_and_names_what_bound_it() {
+        let operator = |hours: u32| {
+            let cfg = crate::server::config::parse(&format!(
+                "semantic_cache:\n  embedding_models: ollama/embed\n  ttl_hours: {hours}\n"
+            ))
+            .unwrap();
+            SemanticCache::new(
+                crate::clickhouse_query::ch_client("http://127.0.0.1:1"),
+                Arc::new(registry_pointing_ollama_at("http://127.0.0.1:1".into())),
+                cfg.semantic_cache().unwrap().clone(),
+            )
+        };
+        assert_eq!(crate::cache_controls::config().ttl_ceiling_hours, 168);
+        // (requested, workspace, plan, operator) -> (effective, binding)
+        for (requested, workspace, plan, op, want) in [
+            (None, None, Some(24), 168, (24, "plan")),
+            (None, Some(12), Some(24), 168, (12, "workspace")),
+            (None, Some(24), Some(24), 168, (24, "workspace,plan")),
+            (Some(2), Some(12), Some(24), 168, (2, "requested")),
+            (Some(500), Some(12), Some(24), 168, (12, "workspace")),
+            (None, None, Some(720), 720, (168, "ceiling")),
+            (Some(500), None, Some(720), 720, (168, "ceiling")),
+            (None, None, Some(168), 168, (168, "plan,operator")),
+            (Some(168), None, Some(720), 720, (168, "requested")),
+            (Some(100), None, Some(720), 168, (100, "requested")),
+            (None, None, Some(720), 48, (48, "operator")),
+            (None, Some(48), Some(720), 48, (48, "workspace,operator")),
+        ] {
+            let cache = operator(op);
+            assert_eq!(
+                effective_ttl(requested, workspace, plan, Some(&cache)),
+                want,
+                "requested={requested:?} workspace={workspace:?} plan={plan:?} operator={op}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn og12_model_arms_use_cache_without_sharing_exact_or_semantic_namespace() {
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let cache = cache("http://127.0.0.1:1".into());
+        cache.no_embedder.insert(tenant.clone(), ()).await;
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"identical request"}]})).unwrap();
+        let a = cache.bind_key(&tenant, request_key(&request), Some("rule:arm-a"));
+        let b = cache.bind_key(&tenant, request_key(&request), Some("rule:arm-b"));
+        let ordinary = cache.bind_key(&tenant, request_key(&request), None);
+        assert!(!a.bypass && !b.bypass);
+        assert_ne!(a.exact_hash, b.exact_hash);
+        assert_ne!(a.params_hash, b.params_hash);
+        assert_ne!(a.params_hash, ordinary.params_hash);
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &a,
+                "arm A",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert_eq!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &a)
+                .await
+                .unwrap()
+                .response_json,
+            "arm A"
+        );
+        assert!(cache.lookup(&tenant, "ollama/llama3", &b).await.is_none());
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &ordinary)
+                .await
+                .is_none()
+        );
+        cache
+            .store(
+                &tenant,
+                "ollama/llama3",
+                &b,
+                "arm B",
+                1,
+                1,
+                0.0,
+                Uuid::new_v4(),
+            )
+            .await;
+        assert_eq!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &b)
+                .await
+                .unwrap()
+                .response_json,
+            "arm B"
+        );
+    }
+
     #[tokio::test]
     async fn canary_never_reuses_another_arm_or_lifecycle() {
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
@@ -1614,7 +2017,7 @@ mod request_policy_tests {
         let cache = cache("http://127.0.0.1:1".into()).with_prompt_router(router.clone());
         cache.no_embedder.insert(tenant.clone(), ()).await;
         let request:ChatRequest=serde_json::from_value(serde_json::json!({"model":"ollama/llama3","messages":[{"role":"user","content":"same model input"}]})).unwrap();
-        let before = cache.bind_key(&tenant, request_key(&request));
+        let before = cache.bind_key(&tenant, request_key(&request), None);
         cache
             .store(
                 &tenant,
@@ -1639,7 +2042,7 @@ mod request_policy_tests {
             .configure_canary(&tenant, "proof", candidate, 50.0, "tester")
             .await
             .unwrap();
-        let active = cache.bind_key(&tenant, request_key(&request));
+        let active = cache.bind_key(&tenant, request_key(&request), None);
         assert!(
             cache
                 .lookup(&tenant, "ollama/llama3", &before)
@@ -1675,7 +2078,7 @@ mod request_policy_tests {
             .stop_canary(&tenant, "proof", "tester")
             .await
             .unwrap();
-        let after = cache.bind_key(&tenant, request_key(&request));
+        let after = cache.bind_key(&tenant, request_key(&request), None);
         assert_ne!(after.params_hash, before.params_hash);
         assert_ne!(after.params_hash, active.params_hash);
         cache
@@ -1761,7 +2164,7 @@ mod request_policy_tests {
             .await;
         assert!(cache.lookup(&tenant, "ollama/llama3", &k).await.is_none());
         let bypass = CacheControl::Bypass
-            .resolve(None, None, true)
+            .resolve(None, None, true, &CacheCaller::default())
             .unwrap()
             .key(key());
         cache
@@ -1830,7 +2233,7 @@ mod request_policy_tests {
                 .is_none()
         );
         let bypass = CacheControl::Bypass
-            .resolve(None, None, true)
+            .resolve(None, None, true, &CacheCaller::default())
             .unwrap()
             .key(k);
         assert!(
@@ -1839,5 +2242,187 @@ mod request_policy_tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// OG-51 / spec §7 rows 2 and 3 on a REAL ClickHouse: the semantic tier's
+    /// `(tenant, model, params_hash)` prefilter separates namespaces and epochs with no schema
+    /// change, an invalidation hides the old row without deleting it, and no DELETE is issued.
+    /// Run with `CLICKHOUSE_TEST_URL` pointing at a server with migration 17 applied.
+    #[tokio::test]
+    #[ignore = "local initialized ClickHouse only; migration 17 applied"]
+    async fn og51_the_semantic_tier_separates_namespaces_and_epochs_on_real_clickhouse() {
+        use crate::cache_controls::{Namespace, NamespaceValue};
+        use crate::db::cache_settings::NamespaceBy;
+        let _guard = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/embeddings")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"model":"ollama/embed","usage":{"prompt_tokens":1,"total_tokens":1}}))).mount(&server).await;
+        let mut cache = cache(server.uri());
+        let url = std::env::var("CLICKHOUSE_TEST_URL").expect("local proof URL");
+        cache.ch = crate::clickhouse_query::ch_client(url);
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let policy = |ns: &str, epoch: i64| CachePolicy {
+            fold: crate::cache_controls::fold(
+                &NamespaceValue::Value(Namespace {
+                    kind: NamespaceBy::Key,
+                    value: ns.into(),
+                }),
+                None,
+                &if epoch > 0 {
+                    vec![("workspace".to_owned(), epoch)]
+                } else {
+                    Vec::new()
+                },
+            ),
+            ..CachePolicy::default()
+        };
+        let (ka, kb) = (policy("key-a", 0).key(key()), policy("key-b", 0).key(key()));
+        assert_ne!(
+            ka.params_hash, kb.params_hash,
+            "namespaces never share a prefilter key"
+        );
+        let row = CacheRow {
+            tenant_id: tenant.to_string(),
+            cache_id: Uuid::new_v4(),
+            model: "ollama/llama3".into(),
+            params_hash: crate::prompt_router::FixedHex64::from_hex_str(&ka.params_hash).unwrap(),
+            exact_hash: crate::prompt_router::FixedHex64::from_hex_str(&ka.exact_hash).unwrap(),
+            embedding: vec![1.0, 0.0, 0.0],
+            embedding_model: "ollama/embed".into(),
+            embedding_dims: 3,
+            response_json: "key-a's answer".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cost_usd: 0.0,
+            source_trace_id: Uuid::new_v4(),
+            created_at: crate::clickhouse_query::datetime64_millis_now(),
+        };
+        cache.insert_row(&row).await.unwrap();
+        // The stored row is served to its own namespace on the SEMANTIC tier …
+        let hit = cache.lookup(&tenant, "ollama/llama3", &ka).await.unwrap();
+        assert_eq!(
+            (hit.tier, hit.response_json.as_str()),
+            ("semantic", "key-a's answer")
+        );
+        // … and to nobody else: another key, and the same key after an invalidation.
+        assert!(cache.lookup(&tenant, "ollama/llama3", &kb).await.is_none());
+        let bumped = policy("key-a", 1).key(key());
+        assert!(
+            cache
+                .lookup(&tenant, "ollama/llama3", &bumped)
+                .await
+                .is_none()
+        );
+        // The row is still there: invalidation stops serving, it does not erase.
+        #[derive(serde::Deserialize, clickhouse::Row)]
+        struct N {
+            n: u64,
+        }
+        let n = cache
+            .ch
+            .query("SELECT count() AS n FROM semantic_cache WHERE tenant_id = ?")
+            .bind(tenant.to_string())
+            .fetch_one::<N>()
+            .await
+            .unwrap()
+            .n;
+        assert_eq!(n, 1);
+    }
+}
+
+/// `OG-03` — every new answer-changing field is part of the cache identity.
+#[cfg(test)]
+mod og03_key_tests {
+    use super::request_key;
+    use tracelane_shared::{ChatRequest, Message, MessageContent, Role, Stop};
+
+    fn base() -> ChatRequest {
+        ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hello".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_requests_differing_in_one_new_field_never_share_a_key() {
+        let plain = request_key(&base());
+        type Mutation = fn(&mut ChatRequest);
+        let variants: Vec<(&str, Mutation)> = vec![
+            ("stop", |r| r.stop = Some(Stop::One("END".into()))),
+            ("stop (other)", |r| r.stop = Some(Stop::One("STOP".into()))),
+            ("response_format", |r| {
+                r.response_format = Some(serde_json::json!({"type": "json_object"}))
+            }),
+            ("reasoning_effort", |r| {
+                r.reasoning_effort = Some("high".into())
+            }),
+            ("max_completion_tokens", |r| {
+                r.max_completion_tokens = Some(5)
+            }),
+            ("presence_penalty", |r| r.presence_penalty = Some(0.5)),
+            ("frequency_penalty", |r| r.frequency_penalty = Some(0.5)),
+            ("parallel_tool_calls", |r| {
+                r.parallel_tool_calls = Some(false)
+            }),
+            ("extra", |r| {
+                r.extra
+                    .insert("logit_bias".into(), serde_json::json!({"1": 2}));
+            }),
+        ];
+        let mut seen = vec![plain.exact_hash.clone()];
+        for (name, f) in variants {
+            let mut r = base();
+            f(&mut r);
+            let k = request_key(&r);
+            assert_ne!(
+                k.exact_hash, plain.exact_hash,
+                "{name}: exact key collides with the plain request"
+            );
+            assert_ne!(
+                k.params_hash, plain.params_hash,
+                "{name}: params hash collides"
+            );
+            assert!(
+                !seen.contains(&k.exact_hash),
+                "{name}: collides with another variant"
+            );
+            seen.push(k.exact_hash);
+        }
+    }
+
+    #[test]
+    fn extra_is_hashed_canonically_and_value_changes_move_the_key() {
+        let mut a = base();
+        a.extra
+            .insert("a".into(), serde_json::json!({"x": 1, "y": 2}));
+        a.extra.insert("b".into(), serde_json::json!(true));
+        let mut b = base();
+        b.extra.insert("b".into(), serde_json::json!(true));
+        b.extra
+            .insert("a".into(), serde_json::json!({"y": 2, "x": 1}));
+        assert_eq!(request_key(&a).exact_hash, request_key(&b).exact_hash);
+        b.extra
+            .insert("a".into(), serde_json::json!({"y": 2, "x": 9}));
+        assert_ne!(request_key(&a).exact_hash, request_key(&b).exact_hash);
+    }
+
+    /// `user` and `service_tier` do not change the answer, and `n` is always 1: none of them
+    /// may fragment the cache. Existing keys (requests carrying none of the new fields) are
+    /// untouched because every addition is tagged and hashed only when present.
+    #[test]
+    fn fields_that_do_not_change_the_answer_do_not_change_the_key() {
+        let plain = request_key(&base());
+        let mut r = base();
+        r.user = Some("end-user-1".into());
+        r.service_tier = Some("flex".into());
+        r.n = Some(1);
+        let k = request_key(&r);
+        assert_eq!(k.exact_hash, plain.exact_hash);
+        assert_eq!(k.params_hash, plain.params_hash);
     }
 }

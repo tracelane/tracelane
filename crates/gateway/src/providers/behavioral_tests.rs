@@ -79,6 +79,7 @@ fn request_with_tools(model: &str) -> ChatRequest {
         tool_choice: None,
         system: None,
         metadata: None,
+        ..Default::default()
     }
 }
 
@@ -407,36 +408,111 @@ async fn google_chunk_with_text_tools_and_usage_loses_nothing() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Cohere — NDJSON events; tools previously dropped end-to-end (fix).
+// D9 — Cohere v2 chat: a 2-turn tool conversation, asserted on the BODY.
 // ═════════════════════════════════════════════════════════════════════════
 
-const COHERE_BEHAVIORAL_BODY: &str = concat!(
-    "{\"event_type\":\"text-generation\",\"text\":\"The weather is \"}\n",
-    "{\"event_type\":\"text-generation\",\"text\":\"sunny.\"}\n",
-    "{\"event_type\":\"tool-calls-generation\",\"tool_calls\":[{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Bangalore\"}}]}\n",
-    "{\"event_type\":\"stream-end\",\"finish_reason\":\"COMPLETE\",\"response\":{\"meta\":{\"tokens\":{\"input_tokens\":42,\"output_tokens\":17}}}}\n",
+fn cohere_v2_tool_conversation() -> ChatRequest {
+    use tracelane_shared::ToolCall;
+    let mut req = request_with_tools("command-a-03-2025");
+    req.messages = vec![
+        Message {
+            role: Role::System,
+            content: MessageContent::Text("Be brief.".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::User,
+            content: MessageContent::Text("weather in Bangalore?".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_77".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({"city": "Bangalore"}),
+            }]),
+        },
+        // The LAST message is a tool result: v1 sent it as `message` text.
+        Message {
+            role: Role::Tool,
+            content: MessageContent::Text("29C, sunny".into()),
+            tool_call_id: Some("call_77".into()),
+            tool_calls: None,
+        },
+    ];
+    req
+}
+
+/// Cohere v2 `POST /v2/chat` stream, event names and shapes per docs.cohere.com/reference/chat-stream.
+const COHERE_V2_SSE: &str = concat!(
+    "event: message-start\n",
+    r#"data: {"type":"message-start","id":"m1","delta":{"message":{"role":"assistant"}}}"#,
+    "\n\n",
+    "event: content-start\n",
+    r#"data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}"#,
+    "\n\n",
+    "event: content-delta\n",
+    r#"data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"It is "}}}}"#,
+    "\n\n",
+    "event: content-delta\n",
+    r#"data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"sunny."}}}}"#,
+    "\n\n",
+    "event: content-end\n",
+    r#"data: {"type":"content-end","index":0}"#,
+    "\n\n",
+    "event: tool-plan-delta\n",
+    r#"data: {"type":"tool-plan-delta","delta":{"message":{"tool_plan":"I will look"}}}"#,
+    "\n\n",
+    "event: tool-call-start\n",
+    r#"data: {"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{"id":"call_88","type":"function","function":{"name":"get_weather","arguments":""}}}}}"#,
+    "\n\n",
+    "event: tool-call-delta\n",
+    r#"data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"city\":"}}}}}"#,
+    "\n\n",
+    "event: tool-call-delta\n",
+    r#"data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"\"Pune\"}"}}}}}"#,
+    "\n\n",
+    "event: tool-call-end\n",
+    r#"data: {"type":"tool-call-end","index":0}"#,
+    "\n\n",
+    "event: message-end\n",
+    r#"data: {"type":"message-end","id":"m1","delta":{"finish_reason":"TOOL_CALL","usage":{"billed_units":{"input_tokens":50,"output_tokens":20},"tokens":{"input_tokens":42,"output_tokens":17}}}}"#,
+    "\n\n",
 );
 
 #[tokio::test]
-async fn cohere_stream_sends_tools_and_surfaces_tool_calls_and_usage() {
+async fn d9_cohere_v2_body_carries_tool_history_and_the_stream_surfaces_tool_calls_and_usage() {
     let _bypass = LoopbackBypassGuard::new();
     let server = MockServer::start().await;
-    // The request body must CARRY the tool definitions (previously dropped):
-    // matching on the translated Cohere shape is the request-side proof.
     Mock::given(method("POST"))
         .and(path("/chat"))
         .and(body_partial_json(serde_json::json!({
-            "tools": [{
+            "model": "command-a-03-2025",
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "weather in Bangalore?"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_77", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Bangalore\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_77", "content": "29C, sunny"}
+            ],
+            "tools": [{"type": "function", "function": {
                 "name": "get_weather",
-                "parameter_definitions": {
-                    "city": { "type": "str", "required": true }
-                }
-            }]
+                "description": "Look up current weather",
+                "parameters": {"type": "object", "required": ["city"]}
+            }}]
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string(COHERE_BEHAVIORAL_BODY)
-                .insert_header("content-type", "application/x-ndjson"),
+                .set_body_string(COHERE_V2_SSE)
+                .insert_header("content-type", "text/event-stream"),
         )
         .expect(1)
         .mount(&server)
@@ -444,25 +520,36 @@ async fn cohere_stream_sends_tools_and_surfaces_tool_calls_and_usage() {
 
     let stream = CohereProvider::for_base_url(server.uri())
         .unwrap()
-        .chat(
-            request_with_tools("command-r-plus"),
-            "co-test",
-            &test_tenant(),
-        )
+        .chat(cohere_v2_tool_conversation(), "co-test", &test_tenant())
         .await
-        .expect("cohere chat returns stream (tools included in request)");
+        .expect("cohere v2 chat returns a stream");
     let events = collect(stream).await;
 
-    assert_eq!(assembled_text(&events), "The weather is sunny.");
-    let (_id, name, args) = assembled_tool(&events)
-        .expect("cohere tool-calls-generation must surface (previously dropped)");
+    // No v1 field survives in the body.
+    let sent = server.received_requests().await.expect("log");
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).expect("json");
+    for v1 in ["message", "chat_history", "connectors"] {
+        assert!(body.get(v1).is_none(), "v1 field `{v1}` must not be sent");
+    }
+    assert!(body["tools"][0].get("parameter_definitions").is_none());
+
+    // content-delta text, then the tool plan (visible output, replayed as `tool_plan`).
+    assert_eq!(assembled_text(&events), "It is sunny.I will look");
+    let (id, name, args) = assembled_tool(&events).expect("v2 tool-call-* events must surface");
+    assert_eq!(id.as_deref(), Some("call_88"));
     assert_eq!(name.as_deref(), Some("get_weather"));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&args).unwrap(),
-        serde_json::json!({"city": "Bangalore"})
+        serde_json::json!({"city": "Pune"})
     );
-    let (input, output, _cost) = usage_of(&events).expect("stream-end usage surfaces");
-    assert_eq!((input, output), (42, 17));
+    let (input, output, _cost) = usage_of(&events).expect("message-end usage surfaces");
+    assert_eq!((input, output), (42, 17), "`tokens`, not `billed_units`");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Finish {
+            reason: crate::providers::FinishReason::ToolCalls
+        }
+    )));
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -637,5 +724,361 @@ async fn a_max_tokens_stop_becomes_finish_reason_length() {
     assert!(
         body["choices"][0]["message"].get("tool_calls").is_none(),
         "a truncated text answer must not grow a tool_calls key"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// OG-05 §3.4 — the chat → Responses bridge, against a wiremock OpenAI.
+//
+// A chat request for a Responses-only model (`gpt-5.5-pro`), or for a "tools
+// need Responses" model (`gpt-6-astra`) WITH tools, must POST `/v1/responses`
+// (never `/v1/chat/completions`), and the Responses stream must come back as the
+// same `ProviderEvent`s every other adapter yields — which the REAL buffered
+// fold then turns into a chat.completion body.
+// ═════════════════════════════════════════════════════════════════════════
+
+const RESPONSES_TEXT_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_og05\",\"model\":\"gpt-5.5-pro-2026-10-01\"}}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hello \"}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"there.\"}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":21,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
+);
+
+const RESPONSES_TOOL_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_og05_t\",\"model\":\"gpt-6-astra\"}}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_og05\",\"name\":\"get_weather\",\"arguments\":\"\"}}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\"}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"Bangalore\\\"}\"}\n\n",
+    "event: response.output_item.done\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_og05\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Bangalore\\\"}\"}}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":30,\"output_tokens\":9}}}\n\n",
+);
+
+async fn mount_responses(server: &MockServer, sse: &'static str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    // The chat route must NEVER be hit for a bridged model.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+fn bridge_request(model: &str, with_tools: bool) -> ChatRequest {
+    let mut r = request_with_tools(model);
+    if !with_tools {
+        r.tools = None;
+    }
+    r
+}
+
+/// Buffered, exactly as `buffer_provider_stream` folds a stream.
+fn fold_buffered(events: &[ProviderEvent], model: &str) -> serde_json::Value {
+    let mut state = crate::server::BufferedToolState::default();
+    let mut text = String::new();
+    let (mut i_tok, mut o_tok) = (0u32, 0u32);
+    for ev in events {
+        if state.absorb(ev) {
+            continue;
+        }
+        match ev {
+            ProviderEvent::StreamChunk { delta } => text.push_str(delta),
+            ProviderEvent::UsageUpdate {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                i_tok = *input_tokens;
+                o_tok = *output_tokens;
+            }
+            _ => {}
+        }
+    }
+    crate::server::buffered_completion_payload("chatcmpl-og05", model, text, &state, i_tok, o_tok)
+}
+
+#[tokio::test]
+async fn og05_bridge_buffered_text_round_trip_hits_responses_not_chat() {
+    let _bypass = LoopbackBypassGuard::new();
+    let server = MockServer::start().await;
+    mount_responses(&server, RESPONSES_TEXT_SSE).await;
+
+    let stream = OpenAiProvider::compatible(server.uri(), "openai")
+        .unwrap()
+        .chat(
+            bridge_request("gpt-5.5-pro", false),
+            "sk-test-bridge",
+            &test_tenant(),
+        )
+        .await
+        .expect("a bridged chat returns a stream");
+    let events = collect(stream).await;
+    let body = fold_buffered(&events, "gpt-5.5-pro");
+
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello there.");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    // Usage: `input_tokens` is inclusive of the cached prefix, as in the chat adapter.
+    assert_eq!(body["usage"]["prompt_tokens"], 21);
+    assert_eq!(body["usage"]["completion_tokens"], 4);
+    assert!(
+        events.iter().any(
+            |e| matches!(e, ProviderEvent::ResponseMeta { id: Some(i), .. } if i == "resp_og05")
+        ),
+        "the upstream response id must reach the span"
+    );
+
+    // What the gateway SENT: the Responses shape, the tenant key, no retention.
+    let reqs = server.received_requests().await.expect("recorded");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url.path(), "/v1/responses");
+    assert_eq!(
+        reqs[0]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-test-bridge")
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["model"], "gpt-5.5-pro");
+    assert_eq!(sent["store"], false);
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["max_output_tokens"], 128);
+    assert_eq!(sent["input"][0]["role"], "user");
+    assert!(sent.get("messages").is_none(), "{sent}");
+}
+
+#[tokio::test]
+async fn og05_bridge_stream_yields_incremental_chunks_in_order() {
+    let _bypass = LoopbackBypassGuard::new();
+    let server = MockServer::start().await;
+    mount_responses(&server, RESPONSES_TEXT_SSE).await;
+
+    let stream = OpenAiProvider::compatible(server.uri(), "openai")
+        .unwrap()
+        .chat(
+            bridge_request("gpt-5.3-codex", false),
+            "sk-test",
+            &test_tenant(),
+        )
+        .await
+        .expect("stream");
+    let events = collect(stream).await;
+    let chunks: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::StreamChunk { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chunks, vec!["Hello ", "there."], "deltas stay incremental");
+    // Finish precedes the usage tail, as on the chat wire.
+    let fin = events
+        .iter()
+        .position(|e| matches!(e, ProviderEvent::Finish { .. }))
+        .expect("finish");
+    let usage = events
+        .iter()
+        .position(|e| matches!(e, ProviderEvent::UsageUpdate { .. }))
+        .expect("usage");
+    assert!(fin < usage);
+    let (_, _, cost) = usage_of(&events).expect("usage");
+    assert_eq!(
+        cost, None,
+        "the gateway prices from its own cards, never invents one"
+    );
+}
+
+/// The tool-call round trip: turn 1 returns a `function_call`, which comes out as
+/// an OpenAI `tool_calls` entry; turn 2 replays it with its result and the
+/// request reaches the wire as `function_call` + `function_call_output` items.
+#[tokio::test]
+async fn og05_bridge_tool_call_round_trip() {
+    let _bypass = LoopbackBypassGuard::new();
+    let server = MockServer::start().await;
+    mount_responses(&server, RESPONSES_TOOL_SSE).await;
+    let provider = OpenAiProvider::compatible(server.uri(), "openai").unwrap();
+
+    // Turn 1: tools present on gpt-6-astra => bridged.
+    let stream = provider
+        .chat(
+            bridge_request("gpt-6-astra", true),
+            "sk-test",
+            &test_tenant(),
+        )
+        .await
+        .expect("stream");
+    let events = collect(stream).await;
+    let body = fold_buffered(&events, "gpt-6-astra");
+    let calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_og05");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    let args: serde_json::Value =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, serde_json::json!({ "city": "Bangalore" }));
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+
+    // The tool went out FLAT (Responses shape), not nested (chat shape).
+    let reqs = server.received_requests().await.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["tools"][0]["name"], "get_weather");
+    assert!(sent["tools"][0].get("function").is_none());
+
+    // Turn 2 (a fresh mock server for a clean request log): replay + result.
+    let server2 = MockServer::start().await;
+    mount_responses(&server2, RESPONSES_TEXT_SSE).await;
+    let provider2 = OpenAiProvider::compatible(server2.uri(), "openai").unwrap();
+    let mut r2 = bridge_request("gpt-6-astra", true);
+    r2.messages.push(Message {
+        role: Role::Assistant,
+        content: MessageContent::Text(String::new()),
+        tool_call_id: None,
+        tool_calls: Some(vec![tracelane_shared::ToolCall {
+            id: "call_og05".into(),
+            name: "get_weather".into(),
+            input: serde_json::json!({ "city": "Bangalore" }),
+        }]),
+    });
+    r2.messages.push(Message {
+        role: Role::Tool,
+        content: MessageContent::Text("31C and clear".into()),
+        tool_call_id: Some("call_og05".into()),
+        tool_calls: None,
+    });
+    let events2 = collect(
+        provider2
+            .chat(r2, "sk-test", &test_tenant())
+            .await
+            .expect("stream"),
+    )
+    .await;
+    assert_eq!(assembled_text(&events2), "Hello there.");
+    let sent2: serde_json::Value =
+        serde_json::from_slice(&server2.received_requests().await.unwrap()[0].body).unwrap();
+    let items = sent2["input"].as_array().unwrap();
+    assert_eq!(items[1]["type"], "function_call");
+    assert_eq!(items[1]["call_id"], "call_og05");
+    assert_eq!(items[2]["type"], "function_call_output");
+    assert_eq!(items[2]["output"], "31C and clear");
+}
+
+/// The control: a model NOT on the list, and a "tools need Responses" model with
+/// NO tools, still use the chat route — nothing was rewritten for ordinary traffic.
+#[tokio::test]
+async fn og05_non_bridged_requests_still_use_chat_completions() {
+    let _bypass = LoopbackBypassGuard::new();
+    for (model, tools) in [("gpt-5.5", true), ("gpt-6-astra", false)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("data: [DONE]\n\n")
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let stream = OpenAiProvider::compatible(server.uri(), "openai")
+            .unwrap()
+            .chat(bridge_request(model, tools), "sk-test", &test_tenant())
+            .await
+            .expect("stream");
+        let _ = collect(stream).await;
+    }
+}
+
+/// Failure handling is the chat path's: a typed `ProviderHttpError` carrying the
+/// status — never the upstream body — and a truncated stream is an error.
+#[tokio::test]
+async fn og05_bridge_failures_are_typed_and_never_leak_the_upstream_body() {
+    let _bypass = LoopbackBypassGuard::new();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string("{\"error\":{\"message\":\"bad key sk-LEAK-ME-1234567890\"}}"),
+        )
+        .mount(&server)
+        .await;
+    let err = OpenAiProvider::compatible(server.uri(), "openai")
+        .unwrap()
+        .chat(
+            bridge_request("gpt-5.5-pro", false),
+            "sk-LEAK-ME-1234567890",
+            &test_tenant(),
+        )
+        .await
+        .err()
+        .expect("a 401 must be an error");
+    let http = err
+        .downcast_ref::<crate::providers::ProviderHttpError>()
+        .expect("typed ProviderHttpError");
+    assert_eq!(http.status, 401);
+    assert!(
+        !format!("{err:#}").contains("LEAK-ME"),
+        "the upstream body / key must never reach an error string"
+    );
+
+    // A stream that ends before `response.completed`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"par\"}\n\n",
+                )
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let mut s = OpenAiProvider::compatible(server.uri(), "openai")
+        .unwrap()
+        .chat(
+            bridge_request("gpt-5.5-pro", false),
+            "sk-test",
+            &test_tenant(),
+        )
+        .await
+        .expect("stream");
+    let mut saw_err = false;
+    while let Some(item) = s.next().await {
+        if item.is_err() {
+            saw_err = true;
+        }
+    }
+    assert!(
+        saw_err,
+        "a truncated Responses stream must surface as an error"
     );
 }

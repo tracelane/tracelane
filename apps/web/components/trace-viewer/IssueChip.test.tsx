@@ -47,7 +47,7 @@ it("adds/removes OR filters while retaining windows and resetting pagination", (
 });
 it("separates empty filtered evidence from denied and invalid reads", () => {
 	expect(noMatchCopy(undefined, "truncated").title).toBe(
-		"No traces in this window have Truncated.",
+		"No traces in this window have Hit token limit.",
 	);
 	expect(
 		classifyTraceFetchError({ status: 403, message: "denied", body: null })

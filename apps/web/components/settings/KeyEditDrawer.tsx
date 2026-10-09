@@ -253,7 +253,7 @@ export function KeyEditDrawer({
 								: ""}
 						</legend>
 						<div className="mt-2 flex flex-wrap gap-4">
-							{["chat", "read", "ingest", "admin"].map((s) => (
+							{["chat", "read", "ingest", "admin", "passthrough"].map((s) => (
 								<label key={s} className="flex gap-2">
 									<input
 										type="checkbox"

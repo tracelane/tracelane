@@ -255,20 +255,53 @@ pub fn freezes_for(candidates: Vec<Candidate>, enabled: &HashSet<Uuid>) -> HashM
 /// a 404: a human should never have to check state before fixing it.
 ///
 /// # Errors
-/// Propagates a pool/query failure; the route surfaces it as `503`.
-pub async fn clear_freeze(pg: &crate::db::DbPool, tenant_id: Uuid) -> anyhow::Result<()> {
-    let client = pg
+/// Fail-CLOSED (OG-35): a pool, query OR audit-insert failure rolls the clear back;
+/// the route surfaces it as `503`.
+pub async fn clear_freeze(
+    pg: &crate::db::DbPool,
+    actor: &crate::control_plane::ControlActor,
+) -> anyhow::Result<()> {
+    let mut client = pg
         .get()
         .await
         .map_err(|e| anyhow::anyhow!("promotion-freeze clear pool: {e}"))?;
-    client
-        .execute(
-            "UPDATE tenants SET promotion_frozen_at = NULL, promotion_frozen_reason = NULL \
-             WHERE id = $1",
-            &[&tenant_id],
+    // OG-35: the clear and its audit row commit together, or neither does.
+    let tx = client.transaction().await?;
+    let tenant = &actor.tenant_id;
+    let before = tx
+        .query_opt(
+            "SELECT promotion_frozen_at, promotion_frozen_reason FROM tenants WHERE id = $1 FOR UPDATE",
+            &[tenant.as_uuid()],
         )
         .await
-        .map_err(|e| anyhow::anyhow!("promotion-freeze clear: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("promotion-freeze read: {e}"))?
+        .map(|r| {
+            serde_json::json!({
+                "frozen_at": r.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0),
+                "reason": r.get::<_, Option<String>>(1),
+            })
+        });
+    tx.execute(
+        "UPDATE tenants SET promotion_frozen_at = NULL, promotion_frozen_reason = NULL \
+         WHERE id = $1",
+        &[tenant.as_uuid()],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("promotion-freeze clear: {e}"))?;
+    crate::db::control_audit::record(
+        &tx,
+        tenant,
+        &actor.audit,
+        crate::db::control_audit::Change {
+            action: "billing.promotion_freeze.clear",
+            target_type: "workspace",
+            target_id: tenant.to_string(),
+            before,
+            after: Some(serde_json::json!({"frozen_at": null, "reason": null})),
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -522,7 +555,10 @@ mod tests {
             .await
             .expect("insert frozen tenant");
 
-        clear_freeze(&pool, tenant_id).await.expect("first clear");
+        let actor = crate::control_plane::ControlActor::for_test(
+            tracelane_shared::TenantId::from_jwt_claim(tenant_id),
+        );
+        clear_freeze(&pool, &actor).await.expect("first clear");
         let row = client
             .query_one(
                 "SELECT promotion_frozen_at, promotion_frozen_reason FROM tenants WHERE id = $1",
@@ -534,7 +570,7 @@ mod tests {
         assert!(frozen_at.is_none(), "clear must NULL promotion_frozen_at");
 
         // Clearing an already-clear tenant must not error.
-        clear_freeze(&pool, tenant_id)
+        clear_freeze(&pool, &actor)
             .await
             .expect("second clear is idempotent");
     }

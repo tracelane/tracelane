@@ -144,6 +144,7 @@ describe("POST /api/webhooks/polar", () => {
 			[{ id: "ten_1", plan: "free", priceProtectedUntil: null }], // tenant select
 			[{ value: 12 }], // billing_policy.price_protection_months
 			[{ priceVersion: "v3" }], // pricing_rates WHERE is_current
+			[{ planVersion: "v3" }], // B-409: plan_allowances WHERE is_current
 			[], // update tenants
 			[], // upsert workspace_entitlements
 			[], // record webhook_events
@@ -153,11 +154,42 @@ describe("POST /api/webhooks/polar", () => {
 		const setArg = h.db?.setCalls[0]?.[0] as {
 			priceProtectedUntil?: Date;
 			priceVersion?: string;
+			planVersion?: string;
 			billingInterval?: string;
 		};
 		expect(setArg?.priceVersion).toBe("v3");
+		// B-409: the allowance version is pinned in the SAME update, at the SAME
+		// moment, read from the table — never a literal.
+		expect(setArg?.planVersion).toBe("v3");
 		expect(setArg?.billingInterval).toBe("month");
 		expect(setArg?.priceProtectedUntil).toBeInstanceOf(Date);
+	});
+
+	it("rev4 L8: no billing_policy.price_protection_months → the first paid activation pins NOTHING (a version with no expiry would pin forever and re-pin on every event)", async () => {
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		setDb([
+			[], // dedup select → not seen
+			[{ id: "ten_1", plan: "free", priceProtectedUntil: null }], // tenant select
+			[], // billing_policy.price_protection_months → NO ROW
+			// Readable version rows: a resolver that read them anyway would pin.
+			[{ priceVersion: "v3" }],
+			[{ planVersion: "v3" }],
+			[], // update tenants
+			[], // upsert workspace_entitlements
+			[], // record webhook_events
+		]);
+		const res = await POST(makeReq(subEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("team");
+		expect(setArg.priceProtectedUntil).toBeUndefined();
+		expect(setArg.priceVersion).toBeUndefined();
+		expect(setArg.planVersion).toBeUndefined();
+		// Logged once, with the refusal counted (no per-request noise beyond it).
+		expect(err).toHaveBeenCalledWith(
+			expect.stringContaining("price_protection_months"),
+		);
+		err.mockRestore();
 	});
 
 	it("ADR-076: subscription.past_due starts the dunning clock; plan is UNCHANGED", async () => {
@@ -509,6 +541,59 @@ describe("POST /api/webhooks/polar", () => {
 			"annual_pair_usage_missing",
 		);
 		expect(setArg.currentPeriodStart).toBeNull();
+	});
+
+	it("rev4 L8: an annual pair's first paid activation with NO price_protection_months refuses to pin (no NULL-expiry pin)", async () => {
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		const [row] = tenantRow({
+			base: {
+				id: "sub_base",
+				plan: "team",
+				status: "active",
+				period_end: "2027-09-14T00:00:00Z",
+			},
+			alert: "annual_pair_usage_missing",
+		});
+		// The policy row is missing; a version row WOULD be readable — the pin must
+		// still not happen, because a version without an expiry pins forever.
+		pairDb(
+			[{ ...row, priceProtectedUntil: null }],
+			[[], [{ priceVersion: "v3" }], [{ planVersion: "v3" }]],
+		);
+		const res = await POST(makeReq(usageEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("team");
+		expect(setArg.priceVersion).toBeUndefined();
+		expect(setArg.planVersion).toBeUndefined();
+		expect(setArg.priceProtectedUntil).toBeUndefined();
+		expect(err).toHaveBeenCalledWith(
+			expect.stringContaining("price_protection_months"),
+		);
+		err.mockRestore();
+	});
+
+	it("B-409: an annual pair's FIRST paid activation pins plan_version beside price_version, in the same update", async () => {
+		const [row] = tenantRow({
+			base: {
+				id: "sub_base",
+				plan: "team",
+				status: "active",
+				period_end: "2027-09-14T00:00:00Z",
+			},
+			alert: "annual_pair_usage_missing",
+		});
+		pairDb(
+			[{ ...row, priceProtectedUntil: null }],
+			[[{ value: 12 }], [{ priceVersion: "v3" }], [{ planVersion: "v3" }]],
+		);
+		const res = await POST(makeReq(usageEvent()));
+		expect(res.status).toBe(200);
+		const setArg = h.db?.setCalls[0]?.[0] as Record<string, unknown>;
+		expect(setArg.plan).toBe("team");
+		expect(setArg.priceVersion).toBe("v3");
+		expect(setArg.planVersion).toBe("v3");
+		expect(h.db?.setCalls.length).toBe(1);
 	});
 
 	it("BILL-02 P1: the USAGE half arrives for a tenant holding an active base → the tier, interval year, the USAGE cycle as the period, alert null", async () => {

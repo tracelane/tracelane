@@ -22,6 +22,7 @@ vi.mock("@/db", () => ({
 import { tenants } from "@/db/schema";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import {
+	ALLOWANCE_DENY_FLOOR,
 	PLANS_V3,
 	PLAN_ENTITLEMENTS,
 	type Plan,
@@ -136,10 +137,105 @@ describe("resolveEntitlements", () => {
 		setDb([
 			[{ unlimitedSeats: true, indexedWindowDays: 120 }], // plan row
 			[], // no workspace override (empty array → undefined first elem)
+			// B-409: allowances + windows come from the tenant's plan_allowances row
+			[{ found: true, planVersion: "v3", indexedWindowDays: 120 }],
 		]);
 		const ent = await resolveEntitlements("tenant-uuid", "team");
 		expect(ent.unlimited_seats).toBe(true);
 		expect(ent.indexed_window_days).toBe(120);
+	});
+});
+
+describe("B-409 — allowances resolve from the tenant's PINNED plan_allowances row", () => {
+	beforeEach(() => {
+		h.current = null;
+	});
+
+	// A later ruling (v4) in the catalog row, the tenant pinned to v3. The v3 numbers
+	// are the JSON's own team row; v4 doubles every one, so a wrong read cannot match.
+	const v3 = PLANS_V3.plans.team_v1;
+	if (!v3) throw new Error("plans.v3.json has no team_v1");
+	const v4CatalogRow = {
+		hotGbIncluded: String((v3.hot_gb_included ?? 0) * 2),
+		ingestGbIncluded: String((v3.ingest_gb_included ?? 0) * 2),
+		seriesIncluded: (v3.series_included ?? 0) * 2,
+		scanUnitsIncluded: (v3.scan_units_included ?? 0) * 2,
+		evalRunsIncluded: (v3.eval_runs_included ?? 0) * 2,
+		indexedWindowDays: v3.indexed_window_days * 2,
+		queryableDays: v3.queryable_days / 2,
+		ledgerDays: v3.ledger_days / 2,
+		fPromptPromotionWrite: true,
+	};
+	const v3PinnedRow = {
+		found: true,
+		planVersion: "v3",
+		hotGbIncluded: String(v3.hot_gb_included),
+		ingestGbIncluded: String(v3.ingest_gb_included),
+		seriesIncluded: v3.series_included,
+		scanUnitsIncluded: v3.scan_units_included,
+		evalRunsIncluded: v3.eval_runs_included,
+		indexedWindowDays: v3.indexed_window_days,
+		queryableDays: v3.queryable_days,
+		ledgerDays: v3.ledger_days,
+	};
+
+	it("a tenant pinned to v3 reads v3's allowances after v4 reached the catalog row", async () => {
+		setDb([[v4CatalogRow], [], [v3PinnedRow]]);
+		const ent = await resolveEntitlements("tenant-uuid", "team");
+		expect(ent.hot_gb_included).toBe(v3.hot_gb_included);
+		expect(ent.ingest_gb_included).toBe(v3.ingest_gb_included);
+		expect(ent.series_included).toBe(v3.series_included);
+		expect(ent.scan_units_included).toBe(v3.scan_units_included);
+		expect(ent.eval_runs_included).toBe(v3.eval_runs_included);
+		expect(ent.indexed_window_days).toBe(v3.indexed_window_days);
+		expect(ent.queryable_days).toBe(v3.queryable_days);
+		expect(ent.ledger_days).toBe(v3.ledger_days);
+	});
+
+	/** rev4 L7: what the GATEWAY serves when no row resolves (`ResolvedEntitlements::
+	 * deny_all()` — zero on every meter, 30-day windows). The web must show the same
+	 * numbers the gateway enforces, not the free tier's. */
+	function expectDenyFloor(
+		ent: Awaited<ReturnType<typeof resolveEntitlements>>,
+	) {
+		expect(ent.hot_gb_included).toBe(ALLOWANCE_DENY_FLOOR.hot_gb_included);
+		expect(ent.ingest_gb_included).toBe(0);
+		expect(ent.series_included).toBe(0);
+		expect(ent.scan_units_included).toBe(0);
+		expect(ent.eval_runs_included).toBe(0);
+		expect(ent.indexed_window_days).toBe(30);
+		expect(ent.queryable_days).toBe(30);
+		expect(ent.ledger_days).toBe(30);
+	}
+
+	it("rev4 L7 FAIL-CLOSED: neither a pinned nor a current row → the gateway's deny floor, never the catalog's paid numbers", async () => {
+		setDb([[v4CatalogRow], [], [{ found: false, planVersion: null }]]);
+		const ent = await resolveEntitlements("tenant-uuid", "team");
+		expectDenyFloor(ent);
+		// Feature flags are not versioned — the plan's own flags still apply.
+		expect(ent.prompt_promotion_write).toBe(true);
+	});
+
+	it("rev4 L7: a READ ERROR on the allowance row → the deny floor too (the catalog's paid numbers are not this tenant's)", async () => {
+		setDb([[v4CatalogRow], [], new Error("connection reset")]);
+		const ent = await resolveEntitlements("tenant-uuid", "team");
+		expectDenyFloor(ent);
+		expect(ent.prompt_promotion_write).toBe(true);
+	});
+
+	it("rev4 L7: Postgres down before any row is read → the allowances are the deny floor; plan flags keep the map default", async () => {
+		setDb([new Error("connection refused")]);
+		const ent = await resolveEntitlements("tenant-uuid", "team");
+		expectDenyFloor(ent);
+		expect(ent.plan).toBe("team");
+		expect(ent.unlimited_seats).toBe(true);
+	});
+
+	it("a workspace override still beats the pinned row (deny-overrides-grant unchanged)", async () => {
+		setDb([[v4CatalogRow], [{ indexedWindowDays: 7 }], [v3PinnedRow]]);
+		const ent = await resolveEntitlements("tenant-uuid", "team");
+		expect(ent.indexed_window_days).toBe(7);
+		expect(ent.queryable_days).toBe(v3.queryable_days);
 	});
 });
 

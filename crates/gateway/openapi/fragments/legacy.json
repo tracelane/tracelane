@@ -1,0 +1,584 @@
+{
+  "operations": {
+    "POST /v1/alerts/rules": {
+      "module": "crates/gateway/src/alerts/routes.rs",
+      "summary": "Create an alert rule.",
+      "tags": [
+        "alerts"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "comparator": {
+            "type": "string"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "window_minutes": {
+            "type": "integer"
+          },
+          "destination_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "threshold",
+          "destination_id"
+        ]
+      }
+    },
+    "DELETE /v1/alerts/rules/{id}": {
+      "module": "crates/gateway/src/alerts/routes.rs",
+      "summary": "Delete an alert rule.",
+      "tags": [
+        "alerts"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "POST /v1/alerts/destinations": {
+      "module": "crates/gateway/src/alerts/routes.rs",
+      "summary": "Create an alert destination (slack, discord, webhook).",
+      "tags": [
+        "alerts"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ]
+      }
+    },
+    "DELETE /v1/alerts/destinations/{id}": {
+      "module": "crates/gateway/src/alerts/routes.rs",
+      "summary": "Delete an alert destination.",
+      "tags": [
+        "alerts"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "POST /v1/alerts/test": {
+      "module": "crates/gateway/src/alerts/routes.rs",
+      "summary": "Send a test alert to a destination.",
+      "tags": [
+        "alerts"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "destination_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "destination_id"
+        ]
+      }
+    },
+    "POST /v1/online-evals/policy": {
+      "module": "crates/gateway/src/online_eval_routes.rs",
+      "summary": "Create or update the online-eval policy (judge budget required; no default).",
+      "tags": [
+        "online-evals"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "budget_required",
+        "invalid_budget",
+        "invalid_sample_rate",
+        "entitlement_required",
+        "role_forbidden",
+        "policy_write_failed"
+      ],
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "judge_budget_usd_monthly": {
+            "type": "number"
+          },
+          "sample_rate": {
+            "type": "number"
+          },
+          "rubric_kind": {
+            "type": "string"
+          },
+          "rubric": {
+            "type": "string"
+          },
+          "judge_model": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "DELETE /v1/online-evals/policy": {
+      "module": "crates/gateway/src/online_eval_routes.rs",
+      "summary": "Disable the online-eval policy.",
+      "tags": [
+        "online-evals"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "role_forbidden",
+        "policy_write_failed"
+      ],
+      "x-error-envelope": "control"
+    },
+    "POST /v1/billing/checkout": {
+      "module": "crates/gateway/src/billing/checkout.rs",
+      "summary": "Start a checkout (billing changes only through the Polar webhook).",
+      "tags": [
+        "billing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "product_id": {
+            "type": "string"
+          },
+          "customer_email": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "POST /v1/billing/portal": {
+      "module": "crates/gateway/src/billing/portal.rs",
+      "summary": "Open the billing portal.",
+      "tags": [
+        "billing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "PUT /v1/billing/ceiling": {
+      "module": "crates/gateway/src/billing/usage.rs",
+      "summary": "Set the spend ceiling and overflow mode.",
+      "tags": [
+        "billing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "usd": {
+            "type": "number"
+          },
+          "overflow_mode": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "DELETE /v1/billing/promotion-freeze": {
+      "module": "crates/gateway/src/billing/usage.rs",
+      "summary": "Clear a promotion freeze.",
+      "tags": [
+        "billing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "POST /v1/guardrails/tool-pins": {
+      "module": "crates/gateway/src/guardrail/tool_pins_api.rs",
+      "summary": "Pin a tool definition (envelope: {error: <message>}).",
+      "tags": [
+        "guardrails"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string"
+          },
+          "schema": {},
+          "description": {
+            "type": "string"
+          },
+          "caps": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tool_name",
+          "schema"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "POST /v1/guardrails/tool-pins/approve": {
+      "module": "crates/gateway/src/guardrail/tool_pins_api.rs",
+      "summary": "Approve a changed tool definition by hash.",
+      "tags": [
+        "guardrails"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string"
+          },
+          "def_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_name",
+          "def_hash"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "DELETE /v1/guardrails/tool-pins/{tool_name}": {
+      "module": "crates/gateway/src/guardrail/tool_pins_api.rs",
+      "summary": "Remove a tool pin.",
+      "tags": [
+        "guardrails"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "PUT /v1/model-aliases": {
+      "module": "crates/gateway/src/model_alias_routes.rs",
+      "summary": "Create or replace a workspace model alias.",
+      "tags": [
+        "routing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "invalid_alias",
+        "invalid_target",
+        "alias_exists",
+        "alias_cap_reached",
+        "self_alias",
+        "target_is_alias",
+        "unroutable_target",
+        "write_failed"
+      ],
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "target_model": {
+            "type": "string"
+          },
+          "create": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "alias",
+          "target_model"
+        ]
+      }
+    },
+    "DELETE /v1/model-aliases": {
+      "module": "crates/gateway/src/model_alias_routes.rs",
+      "summary": "Delete a workspace model alias (query: alias).",
+      "tags": [
+        "routing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "invalid_query",
+        "not_found",
+        "delete_failed"
+      ],
+      "x-error-envelope": "control"
+    },
+    "PUT /v1/gateway/failover": {
+      "module": "crates/gateway/src/model_alias_routes.rs",
+      "summary": "Set the workspace's cross-provider failover chain.",
+      "tags": [
+        "routing"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "failover_limit_unavailable",
+        "invalid_body",
+        "write_failed"
+      ],
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      }
+    },
+    "PUT /v1/workspace/capture": {
+      "module": "crates/gateway/src/workspace_capture_routes.rs",
+      "summary": "Choose whether prompt (input) and response (output) text is recorded (owner only; ledger-recorded).",
+      "tags": [
+        "settings"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "invalid_body",
+        "audit_unavailable",
+        "no_control_plane",
+        "write_failed"
+      ],
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "boolean"
+          },
+          "output": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "input",
+          "output"
+        ]
+      }
+    },
+    "POST /v1/byok/provider-keys": {
+      "module": "crates/gateway/src/byok_api/provider_keys_api.rs",
+      "summary": "Store a provider API key (encrypted; AAD-bound to tenant + provider).",
+      "tags": [
+        "byok"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "provider_id": {
+            "type": "string"
+          },
+          "plaintext": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_id",
+          "plaintext"
+        ]
+      }
+    },
+    "DELETE /v1/byok/provider-keys/{provider_id}": {
+      "module": "crates/gateway/src/byok_api/provider_keys_api.rs",
+      "summary": "Delete a stored provider key.",
+      "tags": [
+        "byok"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "error"
+      ],
+      "x-error-envelope": "legacy"
+    },
+    "POST /v1/provider-keys/{id}/validate": {
+      "module": "crates/gateway/src/provider_key_validate.rs",
+      "summary": "Probe a stored provider key against its provider.",
+      "tags": [
+        "byok"
+      ],
+      "responses": {
+        "default": {
+          "description": "Response shape not yet described (x-response-schema-incomplete)."
+        }
+      },
+      "x-response-schema-incomplete": true,
+      "x-error-codes": [
+        "unknown_provider",
+        "no_tenant_credential",
+        "cannot_validate",
+        "unavailable"
+      ],
+      "x-error-envelope": "control"
+    }
+  }
+}

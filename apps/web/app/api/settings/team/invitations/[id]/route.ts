@@ -8,6 +8,10 @@
  */
 
 import { requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { callerIsOrgAdmin, getInvitationInOrg } from "@/lib/workos-org";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -50,11 +54,19 @@ export async function DELETE(
 		);
 	}
 
+	const rec = await recordControlChange("member.invite_revoke", id, {
+		state: inv.state,
+	});
+	if (!rec.ok) return rec.response;
+
 	const res = await fetch(
 		`${WORKOS}/user_management/invitations/${encodeURIComponent(id)}/revoke`,
 		{ method: "POST", headers: { Authorization: `Bearer ${key}` } },
 	);
 	if (!res.ok) {
+		await recordControlChangeFailed("member.invite_revoke", id, {
+			state: inv.state,
+		});
 		return NextResponse.json(
 			{ error: "workos_revoke_failed" },
 			{ status: 502 },

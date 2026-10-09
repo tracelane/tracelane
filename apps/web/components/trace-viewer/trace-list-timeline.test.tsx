@@ -168,3 +168,18 @@ describe("TraceList — the column is omitted rather than drawn flat", () => {
 		expect(html).toContain("Started (UTC)");
 	});
 });
+
+describe("TraceList — cost and error sorting", () => {
+	it("links both sort columns and labels absent prices as unknown", () => {
+		const html = renderToStaticMarkup(
+			h(TraceList, {
+				traces: [trace({ trace_id: "unpriced", cost_usd: 0 })],
+				costHref: "/traces?sort=cost&order=desc",
+				errorsHref: "/traces?sort=errors&order=desc",
+			}),
+		);
+		expect(html).toContain("sort=cost");
+		expect(html).toContain("sort=errors");
+		expect(html).toContain("Unknown cost");
+	});
+});

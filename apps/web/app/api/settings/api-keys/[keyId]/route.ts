@@ -48,6 +48,11 @@ const PATCH_FIELDS = {
 	rateLimitRpm: "rate_limit_rpm",
 	budgetReset: "budget_reset",
 	velocityBreaker: "velocity_breaker",
+	// OG-60: the OG-20 policy document and the OG-23 project / environment. The gateway
+	// validates all three (`PatchKeyBody`); this proxy forwards them untouched.
+	projectId: "project_id",
+	environment: "environment",
+	policy: "policy",
 } as const;
 
 type PatchField = keyof typeof PATCH_FIELDS;

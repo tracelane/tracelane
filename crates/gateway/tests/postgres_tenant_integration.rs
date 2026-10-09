@@ -127,18 +127,45 @@ async fn provider_validation_records_only_current_tenant_key_version() -> Result
     db::tenants::create(&pool, b, "provider-validation-b", "free").await?;
     let a = tracelane_shared::TenantId::from_jwt_claim(a);
     let b = tracelane_shared::TenantId::from_jwt_claim(b);
-    upsert(&pool, &a, "anthropic", "unit-test-ciphertext-only", "test").await?;
-    let source = get(&pool, &a, "anthropic").await?.unwrap();
+    upsert(
+        &pool,
+        &a,
+        "anthropic",
+        "default",
+        "unit-test-ciphertext-only",
+        "test",
+        &db::control_audit::Actor::system("owner-a"),
+    )
+    .await?;
+    let source = get(&pool, &a, "anthropic", "default").await?.unwrap();
     assert!(source.saved_at <= chrono::Utc::now());
     assert!(source.last_validation.is_none());
-    assert!(get(&pool, &b, "anthropic").await?.is_none());
+    assert!(get(&pool, &b, "anthropic", "default").await?.is_none());
     let result = KeyValidation {
         status: "valid".into(),
         reason: "authenticated".into(),
         checked_at: chrono::Utc::now(),
     };
-    assert!(!record_validation(&pool, &b, &source, "other-owner", &result).await?);
-    assert!(record_validation(&pool, &a, &source, "owner-a", &result).await?);
+    assert!(
+        !record_validation(
+            &pool,
+            &b,
+            &source,
+            &db::control_audit::Actor::system("other-owner"),
+            &result
+        )
+        .await?
+    );
+    assert!(
+        record_validation(
+            &pool,
+            &a,
+            &source,
+            &db::control_audit::Actor::system("owner-a"),
+            &result
+        )
+        .await?
+    );
     let rows = list(&pool, &a).await?;
     assert_eq!(rows[0].last_validation.as_ref().unwrap().status, "valid");
     assert_eq!(
@@ -151,18 +178,45 @@ async fn provider_validation_records_only_current_tenant_key_version() -> Result
         &pool,
         &a,
         "anthropic",
+        "default",
         "unit-test-replacement-ciphertext",
         "next",
+        &db::control_audit::Actor::system("owner-a"),
     )
     .await?;
     assert!(list(&pool, &a).await?[0].last_validation.is_none());
-    assert!(!record_validation(&pool, &a, &source, "owner-a", &result).await?);
+    assert!(
+        !record_validation(
+            &pool,
+            &a,
+            &source,
+            &db::control_audit::Actor::system("owner-a"),
+            &result
+        )
+        .await?
+    );
     let client = pool.get().await?;
     let audit = client.query_one("SELECT actor_user_id, after_json::text FROM admin_audit_log WHERE actor_workspace_id = $1 AND action = 'provider_key.validate'", &[a.as_uuid()]).await?;
     assert_eq!(audit.get::<_, &str>(0), "owner-a");
     assert!(!audit.get::<_, &str>(1).contains("ciphertext"));
-    delete(&pool, &a, "anthropic").await?;
-    assert!(!record_validation(&pool, &a, &source, "owner-a", &result).await?);
+    delete(
+        &pool,
+        &a,
+        "anthropic",
+        "default",
+        &db::control_audit::Actor::system("owner-a"),
+    )
+    .await?;
+    assert!(
+        !record_validation(
+            &pool,
+            &a,
+            &source,
+            &db::control_audit::Actor::system("owner-a"),
+            &result
+        )
+        .await?
+    );
     Ok(())
 }
 
@@ -182,6 +236,7 @@ async fn rotation_preserves_settings_authenticates_grace_and_audits() -> Result<
         rate_limit_rpm: Some(17),
         budget_reset: Some(tracelane_shared::spend::BudgetReset::Weekly),
         velocity_breaker: true,
+        ..Default::default()
     };
     let old = mint(
         &pool,
@@ -293,9 +348,11 @@ async fn rotation_has_one_winner_and_zero_grace_revokes_immediately() -> Result<
         .query_one("SELECT count(*) FROM api_keys WHERE tenant_id = $1", &[&id])
         .await?
         .get(0);
+    // OG-35: `mint` now records `api_key.create` too, so count the ROTATIONS.
     let audits: i64 = client
         .query_one(
-            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1",
+            "SELECT count(*) FROM admin_audit_log
+             WHERE actor_workspace_id = $1 AND action = 'api_key.rotate'",
             &[&id],
         )
         .await?
@@ -567,10 +624,12 @@ async fn set38_update_refusals_write_nothing() -> Result<()> {
     };
     let c = &client;
     let t = &tenant;
+    // OG-35: `mint` records `api_key.create` too — count the EDITS this test makes.
     let audits = || async move {
         let n: i64 = c
             .query_one(
-                "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1",
+                "SELECT count(*) FROM admin_audit_log
+                  WHERE actor_workspace_id = $1 AND action = 'api_key.update'",
                 &[t.as_uuid()],
             )
             .await
@@ -1659,7 +1718,16 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
     let legacy = byok::ByokMasterKey::from_values(Some(&k0), None, None)?.expect("ring");
     let secret = SecretString::from("sk-live-provider-key-do-not-use".to_string());
     let v2 = legacy.encrypt_with_context(&secret, &byok::provider_key_aad(&tenant, "openai"))?;
-    db::provider_keys::upsert(&pool, &tenant, "openai", &v2, "tuse").await?;
+    db::provider_keys::upsert(
+        &pool,
+        &tenant,
+        "openai",
+        "default",
+        &v2,
+        "tuse",
+        &db::control_audit::Actor::system("test"),
+    )
+    .await?;
     let audit_secret = SecretString::from("pkcs8-der-b64-do-not-use".to_string());
     let audit_v2 = legacy.encrypt_with_context(&audit_secret, &byok::audit_key_aad(&tenant))?;
     let anchor_v2 = legacy.encrypt_with_context(&audit_secret, &byok::anchor_key_aad(&tenant))?;
@@ -1673,6 +1741,16 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
         .await?;
     }
 
+    // The custom-hook credential participates in the same re-wrap operation.
+    let hook_id = Uuid::new_v4();
+    let endpoint = "https://hooks.example.com/check";
+    let hook_aad = byok::guardrail_hook_aad(&tenant_id, &format!("{hook_id}:{endpoint}"));
+    let hook_v2 = legacy.encrypt_with_context(&secret, &hook_aad)?;
+    pool.get().await?.execute(
+        "INSERT INTO guardrail_hooks (tenant_id,id,config,ciphertext_b64,updated_by) VALUES ($1,$2,$3,$4,'test')",
+        &[&tenant_id,&hook_id,&serde_json::json!({"endpoint":endpoint,"pre":true,"post":false,"timeout_ms":1000}),&hook_v2],
+    ).await?;
+
     // The rotated process: both keys, KEK 1 active.
     let ring = byok::ByokMasterKey::from_values(Some(&k0), Some(&format!("1:{k1}")), Some(1))?
         .expect("ring");
@@ -1682,12 +1760,12 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
     let dry = byok_rotate::rotate(&pool, &ring, true).await?;
     assert_eq!(
         dry.tables.iter().map(|t| t.rewrapped).sum::<u64>(),
-        3,
+        4,
         "{}",
         dry.render()
     );
-    assert_eq!(dry.remaining(), 3);
-    let still_v2 = db::provider_keys::get(&pool, &tenant, "openai")
+    assert_eq!(dry.remaining(), 4);
+    let still_v2 = db::provider_keys::get(&pool, &tenant, "openai", "default")
         .await?
         .expect("row");
     assert_eq!(still_v2.ciphertext_b64, v2, "dry-run must not write");
@@ -1698,13 +1776,13 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
     assert_eq!(run.remaining(), 0, "{}", run.render());
     assert_eq!(
         run.tables.iter().map(|t| t.rewrapped).sum::<u64>(),
-        3,
+        4,
         "{}",
         run.render()
     );
 
     // The row is now v3 under KEK 1, decrypts under the ring, and NOT under KEK 0 alone.
-    let moved = db::provider_keys::get(&pool, &tenant, "openai")
+    let moved = db::provider_keys::get(&pool, &tenant, "openai", "default")
         .await?
         .expect("row");
     assert_ne!(moved.ciphertext_b64, v2);
@@ -1747,6 +1825,22 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
             audit_secret.expose_secret()
         );
     }
+    let hook_moved: String = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT ciphertext_b64 FROM guardrail_hooks WHERE tenant_id = $1 AND id = $2",
+            &[&tenant_id, &hook_id],
+        )
+        .await?
+        .get(0);
+    assert_ne!(hook_moved, hook_v2);
+    assert_eq!(byok::ByokMasterKey::kek_id_of(&hook_moved), Some(1));
+    assert_eq!(
+        ring.decrypt_with_context(&hook_moved, &hook_aad)?
+            .expose_secret(),
+        secret.expose_secret()
+    );
     // Idempotent: a second run has nothing to do.
     let again = byok_rotate::rotate(&pool, &ring, false).await?;
     assert_eq!(
@@ -1755,7 +1849,7 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
         "{}",
         again.render()
     );
-    assert_eq!(again.tables.iter().map(|t| t.current).sum::<u64>(), 3);
+    assert_eq!(again.tables.iter().map(|t| t.current).sum::<u64>(), 4);
 
     // A blob the ring cannot open is reported, not skipped silently, and does
     // not stop the other rows.
@@ -1767,10 +1861,27 @@ async fn b383_byok_rotate_rewraps_every_blob_under_the_active_kek() -> Result<()
     .expect("ring");
     let foreign =
         stranger.encrypt_with_context(&secret, &byok::provider_key_aad(&tenant, "cohere"))?;
-    db::provider_keys::upsert(&pool, &tenant, "cohere", &foreign, "tuse").await?;
+    db::provider_keys::upsert(
+        &pool,
+        &tenant,
+        "cohere",
+        "default",
+        &foreign,
+        "tuse",
+        &db::control_audit::Actor::system("test"),
+    )
+    .await?;
     let with_foreign = byok_rotate::rotate(&pool, &ring, false).await?;
     assert_eq!(with_foreign.failed(), 1, "{}", with_foreign.render());
-    assert_eq!(with_foreign.tables[0].unreadable, 1);
+    assert_eq!(
+        with_foreign
+            .tables
+            .iter()
+            .find(|t| t.table == "provider_keys")
+            .unwrap()
+            .unreadable,
+        1
+    );
     Ok(())
 }
 
@@ -1893,5 +2004,1212 @@ async fn ri04_run_claimed_runs_a_job_once_across_two_concurrent_runners() -> Res
         "a fresh claim after both runners finished must win"
     );
     assert_eq!(ran.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+// ── B-594 (2026-10-03): a flood of NEVER-SEEN keys is bounded at Postgres ──
+//
+// The negative cache above absorbs REPEATS; a new random key per request
+// defeats it by construction. The cold-lookup gate (`db::api_keys::
+// gated_cold_lookup`, scoped per request by `preauth_limiter::layer`) reserves
+// a token per source before `pool.get()`. Measured here at the DATABASE, not at
+// a fake: the scans Postgres itself counted on `api_keys` (index + sequential,
+// read from `pg_stat_user_tables` after the flooding connections closed, which
+// flushes their statistics) stay within the bucket, while a warm valid key from
+// the same source and a junk key from another source behave normally.
+
+/// A fixed-size, non-refilling bucket per source, enough to prove placement:
+/// the production limiter (token bucket, IPv6 /64, overflow) is unit-tested in
+/// `preauth_limiter.rs`, which this crate cannot mount.
+struct FixedGate {
+    burst: u32,
+    taken: std::sync::Mutex<std::collections::HashMap<u128, u32>>,
+}
+
+impl db::api_keys::ColdLookupGate for FixedGate {
+    fn try_acquire(&self, source: u128) -> std::result::Result<db::api_keys::Reservation, u64> {
+        let mut m = self.taken.lock().unwrap();
+        let n = m.entry(source).or_insert(0);
+        if *n >= self.burst {
+            return Err(1);
+        }
+        *n += 1;
+        Ok(db::api_keys::Reservation::default())
+    }
+    fn refund(&self, source: u128, _reservation: db::api_keys::Reservation) {
+        let mut m = self.taken.lock().unwrap();
+        if let Some(n) = m.get_mut(&source) {
+            *n = n.saturating_sub(1);
+        }
+    }
+    fn charge(&self, _source: u128) {}
+}
+
+async fn api_keys_scans(db_name: &str) -> Result<i64> {
+    let mut cfg: tokio_postgres::Config = require_url().parse()?;
+    cfg.dbname(db_name);
+    let (client, conn) = cfg.connect(tokio_postgres::NoTls).await?;
+    let handle = tokio::spawn(conn);
+    // A closing backend flushes its counters as it exits; poll until two reads
+    // a beat apart agree, so the figure is settled rather than mid-flush.
+    let read = || async {
+        client
+            .batch_execute("SELECT pg_stat_clear_snapshot()")
+            .await?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(idx_scan, 0) + COALESCE(seq_scan, 0) \
+                 FROM pg_stat_user_tables WHERE relname = 'api_keys'",
+                &[],
+            )
+            .await?;
+        anyhow::Ok(row.get::<_, i64>(0))
+    };
+    let mut last = read().await?;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let now = read().await?;
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    drop(client);
+    handle.abort();
+    Ok(last)
+}
+
+#[tokio::test]
+#[ignore]
+async fn b594_a_flood_of_never_seen_keys_is_bounded_at_postgres() -> Result<()> {
+    use std::sync::Arc;
+    let template = template_database().await?;
+    let db_name = create_fresh_database(Some(template)).await?;
+    let _ = db::api_keys::init_pepper(&"11".repeat(32));
+
+    // A real key, minted and warmed on its own pool (not counted below).
+    let warm_body = format!("b594_warm_{}", Uuid::new_v4().simple());
+    {
+        let pool = pool_for(&db_name)?;
+        let tenant_id = Uuid::new_v4();
+        db::tenants::create(&pool, tenant_id, "b594-tenant", "free").await?;
+        let material = db::api_keys::KeyMaterial::from_body(&warm_body)?;
+        db::api_keys::create(
+            &pool,
+            &tracelane_shared::TenantId::from_jwt_claim(tenant_id),
+            &material,
+            "ci-b594",
+            &warm_body[..6],
+            None,
+            &db::api_keys::MintOptions::default(),
+        )
+        .await?;
+        assert!(
+            db::api_keys::lookup_tenant_by_key_body(&pool, &warm_body)
+                .await?
+                .is_some()
+        );
+        pool.close();
+    }
+    let before = api_keys_scans(&db_name).await?;
+
+    const BURST: u32 = 10;
+    const FLOOD: usize = 300;
+    let gate: Arc<dyn db::api_keys::ColdLookupGate> = Arc::new(FixedGate {
+        burst: BURST,
+        taken: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    let scope = |source: u128| db::api_keys::ColdGateScope::new(Arc::clone(&gate), source, None);
+    let pool = pool_for(&db_name)?;
+    let (mut refused, mut not_found) = (0usize, 0usize);
+    for i in 0..FLOOD {
+        let body = format!("b594_junk_{i}_{}", Uuid::new_v4().simple());
+        match db::api_keys::with_cold_gate(
+            scope(1),
+            db::api_keys::lookup_tenant_by_key_body(&pool, &body),
+        )
+        .await
+        {
+            Ok(None) => not_found += 1,
+            Ok(Some(_)) => panic!("a random key authenticated"),
+            Err(e) if e.is::<db::api_keys::AuthThrottled>() => refused += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    assert_eq!(
+        not_found, BURST as usize,
+        "exactly the burst reached the store"
+    );
+    assert_eq!(refused, FLOOD - BURST as usize);
+
+    // The warm valid key, same source, after the flood: served.
+    let warm = db::api_keys::with_cold_gate(
+        scope(1),
+        db::api_keys::lookup_tenant_by_key_body(&pool, &warm_body),
+    )
+    .await?;
+    assert!(
+        warm.is_some(),
+        "a warm valid key must not pay for the flood"
+    );
+    // Another source still reaches the store.
+    let other = db::api_keys::with_cold_gate(
+        scope(2),
+        db::api_keys::lookup_tenant_by_key_body(&pool, "b594_other_source_junk_key"),
+    )
+    .await?;
+    assert!(other.is_none());
+    pool.close();
+
+    let delta = api_keys_scans(&db_name).await? - before;
+    eprintln!(
+        "B-594 real-Postgres: {FLOOD} junk keys + 1 other-source key -> {delta} api_keys scans"
+    );
+    // Exactly the admitted lookups: fewer would mean the measurement sees nothing,
+    // more would mean a refused key still reached Postgres.
+    assert_eq!(
+        delta,
+        i64::from(BURST) + 1,
+        "{FLOOD} never-seen keys + 1 other-source key cost {delta} api_keys scans; the gate admits {}",
+        BURST + 1
+    );
+    Ok(())
+}
+
+// ── rev4 H1 d / M1 (2026-10-03): the VALID-KEY SET, against a real Postgres ──
+//
+// A flood of never-seen keys does ZERO per-key lookups once the set is loaded —
+// the only `api_keys` scans it causes are the set's own reads (one for everyone,
+// at most once per refresh); a key minted elsewhere (here: by `create`, which does
+// not touch THIS set) is accepted on its first request within one refresh; a key
+// revoked after the set loaded is refused by the ordinary lookup it is admitted to.
+// The set is this test's OWN instance over its own database (the process set would
+// answer for another database).
+
+#[tokio::test]
+#[ignore]
+async fn b594_rev4_the_valid_key_set_refuses_junk_without_a_lookup_and_tracks_mints_and_revokes()
+-> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let template = template_database().await?;
+    let db_name = create_fresh_database(Some(template)).await?;
+    let _ = db::api_keys::init_pepper(&"11".repeat(32));
+    let tenant_id = Uuid::new_v4();
+    let tenant = tracelane_shared::TenantId::from_jwt_claim(tenant_id);
+    {
+        let pool = pool_for(&db_name)?;
+        db::tenants::create(&pool, tenant_id, "rev4-known-keys", "free").await?;
+        pool.close();
+    }
+    let mint = |body: String| {
+        let tenant = tenant.clone();
+        let db_name = db_name.clone();
+        async move {
+            let pool = pool_for(&db_name)?;
+            let material = db::api_keys::KeyMaterial::from_body(&body)?;
+            let k = db::api_keys::create(
+                &pool,
+                &tenant,
+                &material,
+                "ci-rev4",
+                &body[..6],
+                None,
+                &db::api_keys::MintOptions::default(),
+            )
+            .await?;
+            pool.close();
+            anyhow::Ok(k.id)
+        }
+    };
+    // Key A exists before the set loads; it is revoked AFTER (never looked up
+    // before that, so no positive-cache entry can answer for it).
+    let body_a = format!("rev4_a_{}", Uuid::new_v4().simple());
+    let id_a = mint(body_a.clone()).await?;
+
+    const REFRESH: Duration = Duration::from_millis(300);
+    let known = db::api_keys::KnownKeys::new(db::api_keys::KnownKeysConfig {
+        refresh: REFRESH,
+        wait: Duration::from_secs(5),
+        full_reload: Duration::from_secs(3600),
+        overlap: Duration::from_secs(300),
+        max: 10_000,
+    });
+
+    // 1. The flood: 300 never-seen keys at once.
+    let before = api_keys_scans(&db_name).await?;
+    let reads_before = db::api_keys::KNOWN_KEYS_READS_TOTAL.load(Ordering::SeqCst);
+    {
+        let pool = pool_for(&db_name)?;
+        let flood =
+            (0..300).map(|i| {
+                let body = format!("rev4_junk_{i}_{}", Uuid::new_v4().simple());
+                let (pool, known) = (&pool, &known);
+                async move {
+                    db::api_keys::lookup_tenant_by_key_body_with(pool, &body, Some(known)).await
+                }
+            });
+        for r in futures::future::join_all(flood).await {
+            assert!(r?.is_none(), "a random key authenticated");
+        }
+        pool.close();
+    }
+    assert!(known.is_loaded(), "the first miss loaded the set");
+    let reads = db::api_keys::KNOWN_KEYS_READS_TOTAL.load(Ordering::SeqCst) - reads_before;
+    let scans = api_keys_scans(&db_name).await? - before;
+    eprintln!("rev4 real-Postgres: 300 junk keys -> {reads} set reads, {scans} api_keys scans");
+    assert!(
+        (1..=3).contains(&reads),
+        "one load plus at most a refresh or two for everyone, got {reads}"
+    );
+    assert_eq!(
+        scans,
+        i64::try_from(reads)?,
+        "every api_keys scan is a set read — zero per-key lookups for 300 junk keys"
+    );
+
+    // 2. A key minted elsewhere after the set loaded: accepted on its first request,
+    //    within one refresh.
+    let body_b = format!("rev4_b_{}", Uuid::new_v4().simple());
+    mint(body_b.clone()).await?;
+    let pool = pool_for(&db_name)?;
+    let t0 = Instant::now();
+    let b = db::api_keys::lookup_tenant_by_key_body_with(&pool, &body_b, Some(&known)).await?;
+    let waited = t0.elapsed();
+    assert!(
+        b.is_some(),
+        "a freshly minted key must authenticate on its first request"
+    );
+    assert!(
+        waited < REFRESH + Duration::from_secs(2),
+        "accepted after {waited:?}; the bound is one refresh plus one query"
+    );
+
+    // 3. Key A, revoked after the set loaded: still in the set, refused by the
+    //    lookup the set admits it to.
+    db::api_keys::revoke(&pool, id_a).await?;
+    let a = db::api_keys::lookup_tenant_by_key_body_with(&pool, &body_a, Some(&known)).await?;
+    assert!(a.is_none(), "a revoked key must be refused");
+    pool.close();
+    Ok(())
+}
+
+// ── OG-23 / OG-20: projects, assignment and the auth JOIN, on a real Postgres ──────────
+
+/// A fresh tenant + the pepper, for the OG-23/OG-20 tests.
+async fn og23_tenant(
+    pool: &deadpool_postgres::Pool,
+    name: &str,
+) -> Result<tracelane_shared::TenantId> {
+    let id = Uuid::new_v4();
+    db::tenants::create(pool, id, name, "free").await?;
+    let _ = db::api_keys::init_pepper(&"11".repeat(32));
+    Ok(tracelane_shared::TenantId::from_jwt_claim(id))
+}
+
+fn og23_new(name: &str, policy: Option<serde_json::Value>) -> db::projects::NewProject {
+    db::projects::NewProject {
+        name: name.into(),
+        environments: vec!["production".into(), "staging".into()],
+        policy,
+    }
+}
+
+/// OG-23 proof 1 + 3, OG-20 proof 7: a key minted into a project authenticates with the
+/// project, its environment and BOTH policy layers on its claims — cold, and again after a
+/// project-policy edit (which evicts the key, so the next lookup reads the new policy).
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og23_a_project_keys_auth_carries_project_environment_and_both_policies() -> Result<()> {
+    use db::api_keys::*;
+    use db::projects::{CreateOutcome, PatchOutcome, ProjectPatch};
+    let pool = test_pool().await?;
+    let tenant = og23_tenant(&pool, "og23-auth").await?;
+    let project_policy = serde_json::json!({"models": {"allow": ["gpt-4o*"]}});
+    let CreateOutcome::Created(project) = db::projects::create(
+        &pool,
+        &tenant,
+        &og23_new("Checkout", Some(project_policy.clone())),
+        100,
+        "owner-a",
+    )
+    .await?
+    else {
+        panic!("project create refused")
+    };
+    let key_policy = serde_json::json!({"source_ips": ["10.0.0.0/8"]});
+    let key = mint(
+        &pool,
+        &tenant,
+        "checkout-staging",
+        Some("owner-a"),
+        MintOptions {
+            scope: Some(vec!["chat".into()]),
+            project_id: Some(project.id),
+            environment: Some("staging".into()),
+            policy: Some(key_policy.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let body = key.raw_key.strip_prefix("tlane_").unwrap();
+    let auth = lookup_tenant_by_key_body(&pool, body)
+        .await?
+        .expect("authenticates");
+    let gov = auth.governance.expect("a governance");
+    assert_eq!(gov.project_id, Some(project.id));
+    assert_eq!(gov.environment.as_deref(), Some("staging"));
+    assert_eq!(gov.layers.len(), 2, "the project's policy AND the key's");
+    assert!(gov.has_policy());
+    // Edit the PROJECT's policy: the key is evicted, so its next lookup reads the new one.
+    let PatchOutcome::Updated { changed, .. } = db::projects::update(
+        &pool,
+        &tenant,
+        project.id,
+        &ProjectPatch {
+            policy: Some(None),
+            ..Default::default()
+        },
+        "owner-a",
+    )
+    .await?
+    else {
+        panic!("project update refused")
+    };
+    assert_eq!(changed, vec!["policy"]);
+    let auth = lookup_tenant_by_key_body(&pool, body)
+        .await?
+        .expect("authenticates");
+    assert_eq!(auth.governance.expect("still a project").layers.len(), 1);
+    // A key with nothing set carries no governance at all (today's shape).
+    let plain = mint(&pool, &tenant, "plain", None, MintOptions::default()).await?;
+    let auth = lookup_tenant_by_key_body(&pool, plain.raw_key.strip_prefix("tlane_").unwrap())
+        .await?
+        .expect("authenticates");
+    assert!(auth.governance.is_none());
+    // The audit rows exist, before AND after for the policy change.
+    let client = pool.get().await?;
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 \
+             AND action IN ('project.create', 'project.update')",
+            &[tenant.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n, 2);
+    Ok(())
+}
+
+/// OG-23 proof 2 — the guard blocks: tenant B can neither read, edit, archive nor attach
+/// a key to tenant A's project; every answer is the one an absent project gets.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og23_another_tenants_project_is_unreachable() -> Result<()> {
+    use db::api_keys::*;
+    use db::projects::{ArchiveOutcome, CreateOutcome, PatchOutcome, ProjectPatch};
+    let pool = test_pool().await?;
+    let a = og23_tenant(&pool, "og23-a").await?;
+    let b = og23_tenant(&pool, "og23-b").await?;
+    let CreateOutcome::Created(pa) =
+        db::projects::create(&pool, &a, &og23_new("A", None), 100, "owner-a").await?
+    else {
+        panic!("create refused")
+    };
+    assert!(db::projects::get(&pool, &b, pa.id).await?.is_none());
+    assert!(db::projects::list(&pool, &b).await?.is_empty());
+    assert_eq!(
+        db::projects::update(
+            &pool,
+            &b,
+            pa.id,
+            &ProjectPatch {
+                name: Some("stolen".into()),
+                ..Default::default()
+            },
+            "owner-b"
+        )
+        .await?,
+        PatchOutcome::NotFound
+    );
+    assert_eq!(
+        db::projects::archive(&pool, &b, pa.id, "owner-b").await?,
+        ArchiveOutcome::NotFound
+    );
+    // Mint INTO A's project as B: refused, nothing minted.
+    let err = mint(
+        &pool,
+        &b,
+        "k",
+        None,
+        MintOptions {
+            project_id: Some(pa.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("must be refused");
+    assert!(matches!(
+        err.downcast_ref::<AssignmentError>(),
+        Some(AssignmentError::ProjectNotFound)
+    ));
+    // Move B's own key into A's project: refused under the row lock, row unchanged.
+    let kb = mint(&pool, &b, "kb", None, MintOptions::default()).await?;
+    let out = db::api_keys::update(
+        &pool,
+        &b,
+        kb.api_key.id,
+        KeyEditor::Any,
+        &KeyPatch {
+            project_id: Some(Some(pa.id)),
+            ..Default::default()
+        },
+        "owner-b",
+    )
+    .await?;
+    assert_eq!(out, UpdateOutcome::ProjectNotFound);
+    assert_eq!(
+        db::api_keys::get(&pool, &b, kb.api_key.id)
+            .await?
+            .unwrap()
+            .project_id,
+        None
+    );
+    // A's project is untouched.
+    assert_eq!(
+        db::projects::get(&pool, &a, pa.id).await?.unwrap().0.name,
+        "A"
+    );
+    Ok(())
+}
+
+/// OG-23 §4: assignment and archive refusals, and rotation keeps the governance.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og23_assignment_archive_and_rotation_rules() -> Result<()> {
+    use db::api_keys::*;
+    use db::projects::{ArchiveOutcome, CreateOutcome, PatchOutcome, ProjectPatch};
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og23-rules").await?;
+    let CreateOutcome::Created(p) =
+        db::projects::create(&pool, &t, &og23_new("P", None), 2, "owner").await?
+    else {
+        panic!("create refused")
+    };
+    assert_eq!(
+        db::projects::create(&pool, &t, &og23_new("p", None), 2, "owner").await?,
+        CreateOutcome::NameTaken,
+        "names are unique per tenant, case-insensitively"
+    );
+    let CreateOutcome::Created(_) =
+        db::projects::create(&pool, &t, &og23_new("Q", None), 2, "owner").await?
+    else {
+        panic!("second create refused")
+    };
+    assert_eq!(
+        db::projects::create(&pool, &t, &og23_new("R", None), 2, "owner").await?,
+        CreateOutcome::LimitReached { max: 2 }
+    );
+    // An environment the project does not have, and an environment with no project.
+    let err = mint(
+        &pool,
+        &t,
+        "k",
+        None,
+        MintOptions {
+            project_id: Some(p.id),
+            environment: Some("qa".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("qa is not one of P's environments");
+    assert!(matches!(
+        err.downcast_ref::<AssignmentError>(),
+        Some(AssignmentError::EnvironmentNotInProject(_))
+    ));
+    let policy = serde_json::json!({"max_output_tokens": 100});
+    let k = mint(
+        &pool,
+        &t,
+        "k",
+        Some("owner"),
+        MintOptions {
+            scope: Some(vec!["chat".into()]),
+            project_id: Some(p.id),
+            environment: Some("staging".into()),
+            policy: Some(policy.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    // Clearing the project while the key keeps its environment is refused.
+    assert_eq!(
+        db::api_keys::update(
+            &pool,
+            &t,
+            k.api_key.id,
+            KeyEditor::Any,
+            &KeyPatch {
+                project_id: Some(None),
+                ..Default::default()
+            },
+            "owner"
+        )
+        .await?,
+        UpdateOutcome::EnvironmentNeedsProject
+    );
+    // Removing an environment a live key carries is refused.
+    assert_eq!(
+        db::projects::update(
+            &pool,
+            &t,
+            p.id,
+            &ProjectPatch {
+                environments: Some(vec!["production".into()]),
+                ..Default::default()
+            },
+            "owner"
+        )
+        .await?,
+        PatchOutcome::EnvironmentInUse {
+            environment: "staging".into()
+        }
+    );
+    // Archive refused while the key is live.
+    assert_eq!(
+        db::projects::archive(&pool, &t, p.id, "owner").await?,
+        ArchiveOutcome::HasKeys { count: 1 }
+    );
+    // Rotation: the successor carries project, environment AND policy.
+    let rotated = rotate(&pool, &t, k.api_key.id, "owner", 0).await?.unwrap();
+    assert_eq!(rotated.options.project_id, Some(p.id));
+    assert_eq!(rotated.options.environment.as_deref(), Some("staging"));
+    assert_eq!(rotated.options.policy, Some(policy));
+    let succ = rotated
+        .minted
+        .raw_key
+        .strip_prefix("tlane_")
+        .unwrap()
+        .to_owned();
+    let auth = lookup_tenant_by_key_body(&pool, &succ)
+        .await?
+        .expect("successor works");
+    assert_eq!(auth.governance.expect("governed").layers.len(), 1);
+    // Revoke the successor; then nothing live remains and the archive succeeds.
+    assert!(
+        revoke_key(&pool, &t, rotated.minted.api_key.id, "owner")
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        db::projects::archive(&pool, &t, p.id, "owner").await?,
+        ArchiveOutcome::Archived
+    );
+    assert!(
+        db::projects::get(&pool, &t, p.id).await?.is_none(),
+        "archived is not live"
+    );
+    Ok(())
+}
+
+/// OG-20 §2: a stored policy the gateway cannot parse is an INVALID layer on the auth
+/// result — refused downstream, never read as "no policy". (The write path validates, so
+/// this state needs a hand edit; the CHECK still requires an object.)
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og20_a_hand_edited_unparseable_policy_authenticates_as_an_invalid_layer() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og20-invalid").await?;
+    let k = mint(&pool, &t, "k", None, MintOptions::default()).await?;
+    let client = pool.get().await?;
+    assert!(
+        client
+            .execute(
+                "UPDATE api_keys SET policy = '\"a string\"'::jsonb WHERE id = $1",
+                &[&k.api_key.id]
+            )
+            .await
+            .is_err(),
+        "the CHECK refuses a non-object"
+    );
+    client
+        .execute(
+            "UPDATE api_keys SET policy = '{\"rule_from_the_future\": true}'::jsonb WHERE id = $1",
+            &[&k.api_key.id],
+        )
+        .await?;
+    let auth = lookup_tenant_by_key_body(&pool, k.raw_key.strip_prefix("tlane_").unwrap())
+        .await?
+        .expect("the credential itself is good");
+    let gov = auth.governance.expect("a governance");
+    assert_eq!(
+        gov.layers[0].policy,
+        tracelane_shared::key_policy::LayerPolicy::Invalid
+    );
+    assert_eq!(
+        gov.check_source(Some("10.0.0.1".parse().unwrap()))
+            .unwrap_err()
+            .code,
+        "policy_invalid"
+    );
+    Ok(())
+}
+
+// ── OG-25 / OG-24: workspace controls, revoke-all and the alert outbox, on a real Postgres ──
+
+/// OG-25 proof 4: revoke-all revokes every live key of ONE tenant in one transaction,
+/// writes one `api_key.revoke_all` row per call, and leaves another tenant untouched; a
+/// revoked key no longer authenticates.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og25_revoke_all_revokes_every_key_of_one_tenant_only() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let a = og23_tenant(&pool, "og25-a").await?;
+    let b = og23_tenant(&pool, "og25-b").await?;
+    let k1 = mint(&pool, &a, "a1", None, MintOptions::default()).await?;
+    let _k2 = mint(&pool, &a, "a2", None, MintOptions::default()).await?;
+    let kb = mint(&pool, &b, "b1", None, MintOptions::default()).await?;
+    let ids = revoke_all_keys(&pool, &a, "owner-a").await?;
+    assert_eq!(ids.len(), 2);
+    assert!(
+        lookup_tenant_by_key_body(&pool, k1.raw_key.strip_prefix("tlane_").unwrap())
+            .await?
+            .is_none(),
+        "a revoked key no longer authenticates"
+    );
+    assert!(
+        lookup_tenant_by_key_body(&pool, kb.raw_key.strip_prefix("tlane_").unwrap())
+            .await?
+            .is_some(),
+        "the other tenant's key is untouched"
+    );
+    assert!(
+        revoke_all_keys(&pool, &a, "owner-a").await?.is_empty(),
+        "nothing left to revoke"
+    );
+    let client = pool.get().await?;
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 \
+             AND action = 'api_key.revoke_all'",
+            &[a.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n, 2, "one control-change row per call");
+    Ok(())
+}
+
+/// OG-25: the controls row round-trips through pause (idempotent), blocks, policy and
+/// resume, each write audited, and the entitlement read sees it.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og25_controls_round_trip_and_are_audited() -> Result<()> {
+    use db::controls::{Change, apply, get, read_with};
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og25-controls").await?;
+    assert_eq!(
+        get(&pool, &t).await?,
+        db::controls::ControlsRow::default(),
+        "no row = nothing set"
+    );
+    let first = apply(
+        &pool,
+        &t,
+        &Change::Pause {
+            reason: Some("incident".into()),
+        },
+        "owner",
+    )
+    .await?;
+    let at = first.paused_at.expect("paused");
+    let again = apply(
+        &pool,
+        &t,
+        &Change::Pause {
+            reason: Some("other".into()),
+        },
+        "owner",
+    )
+    .await?;
+    assert_eq!(
+        again.paused_at,
+        Some(at),
+        "pausing again keeps the first pause"
+    );
+    assert_eq!(again.pause_reason.as_deref(), Some("incident"));
+    apply(
+        &pool,
+        &t,
+        &Change::Blocks {
+            models: Some(vec!["gpt-4o*".into()]),
+            providers: None,
+            end_users: Some(vec!["u1".into()]),
+        },
+        "owner",
+    )
+    .await?;
+    apply(
+        &pool,
+        &t,
+        &Change::Policy(Some(serde_json::json!({"limits": {"rpm": 5}}))),
+        "owner",
+    )
+    .await?;
+    let client = pool.get().await?;
+    let row = read_with(&client, t.as_uuid()).await?.expect("a row");
+    assert_eq!(row.blocked_models, vec!["gpt-4o*".to_string()]);
+    assert_eq!(row.blocked_end_users, vec!["u1".to_string()]);
+    assert!(row.blocked_providers.is_empty());
+    assert!(row.paused_at.is_some());
+    assert_eq!(
+        row.policy.as_ref().unwrap()["limits"]["rpm"],
+        serde_json::json!(5)
+    );
+    let resumed = apply(&pool, &t, &Change::Resume, "owner").await?;
+    assert!(resumed.paused_at.is_none());
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 \
+             AND action LIKE 'workspace.%'",
+            &[t.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n, 5);
+    Ok(())
+}
+
+/// OG-24 proof 5: the outbox admits ONE row per (channel, dedup key) — a second crossing
+/// of the same threshold in the same window inserts nothing; the next window fires again;
+/// another tenant's channels never receive it; claimed rows are leased.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og24_the_outbox_fires_a_threshold_once_per_channel_per_window() -> Result<()> {
+    use db::spend_alerts::*;
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og24-a").await?;
+    let other = og23_tenant(&pool, "og24-b").await?;
+    for (tenant, n) in [(&t, 2usize), (&other, 1)] {
+        for i in 0..n {
+            let out = create_channel(
+                &pool,
+                tenant,
+                &NewChannel {
+                    id: Uuid::new_v4(),
+                    kind: "email",
+                    name: format!("ch{i}"),
+                    target: format!("ops{i}@example.com"),
+                    secret_enc: None,
+                },
+                20,
+                "owner",
+            )
+            .await?;
+            assert!(matches!(out, CreateOutcome::Created(_)));
+        }
+    }
+    let payload = serde_json::json!({"threshold": "80%"});
+    let key = "budget:workspace:workspace:monthly:80%:202610";
+    assert_eq!(
+        enqueue(&pool, *t.as_uuid(), key, &payload).await?,
+        2,
+        "one row per channel"
+    );
+    assert_eq!(
+        enqueue(&pool, *t.as_uuid(), key, &payload).await?,
+        0,
+        "never twice"
+    );
+    assert_eq!(
+        enqueue(
+            &pool,
+            *t.as_uuid(),
+            "budget:workspace:workspace:monthly:80%:202611",
+            &payload
+        )
+        .await?,
+        2,
+        "the next window fires again"
+    );
+    let due = claim_due(&pool, 50, 300).await?;
+    assert_eq!(due.len(), 4);
+    assert!(due.iter().all(|d| d.channel.tenant_id == *t.as_uuid()));
+    assert!(
+        claim_due(&pool, 50, 300).await?.is_empty(),
+        "claimed rows are leased"
+    );
+    record_outcome(&pool, due[0].event_id, Ok(()), 30, false).await?;
+    let ev = list_events(&pool, &t, 10).await?;
+    assert_eq!(ev.iter().filter(|e| e["status"] == "delivered").count(), 1);
+    Ok(())
+}
+
+/// OG-51: the cache settings, the invalidation epochs and a key's narrowing round-trip through
+/// REAL rows; each write is audited with before and after; a second identical write records
+/// nothing; the epoch row cap holds; a garbage stored key document reads as OFF (fail-closed);
+/// and another tenant sees none of it.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og51_cache_settings_epochs_and_key_narrowing_round_trip_and_are_audited() -> Result<()> {
+    use db::api_keys::{KeyEditor, KeyPatch, MintOptions, UpdateOutcome, mint, update};
+    use db::cache_settings::*;
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og51-a").await?;
+    let other = og23_tenant(&pool, "og51-b").await?;
+    let client = pool.get().await?;
+    assert_eq!(
+        read_with(&client, t.as_uuid()).await?,
+        Loaded::default(),
+        "no rows = nothing set = today's behaviour"
+    );
+
+    // Settings: written, read back, audited with before AND after.
+    let want = Settings {
+        mode: Mode::On,
+        ttl_hours: Some(24),
+        namespace_by: NamespaceBy::Key,
+        semantic: false,
+    };
+    let first = set_settings(&pool, &t, &want, "owner").await?;
+    assert!(first.changed);
+    assert_eq!(first.previous, Settings::default());
+    let loaded = read_with(&client, t.as_uuid()).await?;
+    assert_eq!(loaded.settings, want);
+    assert!(loaded.updated_at.is_some());
+    let again = set_settings(&pool, &t, &want, "owner").await?;
+    assert!(!again.changed, "the same document again changes nothing");
+    let audit = client
+        .query(
+            "SELECT before_json, after_json FROM admin_audit_log \
+             WHERE actor_workspace_id = $1 AND action = 'cache.settings.set'",
+            &[t.as_uuid()],
+        )
+        .await?;
+    assert_eq!(audit.len(), 1, "one control-change row, none for the no-op");
+    let (before, after): (serde_json::Value, serde_json::Value) =
+        (audit[0].get(0), audit[0].get(1));
+    assert_eq!(before["mode"], "inherit");
+    assert_eq!(after["mode"], "on");
+    assert_eq!(after["ttl_hours"], 24);
+    assert_eq!(after["namespace_by"], "key");
+
+    // The CHECK constraints are the last line: a value the route would never send is refused.
+    assert!(
+        client
+            .execute(
+                "UPDATE workspace_cache_settings SET namespace_by = 'galaxy' WHERE tenant_id = $1",
+                &[t.as_uuid()]
+            )
+            .await
+            .is_err()
+    );
+
+    // Epochs: a counter that only goes up, audited, capped per workspace.
+    let key_scope = format!("key:{}", Uuid::new_v4());
+    assert_eq!(
+        bump_epoch(&pool, &t, "workspace", 2, "owner").await?,
+        BumpOutcome::Bumped { epoch: 1 }
+    );
+    assert_eq!(
+        bump_epoch(&pool, &t, "workspace", 2, "owner").await?,
+        BumpOutcome::Bumped { epoch: 2 }
+    );
+    assert_eq!(
+        bump_epoch(&pool, &t, &key_scope, 2, "owner").await?,
+        BumpOutcome::Bumped { epoch: 1 }
+    );
+    assert_eq!(
+        bump_epoch(&pool, &t, "model:gpt-4o", 2, "owner").await?,
+        BumpOutcome::LimitReached { max: 2 },
+        "the 3rd NEW scope is refused at the cap"
+    );
+    assert_eq!(
+        bump_epoch(&pool, &t, "workspace", 2, "owner").await?,
+        BumpOutcome::Bumped { epoch: 3 },
+        "an existing scope is still bumpable at the cap"
+    );
+    let loaded = read_with(&client, t.as_uuid()).await?;
+    assert_eq!(loaded.epoch("workspace"), 3);
+    assert_eq!(loaded.epoch(&key_scope), 1);
+    assert_eq!(
+        loaded.epoch("model:gpt-4o"),
+        0,
+        "the refused scope has no row"
+    );
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 \
+             AND action = 'cache.invalidate'",
+            &[t.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n, 4, "one row per bump; the refused one wrote nothing");
+    // Another tenant's cache is untouched.
+    assert_eq!(
+        read_with(&client, other.as_uuid()).await?,
+        Loaded::default()
+    );
+
+    // A key's narrowing rides PATCH, is audited as a key update, and is read per tenant.
+    let key = mint(&pool, &t, "narrowed", None, MintOptions::default()).await?;
+    let patch = KeyPatch {
+        cache: Some(Some(serde_json::json!({"mode": "off"}))),
+        ..Default::default()
+    };
+    let UpdateOutcome::Updated { record, changed } =
+        update(&pool, &t, key.api_key.id, KeyEditor::Any, &patch, "owner").await?
+    else {
+        panic!("expected Updated");
+    };
+    assert_eq!(changed, vec!["cache"]);
+    assert_eq!(record.cache, Some(serde_json::json!({"mode": "off"})));
+    let loaded = read_with(&client, t.as_uuid()).await?;
+    assert!(loaded.keys[&key.api_key.id].off);
+    assert!(read_with(&client, other.as_uuid()).await?.keys.is_empty());
+    // Stored garbage is read as OFF — the narrowing direction, never ignored.
+    client
+        .execute(
+            "UPDATE api_keys SET cache = '{\"mode\":\"on\"}'::jsonb WHERE id = $1",
+            &[&key.api_key.id],
+        )
+        .await?;
+    assert!(
+        read_with(&client, t.as_uuid()).await?.keys[&key.api_key.id].off,
+        "a key document that tries to turn the cache ON is read as off"
+    );
+    // Clearing removes the narrowing (the owner decision that widens).
+    let clear = KeyPatch {
+        cache: Some(None),
+        ..Default::default()
+    };
+    let UpdateOutcome::Updated { changed, .. } =
+        update(&pool, &t, key.api_key.id, KeyEditor::Any, &clear, "owner").await?
+    else {
+        panic!("expected Updated");
+    };
+    assert_eq!(changed, vec!["cache"]);
+    assert!(read_with(&client, t.as_uuid()).await?.keys.is_empty());
+    Ok(())
+}
+
+/// OG-50: an export round-trips through real rows; the sealed blob never reaches a list or an
+/// audit row; the plan cap holds; tenant isolation holds on every statement; the status flush
+/// only moves `last_success_at` forward; the directory returns enabled exports only.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn og50_exports_round_trip_are_sealed_isolated_and_audited() -> Result<()> {
+    use db::otel_exports::*;
+    let pool = test_pool().await?;
+    let t = og23_tenant(&pool, "og50-a").await?;
+    let other = og23_tenant(&pool, "og50-b").await?;
+    let client = pool.get().await?;
+    let new = |name: &str, sealed: Option<&str>| NewExport {
+        id: Uuid::new_v4(),
+        name: name.into(),
+        url: "https://collector.example.com/v1/traces?token=URLSECRET".into(),
+        headers_enc: sealed.map(str::to_owned),
+        header_names: if sealed.is_some() {
+            vec!["authorization".into()]
+        } else {
+            Vec::new()
+        },
+        include_content: false,
+        sample_ratio: 0.5,
+        only_errors: false,
+    };
+    let a = new("prod", Some("SEALED-BLOB-AAA"));
+    let CreateOutcome::Created(created) = create(&pool, &t, &a, 1, "owner").await? else {
+        panic!("expected Created")
+    };
+    assert_eq!(created.status, "never_delivered");
+    assert_eq!(created.header_names, vec!["authorization".to_string()]);
+    assert!(
+        matches!(
+            create(&pool, &t, &new("second", None), 1, "owner").await?,
+            CreateOutcome::LimitReached { max: 1 }
+        ),
+        "the plan cap holds"
+    );
+    // The blob is in the row, in the one column, and nowhere a reader looks.
+    let stored: Option<String> = client
+        .query_one(
+            "SELECT headers_enc FROM otel_exports WHERE id = $1",
+            &[&a.id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored.as_deref(), Some("SEALED-BLOB-AAA"));
+    let listed = list(&pool, &t).await?;
+    assert_eq!(listed.len(), 1);
+    assert!(!format!("{listed:?}").contains("SEALED-BLOB"));
+    assert!(
+        list(&pool, &other).await?.is_empty(),
+        "another tenant lists none"
+    );
+
+    // Update: audited with before AND after; the audit row never holds the blob or the URL query.
+    let patch = Patch {
+        enabled: Some(false),
+        headers: Some((None, Vec::new())),
+        ..Default::default()
+    };
+    assert!(
+        update(&pool, &other, a.id, &patch, "owner")
+            .await?
+            .is_none(),
+        "another tenant cannot update it"
+    );
+    let updated = update(&pool, &t, a.id, &patch, "owner")
+        .await?
+        .expect("updated");
+    assert!(!updated.enabled);
+    assert!(updated.header_names.is_empty());
+    let audit = client
+        .query(
+            "SELECT before_json::text, after_json::text FROM admin_audit_log \
+             WHERE actor_workspace_id = $1 AND action IN ('otel_export.create', 'otel_export.update')",
+            &[t.as_uuid()],
+        )
+        .await?;
+    assert_eq!(audit.len(), 2, "create + update, one row each");
+    for r in &audit {
+        let text = format!(
+            "{} {}",
+            r.get::<_, Option<String>>(0).unwrap_or_default(),
+            r.get::<_, Option<String>>(1).unwrap_or_default()
+        );
+        assert!(
+            !text.contains("SEALED-BLOB") && !text.contains("URLSECRET"),
+            "{text}"
+        );
+        assert!(
+            text.contains("collector.example.com"),
+            "the host is recorded"
+        );
+    }
+    let stored: Option<String> = client
+        .query_one(
+            "SELECT headers_enc FROM otel_exports WHERE id = $1",
+            &[&a.id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(stored, None, "headers: null cleared the sealed map");
+
+    // The directory returns ENABLED exports only; the tenant-scoped sealed read is isolated.
+    assert!(directory(&pool).await?.iter().all(|s| s.id != a.id));
+    update(
+        &pool,
+        &t,
+        a.id,
+        &Patch {
+            enabled: Some(true),
+            ..Default::default()
+        },
+        "owner",
+    )
+    .await?;
+    assert!(directory(&pool).await?.iter().any(|s| s.id == a.id));
+    assert!(get_sealed(&pool, &other, a.id).await?.is_none());
+    assert!(get_sealed(&pool, &t, a.id).await?.is_some());
+
+    // The status flush: counters set, last_success_at only forward.
+    let now = chrono::Utc::now();
+    let flush = |ok_at: Option<chrono::DateTime<chrono::Utc>>, delivered: i64| StatusUpdate {
+        id: a.id,
+        tenant_id: *t.as_uuid(),
+        status: "ok",
+        last_success_at: ok_at,
+        last_error_class: None,
+        delivered,
+        dropped: 2,
+        failed: 3,
+    };
+    flush_status(&pool, &[flush(Some(now), 10)]).await?;
+    flush_status(&pool, &[flush(Some(now - chrono::Duration::hours(1)), 11)]).await?;
+    flush_status(&pool, &[flush(None, 12)]).await?;
+    let row = list(&pool, &t).await?.remove(0);
+    assert_eq!((row.delivered, row.dropped, row.failed), (12, 2, 3));
+    assert_eq!(row.status, "ok");
+    let at = row.last_success_at.expect("set");
+    assert!(
+        (at - now).num_seconds().abs() <= 1,
+        "an older success never moves it back"
+    );
+
+    // Delete: audited; another tenant cannot.
+    assert!(!delete(&pool, &other, a.id, "owner").await?);
+    assert!(delete(&pool, &t, a.id, "owner").await?);
+    assert!(!delete(&pool, &t, a.id, "owner").await?, "already gone");
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 \
+             AND action = 'otel_export.delete'",
+            &[t.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated migrated Postgres; never run against production"]
+async fn og32_rotation_rewraps_both_adapter_bound_credentials() -> Result<()> {
+    use base64::Engine as _;
+    use secrecy::{ExposeSecret as _, SecretString};
+    let pool = test_pool().await?;
+    let tenant = Uuid::new_v4();
+    db::tenants::create(&pool, tenant, "adapter-rotation", "free").await?;
+    let k0 = base64::engine::general_purpose::STANDARD.encode([0x44_u8; 32]);
+    let k1 = base64::engine::general_purpose::STANDARD.encode([0x55_u8; 32]);
+    let old = byok::ByokMasterKey::from_values(Some(&k0), None, None)?.unwrap();
+    let current =
+        byok::ByokMasterKey::from_values(Some(&k0), Some(&format!("1:{k1}")), Some(1))?.unwrap();
+    let secret = SecretString::from("synthetic-vendor-key");
+    let mut rows = Vec::new();
+    for (kind, endpoint) in [
+        ("lakera", "https://api.lakera.ai/v2/guard"),
+        (
+            "azure_content_safety",
+            "https://unit.cognitiveservices.azure.com",
+        ),
+    ] {
+        let id = Uuid::new_v4();
+        let aad = byok::guardrail_hook_aad(&tenant, &format!("{kind}:{id}:{endpoint}"));
+        let sealed = old.encrypt_with_context(&secret, &aad)?;
+        let mut adapter = serde_json::json!({"kind":kind});
+        if kind == "azure_content_safety" {
+            adapter["thresholds"] =
+                serde_json::json!({"Hate":4,"SelfHarm":4,"Sexual":4,"Violence":4});
+        }
+        let config = serde_json::json!({"endpoint":endpoint,"adapter":adapter,"pre":true,"post":false,"timeout_ms":1000});
+        pool.get().await?.execute("INSERT INTO guardrail_hooks (tenant_id,id,config,ciphertext_b64,updated_by) VALUES ($1,$2,$3,$4,'test')",&[&tenant,&id,&config,&sealed]).await?;
+        rows.push((id, aad));
+    }
+    let report = byok_rotate::rotate(&pool, &current, false).await?;
+    assert_eq!(report.remaining(), 0);
+    assert_eq!(report.tables.iter().map(|t| t.rewrapped).sum::<u64>(), 2);
+    for (id, aad) in rows {
+        let value: String = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT ciphertext_b64 FROM guardrail_hooks WHERE tenant_id = $1 AND id = $2",
+                &[&tenant, &id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(byok::ByokMasterKey::kek_id_of(&value), Some(1));
+        assert_eq!(
+            current.decrypt_with_context(&value, &aad)?.expose_secret(),
+            secret.expose_secret()
+        );
+    }
     Ok(())
 }
