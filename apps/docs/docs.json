@@ -3,17 +3,17 @@
   "theme": "maple",
   "name": "Tracelane",
   "colors": {
-    "primary": "#7c85e0",
-    "light": "#a5adf5",
-    "dark": "#7c85e0"
+    "primary": "#d0423b",
+    "light": "#e0675f",
+    "dark": "#d0423b"
   },
   "appearance": {
-    "default": "dark",
+    "default": "light",
     "strict": false
   },
   "background": {
     "color": {
-      "light": "#f5f5f7",
+      "light": "#ffffff",
       "dark": "#101113"
     }
   },
