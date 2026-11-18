@@ -285,7 +285,7 @@ impl CohereProvider {
             while let Some(chunk) = byte_stream.next().await {
                 use bytes::Bytes;
                 let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("stream chunk")?;
-                lines.push(&chunk);
+                lines.push(&chunk)?;
                 while let Some(line) = lines.next_line_lossy() {
                     // SSE: `event:` names are redundant with `data.type`; a bare JSON line
                     // (NDJSON) is tolerated for proxies that strip the framing.

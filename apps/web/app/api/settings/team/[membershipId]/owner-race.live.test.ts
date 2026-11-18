@@ -20,6 +20,10 @@ vi.mock("@workos-inc/authkit-nextjs", () => ({
 	}),
 }));
 vi.mock("@/lib/auth", () => ({
+	requireGatewayToken: async () => ({
+		token: "unit-test-human-jwt",
+		tenantId: "org_OWNER_RACE_TEST",
+	}),
 	requireSession: vi.fn(async () => ({
 		tenantId: "org_OWNER_RACE_TEST",
 		userId: h.sessions.shift(),
@@ -110,7 +114,11 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 	it.each(["team", "account"])(
 		"%s fails closed before WorkOS when the lock database is unavailable",
 		async (kind) => {
-			const fetcher = vi.fn();
+			const fetcher = vi.fn(async () =>
+				Response.json({
+					data: [{ user_id: "a", organization_id: "org_OWNER_RACE_TEST" }],
+				}),
+			);
 			vi.stubGlobal("fetch", fetcher);
 			vi.stubEnv("DATABASE_URL", "");
 			h.sessions = ["a"];
@@ -129,7 +137,8 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 				expect((await response.json()).error).toBe(
 					"membership_change_unavailable",
 				);
-				expect(fetcher).not.toHaveBeenCalled();
+				if (kind === "account") expect(fetcher).toHaveBeenCalledTimes(1);
+				else expect(fetcher).not.toHaveBeenCalled();
 			} finally {
 				vi.stubEnv("DATABASE_URL", url ?? "");
 			}
@@ -145,12 +154,14 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 					user_id: "a",
 					organization_id: "org_OWNER_RACE_TEST",
 					role: { slug: "owner" },
+					status: "active",
 				},
 				{
 					id: "b",
 					user_id: "b",
 					organization_id: "org_OWNER_RACE_TEST",
 					role: { slug: "owner" },
+					status: "active",
 				},
 			];
 			if (kind === "account" || kind === "mixed")
@@ -159,6 +170,7 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 					user_id: "member",
 					organization_id: "org_OWNER_RACE_TEST",
 					role: { slug: "member" },
+					status: "active",
 				});
 			h.sessions = ["a", "b"];
 			const writes: string[] = [];
@@ -175,7 +187,16 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 			vi.stubGlobal(
 				"fetch",
 				vi.fn(async (raw: string, init?: RequestInit) => {
+					if (raw.endsWith("/v1/keys/invalidate-cache"))
+						return Response.json({ invalidated: true });
+					if (raw.endsWith("/v1/audit/control-changes"))
+						return Response.json({ recorded: true });
 					if ((init?.method ?? "GET") === "GET") {
+						const user = new URL(raw).searchParams.get("user_id");
+						if (user)
+							return Response.json({
+								data: members.filter((m) => m.user_id === user),
+							});
 						const snapshot = structuredClone(members);
 						reads++;
 						firstRead();
@@ -188,7 +209,9 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 						members = members.filter((m) => m.id !== id);
 					else
 						members = members.map((m) =>
-							m.id === id ? { ...m, role: { slug: "member" } } : m,
+							m.id === id
+								? { ...m, role: { slug: "member" }, status: "active" }
+								: m,
 						);
 					return new Response(null, { status: 200 });
 				}),
@@ -245,4 +268,80 @@ describe.skipIf(!url)("serialized owner mutations with real Postgres", () => {
 			expect(body.message ?? body.detail).toMatch(/owner/);
 		},
 	);
+	it("concurrent global deletions through another workspace retain a protected owner", async () => {
+		const selected = "org_OWNER_RACE_TEST";
+		const protectedOrg = "org_Z_PROTECTED";
+		let members = [
+			...["a", "b"].flatMap((user) => [
+				{
+					id: `${user}-selected`,
+					user_id: user,
+					organization_id: selected,
+					role: { slug: "member" },
+					status: "active",
+				},
+				{
+					id: `${user}-protected`,
+					user_id: user,
+					organization_id: protectedOrg,
+					role: { slug: "owner" },
+					status: "active",
+				},
+			]),
+			{
+				id: "selected-owner",
+				user_id: "selected-owner",
+				organization_id: selected,
+				role: { slug: "owner" },
+				status: "active",
+			},
+			{
+				id: "protected-member",
+				user_id: "protected-member",
+				organization_id: protectedOrg,
+				role: { slug: "member" },
+				status: "active",
+			},
+		];
+		h.sessions = ["a", "b"];
+		const deleted: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (raw: string, init?: RequestInit) => {
+				if (raw.endsWith("/v1/keys/invalidate-cache"))
+					return Response.json({ invalidated: true });
+				const target = new URL(raw);
+				if ((init?.method ?? "GET") === "GET") {
+					const user = target.searchParams.get("user_id");
+					const org = target.searchParams.get("organization_id");
+					return Response.json({
+						data: structuredClone(
+							members.filter((m) =>
+								user ? m.user_id === user : m.organization_id === org,
+							),
+						),
+					});
+				}
+				const user = target.pathname.split("/").at(-1) ?? "";
+				deleted.push(user);
+				members = members.filter((m) => m.user_id !== user);
+				return new Response(null, { status: 204 });
+			}),
+		);
+		const request = () =>
+			({
+				json: async () => ({ confirmEmail: "unit-test@example.invalid" }),
+			}) as NextRequest;
+		const responses = await Promise.all([
+			deleteAccount(request()),
+			deleteAccount(request()),
+		]);
+		expect(responses.map((r) => r.status).sort()).toEqual([200, 409]);
+		expect(deleted).toHaveLength(1);
+		expect(
+			members.filter(
+				(m) => m.organization_id === protectedOrg && m.role.slug === "owner",
+			),
+		).toHaveLength(1);
+	});
 });

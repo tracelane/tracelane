@@ -14,12 +14,10 @@ pub mod mcp_hash_watcher;
 pub mod pr8_lite_argument_drift;
 pub mod prompt_guard;
 pub mod prompt_injection;
-pub mod slm_judge;
 pub mod stuck_loop;
 pub mod taint_tracker;
 pub mod tool_definition_drift;
 pub mod tool_schema_validator;
-pub mod trajectory_guard;
 
 use a2a_validator::A2aValidator;
 use a2ui_validator::A2uiValidator;
@@ -29,13 +27,11 @@ use mcp_hash_watcher::McpHashWatcher;
 use pr8_lite_argument_drift::Pr8LiteArgumentDrift;
 use prompt_guard::PromptGuardPredictor;
 use prompt_injection::PromptInjectionDetector;
-use slm_judge::SlmJudge;
 use stuck_loop::StuckLoopDetector;
 use taint_tracker::TaintTracker;
 use tool_definition_drift::ToolDefinitionDrift;
 use tool_schema_validator::ToolSchemaValidator;
 use tracelane_shared::TenantId;
-use trajectory_guard::TrajectoryGuard;
 
 /// Predictive layer decision returned by every predictor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +145,6 @@ impl PredictiveLayer {
                 );
             }
         }
-
-        // Tier 2 predictors (Week 8 ML models): ONNX Runtime inference
-        // Both are no-ops until model files are trained and placed in models/
-        predictors.push(Box::new(TrajectoryGuard::new()));
-        predictors.push(Box::new(SlmJudge::new()));
 
         Self {
             predictors,
@@ -308,6 +299,53 @@ mod tests {
     use super::*;
     use tracelane_shared::TenantId;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn constant_predictors_are_not_registered() {
+        let layer = PredictiveLayer::new();
+        let names: Vec<_> = layer.predictors.iter().map(|p| p.name()).collect();
+        assert!(
+            !names.contains(&"trajectory_guard"),
+            "constant trajectory scoring is not detection"
+        );
+        assert!(
+            !names.contains(&"slm_judge"),
+            "constant judge scoring is not detection"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_predictors_survive_noop_retirement() {
+        let layer = PredictiveLayer::new();
+        let names: Vec<_> = layer.predictors.iter().map(|p| p.name()).collect();
+        for name in [
+            "mcp-hash-watcher",
+            "tool-definition-drift",
+            "taint-tracker",
+            "stuck-loop",
+            "browser-passive-observer",
+            "prompt-injection",
+            "a2a-validator",
+            "a2ui-catalog-validator",
+            "captcha-preemptor",
+            "pr8-lite-argument-drift",
+            "tool-schema-validator",
+        ] {
+            assert!(names.contains(&name), "working predictor removed: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_predictor_kill_keys_are_reported() {
+        let layer = PredictiveLayer::new().with_kill_switch(std::sync::Arc::new(
+            crate::kill_switch::KillSwitch::from_flag_list(
+                "kill.predictive.slm_judge,kill.predictive.trajectory_guard",
+            ),
+        ));
+        let mut unknown = layer.unknown_predictive_keys();
+        unknown.sort();
+        assert_eq!(unknown, vec!["slm_judge", "trajectory_guard"]);
+    }
 
     /// A predictor that always panics — stands in for an ONNX Runtime crash
     /// (OOM, corrupt model file) on the FT-05 fail-open path.

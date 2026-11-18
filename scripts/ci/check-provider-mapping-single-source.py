@@ -151,6 +151,16 @@ WILDCARD_PREFIXES = frozenset({"", "*", "/", "**", "?", ".", ".*"})
 # Data files under crates/gateway that are allowed to exist, and why. Anything
 # else matching *.tsv/*.json is a second provider list until proven otherwise.
 KNOWN_DATA_FILES = {
+    "crates/gateway/openapi/fragments/mcp.json": "source-derived MCP/approval API contract, validated by build-openapi.py",
+    "crates/gateway/openapi/fragments/action-control.json": "source-derived action-control API contract (#278), validated by build-openapi.py",
+    "crates/gateway/openapi/fragments/data-controls.json": "source-derived retention API contract, validated by build-openapi.py",
+    # mcp_policy.rs decodes Settings: numeric limits, protocol methods and policy
+    # defaults. Routing sources are still forbidden to embed this exact file;
+    # the selftest plants both catalog and dispatcher inclusions below.
+    "crates/gateway/mcp_policy.v1.json": "MCP Settings consumed by mcp_policy.rs, not model/provider routing",
+    # OBS-64 (#290): a test-only snapshot of the OTel semantic-convention attribute registry the
+    # SIEM records are checked against; attribute names and types, never provider/model routing.
+    "crates/gateway/src/siem_export/fixtures/semconv-v1.41.1.json": "OBS-64 test fixture: OTel semconv v1.41.1 attribute registry, not a provider catalog",
     # OG-60: control API schemas/operations, never provider-routing data.
     "crates/gateway/openapi/control.v1.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
     "crates/gateway/openapi/fragments/_shared.json": "OG-60 OpenAPI description; validated by build-openapi.py, not a provider catalog",
@@ -948,6 +958,24 @@ def selftest() -> int:
         "a second provider .tsv appears under crates/gateway -> REFUSED",
         "unexpected data file",
         files=CLEAN_FILES + ["crates/gateway/providers_v2.tsv"],
+    )
+
+    case(
+        "MCP settings are not a provider catalog",
+        None,
+        files=CLEAN_FILES + ["crates/gateway/mcp_policy.v1.json"],
+    )
+    case(
+        "MCP settings cannot become a second catalog include",
+        "it must embed exactly one file",
+        catalog_src=CLEAN_CATALOG
+        + '\nconst MCP: &str = include_str!("../../mcp_policy.v1.json");\n',
+    )
+    case(
+        "MCP settings cannot be embedded by the provider dispatcher",
+        "embeds the data file",
+        server_src=CLEAN_SERVER
+        + '\nconst MCP: &str = include_str!("../../mcp_policy.v1.json");\n',
     )
 
     # ── 0. PARSER ROT. The guard must refuse to report OK on input it did not

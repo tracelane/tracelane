@@ -17,6 +17,7 @@ import type { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
+	rateLimit: vi.fn(),
 	session: {
 		tenantId: "org_S",
 		userId: "user_ME",
@@ -29,6 +30,10 @@ const h = vi.hoisted(() => ({
 	n: 0,
 }));
 
+vi.mock("@/lib/rate-limit", async (original) => ({
+	...(await original<typeof import("@/lib/rate-limit")>()),
+	rateLimit: h.rateLimit,
+}));
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
@@ -50,8 +55,7 @@ const GOOD = {
 	confirmCurrentEmail: "old@example.com",
 };
 
-/** Build a request. Each call uses a distinct user id so the per-user rate
- * limiter (module-level state) never bleeds between cases. */
+/** Build a request with a distinct session identity for caller-key assertions. */
 function req(body: unknown): NextRequest {
 	h.n += 1;
 	h.session = { ...h.session, userId: `user_ME_${h.n}` };
@@ -108,6 +112,7 @@ const sentVerification = (spy: ReturnType<typeof stubWorkos>) =>
 	spy.mock.calls.some((c) => String(c[0]).includes("/email_verification/send"));
 
 beforeEach(() => {
+	h.rateLimit.mockReset().mockResolvedValue(true);
 	h.session = {
 		tenantId: "org_S",
 		userId: "user_ME",
@@ -228,7 +233,9 @@ describe("SET-26 — refuses anything that is not a proved, deliberate change", 
 		expect(res.status).toBe(501);
 	});
 
-	it("caps repeated attempts per user", async () => {
+	it("email_change_limit_durable", async () => {
+		h.rateLimit.mockResolvedValue(false);
+		for (let i = 0; i < 5; i++) h.rateLimit.mockResolvedValueOnce(true);
 		stubWorkos();
 		// Pin ONE user id so every attempt shares a rate-limit key.
 		h.session = { ...h.session, userId: "user_BURST" };
@@ -242,7 +249,12 @@ describe("SET-26 — refuses anything that is not a proved, deliberate change", 
 			}) as unknown as NextRequest;
 		const codes: number[] = [];
 		for (let i = 0; i < 7; i++) codes.push((await POST(fixed())).status);
-		expect(codes.filter((c) => c === 429).length).toBeGreaterThan(0);
+		expect(codes.filter((c) => c === 429)).toHaveLength(2);
+		expect(h.rateLimit).toHaveBeenCalledWith(
+			"email-change:user_BURST",
+			5,
+			15 * 60_000,
+		);
 	});
 });
 
@@ -401,5 +413,30 @@ describe("SET-26 — validator verdicts", () => {
 		]) {
 			expect(validateEmailChange(bad, "old@example.com").ok).toBe(false);
 		}
+	});
+});
+
+describe("durable limiter responses", () => {
+	it("durable false is awaited and keeps the existing 429 body", async () => {
+		h.rateLimit.mockResolvedValueOnce(false);
+		const fetcher = stubWorkos();
+		const response = await POST(req(GOOD));
+		expect(response.status).toBe(429);
+		expect(await response.json()).toEqual({
+			error: "rate_limited",
+			detail: "too many attempts — try again in a few minutes",
+		});
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(h.db?.cursor()).toBe(0);
+	});
+	it("durable store failure returns 503 without changing identity", async () => {
+		h.rateLimit.mockRejectedValueOnce(new Error("private DB detail"));
+		const fetcher = stubWorkos();
+		const response = await POST(req(GOOD));
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({ error: "rate_limit_unavailable" });
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(h.db?.cursor()).toBe(0);
+		expect(h.recordAdminAction).not.toHaveBeenCalled();
 	});
 });

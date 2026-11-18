@@ -25,7 +25,7 @@ COPY apps/web/db/plans.v3.json apps/web/db/plans.v3.json
 COPY apps/web/db/usage_conventions.v1.json apps/web/db/usage_conventions.v1.json
 RUN cargo build --release -p ingest
 
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:57e5704e70a85b90191182eb6110d1c817df0d8e96035cb041195c5a351f0861 AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:2c362104c7f7adc37e6bdc87451450ff3834871a6268d930815cbe561493f947 AS runtime
 LABEL org.opencontainers.image.title="Tracelane Ingest" \
       org.opencontainers.image.description="OTLP receiver + NATS consumer + ClickHouse writer (SPIFFE mTLS)" \
       org.opencontainers.image.licenses="Apache-2.0" \

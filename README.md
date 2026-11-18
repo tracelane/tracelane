@@ -1,7 +1,7 @@
 <!-- tracelane:classification: PUBLIC -->
 # Tracelane
 
-**flight recorder for AI agents.**
+**The tamper-evident runtime proxy for enterprise AI agents.**
 
 [![CI](https://github.com/tracelane/tracelane/actions/workflows/ci.yml/badge.svg)](https://github.com/tracelane/tracelane/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -17,9 +17,9 @@
 Tracelane sits between your AI agents and your LLM providers. You get:
 
 - **BYOK proxy** — point agents at `https://gateway.tracelane.dev`, pass your own API key. 0% markup.
-- **Full-fidelity traces** — LLM calls, tool invocations, agent steps and retries captured as OTel spans using the GenAI semantic conventions, at full fidelity for everything routed through the gateway. Full capture is the default; there is no sampling you have to turn off. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
+- **Full-fidelity traces** — LLM calls, tool invocations, agent steps and retries captured as OTel spans using the GenAI semantic conventions, at full fidelity for everything routed through the gateway. There is no sampling you have to turn off: every gateway call is recorded as a span. Prompt and completion **text** is a separate, safe-by-default boundary — off unless a workspace owner turns it on. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
 - **Tamper-evident audit ledger** — recorded gateway audit events are hash-chained per tenant. Batches are signed; public transparency-log anchoring is best-effort when configured, and an unanchored batch is reported as such. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us.
-- **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Detection is **observe-first** by default: a rail records and flags rather than blocking, because a false-positive block breaks a legitimate run.
+- **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Every rail verdict is written to the audit ledger. Most rails record and flag; the prompt-injection rail (R8) refuses a request carrying an injection in a tool result with a `403`. The separate predictive layer is **observe-first**: it records verdicts and enforces nothing unless an operator opts in.
 - **Cross-language ledger conformance** — the audit verifier is implemented three times, in Rust, Python and TypeScript, and all three are held to **one shared corpus of 8 conformance vectors** that includes deliberately-forged and boundary-numeric cases. **10 Rust + 14 Python + 19 TypeScript** conformance tests run in CI, plus a round-trip job asserting the three implementations agree. That is the suite behind "a third party can verify offline" — you can run it in this clone.
   Note the honest scope: `evals/` here carries the 20 conformance evals; some internal suites target private ADRs and infrastructure and are not part of this repo, so the `test` script says so rather than pretending to pass.
 - **Time-travel trace viewer** — step through any recorded agent trace span-by-span with `tlane replay` (read-only). Cross-model re-execution is on the roadmap.
@@ -54,10 +54,10 @@ per-rail status.
 | OTel-native ingest | ✓ | partial | partial | ✓ | partial |
 | Multi-agent swimlanes | ✓ | — | — | ✓ | ✓ |
 | Sessions | ✓ (per-user identity on the roadmap) | — | — | ✓ | ✓ |
-| Eval loop (datasets, experiments, online evals, annotation queues, CI gate) | ✓, proven on prod | — | — | ✓ | ✓ |
+| Eval loop (datasets, experiments, online evals, annotation queues, CI gate) | ✓ (proven on a demo workspace in production; no customer deployments yet) | — | — | ✓ | ✓ |
 | Prompt management + playground | ✓ | — | ✓ | ✓ | ✓ |
 | MCP server for traces | ✓ (`@tracelanedev/mcp` on npm) | — | — | — | — |
-| Claude Code flight recorder | ✓ | — | — | — | — |
+| Claude Code session capture | ✓ | — | — | — | — |
 | Tamper-evident ledger, offline-verifiable | ✓ | — | — | — | — |
 | Self-host, single Compose file | ✓ | ✓ | ✓ | ✓ (+ Kubernetes) | partial (Enterprise BYOC) |
 | License | Apache 2.0 | MIT (core) | MIT | MIT | none for OSS; Enterprise self-hosted SKU is proprietary |

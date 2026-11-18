@@ -639,6 +639,9 @@ fn unroutable_on_gemini() -> crate::admission::Malformed {
 }
 
 impl crate::admission::Parsed for GeminiParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<Value> {
+        Some(serde_json::json!({"body":self.json_body,"stream":self.stream}))
+    }
     fn model(&self) -> &str {
         &self.chat_request.model
     }
@@ -664,6 +667,7 @@ impl crate::admission::Route for Gemini {
     const NAME: &'static str = "gemini";
     const AUDIT_EVENT_TYPE: &'static str = "gemini.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     // OG-11 (a native relay: only Google AI Studio targets, fallthrough within Google).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Gemini,
@@ -876,7 +880,7 @@ pub async fn model_action_handler(
             crate::server::request_labels::response(result, &labels)
         }
         Action::CountTokens => match authenticate(&headers).await {
-            Ok(claims) => count_tokens_with_claims(state, model, body, claims).await,
+            Ok(claims) => count_tokens_with_headers(state, model, body, claims, headers).await,
             Err(resp) => resp,
         },
     }
@@ -943,6 +947,8 @@ async fn gemini_admitted(
         crate::server::config::trace_content(),
         entitlements.as_deref().map(|e| e.content_capture),
         &claims.tenant_id,
+        claims.key_capture,
+        Some(&headers),
     );
     let GeminiParsed {
         raw,
@@ -1056,6 +1062,7 @@ async fn gemini_admitted(
         let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
+                zdr_required: headers.contains_key("x-tracelane-zdr"),
                 tenant_id,
                 api_key_id: claims.api_key_id(),
                 project_id: claims.governance.as_ref().and_then(|g| g.project_id),
@@ -2239,12 +2246,32 @@ async fn relay_companion(upstream: reqwest::Response, api_key: &str) -> Response
 
 /// `POST …:countTokens` from the scope gate down — split for the same reason
 /// [`gemini_with_claims`] is.
+#[cfg(test)]
 pub(crate) async fn count_tokens_with_claims(
     state: AppState,
     model: &str,
     body: Bytes,
     claims: crate::auth::Claims,
 ) -> Response {
+    count_tokens_with_headers(state, model, body, claims, HeaderMap::new()).await
+}
+
+async fn count_tokens_with_headers(
+    state: AppState,
+    model: &str,
+    body: Bytes,
+    claims: crate::auth::Claims,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(d) = crate::zdr::gate(
+        &headers,
+        &state.zdr.load(),
+        PROVIDER_ID,
+        crate::zdr::ZdrBinding::Gated,
+    ) {
+        return google_error(StatusCode::BAD_REQUEST, d.code, &d.message, &[]);
+    }
+
     // Refused BEFORE the key is touched: a bad model, a non-Google model, or a body that is
     // not JSON never reaches the tenant's credential.
     if !claims.allows_scope(crate::auth::scope::Scope::Chat) {
@@ -2650,6 +2677,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

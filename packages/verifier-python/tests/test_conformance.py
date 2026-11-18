@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -21,9 +22,13 @@ from tracelane_audit_verifier import (
 )
 
 
-def _vector(name: str) -> Path:
+def _vector(name: str, root: Path | None = None) -> Path:
     pkg_root = Path(__file__).resolve().parent.parent
-    return pkg_root.parent.parent / "evals" / "audit-ledger" / name
+    if root is None:
+        root = pkg_root.parent.parent / "evals" / "audit-ledger"
+    path = root / name
+    path.read_bytes()  # Missing/unreadable mandatory evidence must fail before verification.
+    return path
 
 
 def _trusted_tenant_pubkey() -> bytes:
@@ -33,8 +38,6 @@ def _trusted_tenant_pubkey() -> bytes:
 
 def test_good_vector_passes_chain_check() -> None:
     path = _vector("good.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert report.hash_chain_valid, f"errors: {report.errors}"
     assert report.rows_seen == 100
@@ -44,8 +47,6 @@ def test_eval_verdict_vector_passes_chain_check() -> None:
     # Wedge item 3: promotion-record event; middle row's eval_run_id is JSON
     # null (manual override) — pins null canonicalization cross-language.
     path = _vector("eval-verdict.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert report.hash_chain_valid, f"errors: {report.errors}"
     assert report.rows_seen == 3
@@ -53,8 +54,6 @@ def test_eval_verdict_vector_passes_chain_check() -> None:
 
 def test_tampered_vector_fails_chain_check() -> None:
     path = _vector("tampered.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert not report.hash_chain_valid
     assert report.errors
@@ -62,8 +61,6 @@ def test_tampered_vector_fails_chain_check() -> None:
 
 def test_no_anchor_vector_chain_still_valid() -> None:
     path = _vector("no-anchor.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert report.hash_chain_valid
     assert report.rekor_anchors_seen == 0
@@ -74,8 +71,6 @@ def test_v2_1_boundary_number_vector_passes() -> None:
     # JS-unsafe number class (1.0, >2^53, 1e2, 0.50). Hashed byte-for-byte, so
     # it verifies identically across all three verifiers.
     path = _vector("boundary-numbers.v2_1.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert report.hash_chain_valid, f"errors: {report.errors}"
     assert report.rows_seen == 2
@@ -87,8 +82,6 @@ def test_legacy_v2_object_vector_still_verifies_in_python() -> None:
     # green here — this was a JS-specific divergence (see the TS suite, where
     # the identical vector fails). Documents WHY Path 2 (verbatim) was needed.
     path = _vector("boundary-numbers.v2-legacy.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(offline=True))
     assert report.hash_chain_valid, f"errors: {report.errors}"
 
@@ -101,8 +94,6 @@ def test_legacy_v2_object_vector_still_verifies_in_python() -> None:
 
 def test_anchored_v1_verifies_fully_with_trusted_key() -> None:
     path = _vector("anchored.v1.ndjson")
-    if not path.exists() or not _vector("anchor-vectors.meta.json").exists():
-        pytest.skip(f"vector not found at {path}")
     trusted = _trusted_tenant_pubkey()
     report = verify_ledger(
         path,
@@ -119,8 +110,6 @@ def test_anchored_v1_verifies_fully_with_trusted_key() -> None:
 def test_forged_anchor_rejected_at_trusted_key_gate() -> None:
     # A genuinely-log-included Rekor entry, but signed under an ATTACKER key.
     path = _vector("forged-anchor.ndjson")
-    if not path.exists() or not _vector("anchor-vectors.meta.json").exists():
-        pytest.skip(f"vector not found at {path}")
     trusted = _trusted_tenant_pubkey()
     report = verify_ledger(
         path,
@@ -135,8 +124,6 @@ def test_forged_anchor_rejected_at_trusted_key_gate() -> None:
 def test_chain_only_mode_asserts_no_anchor() -> None:
     # No trusted key -> never green: assert nothing about the anchor.
     path = _vector("anchored.v1.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
     report = verify_ledger(path, VerifyOptions(format_version=FormatVersion.V2_1))
     assert report.hash_chain_valid
     assert report.rekor_anchors_resolved == 0
@@ -286,8 +273,6 @@ def test_forged_anchor_without_a_key_reports_anchors_unverified() -> None:
     and nothing falsifies it, so the caller has nothing to gate on.
     """
     path = _vector("forged-anchor.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
 
     report = verify_ledger(path, VerifyOptions(offline=True))
 
@@ -303,8 +288,6 @@ def test_supplying_the_trusted_key_clears_anchors_unverified() -> None:
     Without this pair, `anchors_unverified > 0` could be satisfied by a constant.
     """
     path = _vector("anchored.v1.ndjson")
-    if not path.exists():
-        pytest.skip(f"vector not found at {path}")
 
     report = verify_ledger(
         path,
@@ -414,3 +397,50 @@ def test_aud29_i_platform_key_list_supports_rotation() -> None:
     )
     assert _kinds(r) == []
     assert r.platform_signed_batches == 1
+
+
+# Fixed inventory: directory discovery must not silently shrink coverage.
+MANDATORY_FIXTURES = (
+    "anchor-vectors.meta.json",
+    "anchored.v1.ndjson",
+    "boundary-numbers.v2-legacy.ndjson",
+    "boundary-numbers.v2_1.ndjson",
+    "eval-verdict.ndjson",
+    "forged-anchor.ndjson",
+    "good.ndjson",
+    "no-anchor.ndjson",
+    "platform-key-vectors.meta.json",
+    "platform-only.ndjson",
+    "platform-shadow.ndjson",
+    "platform-then-workspace.ndjson",
+    "tampered.ndjson",
+    "workspace-then-platform.ndjson",
+)
+
+
+def test_mandatory_fixture_inventory() -> None:
+    assert len(MANDATORY_FIXTURES) == 14
+    for name in MANDATORY_FIXTURES:
+        assert _vector(name).read_bytes()
+
+
+def test_mandatory_missing_directory(tmp_path: Path) -> None:
+    with pytest.raises(OSError, match="tampered.ndjson"):
+        _vector("tampered.ndjson", tmp_path / "absent")
+
+
+@pytest.mark.parametrize("name", MANDATORY_FIXTURES)
+def test_mandatory_missing_file(tmp_path: Path, name: str) -> None:
+    for other in MANDATORY_FIXTURES:
+        if other != name:
+            shutil.copyfile(_vector(other), tmp_path / other)
+    with pytest.raises(OSError, match=name):
+        _vector(name, tmp_path)
+
+
+@pytest.mark.parametrize("name", MANDATORY_FIXTURES)
+def test_mandatory_unreadable_file(tmp_path: Path, name: str) -> None:
+    # A directory is deterministically unreadable as a file, even running as root.
+    (tmp_path / name).mkdir()
+    with pytest.raises(OSError, match=name):
+        _vector(name, tmp_path)

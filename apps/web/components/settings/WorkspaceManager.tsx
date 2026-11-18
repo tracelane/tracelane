@@ -30,13 +30,13 @@ async function renameOrg(name: string): Promise<{ name: string }> {
 
 /** A portal refusal that names where to upgrade — the route sends `upgrade_url` with
  *  `sso_required`, and printing the raw code dropped it (2026-09-27 audit). */
-class PortalUpgradeError extends Error {
+export class PortalUpgradeError extends Error {
 	constructor(public readonly upgradeUrl: string) {
 		super("This needs a plan that includes SSO and directory sync.");
 	}
 }
 
-async function openPortal(intent: string): Promise<void> {
+export async function openPortal(intent: string): Promise<void> {
 	const res = await apiFetchRaw("/api/settings/workspace/portal", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -45,12 +45,15 @@ async function openPortal(intent: string): Promise<void> {
 	if (!res.ok) {
 		const e = (await res.json().catch(() => ({}))) as {
 			error?: string;
+			message?: string;
 			upgrade_url?: string;
 		};
 		if (e.error === "sso_required" && e.upgrade_url?.startsWith("/")) {
 			throw new PortalUpgradeError(e.upgrade_url);
 		}
-		throw new Error(e.error ?? `HTTP ${res.status}`);
+		// The gateway's policy refusals (SSO session required, IP not allowed) carry a
+		// readable `message`; the bare code reused `sso_required` for two meanings.
+		throw new Error(e.message ?? e.error ?? `HTTP ${res.status}`);
 	}
 	const { link } = (await res.json()) as { link: string };
 	// Defense in depth: only ever open an https link, so a compromised/spoofed

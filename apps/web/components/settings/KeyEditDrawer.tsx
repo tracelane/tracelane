@@ -13,11 +13,13 @@ type Spend = {
 	recorded_usd: number | null;
 };
 export function KeyEditDrawer({
+	mayGrantMcp = false,
 	row,
 	onClose,
 	onSaved,
 }: {
 	row: ApiKeyRow;
+	mayGrantMcp?: boolean;
 	onClose: () => void;
 	onSaved: (row: ApiKeyRow, changed: string[]) => void;
 }) {
@@ -253,7 +255,14 @@ export function KeyEditDrawer({
 								: ""}
 						</legend>
 						<div className="mt-2 flex flex-wrap gap-4">
-							{["chat", "read", "ingest", "admin", "passthrough"].map((s) => (
+							{[
+								"chat",
+								"read",
+								"ingest",
+								"admin",
+								"passthrough",
+								...(mayGrantMcp ? ["mcp"] : []),
+							].map((s) => (
 								<label key={s} className="flex gap-2">
 									<input
 										type="checkbox"

@@ -86,7 +86,7 @@ fn token_uri_allowed(uri: &str) -> bool {
 }
 
 /// Parsed service account with the private key contained.
-struct ServiceAccount {
+pub(crate) struct ServiceAccount {
     client_email: String,
     private_key: SecretString,
     project_id: String,
@@ -100,7 +100,7 @@ impl ServiceAccount {
     /// Fails when the blob is not JSON or is missing a required field.
     /// Fail-closed: a malformed credential must never fall through to an
     /// unauthenticated request.
-    fn parse(sa_json: &str) -> Result<Self> {
+    pub(crate) fn parse(sa_json: &str) -> Result<Self> {
         let raw: ServiceAccountJson = serde_json::from_str(sa_json)
             .context("service-account JSON is malformed or missing required fields")?;
         if raw.private_key.is_empty() || raw.client_email.is_empty() || raw.project_id.is_empty() {
@@ -197,70 +197,7 @@ impl VertexProvider {
             return Ok(tok);
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock before UNIX epoch")?
-            .as_secs();
-        let claims = Assertion {
-            iss: &sa.client_email,
-            scope: SCOPE,
-            aud: &sa.token_uri,
-            exp: now + 3600,
-            iat: now,
-        };
-        let key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(sa.private_key.expose_secret().as_bytes())
-                .context("service-account private_key is not a valid RSA PEM")?;
-        let assertion = jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-            &claims,
-            &key,
-        )
-        .context("failed to sign service-account assertion")?;
-
-        // B-472 (REV-3): `token_uri` comes from the CUSTOMER's service-account JSON, so
-        // its DNS is customer-controlled — connect to the addresses the guard checked.
-        let pinned = crate::ssrf_guard::validate_url_pinned(&sa.token_uri)
-            .await
-            .context("SSRF guard rejected the token_uri")?;
-        let token_client = pinned
-            .pin(crate::ssrf_guard::safe_client_builder())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("token-exchange client build failed")?;
-
-        let resp = crate::routing::deadlines::send_auxiliary(
-            token_client
-                .post(&sa.token_uri)
-                .form(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)]),
-        )
-        .await
-        .context("failed to reach Google's OAuth2 token endpoint")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            // SECURITY: the token endpoint echoes the assertion (which is signed
-            // with the customer's private key) in some error bodies. Status only.
-            let retry_after = crate::providers::retry_after_from(resp.headers());
-            let _body = crate::routing::deadlines::error_text(resp).await?;
-            tracing::warn!(status = %status, "Vertex OAuth2 token exchange failed");
-            return Err(ProviderHttpError {
-                provider: "vertex",
-                status: status.as_u16(),
-                reason: crate::providers::reason_from_body(&_body),
-                // The token endpoint echoes the signed assertion: never relayed.
-                message: None,
-                retry_after,
-            }
-            .into());
-        }
-
-        let parsed: TokenResponse = resp
-            .json()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context("token endpoint returned an unparseable body")?;
-        let token: Arc<str> = Arc::from(parsed.access_token.as_str());
+        let token = mint_access_token(sa).await?;
         self.tokens.insert(cache_key, Arc::clone(&token)).await;
         Ok(token)
     }
@@ -385,6 +322,78 @@ thread_local! {
     /// the SSRF loopback bypass it is always used with: no process env, no cross-test leak.
     static TEST_HOST_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Sign an RS256 assertion and exchange it at Google's pinned token endpoint (RFC 7523).
+/// No cache: callers own caching, keyed so a token never crosses a tenant boundary.
+///
+/// # Errors
+/// Fail-CLOSED on an unparseable key, a signing failure or a non-2xx token response.
+/// The token-endpoint body is never surfaced: it can echo the assertion.
+pub(crate) async fn mint_access_token(sa: &ServiceAccount) -> Result<Arc<str>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before UNIX epoch")?
+        .as_secs();
+    let claims = Assertion {
+        iss: &sa.client_email,
+        scope: SCOPE,
+        aud: &sa.token_uri,
+        exp: now + 3600,
+        iat: now,
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(sa.private_key.expose_secret().as_bytes())
+        .context("service-account private_key is not a valid RSA PEM")?;
+    let assertion = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &key,
+    )
+    .context("failed to sign service-account assertion")?;
+
+    // B-472 (REV-3): `token_uri` comes from the CUSTOMER's service-account JSON, so
+    // its DNS is customer-controlled — connect to the addresses the guard checked.
+    let pinned = crate::ssrf_guard::validate_url_pinned(&sa.token_uri)
+        .await
+        .context("SSRF guard rejected the token_uri")?;
+    let token_client = pinned
+        .pin(crate::ssrf_guard::safe_client_builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("token-exchange client build failed")?;
+
+    let resp = crate::routing::deadlines::send_auxiliary(
+        token_client
+            .post(&sa.token_uri)
+            .form(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)]),
+    )
+    .await
+    .context("failed to reach Google's OAuth2 token endpoint")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // SECURITY: the token endpoint echoes the assertion (which is signed
+        // with the customer's private key) in some error bodies. Status only.
+        let retry_after = crate::providers::retry_after_from(resp.headers());
+        let _body = crate::routing::deadlines::error_text(resp).await?;
+        tracing::warn!(status = %status, "Google OAuth2 token exchange failed (Vertex or Model Armor)");
+        return Err(ProviderHttpError {
+            provider: "vertex",
+            status: status.as_u16(),
+            reason: crate::providers::reason_from_body(&_body),
+            // The token endpoint echoes the signed assertion: never relayed.
+            message: None,
+            retry_after,
+        }
+        .into());
+    }
+
+    let parsed: TokenResponse = resp
+        .json()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("token endpoint returned an unparseable body")?;
+    Ok(Arc::from(parsed.access_token.as_str()))
 }
 
 #[cfg(test)]

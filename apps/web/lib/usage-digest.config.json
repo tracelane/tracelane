@@ -1,0 +1,5 @@
+{
+	"_what": "PLT-54 reference values (CLAUDE.md §23): send_hour_utc = the UTC hour each day's windows end at (4 = 09:30 IST; keep it equal to the first cron in wrangler.jsonc triggers.crons); max_listed_signups = new people's addresses listed before 'and N more'. Read by lib/usage-digest.ts.",
+	"send_hour_utc": 4,
+	"max_listed_signups": 20
+}

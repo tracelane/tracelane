@@ -15,6 +15,7 @@
  */
 
 import { rateLimit } from "@/lib/rate-limit";
+import { scheduleSignupAlert } from "@/lib/signup-alert";
 import { upsertTenantId, upsertUserMirror } from "@/lib/tenant";
 import { scheduleWelcomeEmail } from "@/lib/welcome-email";
 import { switchToOrganization, withAuth } from "@workos-inc/authkit-nextjs";
@@ -47,9 +48,14 @@ async function existingOrgId(
 		`${WORKOS_API}/user_management/organization_memberships?user_id=${encodeURIComponent(userId)}&statuses=active`,
 		{ headers: { Authorization: `Bearer ${key}` } },
 	);
-	if (!res.ok) return null;
+	if (!res.ok) throw new Error("membership lookup failed");
 	const json = (await res.json()) as { data?: Membership[] };
-	return json.data?.[0]?.organization_id ?? null;
+	if (
+		!Array.isArray(json.data) ||
+		(json.data.length > 0 && !json.data[0]?.organization_id)
+	)
+		throw new Error("membership lookup failed");
+	return json.data[0]?.organization_id ?? null;
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
@@ -76,7 +82,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	}
 
 	// 2. Retry-safe: reuse an existing membership if the user already has one.
-	const priorOrg = await existingOrgId(user.id, key);
+	let priorOrg: string | null;
+	try {
+		priorOrg = await existingOrgId(user.id, key);
+	} catch {
+		return NextResponse.json(
+			{ error: "membership lookup failed" },
+			{ status: 502 },
+		);
+	}
 	if (priorOrg) {
 		await switchToOrganization(priorOrg);
 		const tenantId = await upsertTenantId(priorOrg);
@@ -95,16 +109,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
 	// Signup-abuse control (pre-announce hardening): steps 1&2 are idempotent
 	// returns; only step 3 mints a NEW free tenant. Throttle fresh org creation
-	// per user so a single account can't farm free workspaces. (Per-isolate burst
-	// suppression — see lib/rate-limit.ts caveat; the WorkOS-authed identity is the
-	// real bound on account creation.)
-	if (!rateLimit(`org-create:${user.id}`, 5, 60 * 60_000)) {
+	// per user so a single account cannot farm workspaces across isolates.
+	try {
+		if (!(await rateLimit(`org-create:${user.id}`, 5, 60 * 60_000))) {
+			return NextResponse.json(
+				{
+					error: "rate_limited",
+					message: "too many workspaces created recently — try again later",
+				},
+				{ status: 429 },
+			);
+		}
+	} catch {
 		return NextResponse.json(
-			{
-				error: "rate_limited",
-				message: "too many workspaces created recently — try again later",
-			},
-			{ status: 429 },
+			{ error: "rate_limit_unavailable" },
+			{ status: 503 },
 		);
 	}
 
@@ -182,6 +201,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 			to: user.email,
 		});
 	}
+	// PLT-53: tell the operator about every new workspace — same once-only branch as the
+	// welcome email, but sent for unverified addresses too (it goes to us, not to them).
+	scheduleSignupAlert({
+		workspaceId: org.id,
+		workspaceName: name,
+		tenantId,
+		email: user.email,
+		emailVerified: user.emailVerified === true,
+		at: new Date(),
+	});
 	return NextResponse.json(
 		{ organizationId: org.id, tenantId, created: true },
 		{ status: 201 },

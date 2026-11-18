@@ -1,4 +1,8 @@
 {
+  "zdr_policy": {
+    "max_age_days": 90,
+    "_source": "ADR-079 section 4: quarterly provider-policy evidence review, based on documented retention-policy revisions. Policy validity interval, not a latency timeout. Parsed once by zdr.rs; absent or invalid values fail closed."
+  },
   "kms": {
     "dek_cache_ttl_secs": 300,
     "dek_cache_max_entries": 10000,
@@ -32,6 +36,18 @@
     "known_keys_full_reload_secs": 3600,
     "known_keys_overlap_secs": 300,
     "known_keys_max": 1000000
+  },
+  "audit_pubkey": {
+    "_what": "Public workspace audit-key lookup bounds. Source identity and IPv6 prefixes reuse auth_throttle. UUID validation precedes source allocation. Source buckets have a one-minute burst/refill and expire after a full interval without admission; throttles do not refresh recency. At capacity, unknown sources share the bounded overflow bucket without allocation. Recent overflow admission defers new source allocation until a full idle refill interval. Confirmed UUID misses expire from read start, never on hit; newly enrolled keys are eligible for lookup within negative_ttl_secs. Store failures are not cached. Limits apply per gateway process; platform-key/OpenAPI budgets are independent of workspace store work.",
+    "source_per_minute": 60,
+    "overflow_per_minute": 6,
+    "max_sources": 4096,
+    "source_idle_secs": 60,
+    "store_per_minute": 600,
+    "store_concurrency": 4,
+    "lookup_timeout_ms": 2000,
+    "negative_max_entries": 4096,
+    "negative_ttl_secs": 5
   },
   "key_policy": {
     "_what": "OG-20 / OG-23 reference table (CLAUDE.md §23): the WRITE-side bounds on a per-key or per-project policy document and on projects. Read by crates/gateway/src/providers/translation_policy.rs key_policy_limits() (parsed on its own, like auth_throttle) and enforced by the key and project routes through tracelane_shared::key_policy::KeyPolicy::parse. The READ path (the auth SELECT) never applies them, so lowering a bound never makes a stored policy unenforceable. max_patterns = entries per models/providers allow or deny list; max_pattern_chars = one model glob's length; max_cidrs = source_ips entries; max_required_keys = required_tags or required_metadata_keys entries; max_projects_per_tenant = live (unarchived) projects; max_environments_per_project = a project's environment labels. Specs: specs/OG-20-per-key-policy.md §5, specs/OG-23-projects-environments.md §5.",
@@ -74,6 +90,18 @@
     "stats_window_hours": 24,
     "inherit_requires_capture": true
   },
+  "siem_export": {
+    "_what": "Reference table (CLAUDE.md §23) for the SIEM cursor worker, read by crates/gateway/src/siem_export/worker.rs Config::default(). poll_secs = tick period; must exceed Neon's 300 s suspend floor. batch = records read per source (actions and spans) per claim; a full batch is drained again within destination_budget_secs. destination_budget_secs = wall-clock spent on one destination per tick, so a slow destination cannot stall other tenants; progress is kept. concurrency = destinations served at once. visibility_lag_secs = span ingest visibility lag. source_timeout_secs = ClickHouse read timeout. timeout_secs and max_bytes cover one delivery. retry_delays_secs = wait before claims 2..n after a failed claim; after the last one the destination pauses with its cursor kept.",
+    "poll_secs": 301,
+    "batch": 100,
+    "destination_budget_secs": 30,
+    "concurrency": 8,
+    "visibility_lag_secs": 30,
+    "source_timeout_secs": 10,
+    "timeout_secs": 5,
+    "max_bytes": 1048576,
+    "retry_delays_secs": [0, 600, 1800]
+  },
   "otel_export": {
     "_what": "OG-50 reference table (CLAUDE.md §23): the bounds of the OTLP/HTTP span export to a customer's collector. Read by crates/gateway/src/otel_export.rs config() (parsed on its own, like gateway_controls). queue_spans = spans one export may have waiting (past it the NEWEST span is dropped and counted); queued_spans_total_max = spans waiting across every export of the process; batch_max_spans / batch_flush_ms / max_request_bytes = when a batch is sent (count, time, encoded size); timeout_secs = one delivery attempt; max_retries = retries of a retryable failure (408/429/5xx/transport) with full-jitter backoff (retry_base_ms doubling to retry_cap_ms, a Retry-After honoured up to retry_after_max_secs); degraded_after_failures = consecutive failed batches before status degraded and the worker backs off (doubling to max_cooldown_secs; an export is NEVER auto-disabled); idle_stop_secs = a worker with nothing to send stops after this long; status_flush_secs = how often counters and status are written to Postgres (never per batch); directory_refresh_secs = how often the set of exporting tenants is re-read (a write refreshes at once); max_headers / max_header_value_bytes / forbidden_headers = the customer header map; max_url_bytes / validate_timeout_secs = the URL and its DNS validation. Spec: specs/OG-50-otel-export.md.",
     "queue_spans": 2048,
@@ -102,6 +130,8 @@
     "stop_max_bytes": 256,
     "user_max_bytes": 256,
     "provider_message_max_chars": 512,
+    "sse_line_max_bytes": 1048576,
+    "response_guard_max_bytes": 1048576,
     "retry_after_max_secs": 3600
   },
   "extra_params": {

@@ -161,7 +161,7 @@ fn build_event_stream(
         use futures::StreamExt as _;
         while let Some(chunk) = byte_stream.next().await {
             let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("error reading response chunk")?;
-            lines.push(&chunk);
+            lines.push(&chunk)?;
 
             // Process complete SSE lines
             while let Some(line) = lines.next_line() {

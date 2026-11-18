@@ -1418,7 +1418,7 @@ pub(crate) enum ClientKind {
 ///
 /// # Errors
 /// Fail-CLOSED: `Err` only if no client can be built; never an unguarded one.
-fn upstream_client(kind: ClientKind) -> anyhow::Result<&'static reqwest::Client> {
+pub(crate) fn upstream_client(kind: ClientKind) -> anyhow::Result<&'static reqwest::Client> {
     static MEDIA: OnceLock<reqwest::Client> = OnceLock::new();
     static FILES: OnceLock<reqwest::Client> = OnceLock::new();
     let (cell, secs) = match kind {
@@ -1431,16 +1431,14 @@ fn upstream_client(kind: ClientKind) -> anyhow::Result<&'static reqwest::Client>
             translation_policy::media_limits().files_timeout_secs,
         ),
     };
-    if let Some(c) = cell.get() {
-        return Ok(c);
-    }
-    // A table that did not parse reads 0 s: refuse rather than build a client that
-    // times out instantly (or never).
-    anyhow::ensure!(secs > 0, "media timeouts are not configured");
-    let built = crate::ssrf_guard::safe_client_builder()
-        .timeout(std::time::Duration::from_secs(secs))
-        .build()?;
-    Ok(cell.get_or_init(|| built))
+    crate::ssrf_guard::shared_client(cell, || {
+        // A table that did not parse reads 0 s: refuse rather than build a client that
+        // times out instantly (or never).
+        anyhow::ensure!(secs > 0, "media timeouts are not configured");
+        Ok(crate::ssrf_guard::safe_client_builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()?)
+    })
 }
 
 /// `{base}/v1/{segments…}?{query}` for a catalog provider, or `{cohere v2 base}/{segments…}`
@@ -1599,6 +1597,7 @@ pub(crate) fn text_view(model: &str, texts: &[&str]) -> ChatRequest {
 /// Fail-CLOSED: a block / redact decision (403 `guardrail_block`) or a verdict that could
 /// not be recorded (503 `audit_unavailable`).
 pub(crate) async fn run_request_rails(
+    zdr_required: bool,
     state: &AppState,
     claims: &Claims,
     correlation_id: ulid::Ulid,
@@ -1611,6 +1610,7 @@ pub(crate) async fn run_request_rails(
     let gr = state
         .guardrail
         .evaluate_request(crate::guardrail::RequestInputs {
+            zdr_required,
             tenant_id: &claims.tenant_id,
             api_key_id: Some(claims.sub.as_str()),
             project_id: claims.governance.as_ref().and_then(|g| g.project_id),
@@ -1803,6 +1803,7 @@ pub(crate) mod test_support {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

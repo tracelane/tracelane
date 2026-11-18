@@ -10,6 +10,8 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	DEADLINE_CACHE_LIMITS,
+	__deadlineCacheStatsForTests,
 	__resetDeadlineCacheForTests,
 	queryWithDeadline,
 	streamQueryWithDeadline,
@@ -109,5 +111,43 @@ describe("FT-07: slow-query deadline + partial result", () => {
 		expect(body).toContain("event: partial");
 		expect(body).toContain("event: error");
 		expect(body).not.toContain("event: full");
+	});
+
+	it("trace_stream_cache_has_bounded_entries", async () => {
+		for (let i = 0; i <= DEADLINE_CACHE_LIMITS.maxEntries; i++) {
+			await readSse(
+				streamQueryWithDeadline(async () => [{ id: i }], {
+					cacheKey: `trace:${i}`,
+				}),
+			);
+		}
+		expect(__deadlineCacheStatsForTests()).toEqual({
+			entries: DEADLINE_CACHE_LIMITS.maxEntries,
+			rows: DEADLINE_CACHE_LIMITS.maxEntries,
+		});
+		const evicted = await readSse(
+			streamQueryWithDeadline(async () => [], {
+				cacheKey: "trace:0",
+			}),
+		);
+		expect(evicted.split("event: full")[0]).toContain('"rows":[]');
+	});
+
+	it("trace_stream_cache_expires_old_entries", async () => {
+		let clock = 1000;
+		await readSse(
+			streamQueryWithDeadline(async () => [{ id: 1 }], {
+				cacheKey: "trace:aged",
+				now: () => clock,
+			}),
+		);
+		clock += DEADLINE_CACHE_LIMITS.maxAgeMs + 1;
+		const body = await readSse(
+			streamQueryWithDeadline(async () => [], {
+				cacheKey: "trace:aged",
+				now: () => clock,
+			}),
+		);
+		expect(body.split("event: full")[0]).toContain('"rows":[]');
 	});
 });

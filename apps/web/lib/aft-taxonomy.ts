@@ -148,8 +148,8 @@ const TAXONOMY: Record<string, AftTaxonomyEntry> = {
 		detectorStatus: "roadmap",
 	},
 	// Learned trajectory-anomaly scoring (AFT-TRAJ-ANOMALY-001) is deliberately
-	// not carried here. Tracelane does not offer it: no model is trained, none
-	// ships, and trajectory_guard.rs scores every trace 0.0. Do not re-add the
+	// not carried here. The former constant scorer has been retired; there is
+	// no learned trajectory scorer in the gateway registry. Do not re-add the
 	// entry — an id in this map is a claim the product makes.
 };
 

@@ -1,11 +1,27 @@
 {
   "module": "crates/gateway/src/guardrail/policy_api.rs",
   "operations": {
+    "GET /v1/guardrails/policy": {
+      "summary": "Read the scoped guardrail policy, effective rails, edit permission and current ETag.",
+      "tags": ["guardrails"],
+      "responses": {
+        "200": {
+          "description": "The policy, effective rails, can_edit and etag; the ETag header matches etag in the body.",
+          "schema": { "type": "object" }
+        },
+        "404": {
+          "description": "scope_not_found",
+          "schema": { "$ref": "#/components/schemas/ControlError" }
+        }
+      },
+      "x-error-codes": ["invalid_scope", "scope_not_found", "policy_unavailable"]
+    },
     "PUT /v1/guardrails/policy": {
-      "summary": "Replace the workspace's (or one project's / key's) scoped guardrail policy document (specs/OG-30).",
+      "summary": "Replace a scoped guardrail policy using the current ETag in If-Match.",
       "tags": [
         "guardrails"
       ],
+      "parameters": [{ "name": "If-Match", "in": "header", "required": true, "schema": { "type": "string" } }],
       "requestBody": {
         "type": "object"
       },
@@ -27,11 +43,21 @@
           "schema": {
             "$ref": "#/components/schemas/ControlError"
           }
+        },
+        "409": {
+          "description": "policy_conflict — the stored policy changed after GET.",
+          "schema": { "$ref": "#/components/schemas/ControlError" }
+        },
+        "428": {
+          "description": "if_match_required",
+          "schema": { "$ref": "#/components/schemas/ControlError" }
         }
       },
       "x-error-codes": [
         "invalid_policy",
         "invalid_scope",
+        "if_match_required",
+        "policy_conflict",
         "scope_not_found",
         "schema_invalid",
         "policy_unavailable",

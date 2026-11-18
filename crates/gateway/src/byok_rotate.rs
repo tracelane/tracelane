@@ -126,6 +126,17 @@ struct Column {
 
 const COLUMNS: &[Column] = &[
     Column {
+        table: "mcp_servers",
+        select: "SELECT tenant_id,'mcp-server-credential:'||id::text,credential_ct FROM mcp_servers WHERE credential_ct IS NOT NULL ORDER BY tenant_id,id",
+        update: "UPDATE mcp_servers SET credential_ct=$3,updated_at=now() WHERE tenant_id=$1 AND 'mcp-server-credential:'||id::text=$2 AND credential_ct=$4",
+        aad: |tenant, purpose| {
+            crate::byok::provider_key_aad(
+                &tracelane_shared::TenantId::from_jwt_claim(*tenant),
+                purpose,
+            )
+        },
+    },
+    Column {
         table: "tenant_kms_configs",
         select: "SELECT tenant_id, tenant_id::text AS row_id, secret_enc FROM tenant_kms_configs WHERE secret_enc IS NOT NULL ORDER BY tenant_id",
         update: "UPDATE tenant_kms_configs SET secret_enc=$3 WHERE tenant_id=$1 AND tenant_id::text=$2 AND secret_enc=$4",
@@ -204,7 +215,9 @@ pub async fn rotate(pool: &Pool, ring: &ByokMasterKey, dry_run: bool) -> Result<
             let tenant: Uuid = row.get(0);
             let key: String = row.get(1);
             let blob: String = row.get(2);
-            if col.table == "provider_keys" && ByokMasterKey::is_customer_envelope(&blob) {
+            if matches!(col.table, "provider_keys" | "mcp_servers")
+                && ByokMasterKey::is_customer_envelope(&blob)
+            {
                 t.customer_managed += 1;
                 continue;
             }

@@ -129,10 +129,6 @@ export function ContentCapture() {
 							Only the workspace owner can change this.
 						</p>
 					)}
-					<p className="text-xs text-ink-2">
-						Responses from the native Anthropic endpoint are not recorded yet —
-						requests are.
-					</p>
 					{busy && <p aria-live="polite">Saving…</p>}
 				</>
 			)}

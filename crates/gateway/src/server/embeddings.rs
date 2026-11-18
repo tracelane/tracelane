@@ -18,8 +18,19 @@ use super::errors::{
     unroutable_model_response,
 };
 use super::spans::{
-    CallerIdentity, GatewayTiming, SpanUsageMeta, build_gateway_span, spawn_span_publish,
+    CallerIdentity, GatewayTiming, SpanUsageMeta, build_gateway_span, record_key_spend,
+    spawn_span_publish,
 };
+
+/// Every embeddings span, refusal or success, reaches the spend recorders before it is
+/// published — the key / workspace trackers, `budgets::record_span` (OG-22) and
+/// `limits::reconcile_span` (OG-21, which also releases a failed request's TPM
+/// reservation). B-617: this route published without them, so a key at its hard budget
+/// kept embedding. Before the NATS check inside `spawn_span_publish`, as on the chat paths.
+fn record_and_publish(state: &AppState, api_key_id: Option<&str>, span: TracelaneSpan) {
+    record_key_spend(api_key_id, &span);
+    spawn_span_publish(state, span);
+}
 
 /// GWY-49: stamp the constraint's outcome on an embeddings span — `None` leaves it
 /// untouched (an unconstrained request), `Some(eligible)` records `zdr_required` and
@@ -250,8 +261,9 @@ async fn embeddings_handler_with_labels(
     // is dropped; each refusal records its OWN embeddings-shaped error span and
     // disarms, so a refused request is visible in /traces rather than silent.
     let refuse_with_span = |dispatch_guard: &mut DispatchGuard, state: &AppState, code: &str| {
-        spawn_span_publish(
+        record_and_publish(
             state,
+            claims.api_key_id(),
             build_embeddings_span(
                 tenant_id,
                 trace_id,
@@ -285,8 +297,9 @@ async fn embeddings_handler_with_labels(
         Ok(Some(crate::zdr::Constraint::Required)) => {
             let caps = state.zdr.load();
             if !caps.eligible(provider_id) {
-                spawn_span_publish(
+                record_and_publish(
                     &state,
+                    claims.api_key_id(),
                     with_zdr(
                         build_embeddings_span(
                             tenant_id,
@@ -573,7 +586,7 @@ async fn embeddings_handler_with_labels(
                 error_span.attributes.tracelane_dispatch_attempts =
                     Some(vec![timeout.attempt(provider_id, &model)]);
             }
-            spawn_span_publish(&state, error_span);
+            record_and_publish(&state, claims.api_key_id(), error_span);
             tracing::warn!(
                 provider = upstream,
                 reason = failure.reason(),
@@ -613,7 +626,7 @@ async fn embeddings_handler_with_labels(
     if timer.is_cold() && ok_span.attributes.tracelane_gateway_overhead_us.is_some() {
         ok_span.attributes.tracelane_gateway_cold_start = Some(true);
     }
-    spawn_span_publish(&state, with_zdr(ok_span, zdr_eligible));
+    record_and_publish(&state, claims.api_key_id(), with_zdr(ok_span, zdr_eligible));
 
     // Echo the model the CALLER asked for. A `tracelane.yaml` alias is the
     // caller's own vocabulary; handing back the upstream name would break a
@@ -791,6 +804,64 @@ mod route_tests {
         // The model the caller sent is echoed back, so a client that
         // round-trips `response.model` keeps working.
         assert_eq!(body["model"], "ollama/nomic-embed-text");
+    }
+
+    /// B-617: the embeddings route published its span but never called
+    /// `record_key_spend`, so an embeddings request never reached the key / workspace
+    /// spend trackers, `budgets::record_span` (OG-22) or `limits::reconcile_span`
+    /// (OG-21) — a key at its hard budget kept embedding. RED before the fix: the
+    /// tracked spend stayed 0 while the span carried a cost.
+    #[tokio::test]
+    async fn embeddings_cost_reaches_the_key_and_workspace_spend_trackers() {
+        use crate::media_common::test_support::{
+            as_claims, claims_for, install_byok, tenant, traced,
+        };
+        let _bypass = LoopbackBypassGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "object": "embedding", "index": 0, "embedding": VECTORS }],
+                "model": "text-embedding-3-small",
+                "usage": { "prompt_tokens": 50_000, "total_tokens": 50_000 }
+            })))
+            .mount(&server)
+            .await;
+        let t = tenant();
+        install_byok(&t, "openai");
+        let claims = claims_for(&t);
+        let key: Uuid = claims
+            .api_key_id()
+            .expect("an API-key credential")
+            .parse()
+            .expect("key id is a UUID");
+        let _claims = as_claims(claims);
+        let mut reg = ProviderRegistry::new().expect("registry");
+        reg.set_compat_base_url_for_test("openai", server.uri())
+            .expect("openai adapter for the mock");
+        let trace = Uuid::new_v4();
+
+        let resp = embeddings_handler(
+            State(test_state(reg)),
+            traced(trace),
+            Json(json!({ "model": "text-embedding-3-small", "input": "embed me" })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        let cost = spans[0].attributes.gen_ai_usage_cost.unwrap_or(0.0);
+        assert!(cost > 0.0, "a priced embedding model yields a cost");
+        for subject in [
+            crate::spend::Subject::Key(key),
+            crate::spend::Subject::Workspace(*t.as_uuid()),
+        ] {
+            assert!(
+                crate::spend::tracker().current_usd(subject) > 0.0,
+                "{subject:?}: the embeddings cost must reach the spend tracker"
+            );
+        }
     }
 
     #[test]

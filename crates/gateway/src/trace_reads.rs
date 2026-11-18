@@ -4330,14 +4330,16 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant).await,
         )
         .sql_with_settings();
-        Ok(self
-            .client
-            .query(&sql)
-            .bind(since)
-            .bind(until)
-            .bind(tenant.to_string())
-            .fetch_all()
-            .await?)
+        Ok(
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until)
+                .bind(tenant.to_string())
+                .fetch_all()
+                .await?,
+        )
     }
     async fn trace_rescues(
         &self,
@@ -4354,15 +4356,17 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant).await,
         )
         .sql_with_settings();
-        Ok(self
-            .client
-            .query(&sql)
-            .bind(since)
-            .bind(until)
-            .bind(tenant.to_string())
-            .bind(ids)
-            .fetch_all()
-            .await?)
+        Ok(
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until)
+                .bind(tenant.to_string())
+                .bind(ids)
+                .fetch_all()
+                .await?,
+        )
     }
     async fn spend_causes(
         &self,
@@ -4375,38 +4379,44 @@ impl TraceReader for ClickHouseTraceReader {
         let end = start + granularity.seconds();
         let tier = self.tier_for(tenant).await;
         let sql = TenantQuery::new(crate::spend_causes::summary_sql(by), tier).sql_with_settings();
-        let summary = self
-            .client
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(start)
-            .bind(end)
-            .fetch_one::<crate::spend_causes::Summary>()
-            .await?;
+        let summary =
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(start)
+                .bind(end)
+                .fetch_one::<crate::spend_causes::Summary>()
+                .await?;
         let sql = TenantQuery::new(crate::spend_causes::rows_sql(by, params.drill_top_n), tier)
             .sql_with_settings();
-        let rows = self
-            .client
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(start)
-            .bind(end)
-            .fetch_all::<crate::spend_causes::CauseRow>()
-            .await?;
+        let rows =
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(start)
+                .bind(end)
+                .fetch_all::<crate::spend_causes::CauseRow>()
+                .await?;
         let mut baseline = Vec::new();
         if !rows.is_empty()
             && let Some(sql) = crate::spend_causes::baseline_sql(by, granularity)
         {
             let sql = TenantQuery::new(sql, tier).sql_with_settings();
-            baseline = self
-                .client
-                .query(&sql)
-                .bind(tenant.to_string())
-                .bind(start - i64::from(params.baseline_buckets) * granularity.seconds())
-                .bind(start)
-                .bind(rows.iter().map(|r| r.dimension.clone()).collect::<Vec<_>>())
-                .fetch_all()
-                .await?;
+            baseline = crate::retention_sweep::read_client(
+                &self.client,
+                self.entitlements.as_deref(),
+                tenant,
+            )
+            .await
+            .query(&sql)
+            .bind(tenant.to_string())
+            .bind(start - i64::from(params.baseline_buckets) * granularity.seconds())
+            .bind(start)
+            .bind(rows.iter().map(|r| r.dimension.clone()).collect::<Vec<_>>())
+            .fetch_all()
+            .await?;
         }
         let series = self
             .spend_series(tenant, start, end, granularity)
@@ -4439,14 +4449,16 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant).await,
         )
         .sql_with_settings();
-        Ok(self
-            .client
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(since)
-            .bind(until)
-            .fetch_all()
-            .await?)
+        Ok(
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(since)
+                .bind(until)
+                .fetch_all()
+                .await?,
+        )
     }
     fn agent_loop_policy(&self) -> Option<crate::billing::rating::AgentLoopPolicy> {
         self.rate_card.load().policy.agent_loop
@@ -4475,12 +4487,13 @@ impl TraceReader for ClickHouseTraceReader {
             tier,
         )
         .sql_with_settings();
-        let query = self
-            .client
-            .query(&sql)
-            .bind(since)
-            .bind(until)
-            .bind(tenant.to_string());
+        let query =
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until)
+                .bind(tenant.to_string());
         let rows = scope
             .bind_instances(scope.bind(query, tenant))
             .fetch_all::<LoopRow>()
@@ -4514,12 +4527,13 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant).await,
         )
         .sql_with_settings();
-        let query = self
-            .client
-            .query(&sql)
-            .bind(since)
-            .bind(until)
-            .bind(tenant.to_string());
+        let query =
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until)
+                .bind(tenant.to_string());
         let (instances, groups, tool_calls, unfingerprinted_tool_calls) = scope
             .bind_instances(scope.bind(query, tenant))
             .fetch_one::<(u64, u64, u64, u64)>()
@@ -4555,7 +4569,12 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant).await,
         )
         .sql_with_settings();
-        let mut query = self.client.query(&sql).bind(since).bind(until);
+        let mut query =
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until);
         if !scope.trace_ids.is_empty() {
             query = query.bind(&scope.trace_ids);
         }
@@ -4610,15 +4629,19 @@ impl TraceReader for ClickHouseTraceReader {
                     self.tier_for(tenant_id).await,
                 )
                 .sql_with_settings();
-                let row = self
-                    .client
-                    .query(&sql)
-                    .bind(tenant_id.to_string())
-                    .bind(since.timestamp_micros())
-                    .bind(until.timestamp_micros())
-                    .fetch_one::<SummaryRow>()
-                    .await
-                    .context("generation issue summary read failed")?;
+                let row = crate::retention_sweep::read_client(
+                    &self.client,
+                    self.entitlements.as_deref(),
+                    tenant_id,
+                )
+                .await
+                .query(&sql)
+                .bind(tenant_id.to_string())
+                .bind(since.timestamp_micros())
+                .bind(until.timestamp_micros())
+                .fetch_one::<SummaryRow>()
+                .await
+                .context("generation issue summary read failed")?;
                 anyhow::ensure!(
                     row.issue_counts.len() == ISSUES.len(),
                     "generation issue summary shape mismatch"
@@ -4664,7 +4687,18 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<TraceSummaryRow>> {
         let sql = TenantQuery::new(build_trace_list_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, None);
+        let mut q = bind_trace_prefix_and_filters(
+            crate::retention_sweep::read_client(
+                &self.client,
+                self.entitlements.as_deref(),
+                tenant_id,
+            )
+            .await
+            .query(&sql),
+            tenant_id,
+            f,
+            None,
+        );
         if let Some((cts, cid)) = &f.cursor {
             q = q.bind(*cts).bind(*cts).bind(cid.clone());
         }
@@ -4686,7 +4720,18 @@ impl TraceReader for ClickHouseTraceReader {
         )
         .sql_with_settings();
         // Filter binds MIRROR list_traces (same order as build_trace_groups_sql).
-        let mut q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, Some(by));
+        let mut q = bind_trace_prefix_and_filters(
+            crate::retention_sweep::read_client(
+                &self.client,
+                self.entitlements.as_deref(),
+                tenant_id,
+            )
+            .await
+            .query(&sql),
+            tenant_id,
+            f,
+            Some(by),
+        );
         q = q.bind(f.limit);
         q.fetch_all::<TraceGroupRow>()
             .await
@@ -4698,7 +4743,18 @@ impl TraceReader for ClickHouseTraceReader {
             .with_log_comment(format!("tenant_id={tenant_id}"))
             .sql_with_settings();
         // Bind order MIRRORS build_trace_list_sql's filter binds, minus cursor/limit.
-        let q = bind_trace_prefix_and_filters(self.client.query(&sql), tenant_id, f, None);
+        let q = bind_trace_prefix_and_filters(
+            crate::retention_sweep::read_client(
+                &self.client,
+                self.entitlements.as_deref(),
+                tenant_id,
+            )
+            .await
+            .query(&sql),
+            tenant_id,
+            f,
+            None,
+        );
         let row = q
             .fetch_one::<TraceTotalRow>()
             .await
@@ -4708,14 +4764,18 @@ impl TraceReader for ClickHouseTraceReader {
 
     async fn list_spans(&self, tenant_id: &TenantId, trace_id: &str) -> Result<Vec<SpanRow>> {
         let sql = TenantQuery::new(SPANS_SQL, self.tier_for(tenant_id).await).sql_with_settings();
-        let mut spans: Vec<SpanRow> = self
-            .client
-            .query(&sql)
-            .bind(tenant_id.to_string())
-            .bind(trace_id.to_string())
-            .fetch_all::<SpanRow>()
-            .await
-            .context("spans SELECT failed")?;
+        let mut spans: Vec<SpanRow> = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string())
+        .bind(trace_id.to_string())
+        .fetch_all::<SpanRow>()
+        .await
+        .context("spans SELECT failed")?;
         // BILL-01 / ADR-076 §2.3 — reverse any content-addressed dedup ingest
         // applied. Fail-open (a read path): a rehydration failure leaves the
         // `$ref` placeholders exactly as stored rather than failing the whole
@@ -4757,14 +4817,18 @@ impl TraceReader for ClickHouseTraceReader {
         // directly and it is the only ledger this deployment has — read it.
         let sql =
             TenantQuery::new(TRACE_CHAIN_SQL, self.tier_for(tenant_id).await).sql_with_settings();
-        let row = self
-            .client
-            .query(&sql)
-            .bind(tenant_id.to_string())
-            .bind(trace_id.to_string())
-            .fetch_optional::<ChainStatusRow>()
-            .await
-            .context("trace chain-status SELECT failed")?;
+        let row = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string())
+        .bind(trace_id.to_string())
+        .fetch_optional::<ChainStatusRow>()
+        .await
+        .context("trace chain-status SELECT failed")?;
         Ok(row.map(|r| TraceChainStatus {
             chained: true,
             seq: Some(r.seq),
@@ -4786,7 +4850,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         for id in trace_ids {
             q = q.bind(id.clone());
         }
@@ -4808,7 +4879,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut query = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut query = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         for id in trace_ids {
             query = query.bind(id);
         }
@@ -4821,7 +4899,14 @@ impl TraceReader for ClickHouseTraceReader {
     async fn slo(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<Vec<SloRow>> {
         let sql =
             TenantQuery::new(build_slo_sql(f), self.tier_for(tenant_id).await).sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4844,7 +4929,14 @@ impl TraceReader for ClickHouseTraceReader {
     async fn slo_summary(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<SloSummary> {
         let sql = TenantQuery::new(build_slo_summary_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4869,7 +4961,14 @@ impl TraceReader for ClickHouseTraceReader {
     async fn slo_by_model(&self, tenant_id: &TenantId, f: &SloFilters) -> Result<Vec<SloModelRow>> {
         let sql = TenantQuery::new(build_slo_by_model_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4901,7 +5000,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4928,7 +5034,14 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<GatewayProviderRow>> {
         let sql = TenantQuery::new(build_gateway_stats_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -4953,7 +5066,13 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql);
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql);
         if let Some(key) = &f.meta_key {
             q = q.bind(key.clone());
         }
@@ -4970,7 +5089,13 @@ impl TraceReader for ClickHouseTraceReader {
         let sql = TenantQuery::new(build_cost_breakdown_sql(f), self.tier_for(tenant_id).await)
             .with_log_comment(format!("tenant_id={tenant_id}"))
             .sql_with_settings();
-        let mut q = self.client.query(&sql);
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql);
         if let Some(key) = &f.meta_key {
             q = q.bind(key.clone());
         }
@@ -5002,7 +5127,14 @@ impl TraceReader for ClickHouseTraceReader {
             )
             .with_log_comment(format!("tenant_id={tenant_id}"))
             .sql_with_settings();
-            let mut totals_q = self.client.query(&totals_sql).bind(tenant_id.to_string());
+            let mut totals_q = crate::retention_sweep::read_client(
+                &self.client,
+                self.entitlements.as_deref(),
+                tenant_id,
+            )
+            .await
+            .query(&totals_sql)
+            .bind(tenant_id.to_string());
             if let Some(s) = base.since_secs {
                 totals_q = totals_q.bind(s);
             } else {
@@ -5039,7 +5171,14 @@ impl TraceReader for ClickHouseTraceReader {
         let totals_sql =
             TenantQuery::new(build_latency_totals_sql(f), self.tier_for(tenant_id).await)
                 .sql_with_settings();
-        let mut tq = self.client.query(&totals_sql).bind(tenant_id.to_string());
+        let mut tq = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&totals_sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             tq = tq.bind(s);
         } else {
@@ -5059,7 +5198,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut mq = self.client.query(&by_model_sql).bind(tenant_id.to_string());
+        let mut mq = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&by_model_sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             mq = mq.bind(s);
         } else {
@@ -5087,7 +5233,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -5109,7 +5262,14 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<GuardrailRailRow>> {
         let sql = TenantQuery::new(build_guardrail_rails_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_secs {
             q = q.bind(s);
         } else {
@@ -5134,7 +5294,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         // Bind order mirrors the SQL: tenant, [decision], [correlation_id], [rail],
         // (since_secs | hours), [until], limit.
         if let Some(d) = f.decision.as_deref() {
@@ -5167,7 +5334,14 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<SignatureHitRow>> {
         let sql = TenantQuery::new(build_signatures_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(s) = f.since_us {
             q = q.bind(s);
         }
@@ -5190,7 +5364,14 @@ impl TraceReader for ClickHouseTraceReader {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         // Bind order MIRRORS build_signatures_trace_total_sql: tenant, live_ids…,
         // [since_us]. The live-id IN list is bound (never interpolated).
         for id in &f.live_signature_ids {
@@ -5216,7 +5397,14 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<SessionSummaryRow>> {
         let sql = TenantQuery::new(build_session_list_sql(f), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let mut q = self.client.query(&sql).bind(tenant_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string());
         if let Some(m) = f.model.as_deref() {
             q = q.bind(m);
         }
@@ -5241,7 +5429,8 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Vec<SessionTraceRow>> {
         let sql = TenantQuery::new(build_session_traces_sql(), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        self.client
+        crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant_id)
+            .await
             .query(&sql)
             .bind(tenant_id.to_string())
             .bind(session_id.to_string())
@@ -5257,14 +5446,18 @@ impl TraceReader for ClickHouseTraceReader {
     ) -> Result<Option<SessionTotalsRow>> {
         let sql = TenantQuery::new(build_session_totals_sql(), self.tier_for(tenant_id).await)
             .sql_with_settings();
-        let row: SessionTotalsRow = self
-            .client
-            .query(&sql)
-            .bind(tenant_id.to_string())
-            .bind(session_id.to_string())
-            .fetch_one()
-            .await
-            .context("session totals SELECT failed")?;
+        let row: SessionTotalsRow = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_one()
+        .await
+        .context("session totals SELECT failed")?;
         // No GROUP BY — the aggregate always returns exactly one row, even for
         // zero matching spans (every `sum`/`count` is then 0). `turns == 0` is
         // therefore the "no such session for this tenant" signal, mirrored by
@@ -5282,11 +5475,15 @@ impl TraceReader for ClickHouseTraceReader {
         let tier = self.tier_for(tenant_id).await;
         let sql =
             TenantQuery::new(build_session_turns_sql(cursor.is_some()), tier).sql_with_settings();
-        let mut q = self
-            .client
-            .query(&sql)
-            .bind(tenant_id.to_string())
-            .bind(session_id.to_string());
+        let mut q = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant_id.to_string())
+        .bind(session_id.to_string());
         if let Some((ts, id)) = &cursor {
             q = q.bind(*ts).bind(id.clone());
         }
@@ -5303,7 +5500,14 @@ impl TraceReader for ClickHouseTraceReader {
         let trace_ids: Vec<String> = turns.iter().map(|t| t.trace_id.clone()).collect();
         let exchange_sql =
             TenantQuery::new(build_session_exchange_sql(trace_ids.len()), tier).sql_with_settings();
-        let mut eq = self.client.query(&exchange_sql).bind(tenant_id.to_string());
+        let mut eq = crate::retention_sweep::read_client(
+            &self.client,
+            self.entitlements.as_deref(),
+            tenant_id,
+        )
+        .await
+        .query(&exchange_sql)
+        .bind(tenant_id.to_string());
         for id in &trace_ids {
             eq = eq.bind(id.clone());
         }
@@ -16565,7 +16769,7 @@ mod clickhouse_roundtrip {
         let (base, since, until) = per_run_window();
         insert_priced_groups(&c, DEV_TENANT, base, "model", groups as u64, 0.01).await;
         let state = TraceReadState {
-            reader: Arc::new(ClickHouseTraceReader::new(c)),
+            reader: Arc::new(historical_cost_reader(c)),
             rejections: test_rejections(),
         };
         let resp = cost_breakdown_handler(
@@ -16625,7 +16829,7 @@ mod clickhouse_roundtrip {
         .await
         .expect("insert unpriced spans");
         let state = TraceReadState {
-            reader: Arc::new(ClickHouseTraceReader::new(c)),
+            reader: Arc::new(historical_cost_reader(c)),
             rejections: test_rejections(),
         };
         let resp = cost_breakdown_handler(
@@ -16653,6 +16857,28 @@ mod clickhouse_roundtrip {
         assert_eq!(v["priced_requests"], cap as u64);
         assert_eq!(v["group_count"], (cap + 1) as u64);
         assert_eq!(v["truncated"], true);
+    }
+
+    // The cap probes intentionally use historical rows for isolation. Grant only
+    // their authenticated fixture tenant a window covering those 30–300-day rows;
+    // a missing cache correctly hides them under the unprivileged retention policy.
+    fn historical_cost_reader(c: clickhouse::Client) -> ClickHouseTraceReader {
+        let fixture_tenant = uuid::Uuid::parse_str(DEV_TENANT).expect("fixture tenant UUID");
+        let resolve: crate::entitlement_cache::ResolveFn = Arc::new(move |tenant| {
+            Box::pin(async move {
+                let mut e = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+                if tenant == fixture_tenant {
+                    e.queryable_days = 365;
+                }
+                Ok(e)
+            })
+        });
+        ClickHouseTraceReader::new(c).with_entitlements(
+            Some(Arc::new(crate::entitlement_cache::EntitlementCache::new(
+                resolve,
+            ))),
+            None,
+        )
     }
 
     /// A one-hour window at a per-run point 30–300 days back, so the dev-token

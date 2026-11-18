@@ -56,6 +56,23 @@ pub fn parse_traceparent(value: &str) -> Option<InboundTraceContext> {
     })
 }
 
+/// MCP request `_meta.traceparent` is a secondary W3C carrier. An HTTP
+/// traceparent wins; a malformed one does not suppress a valid MCP carrier.
+pub fn resolve_trace_identity_with_meta(
+    headers: &HeaderMap,
+    meta_traceparent: Option<&str>,
+) -> (Uuid, Option<Uuid>) {
+    if let Some(context) = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent)
+        .or_else(|| meta_traceparent.and_then(parse_traceparent))
+    {
+        return (context.trace_id, Some(context.parent_span_id));
+    }
+    resolve_trace_identity(headers)
+}
+
 /// Lowercase hex only — the spec mandates lowercase on the wire, and every OTel exporter
 /// emits it. Uppercase is rejected rather than tolerated so a hand-typed header fails the
 /// same way it would fail an OTel receiver.

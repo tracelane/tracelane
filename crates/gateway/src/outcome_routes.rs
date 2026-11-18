@@ -130,7 +130,14 @@ impl OutcomeStore for ClickHouseOutcomeStore {
             PlanTier::Free,
         )
         .sql_with_settings();
-        let mut query = self.ch.query(&sql).bind(tenant.to_string());
+        let mut query = crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            tenant,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant.to_string());
         if !traces.is_empty() {
             query = query.bind(traces);
         }
@@ -146,7 +153,15 @@ impl OutcomeStore for ClickHouseOutcomeStore {
     }
     async fn exists(&self, tenant: &TenantId, kind: &str, id: &str, hours: u32) -> Result<bool> {
         let sql = TenantQuery::new(subject_sql(kind), PlanTier::Free).sql_with_settings();
-        let mut query = self.ch.query(&sql).bind(tenant.to_string()).bind(id);
+        let mut query = crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            tenant,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant.to_string())
+        .bind(id);
         if kind == "session" {
             query = query.bind(hours);
         }
@@ -154,14 +169,18 @@ impl OutcomeStore for ClickHouseOutcomeStore {
     }
     async fn get(&self, tenant: &TenantId, kind: &str, id: &str) -> Result<Option<Outcome>> {
         let sql = TenantQuery::new(OUTCOME_SQL, PlanTier::Free).sql_with_settings();
-        Ok(self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(kind)
-            .bind(id)
-            .fetch_optional()
-            .await?)
+        Ok(crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            tenant,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant.to_string())
+        .bind(kind)
+        .bind(id)
+        .fetch_optional()
+        .await?)
     }
     async fn write(&self, tenant: &TenantId, o: &Outcome) -> Result<()> {
         self.ch.query("INSERT INTO tracelane.outcomes (tenant_id, subject_kind, subject_id, question_id, result, actual, reason, source, version, recorded_at) VALUES (?, ?, ?, '', ?, '', ?, ?, ?, fromUnixTimestamp64Milli(?))")
@@ -699,6 +718,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

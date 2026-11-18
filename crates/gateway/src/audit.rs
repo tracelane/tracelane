@@ -267,6 +267,13 @@ fn local_attest_msg(root: &audit_format::Hash, commitment: &[u8]) -> Vec<u8> {
     v.extend_from_slice(commitment);
     v
 }
+#[cfg(test)]
+pub(crate) fn sign_unanchored_for_test(
+    key: &crate::audit_keys::TenantAuditKeypair,
+    root: &audit_format::Hash,
+) -> Vec<u8> {
+    key.sign(&local_attest_msg(root, &anchor_commitment(None)))
+}
 
 /// A parsed Rekor v2 `TransparencyLogEntry` — the offline-verifiable bundle we
 /// persist (`audit_anchor_records`) + export (ADR-062 Amendment 1). Rekor v2 has
@@ -1713,6 +1720,44 @@ impl AuditChain {
         let Some(outcome) = outcome else {
             return Ok(());
         };
+        self.after_pg_commit(pool, &tenant_id, outcome, count).await
+    }
+
+    /// Explicit protected-writer hook, invoked ONLY after outer commit acknowledgment.
+    /// A separate connection proves the candidate is canonical before any copy/task.
+    /// # Errors
+    /// Fail CLOSED on an uncommitted/rolled-back/foreign candidate. Copy remains fail OPEN.
+    #[allow(dead_code)] // C1-4 protected state writer consumes the C1-1 hook.
+    #[tracing::instrument(skip_all)]
+    pub async fn after_outer_commit(
+        &self,
+        tenant_id: &TenantId,
+        outcome: crate::db::audit_chain_state::AtomicBatchAppend,
+    ) -> Result<()> {
+        let pool = self
+            .pg_pool
+            .as_ref()
+            .context("protected canonical store unavailable")?;
+        anyhow::ensure!(!outcome.rows.is_empty(), "empty protected commit candidate");
+        let stored = crate::db::ledger::read_rows_from(
+            pool,
+            tenant_id,
+            outcome.first_seq,
+            i64::try_from(outcome.rows.len())?,
+        )
+        .await?;
+        let outcome = validate_outer_candidate(tenant_id, &outcome, &stored)?;
+        let count = outcome.kept.len();
+        self.after_pg_commit(pool, tenant_id, outcome, count).await
+    }
+
+    async fn after_pg_commit(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        tenant_id: &TenantId,
+        outcome: crate::db::audit_chain_state::AtomicBatchAppend,
+        count: usize,
+    ) -> Result<()> {
         // ADR-078 (B): the DERIVED copy — ClickHouse `audit_log`, which the
         // dashboards and the per-trace chain view read. After COMMIT, so the
         // canonical row exists whatever happens here; fail-OPEN and COUNTED, never
@@ -1759,9 +1804,12 @@ impl AuditChain {
                 // R34: the SAME rule the age sweeper uses. Never `seq + 1 - n`
                 // directly — that is correct only if no batch was ever closed
                 // early by age.
-                let prev_end = self.last_anchored_end(&tenant_id);
+                let prev_end = self.last_anchored_end(tenant_id);
+                if prev_end.is_some_and(|end| end >= seq) {
+                    continue;
+                }
                 let batch_start = anchor_batch_start(prev_end, seq, n);
-                self.set_last_anchored_end(&tenant_id, seq);
+                self.set_last_anchored_end(tenant_id, seq);
                 let rekor = self.rekor_client.clone();
                 let tid = tenant_id.clone();
                 let pg = pool.clone();
@@ -2756,6 +2804,7 @@ async fn read_full_rows_from(
 async fn read_ch_max_seq(
     client: &ClickhouseClient,
     tenant_id: &TenantId,
+    require_contiguous: bool,
 ) -> anyhow::Result<Option<u64>> {
     #[derive(Debug, serde::Deserialize, clickhouse::Row)]
     struct MaxRow {
@@ -2770,7 +2819,9 @@ async fn read_ch_max_seq(
         .fetch_one::<MaxRow>()
         .await
         .context("read audit_log copy max seq")?;
-    Ok((r.n > 0).then_some(r.hi))
+    // An out-of-order protected hook may leave a hole beneath max(seq).
+    // Rebuild from genesis in that case; never skip it on boot recovery.
+    Ok((r.n > 0 && (!require_contiguous || r.hi.checked_add(1) == Some(r.n))).then_some(r.hi))
 }
 
 /// ADR-078 (B), reconcile rule 3: write every canonical row and anchor bundle the
@@ -2784,8 +2835,8 @@ async fn rebuild_copy_for_tenant(
     page: u32,
 ) -> anyhow::Result<u64> {
     let mut copied = 0u64;
-    let mut from = match read_ch_max_seq(ch, tenant_id).await? {
-        Some(hi) => hi.saturating_add(1),
+    let mut from = match read_ch_max_seq(ch, tenant_id, true).await? {
+        Some(hi) => hi.checked_add(1).context("copy sequence overflow")?,
         None => 0,
     };
     loop {
@@ -5046,6 +5097,7 @@ mod tests {
                 .collect()
         };
         async fn parts_written(ch: &ClickhouseClient, rows_per_part: u64) -> u64 {
+            // Restrict history to this table UUID: DROP/recreate does not clear part_log.
             // `system.part_log` records every part CREATED by an insert, which is
             // the number that matters here — `system.parts` (active) undercounts
             // as soon as background merges absorb the small parts, and they do
@@ -5055,12 +5107,14 @@ mod tests {
             ch.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
             ch.query(
                 "SELECT count() FROM system.part_log WHERE database='tracelane' AND \
-                 table='audit_log' AND event_type='NewPart' AND rows = ?",
+                 table='audit_log' AND table_uuid = (SELECT uuid FROM system.tables \
+                 WHERE database='tracelane' AND name='audit_log') AND \
+                 event_type='NewPart' AND rows = ?",
             )
             .bind(rows_per_part)
             .fetch_one::<u64>()
             .await
-            .unwrap_or(0)
+            .expect("part history must be readable for the current table incarnation")
         }
 
         // (a) sequential, one event per transaction.
@@ -5328,8 +5382,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn chain_seq_survives_restart() {
-        let pool = pg_test_pool();
-        crate::db::apply_migrations(&pool).await.unwrap();
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
 
         let t = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
         seed_tenant(&pool, &t).await;
@@ -5388,8 +5441,7 @@ mod tests {
             eprintln!("skip b108_cross_process_seq_race: CLICKHOUSE_TEST_URL unset");
             return;
         };
-        let pool = pg_test_pool();
-        crate::db::apply_migrations(&pool).await.unwrap();
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
         let ch = ch_test_client(&url);
         ch_reset_replacing_audit_log(&ch).await;
 
@@ -5480,8 +5532,7 @@ mod tests {
             eprintln!("skip b108_crash_mid_append_reconcile: CLICKHOUSE_TEST_URL unset");
             return;
         };
-        let pool = pg_test_pool();
-        crate::db::apply_migrations(&pool).await.unwrap();
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
         let ch = ch_test_client(&url);
         ch_reset_replacing_audit_log(&ch).await;
 
@@ -6187,5 +6238,108 @@ mod tests {
             ok + 1 >= LEDGER_WRITER_QUEUE_ROWS as u64,
             "the queue holds its capacity before refusing: {ok}"
         );
+    }
+}
+
+fn validate_outer_candidate(
+    tenant: &TenantId,
+    outcome: &crate::db::audit_chain_state::AtomicBatchAppend,
+    stored: &[AuditLogRow],
+) -> Result<crate::db::audit_chain_state::AtomicBatchAppend> {
+    let first = stored.first().context("empty canonical commit range")?;
+    anyhow::ensure!(
+        stored.len() == outcome.rows.len()
+            && stored.len() == outcome.kept.len()
+            && first.seq == outcome.first_seq
+            && stored
+                .iter()
+                .zip(&outcome.rows)
+                .enumerate()
+                .all(|(i, (a, b))| a.tenant_id == tenant.to_string()
+                    && first.seq.checked_add(i as u64) == Some(a.seq)
+                    && a.tenant_id == b.tenant_id
+                    && a.seq == b.seq
+                    && a.event_time == b.event_time
+                    && a.row_hash == b.row_hash
+                    && a.prev_hash == b.prev_hash
+                    && a.event_type == b.event_type
+                    && a.actor == b.actor
+                    && a.payload == b.payload),
+        "outer transaction has not committed this canonical range"
+    );
+    let prev_hash = crate::db::ledger::decode_hash_hex(&first.prev_hash)?;
+    let row_hashes = stored
+        .iter()
+        .map(|r| crate::db::ledger::decode_hash_hex(&r.row_hash))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        outcome.prev_hash == prev_hash && outcome.row_hashes == row_hashes,
+        "commit candidate metadata differs from canonical rows"
+    );
+    // Every value consumed by copying/anchor scheduling comes from canonical rows.
+    // kept indexes are builder bookkeeping; the hook needs only the canonical count.
+    Ok(crate::db::audit_chain_state::AtomicBatchAppend {
+        first_seq: first.seq,
+        prev_hash,
+        row_hashes,
+        kept: (0..stored.len()).collect(),
+        rows: stored.to_vec(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod copy_tests;
+
+#[cfg(test)]
+mod c1_fix_tests {
+    fn candidate() -> (
+        tracelane_shared::TenantId,
+        crate::db::audit_chain_state::AtomicBatchAppend,
+    ) {
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::new_v4());
+        let row = crate::db::ledger::AuditLogRow {
+            tenant_id: tenant.to_string(),
+            seq: 0,
+            event_time: 123,
+            event_type: "denied_runtime".into(),
+            actor: "synthetic".into(),
+            payload: "{}".into(),
+            prev_hash: hex::encode([1; 32]),
+            row_hash: hex::encode([2; 32]),
+            rekor_entry_id: None,
+            signature: String::new(),
+            signing_pubkey: String::new(),
+        };
+        (
+            tenant,
+            crate::db::audit_chain_state::AtomicBatchAppend {
+                first_seq: 0,
+                prev_hash: [1; 32],
+                row_hashes: vec![[2; 32]],
+                kept: vec![0],
+                rows: vec![row],
+            },
+        )
+    }
+    #[test]
+    fn committed_candidate_metadata_cannot_be_fabricated() {
+        let (tenant, candidate) = candidate();
+        assert!(super::validate_outer_candidate(&tenant, &candidate, &candidate.rows).is_ok());
+        for mode in 0..7 {
+            let mut malformed = candidate.clone();
+            match mode {
+                0 => malformed.row_hashes.clear(),
+                1 => malformed.kept.push(1),
+                2 => malformed.prev_hash = [3; 32],
+                3 => malformed.first_seq = 10,
+                4 => malformed.row_hashes[0] = [4; 32],
+                5 => malformed.rows[0].event_time += 1,
+                _ => malformed.kept.clear(),
+            }
+            assert!(
+                super::validate_outer_candidate(&tenant, &malformed, &candidate.rows).is_err(),
+                "fabricated metadata accepted: {mode}"
+            );
+        }
     }
 }

@@ -69,7 +69,11 @@ import {
 	webhookEvents,
 	workspaceEntitlements,
 } from "@/db/schema";
-import type { AnnualPairJson, AnnualPairPairingJson } from "@/db/schema";
+import type {
+	AnnualPairHalfJson,
+	AnnualPairJson,
+	AnnualPairPairingJson,
+} from "@/db/schema";
 import {
 	sendDroppedToFreeEmail,
 	sendDunningStartedEmail,
@@ -82,7 +86,6 @@ import {
 } from "@/lib/polar-pair";
 import {
 	type BillingInterval,
-	type PairHalf,
 	type PlanResolution,
 	type PolarLiveSubscription,
 	classifyLive,
@@ -98,7 +101,8 @@ import {
 	resolvePlan,
 	verifySignature,
 } from "@/lib/polar-webhook";
-import { and, eq, sql } from "drizzle-orm";
+import { type SQL, and, eq, isNull, lte, or, sql } from "drizzle-orm";
+import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
 import { type NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -441,22 +445,13 @@ async function handleSubscriptionChange(
 		return;
 	}
 
-	// B-388: refuse an event OLDER than the last one applied to this tenant.
-	// Acked (200), not applied, logged with both clocks — a stale retry after a
-	// cancellation must not re-activate the plan. Compared per TENANT, not per
-	// subscription id: a plan cannot go backwards in time whichever subscription
-	// object carries the older clock.
-	if (isStale(tenant.polarSubscriptionModifiedAt, eventAt)) {
-		console.warn(
-			"[polar-webhook] STALE subscription event — acked, NOT applied:",
-			logSafe(eventType),
-			"event",
-			eventAt?.toISOString() ?? "unparsable",
-			"< applied",
-			tenant.polarSubscriptionModifiedAt?.toISOString(),
-		);
+	// A terminal event for a former subscription cannot revoke its replacement.
+	if (
+		resolution.kind === "free" &&
+		tenant.polarSubscriptionId &&
+		tenant.polarSubscriptionId !== subId
+	)
 		return;
-	}
 
 	// ── BILL-02 (founder ruling B14 → option (c)): an ANNUAL tenant holds TWO
 	// Polar subscriptions. Any event for a `_base_year` / `_usage_month` key —
@@ -469,6 +464,26 @@ async function handleSubscriptionChange(
 	const half = keyed?.half ?? null;
 	const heldPair = tenant.annualPair ?? null;
 	const holdsPair = !!(heldPair?.base || heldPair?.usage);
+	// Monthly events and entry into annual billing use the tenant clock.
+	// Once a pair exists, each half uses its own clock in applyPairEvent.
+	if (
+		(!holdsPair || (half !== "base" && half !== "usage")) &&
+		isStale(tenant.polarSubscriptionModifiedAt, eventAt)
+	) {
+		console.warn(
+			"[polar-webhook] STALE subscription event — acked, NOT applied:",
+			logSafe(eventType),
+			"event",
+			eventAt?.toISOString() ?? "unparsable",
+			"< applied",
+			tenant.polarSubscriptionModifiedAt?.toISOString(),
+		);
+		return;
+	}
+
+	// A former monthly subscription cannot revoke an annual pair. A live,
+	// newer monthly subscription still triggers the existing mismatch refusal.
+	if (holdsPair && half === "single" && resolution.kind === "free") return;
 	if (half === "base" || half === "usage" || (holdsPair && half === "single")) {
 		await applyPairEvent({
 			tenant,
@@ -550,9 +565,8 @@ async function handleSubscriptionChange(
 		Object.assign(extra, await firstActivationPin(resolution.lookupKey, now));
 	}
 
-	await db
-		.update(tenants)
-		.set({
+	await writeBillingState(
+		{
 			plan: planValue,
 			...(customerId ? { polarCustomerId: customerId } : {}),
 			polarSubscriptionId: resolution.kind === "free" ? null : subId,
@@ -561,20 +575,19 @@ async function handleSubscriptionChange(
 			...(eventAt ? { polarSubscriptionModifiedAt: eventAt } : {}),
 			...extra,
 			updatedAt: now,
-		})
-		.where(eq(tenants.id, tenant.id));
-
-	// Polar = plan membership only: set plan_lookup_key, never per-feature flags
-	// (those are workspace overrides under deny-overrides-grant). onConflict sets
-	// ONLY plan_lookup_key, so a per-workspace `f_audit_addon` override (the Enterprise export grant)
-	// survives a plan change.
-	await db
-		.insert(workspaceEntitlements)
-		.values({ tenantId: tenant.id, planLookupKey: resolution.lookupKey })
-		.onConflictDoUpdate({
-			target: workspaceEntitlements.tenantId,
-			set: { planLookupKey: resolution.lookupKey, updatedAt: new Date() },
-		});
+		},
+		and(
+			eq(tenants.id, tenant.id),
+			eventAt
+				? or(
+						isNull(tenants.polarSubscriptionModifiedAt),
+						lte(tenants.polarSubscriptionModifiedAt, eventAt),
+					)
+				: undefined,
+			sql`${tenants.polarSubscriptionId} IS NOT DISTINCT FROM ${tenant.polarSubscriptionId ?? null}`,
+			sql`coalesce(${tenants.annualPair}, 'null'::jsonb) = ${JSON.stringify(tenant.annualPair ?? null)}::jsonb`,
+		),
+	);
 
 	// ── item 8: transactional emails, fire-and-forget-safe (sendEmail never
 	// throws) — sent AFTER the state write succeeds, never before, and gated on
@@ -599,6 +612,41 @@ async function handleSubscriptionChange(
 			});
 		}
 	}
+}
+
+/** The conditional tenant update and its entitlement consumer commit together.
+ * A lost snapshot returns 503 (no dedup record); Polar retries against fresh state. */
+async function writeBillingState(
+	values: PgUpdateSetSource<typeof tenants>,
+	predicate: SQL | undefined,
+): Promise<void> {
+	const applied = db
+		.$with("applied_billing")
+		.as(
+			db
+				.update(tenants)
+				.set(values)
+				.where(predicate)
+				.returning({ id: tenants.id, plan: tenants.plan }),
+		);
+	const rows = await db
+		.with(applied)
+		.insert(workspaceEntitlements)
+		.values({
+			// No matched update yields NULL here, so the tenant-id NOT NULL
+			// constraint rolls back the statement and leaves the event retryable.
+			tenantId: sql`(select ${applied.id} from ${applied})`,
+			planLookupKey: sql`(select ${applied.plan}::text || '_v1' from ${applied})`,
+		})
+		.onConflictDoUpdate({
+			target: workspaceEntitlements.tenantId,
+			set: {
+				planLookupKey: sql`excluded.plan_lookup_key`,
+				updatedAt: new Date(),
+			},
+		})
+		.returning({ tenantId: workspaceEntitlements.tenantId });
+	if (rows.length === 0) throw new Error("billing state changed; retry event");
 }
 
 /**
@@ -636,8 +684,23 @@ async function applyPairEvent(args: {
 		alert = "annual_pair_mismatch";
 		planValue = "free";
 	} else {
-		const incoming: PairHalf = {
+		const previous = pair[half];
+		// Each subscription owns its clock. Legacy halves without a clock use
+		// the stored tenant clock until their next accepted event.
+		const previousClock =
+			parseIsoDate(previous?.modified_at) ??
+			(previous ? tenant.polarSubscriptionModifiedAt : null);
+		if (isStale(previousClock, eventAt)) return;
+		if (
+			previous?.id &&
+			subId !== previous.id &&
+			!isActiveStatus(status) &&
+			!isPastDueStatus(status)
+		)
+			return;
+		const incoming: AnnualPairHalfJson = {
 			id: subId ?? pair[half]?.id ?? "",
+			modified_at: eventAt?.toISOString() ?? previous?.modified_at ?? null,
 			plan: keyedPlan ?? pair[half]?.plan ?? "",
 			status: status ?? "",
 			period_start:
@@ -704,9 +767,8 @@ async function applyPairEvent(args: {
 		Object.assign(extra, await firstActivationPin(`${planValue}_v1`, now));
 	}
 
-	await db
-		.update(tenants)
-		.set({
+	await writeBillingState(
+		{
 			plan: planValue,
 			billingInterval: "year",
 			...(customerId ? { polarCustomerId: customerId } : {}),
@@ -715,24 +777,29 @@ async function applyPairEvent(args: {
 			polarBaseSubscriptionId: pair.base?.id ?? null,
 			polarUsageSubscriptionId: pair.usage?.id ?? null,
 			annualPair: pair,
-			...(eventAt ? { polarSubscriptionModifiedAt: eventAt } : {}),
+			...(eventAt
+				? {
+						polarSubscriptionModifiedAt: isStale(
+							tenant.polarSubscriptionModifiedAt,
+							eventAt,
+						)
+							? tenant.polarSubscriptionModifiedAt
+							: eventAt,
+					}
+				: {}),
 			...extra,
 			updatedAt: now,
-		})
-		.where(eq(tenants.id, tenant.id));
-
-	const lookupKey = planValue === "free" ? "free_v1" : `${planValue}_v1`;
-	await db
-		.insert(workspaceEntitlements)
-		.values({ tenantId: tenant.id, planLookupKey: lookupKey })
-		.onConflictDoUpdate({
-			target: workspaceEntitlements.tenantId,
-			set: { planLookupKey: lookupKey, updatedAt: new Date() },
-		});
+		},
+		and(
+			eq(tenants.id, tenant.id),
+			sql`${tenants.polarSubscriptionModifiedAt} IS NOT DISTINCT FROM ${tenant.polarSubscriptionModifiedAt?.toISOString() ?? null}::timestamptz`,
+			sql`coalesce(${tenants.annualPair}, '{}'::jsonb) = ${JSON.stringify({ ...(tenant.annualPair ?? {}), ...(pair.pairing ? { pairing: pair.pairing } : {}) })}::jsonb`,
+		),
+	);
 
 	if (alert) {
 		console.warn(
-			"[polar-webhook] BILL-02 annual pair REFUSED — plan set to free:",
+			"[polar-webhook] annual pair REFUSED — plan set to free:",
 			logSafe(alert),
 			"tenant",
 			logSafe(tenant.id),
@@ -812,7 +879,7 @@ async function claimSynchronousPairing(args: {
 	const token = process.env.POLAR_WORKER_TOKEN?.trim();
 	if (!token) {
 		console.info(
-			"[polar-webhook] BILL-02 P2: synchronous pairing is OFF — POLAR_WORKER_TOKEN unset; the reconciler pairs on its cadence. tenant",
+			"[polar-webhook] synchronous pairing is OFF — POLAR_WORKER_TOKEN unset; the reconciler pairs on its cadence. tenant",
 			logSafe(tenant.id),
 		);
 		return { claimed: false };
@@ -821,7 +888,7 @@ async function claimSynchronousPairing(args: {
 	if (prior && (prior.result === "created" || prior.result === "existing")) {
 		// A recorded outcome is never repeated — no reads, no Polar call.
 		console.info(
-			"[polar-webhook] BILL-02 P2: pairing already",
+			"[polar-webhook] pairing already",
 			logSafe(prior.result),
 			"at",
 			logSafe(prior.attempted_at),
@@ -832,7 +899,7 @@ async function claimSynchronousPairing(args: {
 	}
 	if (!plan) {
 		console.error(
-			"[polar-webhook] BILL-02 P2: the base's plan is not a known tier — cannot pick a usage product; synchronous pairing skipped. tenant",
+			"[polar-webhook] the base's plan is not a known tier — cannot pick a usage product; synchronous pairing skipped. tenant",
 			logSafe(tenant.id),
 		);
 		return { claimed: false };
@@ -840,7 +907,7 @@ async function claimSynchronousPairing(args: {
 	const usageProductId = await readUsageProductId(plan);
 	if (!usageProductId) {
 		console.error(
-			"[polar-webhook] BILL-02 P2: plan_entitlements has no polar_product_id_usage_month for",
+			"[polar-webhook] plan_entitlements has no polar_product_id_usage_month for",
 			logSafe(plan),
 			"— synchronous pairing skipped (polar-sync not run?). tenant",
 			logSafe(tenant.id),
@@ -852,7 +919,7 @@ async function claimSynchronousPairing(args: {
 		// Reference-tables rule: no literal deadline baked in. A missing policy
 		// row fails toward TODAY's behaviour (the reconciler), loudly.
 		console.error(
-			"[polar-webhook] BILL-02 P2: billing_policy.annual_pairing_deadline_ms missing — synchronous pairing skipped (seed not run?). tenant",
+			"[polar-webhook] billing_policy.annual_pairing_deadline_ms missing — synchronous pairing skipped (seed not run?). tenant",
 			logSafe(tenant.id),
 		);
 		return { claimed: false };
@@ -869,7 +936,7 @@ async function claimSynchronousPairing(args: {
 		now.getTime() - Date.parse(prior.attempted_at) > deadlineMs * 10;
 	if (prior?.result === "attempting" && !staleAttempt) {
 		console.info(
-			"[polar-webhook] BILL-02 P2: another delivery is pairing right now (claim from",
+			"[polar-webhook] another delivery is pairing right now (claim from",
 			logSafe(prior.attempted_at),
 			") — not repeated. tenant",
 			logSafe(tenant.id),
@@ -878,7 +945,7 @@ async function claimSynchronousPairing(args: {
 	}
 	if (staleAttempt) {
 		console.warn(
-			"[polar-webhook] BILL-02 P2: a stale `attempting` pairing claim from",
+			"[polar-webhook] a stale `attempting` pairing claim from",
 			logSafe(prior?.attempted_at ?? null),
 			"is being re-taken (the earlier invocation never recorded an outcome). tenant",
 			logSafe(tenant.id),
@@ -911,7 +978,7 @@ async function claimSynchronousPairing(args: {
 			.limit(1);
 		pair.pairing = live?.annualPair?.pairing ?? prior;
 		console.info(
-			"[polar-webhook] BILL-02 P2: another delivery holds the pairing claim — not repeated. tenant",
+			"[polar-webhook] another delivery holds the pairing claim — not repeated. tenant",
 			logSafe(tenant.id),
 		);
 		return { claimed: false };
@@ -978,7 +1045,7 @@ async function runSynchronousPairing(args: {
 				};
 				if (!paired.defaultPaymentMethodId) {
 					console.warn(
-						"[polar-webhook] BILL-02 P2: usage subscription created with NO card on file — its first non-zero invoice will go past_due (B7 O5). tenant",
+						"[polar-webhook] usage subscription created with NO card on file — its first non-zero invoice will go past_due (B7 O5). tenant",
 						logSafe(tenant.id),
 					);
 				}
@@ -1000,14 +1067,14 @@ async function runSynchronousPairing(args: {
 	}
 	if (record.result === "failed") {
 		console.error(
-			"[polar-webhook] BILL-02 P2: synchronous pairing FAILED — tenant stays free with the alert; the reconciler retries on its cadence. tenant",
+			"[polar-webhook] synchronous pairing FAILED — tenant stays free with the alert; the reconciler retries on its cadence. tenant",
 			logSafe(tenant.id),
 			"reason",
 			logSafe(record.reason ?? null),
 		);
 	} else {
 		console.info(
-			"[polar-webhook] BILL-02 P2: usage half",
+			"[polar-webhook] usage half",
 			logSafe(record.result),
 			logSafe(usageId),
 			"— the tenant stays free until the usage half's own event arrives. tenant",
@@ -1030,7 +1097,7 @@ async function runSynchronousPairing(args: {
 		// gets its 200 and the event is recorded, so it is not redelivered into
 		// the same fault. Loud, not fatal.
 		console.error(
-			"[polar-webhook] BILL-02 P2: could not RECORD the pairing outcome",
+			"[polar-webhook] could not RECORD the pairing outcome",
 			logSafe(record.result),
 			logSafe(usageId),
 			"— the marker stays `attempting` and is re-taken as stale on the next base event. tenant",
@@ -1053,6 +1120,7 @@ async function runSynchronousPairing(args: {
 async function correlateTenant(data: Record<string, unknown>): Promise<{
 	id: string;
 	plan: string | null;
+	polarSubscriptionId: string | null;
 	polarSubscriptionModifiedAt: Date | null;
 	priceProtectedUntil: Date | null;
 	billingEmail: string | null;
@@ -1074,6 +1142,7 @@ async function correlateTenant(data: Record<string, unknown>): Promise<{
 		.select({
 			id: tenants.id,
 			plan: tenants.plan,
+			polarSubscriptionId: tenants.polarSubscriptionId,
 			polarSubscriptionModifiedAt: tenants.polarSubscriptionModifiedAt,
 			priceProtectedUntil: tenants.priceProtectedUntil,
 			billingEmail: tenants.billingEmail,

@@ -77,7 +77,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// composes with `tokio::try_join!`'s other arms.
 pub async fn supervise<F, Fut>(
     name: &'static str,
-    shutdown: Signal,
+    mut shutdown: Signal,
     mut make_fut: F,
 ) -> anyhow::Result<()>
 where
@@ -119,7 +119,15 @@ where
             }
         }
 
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            () = shutdown.wait() => return Ok(()),
+            () = tokio::time::sleep(backoff) => {}
+        }
+        // Both arms can be ready together; do not start another NATS setup
+        // just because the timer won that poll.
+        if shutdown.fired() {
+            return Ok(());
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -129,6 +137,70 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn shutdown_during_restart_backoff_releases_sender() {
+        let (trigger, shutdown) = crate::shutdown::manual();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
+        let (attempted, first_attempt) = tokio::sync::oneshot::channel();
+        let mut attempted = Some(attempted);
+        let handle = tokio::spawn(async move {
+            let _sender = sender;
+            supervise("backoff_sender", shutdown, move || {
+                if let Some(attempted) = attempted.take() {
+                    let _ = attempted.send(());
+                }
+                async { anyhow::bail!("restart") }
+            })
+            .await
+        });
+
+        first_attempt.await.unwrap();
+        trigger.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            handle.await.unwrap().unwrap();
+            assert!(receiver.recv().await.is_none());
+        })
+        .await
+        .expect("shutdown during retry backoff must close the channel promptly");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_at_backoff_deadline_does_not_start_another_attempt() {
+        for _ in 0..4 {
+            let (trigger, shutdown) = crate::shutdown::manual();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let (started, first_attempt) = tokio::sync::oneshot::channel();
+            let mut started = Some(started);
+            let count = Arc::clone(&attempts);
+            let handle = tokio::spawn(async move {
+                supervise("backoff_boundary", shutdown, move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(started) = started.take() {
+                        let _ = started.send(());
+                    }
+                    async { anyhow::bail!("restart") }
+                })
+                .await
+            });
+            first_attempt.await.unwrap();
+            tokio::task::yield_now().await;
+            // Hold this single-thread runtime until both the backoff timer
+            // and the shutdown signal are ready for the same poll.
+            std::thread::sleep(MIN_BACKOFF + Duration::from_millis(50));
+            trigger.send(true).unwrap();
+            tokio::time::timeout(Duration::from_millis(100), handle)
+                .await
+                .expect("shutdown must finish promptly")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "shutdown must not launch another NATS connection"
+            );
+        }
+    }
 
     /// A future that returns `Err` the first two times it is built, then
     /// parks forever (never resolves) on the third — modelling a task that
@@ -161,10 +233,9 @@ mod tests {
             .await
         });
 
-        // Give the two failing attempts + their backoff a moment, then a
-        // third attempt that parks. Backoff starts at 1s, so this must wait
-        // past the first restart to observe attempt 3 having started.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Let both backoffs finish before signaling shutdown, so this test
+        // still proves the retry count independently of prompt shutdown.
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
         assert!(
             attempts.load(Ordering::SeqCst) >= 1,
             "the first attempt must have run immediately"

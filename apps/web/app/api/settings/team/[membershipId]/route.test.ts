@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
 	session: { tenantId: "org_SESSION", userId: "user_ADMIN", email: "a@b.co" },
 	db: null as DbMock | null,
+	ack: true,
 }));
 
 const ctl = vi.hoisted(() => ({
@@ -38,6 +39,7 @@ vi.mock("@/lib/control-change", () => ({
 }));
 
 beforeEach(() => {
+	h.ack = true;
 	ctl.record.mockReset();
 	ctl.record.mockResolvedValue({ ok: true });
 	ctl.failed.mockReset();
@@ -51,6 +53,10 @@ vi.mock("@/db", () => ({
 }));
 
 vi.mock("@/lib/auth", () => ({
+	requireGatewayToken: vi.fn(async () => ({
+		token: "test-human-jwt",
+		tenantId: "org_SESSION",
+	})),
 	requireSession: vi.fn(async () => h.session),
 }));
 
@@ -61,6 +67,7 @@ type M = {
 	user_id: string;
 	organization_id: string;
 	role: { slug: string };
+	status?: string;
 };
 
 function ctx(membershipId: string) {
@@ -82,6 +89,8 @@ function stub(
 	const { delOk = true, putOk = true } = opts;
 	const spy = vi.fn(async (...args: unknown[]) => {
 		const url = args[0] as string;
+		if (url.endsWith("/v1/keys/invalidate-cache"))
+			return Response.json({ invalidated: h.ack });
 		const method = methodOf(args);
 		if (url.includes("organization_memberships") && method === "GET") {
 			if (members === null)
@@ -106,16 +115,19 @@ const admin: M = {
 	user_id: "user_ADMIN",
 	organization_id: "org_SESSION",
 	role: { slug: "owner" },
+	status: "active",
 };
 const member: M = {
 	id: "mem_member",
 	user_id: "user_MEMBER",
 	organization_id: "org_SESSION",
 	role: { slug: "member" },
+	status: "active",
 };
 
 describe("DELETE /api/settings/team/[membershipId] — removal guards", () => {
 	beforeEach(() => {
+		h.ack = true;
 		h.session = {
 			tenantId: "org_SESSION",
 			userId: "user_ADMIN",
@@ -173,10 +185,28 @@ describe("DELETE /api/settings/team/[membershipId] — removal guards", () => {
 			user_id: "user_OWNER2",
 			organization_id: "org_SESSION",
 			role: { slug: "owner" },
+			status: "active",
 		};
 		const spy = stub([admin, owner2]);
 		expect((await del("mem_owner2")).status).toBe(200);
 		expect(spy.mock.calls.some((c) => methodOf(c) === "DELETE")).toBe(true);
+	});
+
+	it("revoke_failure_is_not_swallowed", async () => {
+		const spy = stub([admin, member]);
+		h.db = makeDbMock([[{ id: "tenant-uuid" }], new Error("revoke failed")]);
+		const res = await del("mem_member");
+		expect(res.status).toBe(503);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "DELETE")).toBe(true);
+	});
+
+	it("unconfirmed_revocation_keeps_membership_retryable", async () => {
+		h.ack = false;
+		const spy = stub([admin, member]);
+		// This WorkOS fixture supplies no gateway invalidation acknowledgement.
+		const res = await del("mem_member");
+		expect(res.status).toBe(503);
+		expect(spy.mock.calls.every((c) => methodOf(c) !== "DELETE")).toBe(true);
 	});
 
 	it("HAPPY: owner removes a member → 200, WorkOS DELETE + key-revoke", async () => {
@@ -188,11 +218,11 @@ describe("DELETE /api/settings/team/[membershipId] — removal guards", () => {
 		);
 		const delCall = spy.mock.calls.find((c) => methodOf(c) === "DELETE");
 		expect(delCall?.[0]).toContain("organization_memberships/mem_member");
-		// The key-revoke consumed both queued db chains (tenant lookup + update).
-		expect(h.db?.cursor()).toBe(2);
+		// Tenant lookup and both revocation sweeps completed.
+		expect(h.db?.cursor()).toBe(3);
 	});
 
-	it("REJECT: WorkOS DELETE fails → 502 (before any key-revoke)", async () => {
+	it("REJECT: WorkOS DELETE fails → 502 after confirmed key-revoke", async () => {
 		stub([admin, member], { delOk: false });
 		expect((await del("mem_member")).status).toBe(502);
 	});
@@ -200,6 +230,7 @@ describe("DELETE /api/settings/team/[membershipId] — removal guards", () => {
 
 describe("PATCH /api/settings/team/[membershipId] — role change", () => {
 	beforeEach(() => {
+		h.ack = true;
 		h.session = {
 			tenantId: "org_SESSION",
 			userId: "user_ADMIN",
@@ -247,6 +278,27 @@ describe("PATCH /api/settings/team/[membershipId] — role change", () => {
 		expect(spy.mock.calls.every((c) => methodOf(c) !== "PUT")).toBe(true);
 	});
 
+	it("REJECT: a PENDING or INACTIVE owner does not count — demoting the only active owner → 409", async () => {
+		// Security review of #232, M1: WorkOS lists pending invitations and inactive
+		// memberships with their role, so they used to count as the "other owner".
+		for (const status of ["pending", "inactive"]) {
+			const invited: M = {
+				id: "mem_invited",
+				user_id: "user_INVITED",
+				organization_id: "org_SESSION",
+				role: { slug: "owner" },
+				status,
+			};
+			const spy = stub([admin, invited, member]);
+			const res = await patch("mem_admin", { role: "member" });
+			expect(res.status).toBe(409);
+			expect(((await res.json()) as { error: string }).error).toBe(
+				"last_owner_protected",
+			);
+			expect(spy.mock.calls.every((c) => methodOf(c) !== "PUT")).toBe(true);
+		}
+	});
+
 	it("ALLOWS: promoting a member to owner → 200 (owner-grant)", async () => {
 		const spy = stub([admin, member]);
 		const res = await patch("mem_member", { role: "owner" });
@@ -263,6 +315,7 @@ describe("PATCH /api/settings/team/[membershipId] — role change", () => {
 			user_id: "user_OWNER2",
 			organization_id: "org_SESSION",
 			role: { slug: "owner" },
+			status: "active",
 		};
 		const spy = stub([admin, owner2]);
 		expect((await patch("mem_owner2", { role: "member" })).status).toBe(200);
@@ -278,6 +331,7 @@ vi.mock("../owner-lock", () => ({
 
 describe("control-change recording (gateway audit precedes the WorkOS write)", () => {
 	beforeEach(() => {
+		h.ack = true;
 		h.session = {
 			tenantId: "org_SESSION",
 			userId: "user_ADMIN",

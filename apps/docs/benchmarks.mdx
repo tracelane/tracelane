@@ -24,7 +24,7 @@ gateway comparison argues about, so we measured ours with a harness we did not w
   generator and each gateway ran on that host; the mock was addressed by the host's public
   address for every gateway.
 - **Tracelane configuration:** self-host mode, capture **on** (spans written to NATS and
-  ClickHouse during the run), `TRACELANE_SELF_HOST_TIER=enterprise`. A gateway that scores
+  ClickHouse during the run), no plan-tier rate limit (self-host applies none). A gateway that scores
   well because it stopped recording is not the product.
 - **Two runs**, back to back, both reported.
 

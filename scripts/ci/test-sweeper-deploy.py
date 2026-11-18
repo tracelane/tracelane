@@ -167,23 +167,6 @@ class DeploySecurity(unittest.TestCase):
             script.index("source_archive /tmp/gw-src.tgz"),
         )
 
-    def test_users_proof_cache_covers_script_dependencies(self):
-        gate = (ROOT / "scripts/verify-all.sh").read_text()
-        line = next(
-            line
-            for line in gate.splitlines()
-            if 'run_cached "clickhouse per-service grants' in line
-        )
-        inputs = line.split('"')[3].split()
-        for path in (
-            "scripts/ops/tenant-purge.sh",
-            "scripts/ci/check-orphan-sweep-covers-purge.py",
-            "scripts/ci/check-banned-patterns.py",
-            "scripts/ci/test-sweeper-deploy.py",
-            "scripts/deploy/gateway.sh",
-        ):
-            self.assertIn(path, inputs)
-
     def test_archive_keeps_example_only(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

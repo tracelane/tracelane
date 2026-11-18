@@ -19,9 +19,55 @@ const h = vi.hoisted(() => ({ db: null as DbMock | null }));
 vi.mock("@/db", () => ({
 	get db() {
 		if (!h.db) throw new Error("db mock not initialised");
-		return h.db.db;
+		return withBillingCte(h.db);
 	},
 }));
+
+// Keep the existing sequential write fixtures while the production transport
+// executes update + entitlement upsert as one CTE. Real SQL and contention are
+// exercised by ordering.test.ts; empty write fixtures here mean success.
+function withBillingCte(mock: DbMock) {
+	return {
+		...mock.db,
+		$with: () => ({
+			as: (update: PromiseLike<unknown>) => ({
+				update,
+				id: "id",
+				plan: "plan",
+			}),
+		}),
+		with: (cte: { update: PromiseLike<unknown> }) => ({
+			insert: (...args: unknown[]) => {
+				const chain = mock.db.insert(...args);
+				const wrapped: unknown = new Proxy(
+					{},
+					{
+						get: (_target, prop) => {
+							if (prop === "then")
+								return async (
+									resolve: (value: unknown) => unknown,
+									reject: (error: unknown) => unknown,
+								) => {
+									try {
+										await cte.update;
+										await chain;
+										return resolve([{ tenantId: "ten_1" }]);
+									} catch (error) {
+										return reject(error);
+									}
+								};
+							return (...values: unknown[]) => {
+								chain[prop](...values);
+								return wrapped;
+							};
+						},
+					},
+				);
+				return wrapped;
+			},
+		}),
+	};
+}
 
 import { POST } from "./route";
 

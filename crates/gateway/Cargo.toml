@@ -56,7 +56,7 @@ argon2 = { version = "0.5", features = ["std"] }
 dashmap = "6"
 # In-process entitlement-resolution cache (ADR-035). The only new crate this
 # reconciliation adds; eliminates the per-request Neon round-trip.
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 #  B8: poison-free Mutex for the per-tenant audit chain.
 # `std::sync::Mutex` poison would permanently DoS a tenant after any
 # panic inside the lock; `parking_lot::Mutex` has no poison semantics.
@@ -90,6 +90,7 @@ tracelane-policy = { path = "../policy" }
 # `tracelane-policy`, so declaring it directly adds no code — it just stops the
 # use being an accident of another crate's dependency graph.
 regex = "1.11"
+regex-syntax = "0.8" # GWY-63: a custom pattern's maximum match length (already in the tree via regex)
 
 # Reference audit-ledger verifier (Apache-2.0). The free-tier self-verify
 # endpoint (audit_self_verify.rs) reuses the SAME verifier the OSS CLI ships —
@@ -106,6 +107,9 @@ aho-corasick = "1" # R7 topic/competitor multi-pattern match (§3 R7)
 
 [dev-dependencies]
 tokio-test = "0.4"
+# PLT-50: independent COSE implementation; the real-Postgres export test parses
+# checkpoint.cose with it instead of the encoder under test. Dev-only.
+coset = "0.3"
 # The Vertex probe test signs a real JWT, so it needs a structurally valid RSA
 # PKCS#8 key. Generated in-process rather than committed: `crates/` ships
 # publicly, and a committed PEM is a private key in a public repo. Already in

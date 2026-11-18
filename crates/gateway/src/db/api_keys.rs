@@ -202,6 +202,7 @@ pub struct KeyAuth {
     pub budget_reset: tracelane_shared::spend::BudgetReset,
     /// OG-20 / OG-23 — the key's project, environment and policy layers. `None` for a
     /// key with none of them (the common case: no allocation, today's behaviour).
+    pub key_capture: Option<crate::db::data_controls::KeyCapture>,
     pub governance: Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
     /// B-568 I1: which branch answered. Carries no secret and changes nothing
     /// about the grant — it exists so the slow-request line can say `auth=cold`
@@ -261,6 +262,8 @@ type CachedAuth = (
     // SAME SELECT. Cached WITH the grant: a warm hit that dropped it would serve the
     // key unrestricted, which is the privilege escalation A13 named for scope.
     Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
+    Option<crate::db::data_controls::KeyCapture>,
+    Instant, // absolute lease starts BEFORE the authoritative SELECT
 );
 
 // Only cold lookups and refreshes lock cache writes. Rotation holds the write
@@ -278,19 +281,10 @@ fn auth_deadline(
 static AUTH_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AUTH_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Default auth-cache TTL, and therefore the API-key revocation bound.
-///
-// hot-path-cache-ttl: exempt -- 60s is BELOW the floor deliberately, and it is
-// safe here for a reason that does not generalise: `spawn_auth_cache_refresher`
-// renews active entries every `refresh_interval_secs()` (20s by default) — BUT PROD SETS
-// `TRACELANE_AUTH_REFRESH_SECS=0`, WHICH MAKES THAT TASK A NO-OP (see `start_warm_refresh`).
-// Read this bound as the DEFAULT-CONFIG behaviour, never as the deployed one: on prod the
-// only things bounding staleness are the 60 s TTL and `stale_max_secs()`. A comment that
-// asserts a mechanism the deployment has switched off is worse than none — it retires the
-// question for the next reader (SRE audit finding 41, 2026-09-04). So: a short TTL
-// costs no cache misses and buys a revocation bound three times TIGHTER than the
-// TTL itself. Remove the refresher and this exemption is void — the cache goes
-// back to missing on every sparse request, which is exactly B-256.
+/// Absolute auth-cache lease, measured from the authoritative SELECT's start.
+/// Raw SQL revokes are bounded by this lease even with refresh disabled or the
+/// store down. Coordinated revokes additionally evict before acknowledging.
+// hot-path-cache-ttl: exempt -- security lease; unexpired hits do not query Postgres.
 const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 60;
 /// Hard ceiling. A revocation window is a security property, so an env typo must
 /// not be able to widen it past the value we previously (wrongly) shipped.
@@ -1135,18 +1129,9 @@ fn active_idle_secs() -> u64 {
 /// Digests presented on the hot path, and when each was last seen. Separate from
 /// the moka cache on purpose: moka entries expire, and the set of keys we want to
 /// KEEP alive has to outlive the entries it is keeping alive.
-/// STALE-WHILE-REVALIDATE (2026-09-04, the p95 investigation). The moka cache
-/// EVICTS at its TTL, so a key presented less often than 60 s missed every time
-/// and paid the control-plane round trip on the hot path — with the keepalive
-/// off (NEON-COMPUTE-PIN) that is a fresh connect plus, when the compute had
-/// suspended, its ~1.2 s resume. This map keeps the last successful answer per
-/// digest for up to [`stale_max_secs`] beyond the TTL; a miss that finds one is
-/// served from it and the row is re-checked OFF-PATH (`refresh_one`).
-///
-/// What that means for revocation, stated honestly (B-303, accepted 2026-09-03):
-/// a key revoked while idle may be accepted ONCE more on its next use, and is
-/// refused from the refresh that use triggers (seconds). A key in steady use is
-/// still refused within the 60 s TTL. Nothing is served past `stale_max_secs`.
+/// Retain capacity-evicted answers only within their ORIGINAL SELECT-start lease.
+/// This fallback may refresh off-path, but cannot extend a grant during a store
+/// outage or after an uncoordinated SQL revoke.
 type LastKnownMap = std::sync::Mutex<HashMap<[u8; 32], (CachedAuth, Instant)>>;
 
 fn last_known() -> &'static LastKnownMap {
@@ -1154,10 +1139,29 @@ fn last_known() -> &'static LastKnownMap {
     M.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// How long past the TTL a last-known answer may still be served: 15× the TTL,
-/// capped at 15 minutes — the entitlement cache's own staleness bound.
+/// Every grant branch shares this bound; last-known is not an extra grace period.
 fn stale_max_secs() -> u64 {
-    (auth_cache_ttl_secs() * 15).min(900)
+    auth_cache_ttl_secs()
+}
+
+fn cache_lease_live(select_started: Instant) -> bool {
+    select_started.elapsed() < Duration::from_secs(auth_cache_ttl_secs())
+}
+
+/// Called with AUTH_CACHE_WRITES held for reading. A slow SELECT or KDF never
+/// creates a fresh lease at insertion time. Fail CLOSED when its lease is spent.
+async fn cache_auth_result(digest: [u8; 32], entry: CachedAuth) -> bool {
+    let select_started = entry.9;
+    if !cache_lease_live(select_started) {
+        return false;
+    }
+    auth_cache().insert(digest, entry.clone()).await;
+    remember_last_known(digest, entry);
+    if !cache_lease_live(select_started) {
+        invalidate(digest).await;
+        return false;
+    }
+    true
 }
 
 /// Ceiling on remembered answers, mirroring `MAX_ACTIVE_DIGESTS` above.
@@ -1173,7 +1177,8 @@ const MAX_LAST_KNOWN: usize = 10_000;
 fn remember_last_known(digest: [u8; 32], entry: CachedAuth) {
     if let Ok(mut m) = last_known().lock() {
         evict_last_known_if_full(&mut m, MAX_LAST_KNOWN, stale_max_secs());
-        m.insert(digest, (entry, Instant::now()));
+        let select_started = entry.9;
+        m.insert(digest, (entry, select_started));
     }
 }
 
@@ -1310,6 +1315,7 @@ fn select_due(mut due: Vec<([u8; 32], Duration)>, budget: usize) -> Vec<[u8; 32]
 async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let _cache_write = AUTH_CACHE_WRITES.read().await;
+    let select_started = Instant::now();
     // The SAME predicate the miss path uses. Deliberately not a second copy of
     // the validity rule with its own drift risk — if the miss path's notion of
     // "valid" changes, this must change with it, and keeping the text identical
@@ -1321,7 +1327,7 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
             // refresh can never cache a key without the policy the miss path would read.
             &format!(
                 "SELECT k.tenant_id, k.id, k.scope, k.budget_usd_monthly::text, k.rate_limit_rpm, \
-                        k.budget_reset, k.expires_at, k.revoked_at, {AUTH_GOVERNANCE_COLUMNS}
+                        k.budget_reset, k.expires_at, k.revoked_at, {AUTH_GOVERNANCE_COLUMNS}, k.capture
                  FROM api_keys k {AUTH_PROJECT_JOIN}
                  WHERE k.lookup_hash = $1
                    AND (k.revoked_at IS NULL OR k.revoked_at > now())
@@ -1356,9 +1362,8 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
         .filter(|v| *v > 0);
     let budget_reset = tracelane_shared::spend::BudgetReset::from_column(row.get::<_, &str>(5));
 
-    // Re-inserting resets the TTL, which is what keeps a sparse tenant warm. It
-    // also picks up a budget or rate-limit change within one interval instead of
-    // one TTL — the live-proof found that both ceilings took up to 60s to bind.
+    // A successful authoritative read renews the lease from SELECT start only.
+    // Delayed results cannot extend an unseen revocation's acceptance window.
     let entry = (
         tenant_uuid,
         id,
@@ -1368,10 +1373,10 @@ async fn refresh_one(pool: &Pool, digest: [u8; 32]) -> Result<bool> {
         budget_reset,
         auth_deadline(row.get(6), row.get(7)),
         governance_from_row(&row, 8),
+        crate::db::data_controls::capture_from_row(&row)?,
+        select_started,
     );
-    auth_cache().insert(digest, entry.clone()).await;
-    remember_last_known(digest, entry);
-    Ok(true)
+    Ok(cache_auth_result(digest, entry).await)
 }
 
 /// `OG-20` / `OG-23`: the four governance columns every auth SELECT reads, in
@@ -1392,6 +1397,7 @@ pub const AUTH_SCHEMA_COLUMNS: &[(&str, &str)] = &[
     ("api_keys", "project_id"),
     ("api_keys", "environment"),
     ("api_keys", "policy"),
+    ("api_keys", "capture"),
     ("projects", "id"),
     ("projects", "tenant_id"),
     ("projects", "policy"),
@@ -1474,6 +1480,51 @@ pub async fn invalidate(digest: [u8; 32]) {
     // An explicit invalidation (our own revoke path) is immediate: the
     // last-known answer must not outlive it.
     forget_last_known(digest);
+}
+
+/// Acknowledge an external SQL revoke only after all in-flight cache writers
+/// finish and this tenant's positive AND last-known grants are gone.
+pub async fn invalidate_tenant(tenant: &TenantId) {
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    invalidate_tenant_locked(tenant).await;
+}
+
+/// Subject-scoped cache eviction for account erasure. The subject is supplied
+/// ONLY by validated human claims; no request body identity is accepted.
+pub async fn invalidate_owned(pool: &Pool, subject: &str) -> Result<()> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT lookup_hash FROM api_keys WHERE minted_by = $1",
+            &[&subject],
+        )
+        .await?;
+    let mut digests = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(bytes) = row.get::<_, Option<Vec<u8>>>(0) {
+            digests
+                .push(<[u8; 32]>::try_from(bytes).map_err(|_| anyhow!("invalid lookup digest"))?);
+        }
+    }
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    for digest in digests {
+        invalidate(digest).await;
+    }
+    Ok(())
+}
+
+async fn invalidate_tenant_locked(tenant: &TenantId) {
+    // Complete queued cache maintenance before taking the bounded snapshot.
+    // The write lock excludes every cold/refresh insertion during this sweep.
+    auth_cache().run_pending_tasks().await;
+    for (digest, entry) in auth_cache().iter() {
+        if entry.0 == *tenant.as_uuid() {
+            auth_cache().invalidate(digest.as_ref()).await;
+        }
+    }
+    if let Ok(mut entries) = last_known().lock() {
+        entries.retain(|_, (entry, _)| entry.0 != *tenant.as_uuid());
+    }
 }
 
 /// `OG-20` / `OG-23`: commit `tx` under the auth-cache WRITE lock, then evict every
@@ -1687,6 +1738,60 @@ pub fn valid_rotation_grace(hours: i64) -> bool {
             .is_some()
 }
 
+/// Serialize all key creation (including rotation) with workspace member removal.
+async fn lock_workspace_mints(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+) -> Result<Option<String>> {
+    let row = tx
+        .query_one(
+            "SELECT workos_org_id FROM tenants WHERE id = $1 AND archived_at IS NULL",
+            &[tenant.as_uuid()],
+        )
+        .await?;
+    let org: Option<String> = row.get(0);
+    if let Some(org) = &org {
+        let lock = format!("tracelane:owners:{org}");
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock],
+        )
+        .await?;
+    }
+    if tx
+        .query_opt(
+            "SELECT 1 FROM tenants WHERE id = $1 AND archived_at IS NULL",
+            &[tenant.as_uuid()],
+        )
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("workspace unavailable");
+    }
+    Ok(org)
+}
+
+/// Same lock and durable marker used by erase_account_pii. The marker query MUST
+/// get a fresh READ COMMITTED snapshot after waiting for the identity lock.
+async fn lock_active_identity(tx: &deadpool_postgres::Transaction<'_>, user: &str) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&user],
+    )
+    .await?;
+    if tx
+        .query_opt(
+            "SELECT 1 FROM account_deletions WHERE workos_user_id = $1",
+            &[&user],
+        )
+        .await?
+        .is_some()
+    {
+        anyhow::bail!("account deleted");
+    }
+    Ok(())
+}
+
 /// Atomically create a successor, schedule the source's retirement and audit it.
 /// Source settings (including legacy NULL scope and the original minter) are
 /// copied in SQL. The source row lock makes concurrent rotations single-winner.
@@ -1700,6 +1805,17 @@ pub async fn rotate(
     actor: &(impl crate::db::control_audit::AsActor + ?Sized),
     grace_hours: i64,
 ) -> Result<Option<RotatedKey>> {
+    rotate_with_membership(pool, tenant, id, actor, grace_hours, None).await
+}
+
+pub async fn rotate_with_membership(
+    pool: &Pool,
+    tenant: &TenantId,
+    id: Uuid,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    grace_hours: i64,
+    membership: Option<&dyn ActiveMembership>,
+) -> Result<Option<RotatedKey>> {
     if !valid_rotation_grace(grace_hours) {
         anyhow::bail!("invalid rotation grace");
     }
@@ -1708,6 +1824,36 @@ pub async fn rotate(
     let prefix: String = body.expose_secret().chars().take(KEY_PREFIX_LEN).collect();
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+    let Some(owner) = tx
+        .query_opt(
+            "SELECT minted_by FROM api_keys WHERE tenant_id = $1 AND id = $2",
+            &[tenant.as_uuid(), &id],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let org = lock_workspace_mints(&tx, tenant).await?;
+    let authenticated = actor.as_actor();
+    let mut identities = vec![authenticated.sub.clone()];
+    if let Some(user) = owner.get::<_, Option<String>>(0) {
+        identities.push(user);
+    }
+    identities.sort();
+    identities.dedup();
+    for user in identities {
+        lock_active_identity(&tx, &user).await?;
+    }
+    if authenticated.auth_method == "workos_session" {
+        membership
+            .context("active membership verifier required")?
+            .verify(
+                &authenticated.sub,
+                org.as_deref().context("workspace organization required")?,
+            )
+            .await?;
+    }
+
     let source = tx.query_opt(
         "SELECT lookup_hash FROM api_keys WHERE tenant_id = $1 AND id = $2
          AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > clock_timestamp()) FOR UPDATE",
@@ -1725,12 +1871,12 @@ pub async fn rotate(
         // POLICY — a rotation must never shed a restriction.
         "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by,
              scope, expires_at, budget_usd_monthly, rate_limit_rpm, budget_reset, velocity_breaker,
-             project_id, environment, policy)
+             project_id, environment, policy, capture)
          SELECT tenant_id, name, $3, $4, $5, minted_by, scope, expires_at, budget_usd_monthly,
-             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy
+             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy, capture
              FROM api_keys WHERE tenant_id = $1 AND id = $2
          RETURNING id, name, created_at, scope, expires_at, budget_usd_monthly::text,
-             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy",
+             rate_limit_rpm, budget_reset, velocity_breaker, project_id, environment, policy, capture",
         &[tenant.as_uuid(), &id, &material.lookup_hash.as_slice(), &material.argon2id_phc, &prefix],
     ).await?;
     let successor_id: Uuid = row.get(0);
@@ -1762,6 +1908,7 @@ pub async fn rotate(
     )
     .await?;
     let options = MintOptions {
+        capture: row.get(12),
         scope: row.get(3),
         expires_at: row.get(4),
         budget_usd_monthly: row
@@ -1844,10 +1991,28 @@ pub async fn mint_as(
     opts: MintOptions,
     actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<MintedKey> {
+    mint_as_with_membership(pool, tenant_id, name, minted_by, opts, actor, None).await
+}
+
+/// Active membership is checked while holding the same transaction lock as removal.
+#[async_trait::async_trait]
+pub trait ActiveMembership: Send + Sync {
+    async fn verify(&self, user: &str, org: &str) -> Result<()>;
+}
+
+pub async fn mint_as_with_membership(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    name: &str,
+    minted_by: Option<&str>,
+    opts: MintOptions,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    membership: Option<&dyn ActiveMembership>,
+) -> Result<MintedKey> {
     let body = generate_key_body()?;
     let material = KeyMaterial::from_body(&body)?;
     let key_prefix: String = body.chars().take(KEY_PREFIX_LEN).collect();
-    let api_key = create_as(
+    let api_key = create_as_with_membership(
         pool,
         tenant_id,
         &material,
@@ -1856,6 +2021,7 @@ pub async fn mint_as(
         minted_by,
         &opts,
         actor,
+        membership,
     )
     .await?;
     Ok(MintedKey {
@@ -1892,6 +2058,7 @@ pub struct ApiKey {
 /// see [`mint`] for why that distinction is the whole point.
 #[derive(Debug, Clone, Default)]
 pub struct MintOptions {
+    pub capture: Option<serde_json::Value>,
     pub scope: Option<Vec<String>>,
     pub expires_at: Option<DateTime<Utc>>,
     /// USD/month. Carried as `f64` and bound as TEXT with a `::numeric` cast —
@@ -2047,9 +2214,45 @@ pub async fn create_as(
     opts: &MintOptions,
     actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<ApiKey> {
+    create_as_with_membership(
+        pool, tenant_id, material, name, key_prefix, minted_by, opts, actor, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_as_with_membership(
+    pool: &Pool,
+    tenant_id: &TenantId,
+    material: &KeyMaterial,
+    name: &str,
+    key_prefix: &str,
+    minted_by: Option<&str>,
+    opts: &MintOptions,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    membership: Option<&dyn ActiveMembership>,
+) -> Result<ApiKey> {
     // OG-35: the key and its `api_key.create` row commit together, or neither does.
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let org = lock_workspace_mints(&tx, tenant_id).await?;
+    if let Some(user) = minted_by {
+        lock_active_identity(&tx, user).await?;
+    }
+    let authenticated = actor.as_actor();
+    if authenticated.auth_method == "workos_session" {
+        if minted_by != Some(authenticated.sub.as_str()) {
+            anyhow::bail!("minter identity mismatch");
+        }
+        membership
+            .context("active membership verifier required")?
+            .verify(
+                &authenticated.sub,
+                org.as_deref().context("workspace organization required")?,
+            )
+            .await?;
+    }
+
     // OG-23: the project must be a LIVE project of THIS tenant, and the environment one
     // of its own. (An archive racing this INSERT is harmless: an archived project still
     // governs its keys.)
@@ -2081,9 +2284,9 @@ pub async fn create_as(
         // are likewise bare — `text` and `boolean` both bind natively.
         "INSERT INTO api_keys (tenant_id, name, lookup_hash, argon2id_phc, key_prefix, minted_by, \
                                scope, expires_at, budget_usd_monthly, rate_limit_rpm, \
-                               budget_reset, velocity_breaker, project_id, environment, policy)
+                               budget_reset, velocity_breaker, project_id, environment, policy, capture)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9{BUDGET_NUMERIC_CAST}, $10, \
-                 COALESCE($11, 'monthly'), $12, $13, $14, $15)
+                 COALESCE($11, 'monthly'), $12, $13, $14, $15, $16)
          RETURNING id, tenant_id, name, created_at, last_used_at, revoked_at, scope, expires_at"
     );
     let row = tx
@@ -2105,6 +2308,7 @@ pub async fn create_as(
                 &opts.project_id,
                 &opts.environment,
                 &opts.policy,
+                &opts.capture,
             ],
         )
         .await
@@ -2134,6 +2338,7 @@ pub async fn create_as(
                 "projectId": opts.project_id,
                 "environment": opts.environment,
                 "policy": opts.policy,
+                "capture": opts.capture,
             })),
         },
     )
@@ -2192,7 +2397,12 @@ async fn lookup_with_known(
         budget_reset,
         valid_until,
         governance,
-    )) = auth_cache().get(&lookup).await
+        key_capture,
+        _,
+    )) = auth_cache()
+        .get(&lookup)
+        .await
+        .filter(|entry| cache_lease_live(entry.9))
     {
         // Fail CLOSED at the deadline even while the cache TTL is live.
         if valid_until.is_some_and(|deadline| now >= deadline) {
@@ -2221,6 +2431,7 @@ async fn lookup_with_known(
             rate_limit_rpm,
             budget_reset,
             governance,
+            key_capture,
             path: LookupPath::Warm,
         }));
     }
@@ -2240,6 +2451,8 @@ async fn lookup_with_known(
         budget_reset,
         valid_until,
         governance,
+        key_capture,
+        _,
     )) = last_known_fresh_enough(lookup)
     {
         // Stale grants never extend known expiry or scheduled revocation.
@@ -2263,6 +2476,7 @@ async fn lookup_with_known(
             rate_limit_rpm,
             budget_reset,
             governance,
+            key_capture,
             path: LookupPath::Stale,
         }));
     }
@@ -2340,6 +2554,7 @@ async fn cold_lookup(
     mark.started();
 
     let cache_write = AUTH_CACHE_WRITES.read().await;
+    let select_started = Instant::now();
 
     // A13: `scope` and `expires_at` are read HERE, in the same round-trip that
     // already authenticates the key — not re-derived per route. `expires_at` is
@@ -2363,7 +2578,7 @@ async fn cold_lookup(
             &format!(
                 "SELECT k.tenant_id, k.id, k.argon2id_phc, k.scope, k.expires_at,
                         k.budget_usd_monthly::text, k.rate_limit_rpm, k.budget_reset, k.revoked_at,
-                        {AUTH_GOVERNANCE_COLUMNS}
+                        {AUTH_GOVERNANCE_COLUMNS}, k.capture
                  FROM api_keys k {AUTH_PROJECT_JOIN}
                  WHERE k.lookup_hash = $1
                    AND (k.revoked_at IS NULL OR k.revoked_at > now())
@@ -2448,9 +2663,12 @@ async fn cold_lookup(
         budget_reset,
         valid_until,
         governance.clone(),
+        crate::db::data_controls::capture_from_row(&row)?,
+        select_started,
     );
-    auth_cache().insert(lookup, entry.clone()).await;
-    remember_last_known(lookup, entry);
+    if !cache_auth_result(lookup, entry).await {
+        return Ok(None);
+    }
     note_active(lookup);
     // ponytail: last_used_at is refreshed only on the (cold) miss path — a
     // warm-cached key updates it at most every 15m (TTL refill). Fine for a
@@ -2458,6 +2676,12 @@ async fn cold_lookup(
     // every request, defeating the cache.
     drop(cache_write); // Never wait on the source row while blocking rotation commit.
     touch_last_used(&client, id).await;
+    if !cache_lease_live(select_started)
+        || valid_until.is_some_and(|deadline| now.max(Utc::now()) >= deadline)
+    {
+        return Ok(None);
+    }
+    let key_capture = crate::db::data_controls::capture_from_row(&row)?;
     Ok(Some(KeyAuth {
         tenant_id: TenantId::from_jwt_claim(tenant_uuid),
         key_id: id,
@@ -2466,6 +2690,7 @@ async fn cold_lookup(
         rate_limit_rpm,
         budget_reset,
         governance,
+        key_capture,
         path: LookupPath::Cold,
     }))
 }
@@ -2486,15 +2711,25 @@ async fn touch_last_used(client: &deadpool_postgres::Client, id: Uuid) {
 /// Allow justified the same way as `db::apply_migrations` (B-390, 2026-09-12).
 #[allow(dead_code)]
 pub async fn revoke(pool: &Pool, id: Uuid) -> Result<()> {
-    let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    client
-        .execute(
-            "UPDATE api_keys SET revoked_at = NOW()
-             WHERE id = $1 AND (revoked_at IS NULL OR revoked_at > NOW())",
+    let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    let tx = client.transaction().await?;
+    let row = tx
+        .query_opt(
+            "UPDATE api_keys SET revoked_at = LEAST(revoked_at, clock_timestamp())
+             WHERE id = $1 RETURNING lookup_hash",
             &[&id],
         )
         .await
         .context("UPDATE api_keys revoke failed")?;
+    // Match every other key writer's lock order: row first, cache writer second.
+    let _cache_write = AUTH_CACHE_WRITES.write().await;
+    tx.commit().await.context("api_keys revoke commit failed")?;
+    if let Some(digest) = row
+        .and_then(|r| r.get::<_, Option<Vec<u8>>>(0))
+        .and_then(|d| <[u8; 32]>::try_from(d).ok())
+    {
+        invalidate(digest).await;
+    }
     Ok(())
 }
 
@@ -2522,6 +2757,7 @@ pub enum KeyEditor<'a> {
 /// never re-enter it).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeyPatch {
+    pub capture: Option<Option<serde_json::Value>>,
     pub name: Option<String>,
     pub scope: Option<Vec<String>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
@@ -2545,6 +2781,7 @@ pub struct KeyPatch {
 /// One key as the settings surface reads it. No secret-derived column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyRecord {
+    pub capture: Option<serde_json::Value>,
     pub id: Uuid,
     pub name: String,
     pub key_prefix: String,
@@ -2597,11 +2834,11 @@ pub enum UpdateOutcome {
 /// disagree about positions.
 const RECORD_COLUMNS: &str = "id, name, key_prefix, created_at, last_used_at, minted_by, scope, \
      expires_at, budget_usd_monthly::text, rate_limit_rpm, budget_reset, velocity_breaker, revoked_at, \
-     project_id, environment, policy, cache";
+     project_id, environment, policy, cache, capture";
 
 /// How many columns [`RECORD_COLUMNS`] names — the index of the first column a query
 /// appends after it.
-const RECORD_LEN: usize = 17;
+const RECORD_LEN: usize = 18;
 
 fn record_from_row(row: &tokio_postgres::Row) -> KeyRecord {
     KeyRecord {
@@ -2624,6 +2861,7 @@ fn record_from_row(row: &tokio_postgres::Row) -> KeyRecord {
         environment: row.get(14),
         policy: row.get(15),
         cache: row.get(16),
+        capture: row.get(17),
     }
 }
 
@@ -2760,6 +2998,12 @@ fn diff_patch(
         // security control and from what (OG-35 reads it).
         note("policy", json!(current.policy), json!(policy));
         eff.policy = Some(policy.clone());
+    }
+    if let Some(capture) = &patch.capture
+        && *capture != current.capture
+    {
+        note("capture", json!(current.capture), json!(capture));
+        eff.capture = Some(capture.clone());
     }
     if let Some(cache) = &patch.cache
         && *cache != current.cache
@@ -2925,7 +3169,8 @@ pub async fn update(
            project_id = CASE WHEN $17 THEN $18::uuid ELSE project_id END, \
            environment = CASE WHEN $19 THEN $20::text ELSE environment END, \
            policy = CASE WHEN $21 THEN $22::jsonb ELSE policy END, \
-           cache = CASE WHEN $23 THEN $24::jsonb ELSE cache END \
+           cache = CASE WHEN $23 THEN $24::jsonb ELSE cache END, \
+           capture = CASE WHEN $25 THEN $26::jsonb ELSE capture END \
          WHERE tenant_id = $1 AND id = $2 \
          RETURNING {RECORD_COLUMNS}"
     );
@@ -2933,6 +3178,7 @@ pub async fn update(
     let environment: Option<String> = eff.environment.clone().flatten();
     let policy: Option<serde_json::Value> = eff.policy.clone().flatten();
     let cache: Option<serde_json::Value> = eff.cache.clone().flatten();
+    let capture = eff.capture.clone().flatten();
     let updated = tx
         .query_one(
             sql.as_str(),
@@ -2961,6 +3207,8 @@ pub async fn update(
                 &policy,
                 &eff.cache.is_some(),
                 &cache,
+                &eff.capture.is_some(),
+                &capture,
             ],
         )
         .await
@@ -3092,17 +3340,12 @@ pub async fn revoke_all_keys(pool: &Pool, tenant: &TenantId, actor: &str) -> Res
             "UPDATE api_keys SET revoked_at = clock_timestamp()
              WHERE tenant_id = $1
                AND (revoked_at IS NULL OR revoked_at > clock_timestamp())
-             RETURNING id, lookup_hash",
+             RETURNING id",
             &[tenant.as_uuid()],
         )
         .await
         .context("UPDATE api_keys revoke-all failed")?;
     let ids: Vec<Uuid> = rows.iter().map(|r| r.get(0)).collect();
-    let digests: Vec<[u8; 32]> = rows
-        .iter()
-        .filter_map(|r| r.get::<_, Option<Vec<u8>>>(1))
-        .filter_map(|d| <[u8; 32]>::try_from(d).ok())
-        .collect();
     crate::db::controls::record_control_change(
         &tx,
         &crate::db::controls::ControlChange {
@@ -3123,9 +3366,7 @@ pub async fn revoke_all_keys(pool: &Pool, tenant: &TenantId, actor: &str) -> Res
     tx.commit()
         .await
         .context("api_keys revoke-all commit failed")?;
-    for d in digests {
-        invalidate(d).await;
-    }
+    invalidate_tenant_locked(tenant).await;
     Ok(ids)
 }
 
@@ -3604,6 +3845,8 @@ mod stale_while_revalidate {
             tracelane_shared::spend::BudgetReset::Monthly,
             None,
             None,
+            None,
+            Instant::now(),
         );
         for n in 0..5u8 {
             m.insert(mk(n), (sample.clone(), Instant::now()));
@@ -3623,9 +3866,37 @@ mod stale_while_revalidate {
     use super::*;
 
     #[test]
-    fn stale_bound_is_fifteen_ttls_capped_at_fifteen_minutes() {
-        assert_eq!(stale_max_secs(), (auth_cache_ttl_secs() * 15).min(900));
+    fn stale_bound_is_one_absolute_ttl() {
+        assert_eq!(stale_max_secs(), auth_cache_ttl_secs());
         assert!(stale_max_secs() <= 900);
+    }
+
+    #[test]
+    fn expired_lease_fails_closed() {
+        let digest = [169u8; 32];
+        let entry: CachedAuth = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            tracelane_shared::api_scope::KeyScope::from_column(None),
+            None,
+            None,
+            tracelane_shared::spend::BudgetReset::Monthly,
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        let select_started = Instant::now() - Duration::from_secs(auth_cache_ttl_secs());
+        last_known()
+            .lock()
+            .unwrap()
+            .insert(digest, (entry, select_started));
+        let accepted = last_known_fresh_enough(digest).is_some();
+        forget_last_known(digest);
+        assert!(
+            !accepted,
+            "a revoked key must not authenticate from last-known after its SELECT-start TTL lease"
+        );
     }
 
     #[test]
@@ -3640,6 +3911,8 @@ mod stale_while_revalidate {
             tracelane_shared::spend::BudgetReset::Monthly,
             None,
             None,
+            None,
+            Instant::now(),
         );
         remember_last_known(digest, entry);
         assert!(
@@ -3675,6 +3948,8 @@ mod rotation_cache_tests {
             tracelane_shared::spend::BudgetReset::Monthly,
             Some(deadline),
             None,
+            None,
+            Instant::now(),
         );
         let mut config = deadpool_postgres::Config::new();
         config.host = Some("unused.invalid".into());
@@ -3928,5 +4203,145 @@ mod known_keys_tests {
             .await;
         assert_eq!(m, Membership::Unknown);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod revocation_lease_tests {
+    use super::*;
+
+    fn entry(tenant: Uuid, select_started: Instant) -> CachedAuth {
+        (
+            tenant,
+            Uuid::new_v4(),
+            tracelane_shared::api_scope::KeyScope::from_column(None),
+            None,
+            None,
+            tracelane_shared::spend::BudgetReset::Monthly,
+            None,
+            None,
+            None,
+            select_started,
+        )
+    }
+
+    fn closed_pool() -> Pool {
+        let mut config = deadpool_postgres::Config::new();
+        config.host = Some("127.0.0.1".into());
+        config.dbname = Some("unused".into());
+        let pool = config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .unwrap();
+        pool.close(); // No socket or database is used, even on a cache miss.
+        pool
+    }
+
+    pub(crate) async fn warm_test_key(tenant: &TenantId, body: &str) -> Pool {
+        let _ = init_pepper(&"11".repeat(32));
+        let digest = peppered_lookup(body).unwrap();
+        assert!(cache_auth_result(digest, entry(*tenant.as_uuid(), Instant::now())).await);
+        closed_pool()
+    }
+
+    #[tokio::test]
+    async fn late_result_does_not_extend_lease() {
+        let digest = [170u8; 32];
+        let started = Instant::now() - Duration::from_secs(auth_cache_ttl_secs());
+        let grant = entry(Uuid::new_v4(), started);
+        assert!(!cache_auth_result(digest, grant.clone()).await);
+        assert!(auth_cache().get(&digest).await.is_none());
+        // Even a caller remembering an old result cannot reset its age.
+        remember_last_known(digest, grant);
+        assert!(last_known_fresh_enough(digest).is_none());
+        forget_last_known(digest);
+    }
+
+    #[tokio::test]
+    async fn warm_key_needs_no_database_and_expired_lease_cannot_fall_back() {
+        let _ = init_pepper(&"11".repeat(32));
+        let body = "unit-test-absolute-auth-lease";
+        let digest = peppered_lookup(body).unwrap();
+        let pool = closed_pool();
+        let grant = entry(Uuid::new_v4(), Instant::now());
+        assert!(cache_auth_result(digest, grant.clone()).await);
+        let auth = lookup_with_known(&pool, body, Utc::now(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*auth.tenant_id.as_uuid(), grant.0);
+        // Simulate a pre-revoke read arriving late: moka's insertion TTL is fresh,
+        // but the authoritative SELECT-start lease has expired.
+        let mut expired = grant;
+        expired.9 = Instant::now() - Duration::from_secs(auth_cache_ttl_secs());
+        auth_cache().insert(digest, expired.clone()).await;
+        remember_last_known(digest, expired);
+        assert!(
+            lookup_with_known(&pool, body, Utc::now(), None)
+                .await
+                .is_err(),
+            "store failure at lease expiry must refuse authentication, not serve stale"
+        );
+        invalidate(digest).await;
+    }
+
+    #[tokio::test]
+    async fn invalidation_preserves_other_tenant_and_removes_last_known_only_grants() {
+        let _ = init_pepper(&"11".repeat(32));
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = Uuid::new_v4();
+        let body_a = "unit-test-tenant-invalidation-a";
+        let body_b = "unit-test-tenant-invalidation-b";
+        let da = peppered_lookup(body_a).unwrap();
+        let db = peppered_lookup(body_b).unwrap();
+        let stale = [171u8; 32];
+        let pool = closed_pool();
+        assert!(cache_auth_result(da, entry(*a.as_uuid(), Instant::now())).await);
+        assert!(cache_auth_result(db, entry(b, Instant::now())).await);
+        remember_last_known(stale, entry(*a.as_uuid(), Instant::now()));
+        assert!(
+            lookup_with_known(&pool, body_a, Utc::now(), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        invalidate_tenant(&a).await;
+        invalidate_tenant(&a).await; // empty/replayed eviction also completes
+        assert!(auth_cache().get(&da).await.is_none());
+        assert!(last_known_fresh_enough(da).is_none());
+        assert!(last_known_fresh_enough(stale).is_none());
+        assert!(
+            lookup_with_known(&pool, body_a, Utc::now(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *lookup_with_known(&pool, body_b, Utc::now(), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_id
+                .as_uuid(),
+            b
+        );
+        invalidate(db).await;
+    }
+
+    #[tokio::test]
+    async fn invalidation_waits_for_inflight_cache_writes() {
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let digest = [172u8; 32];
+        let read = AUTH_CACHE_WRITES.read().await;
+        let eviction = invalidate_tenant(&tenant);
+        tokio::pin!(eviction);
+        assert!(futures::poll!(&mut eviction).is_pending());
+        // The same lock spans SELECT and insertion on both cold and refresh paths.
+        assert!(cache_auth_result(digest, entry(*tenant.as_uuid(), Instant::now())).await);
+        drop(read);
+        eviction.await;
+        assert!(auth_cache().get(&digest).await.is_none());
+        assert!(last_known_fresh_enough(digest).is_none());
     }
 }

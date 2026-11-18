@@ -65,7 +65,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
 
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).

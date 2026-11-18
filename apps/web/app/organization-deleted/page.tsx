@@ -6,8 +6,8 @@
  * MUST NOT call requireSession (it would redirect-loop). Static, no session read.
  */
 
+import { SignOutButton } from "@/components/SignOutButton";
 import type { Metadata } from "next";
-import Link from "next/link";
 
 export const metadata: Metadata = { title: "Organization deleted" };
 
@@ -27,12 +27,10 @@ export default function OrganizationDeletedPage() {
 					by default; this is not a guarantee of completed deletion by day 30.
 					Audit records and backups have separate retention rules.
 				</p>
-				<Link
-					href="/sign-out"
-					className="inline-block rounded-control bg-action px-4 py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors"
-				>
+				{/* A route handler: <Link> would prefetch (run) it. */}
+				<SignOutButton className="inline-block rounded-control bg-action px-4 py-2 text-sm font-medium text-action-on hover:bg-action/90 transition-colors">
 					Sign out
-				</Link>
+				</SignOutButton>
 			</div>
 		</div>
 	);

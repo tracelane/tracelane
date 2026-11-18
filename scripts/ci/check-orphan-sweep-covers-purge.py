@@ -74,8 +74,24 @@ def bash_array(text: str, name: str) -> list[str]:
     return [re.split(r"[|:]", t, maxsplit=1)[0] for t in items if t]
 
 
+def strip_test_module(text: str) -> str:
+    """Cut a Rust source at its test MODULE, not at the first `#[cfg(test)]`.
+
+    A test-only struct field (`RunStats.before_tenant`, 2026-10-30) sits above the
+    sweep lists; cutting at the first attribute hid both lists and the guard has
+    refused every run since. Matches `#[cfg(test)]` or `#[cfg(all(test, ..))]`,
+    any further attributes, an optional visibility, then `mod`.
+    """
+    return re.split(
+        r"#\[cfg\((?:test|all\(test\b[^\]]*\))\)\](?:\s*#\[[^\]]*\])*\s*"
+        r"(?:pub(?:\([^)]*\))?\s+)?mod\s",
+        text,
+        maxsplit=1,
+    )[0]
+
+
 def swept_tables(text: str) -> set[str]:
-    text = text.split("#[cfg(test)]", 1)[0]
+    text = strip_test_module(text)
     out: set[str] = set()
     for m in re.finditer(
         r'orphan_(?:count|delete)_sql:\s*"([^"]*(?:\\\n[^"]*)*)"', text
@@ -177,12 +193,34 @@ def selftest() -> int:
                 + ("" if ok else f"  (got {f})")
             )
             bad += 0 if ok else 1
+    # 2026-10-30 regression: a test-only FIELD above the lists must not hide them,
+    # and the test MODULE below them must still be cut.
+    src = (
+        "struct RunStats {\n    #[cfg(test)]\n    before: u8,\n}\n"
+        "const SWEEP_TABLES: &[SweepTable] = &[];\n"
+        "#[cfg(test)]\nmod tests {\n    const PLANTED_IN_TESTS: u8 = 0;\n}\n"
+    )
+    cut = strip_test_module(src)
+    ok = "SWEEP_TABLES" in cut and "PLANTED_IN_TESTS" not in cut
+    head = "const SWEEP_TABLES: &[SweepTable] = &[];\n"
+    for shape in (
+        "#[cfg(test)]\nmod tests;\nconst PLANTED_IN_TESTS: u8 = 0;\n",
+        "#[cfg(test)]\npub(crate) mod t {\n    const PLANTED_IN_TESTS: u8 = 0;\n}\n",
+        "#[cfg(test)]\n#[allow(clippy::all)]\nmod t {\n    const PLANTED_IN_TESTS: u8 = 0;\n}\n",
+        '#[cfg(all(test, feature = "pg"))]\nmod t {\n    const PLANTED_IN_TESTS: u8 = 0;\n}\n',
+    ):
+        cut = strip_test_module(head + shape)
+        ok = ok and "SWEEP_TABLES" in cut and "PLANTED_IN_TESTS" not in cut
+    print(
+        f"selftest: {'✓' if ok else '✗'} a cfg(test) field above the lists does not hide them"
+    )
+    bad += 0 if ok else 1
     return 1 if bad else 0
 
 
 def sweep_statements(text: str) -> list[tuple[str, str, str]]:
     """Read every statement in the two typed Rust lists, refusing any parse gap."""
-    text = text.split("#[cfg(test)]", 1)[0]
+    text = strip_test_module(text)
     out = []
     for name, kind, fields in [
         (
@@ -219,7 +257,7 @@ def grants_and_statements(root: Path) -> list[str]:
     import xml.etree.ElementTree as ET
 
     failures = []
-    text = (root / SWEEP).read_text().split("#[cfg(test)]", 1)[0]
+    text = strip_test_module((root / SWEEP).read_text())
     try:
         statements = sweep_statements(text)
         users = ET.parse(root / USERS).getroot()

@@ -1100,13 +1100,14 @@ impl DatasetStore for ClickHouseDatasetStore {
                 tenant,
             )
             .await;
-        let row = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .fetch_one::<CountRow>()
-            .await
-            .context("dataset count SELECT failed")?;
+        let row =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .fetch_one::<CountRow>()
+                .await
+                .context("dataset count SELECT failed")?;
         Ok(row.n)
     }
 
@@ -1140,7 +1141,11 @@ impl DatasetStore for ClickHouseDatasetStore {
         // this file — built dynamically, it never went through `capped`. Found by the
         // prod query_log proof (empty Settings on exactly this query), not by the guard.
         let sql = self.capped(&sql, tenant).await;
-        let mut q = self.ch.query(&sql).bind(tenant.to_string());
+        let mut q =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string());
         if let Some(n) = name {
             q = q.bind(n);
         }
@@ -1168,14 +1173,15 @@ impl DatasetStore for ClickHouseDatasetStore {
                 tenant,
             )
             .await;
-        let row = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string())
-            .fetch_optional::<DatasetReadRow>()
-            .await
-            .context("dataset get SELECT failed")?;
+        let row =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string())
+                .fetch_optional::<DatasetReadRow>()
+                .await
+                .context("dataset get SELECT failed")?;
         Ok(row.and_then(DatasetReadRow::into_dataset))
     }
 
@@ -1222,14 +1228,15 @@ impl DatasetStore for ClickHouseDatasetStore {
                 tenant,
             )
             .await;
-        let row = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string())
-            .fetch_one::<StatsRow>()
-            .await
-            .context("dataset item stats SELECT failed")?;
+        let row =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string())
+                .fetch_one::<StatsRow>()
+                .await
+                .context("dataset item stats SELECT failed")?;
         Ok(ItemStats {
             items: row.items,
             with_reference: row.with_reference,
@@ -1258,11 +1265,12 @@ impl DatasetStore for ClickHouseDatasetStore {
 
         // SRE #20 follow-up: capped now (was the second uncapped read in this file).
         let sql = self.capped(&sql, tenant).await;
-        let mut q = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string());
+        let mut q =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string());
         if let Some((ts, id)) = &cursor {
             q = q.bind(*ts).bind(*ts).bind(id.clone());
         }
@@ -1295,18 +1303,19 @@ impl DatasetStore for ClickHouseDatasetStore {
         // idempotent (the same set always orders the same way, so the same
         // hashes join in the same sequence), which is the property that has to
         // hold; it does NOT mean ordinal 0 was line 1 of the file.
-        let rows = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string())
-            // The cap is BOUND, not assumed: a dataset that somehow held more
-            // than the ceiling must not silently produce a snapshot the eval
-            // engine will then refuse at 201.
-            .bind(u32::try_from(limits::ITEMS_PER_DATASET).unwrap_or(u32::MAX))
-            .fetch_all::<ItemReadRow>()
-            .await
-            .context("dataset all-items SELECT failed")?;
+        let rows =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string())
+                // The cap is BOUND, not assumed: a dataset that somehow held more
+                // than the ceiling must not silently produce a snapshot the eval
+                // engine will then refuse at 201.
+                .bind(u32::try_from(limits::ITEMS_PER_DATASET).unwrap_or(u32::MAX))
+                .fetch_all::<ItemReadRow>()
+                .await
+                .context("dataset all-items SELECT failed")?;
         Ok(rows
             .into_iter()
             .filter_map(ItemReadRow::into_item)
@@ -1323,15 +1332,16 @@ impl DatasetStore for ClickHouseDatasetStore {
             "SELECT toString(item_id) AS id FROM dataset_items FINAL \
              WHERE tenant_id = ? AND dataset_items.dataset_id = toUUID(?) AND input_hash = ? AND deleted = 0 \
              LIMIT 1", tenant).await;
-        let row = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string())
-            .bind(hash.to_string())
-            .fetch_optional::<IdRow>()
-            .await
-            .context("dataset dedupe SELECT failed")?;
+        let row =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string())
+                .bind(hash.to_string())
+                .fetch_optional::<IdRow>()
+                .await
+                .context("dataset dedupe SELECT failed")?;
         Ok(row.and_then(|r| Uuid::parse_str(&r.id).ok()))
     }
 
@@ -1360,15 +1370,16 @@ impl DatasetStore for ClickHouseDatasetStore {
         struct R {
             input_hash: String,
         }
-        let rows = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(dataset_id.to_string())
-            .bind(hashes)
-            .fetch_all::<R>()
-            .await
-            .context("batch dataset dedupe SELECT failed")?;
+        let rows =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(dataset_id.to_string())
+                .bind(hashes)
+                .fetch_all::<R>()
+                .await
+                .context("batch dataset dedupe SELECT failed")?;
         Ok(rows.into_iter().map(|r| r.input_hash).collect())
     }
 
@@ -1389,14 +1400,15 @@ impl DatasetStore for ClickHouseDatasetStore {
         struct R {
             trace_id: String,
         }
-        let rows = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(trace_ids)
-            .fetch_all::<R>()
-            .await
-            .context("batch trace existence SELECT failed")?;
+        let rows =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(trace_ids)
+                .fetch_all::<R>()
+                .await
+                .context("batch trace existence SELECT failed")?;
         Ok(rows.into_iter().map(|r| r.trace_id).collect())
     }
 
@@ -1432,14 +1444,15 @@ impl DatasetStore for ClickHouseDatasetStore {
             input_messages: String,
             system_instructions: String,
         }
-        let rows: Vec<R> = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(trace_ids)
-            .fetch_all::<R>()
-            .await
-            .context("batch auto span resolve SELECT failed")?;
+        let rows: Vec<R> =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(trace_ids)
+                .fetch_all::<R>()
+                .await
+                .context("batch auto span resolve SELECT failed")?;
         let mut out: Vec<TraceSpanContent> = rows
             .into_iter()
             .map(|r| TraceSpanContent {
@@ -1491,15 +1504,16 @@ impl DatasetStore for ClickHouseDatasetStore {
             input_messages: String,
             system_instructions: String,
         }
-        let rows: Vec<R> = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(&trace_ids)
-            .bind(&span_ids)
-            .fetch_all::<R>()
-            .await
-            .context("batch explicit span read SELECT failed")?;
+        let rows: Vec<R> =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(&trace_ids)
+                .bind(&span_ids)
+                .fetch_all::<R>()
+                .await
+                .context("batch explicit span read SELECT failed")?;
         let wanted: std::collections::HashSet<(String, String)> = pairs.iter().cloned().collect();
         let mut out: Vec<TraceSpanContent> = rows
             .into_iter()
@@ -1613,14 +1627,15 @@ impl DatasetStore for ClickHouseDatasetStore {
             "SELECT trace_id, span_id, JSONExtractRaw(attributes, 'gen_ai_input_messages') AS input_messages, JSONExtractRaw(attributes, 'gen_ai_system_instructions') AS system_instructions FROM tracelane.spans FINAL WHERE tenant_id = ? AND trace_id = ? AND JSONHas(attributes, 'gen_ai_input_messages') AND trimBoth(input_messages) NOT IN ('', 'null') AND NOT (JSONType(input_messages) = 'Array' AND JSONLength(input_messages) = 0) ORDER BY start_time, span_id LIMIT ?",
             tenant,
         ).await;
-        let mut rows: Vec<TraceSpanContent> = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(trace_id)
-            .bind(limit as u64)
-            .fetch_all()
-            .await?;
+        let mut rows: Vec<TraceSpanContent> =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(trace_id)
+                .bind(limit as u64)
+                .fetch_all()
+                .await?;
         // Resolve every referenced input/system blob in one batch, never per span.
         let mut fields: Vec<&mut String> = rows
             .iter_mut()
@@ -1652,15 +1667,16 @@ impl DatasetStore for ClickHouseDatasetStore {
                 tenant,
             )
             .await;
-        let mut row: Option<SpanContentRow> = self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(trace_id.to_string())
-            .bind(span_id.to_string())
-            .fetch_optional::<SpanContentRow>()
-            .await
-            .context("span content SELECT failed")?;
+        let mut row: Option<SpanContentRow> =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(trace_id.to_string())
+                .bind(span_id.to_string())
+                .fetch_optional::<SpanContentRow>()
+                .await
+                .context("span content SELECT failed")?;
         // BILL-01 / ADR-076 §2.3 — `JSONExtractRaw` returns the value VERBATIM,
         // which is `{"$ref":"blake3:<hex>"}` when ingest deduplicated it.
         // Fail-open (a read path): a rehydration failure leaves the `$ref`
@@ -1691,15 +1707,17 @@ impl DatasetStore for ClickHouseDatasetStore {
         struct R {
             span_id: String,
         }
-        Ok(self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(trace_id.to_string())
-            .fetch_optional::<R>()
-            .await
-            .context("content span resolve failed")?
-            .map(|r| r.span_id))
+        Ok(
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(tenant.to_string())
+                .bind(trace_id.to_string())
+                .fetch_optional::<R>()
+                .await
+                .context("content span resolve failed")?
+                .map(|r| r.span_id),
+        )
     }
 
     async fn snapshot_content(
@@ -1765,7 +1783,8 @@ impl DatasetStore for ClickHouseDatasetStore {
                 tenant,
             )
             .await;
-        self.ch
+        crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant)
+            .await
             .query(&sql)
             .bind(tenant.to_string())
             .bind(trace_id.to_string())
@@ -4305,6 +4324,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }
@@ -4388,7 +4408,9 @@ mod tests {
             !capture_enabled(crate::server::config::capture_decision(
                 None,
                 None,
-                &tenant()
+                &tenant(),
+                None,
+                None
             )),
             "no config MUST mean no capture — an absent block is the unprivileged state"
         );
@@ -4400,6 +4422,8 @@ mod tests {
                 output: true,
             }),
             &tenant(),
+            None,
+            None,
         );
         assert!(!capture_enabled(output_only));
     }

@@ -19,6 +19,8 @@ ignore = [
     "RUSTSEC-2026-0049",  # rustls-webpki: vulnerability
     "RUSTSEC-2026-0098",  # rustls-webpki: vulnerability
     "RUSTSEC-2026-0099",  # rustls-webpki: vulnerability
+    "RUSTSEC-2026-0382",  # rustls-webpki 0.102.8 via async-nats 0.42: distrusted intermediates (deny.toml)
+    "RUSTSEC-2026-0387",  # crypto-bigint 0.5.5 via p256 verify-only: public inputs (deny.toml)
     "RUSTSEC-2025-0134",  # rustls-pemfile: informational/deprecated warning
     # wasmtime 20.0.2 — gated behind off-by-default wasm-plugin feature
     "RUSTSEC-2026-0222",  # wasmtime — type indices mixed between engines (2026-08-01)

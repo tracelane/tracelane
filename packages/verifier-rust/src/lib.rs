@@ -66,6 +66,8 @@
 //! the fallback for unmarked rows; per-row `format` markers override it. The
 //! Python and TypeScript verifiers mirror this exactly.
 
+pub mod action;
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -262,6 +264,10 @@ pub struct VerifyReport {
     /// every anchor's signature validated against the recomputed
     /// Merkle root using the embedded (or pinned) pubkey.
     pub signatures_valid: bool,
+    /// Ed25519 batch attestations verified against a trusted key, including
+    /// signed batches with no Rekor entry. Independent of public inclusion.
+    #[serde(default)]
+    pub batch_signatures_verified: u64,
     pub rekor_anchors_seen: u64,
     /// How many anchors successfully verified end-to-end (recomputed
     /// Merkle root matched the signed payload AND the Ed25519
@@ -338,6 +344,7 @@ impl VerifyReport {
             rows_seen: 0,
             hash_chain_valid: true,
             signatures_valid: true,
+            batch_signatures_verified: 0,
             rekor_anchors_seen: 0,
             rekor_anchors_resolved: 0,
             anchors_included: 0,
@@ -1558,6 +1565,7 @@ fn verify_anchors_offline(
             report.signatures_valid = false;
             continue;
         }
+        report.batch_signatures_verified += 1;
         // AUD-29: the attestation verified — record WHICH trust root vouched for it.
         let signers = signers_by_tenant
             .entry(a.tenant_id.clone())

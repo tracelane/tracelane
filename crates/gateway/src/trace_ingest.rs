@@ -469,6 +469,10 @@ pub async fn ingest_traces_handler(
     // validated tenant, never from OTLP attributes and never per span.
     let mut capture =
         crate::server::config::content_capture_for(state.entitlements.as_deref(), &tenant_id).await;
+    let key_capture = claims.key_capture.unwrap_or_default();
+    capture.input &= key_capture.input.unwrap_or(true) && !headers.contains_key("x-tracelane-zdr");
+    capture.output &=
+        key_capture.output.unwrap_or(true) && !headers.contains_key("x-tracelane-zdr");
     if crate::server::config::trace_content().is_none() {
         capture.max_field_bytes = capture_policy.default_max_field_bytes;
     }
@@ -520,7 +524,8 @@ pub async fn ingest_traces_handler(
     // OG-50: the customer's own OTLP export (second tap site; the first is
     // `otlp_emit::spawn_publish`). Only for a batch JetStream accepted WHOLE: a rejected batch
     // is answered 503 and the SDK retries it, so offering now would export it twice. The spans
-    // were content-gated by `capture_batch` above, so the export carries what capture stored.
+    // were content-gated by `capture_batch` above, and `otel_export::offer` applies the same
+    // PII redaction the ClickHouse write does before anything is encoded.
     // Synchronous, no I/O, never fails the request.
     if n_rejected == 0 {
         for span in &batch.spans {
@@ -799,6 +804,8 @@ mod tests {
                 output: false,
             }),
             &tenant,
+            None,
+            None,
         );
         let mut batch = vec![original.clone()];
         capture_batch(&mut batch, capture);
@@ -820,7 +827,7 @@ mod tests {
         let mut allowed = vec![original.clone()];
         capture_batch(
             &mut allowed,
-            capture_decision(cfg.trace_content(), None, &tenant),
+            capture_decision(cfg.trace_content(), None, &tenant, None, None),
         );
         assert!(allowed[0].attributes.gen_ai_input_messages.is_some());
         let other_tenant = TenantId::from_jwt_claim(uuid::Uuid::new_v4());
@@ -828,7 +835,7 @@ mod tests {
         denied[0].tenant_id = other_tenant.clone();
         capture_batch(
             &mut denied,
-            capture_decision(cfg.trace_content(), None, &other_tenant),
+            capture_decision(cfg.trace_content(), None, &other_tenant, None, None),
         );
         assert!(denied[0].attributes.gen_ai_input_messages.is_none());
         let mut batch = vec![original];
@@ -841,6 +848,8 @@ mod tests {
                     output: false,
                 }),
                 &tenant,
+                None,
+                None,
             ),
         );
         assert!(batch[0].attributes.gen_ai_input_messages.is_some());

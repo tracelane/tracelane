@@ -70,7 +70,9 @@ pub fn ingest_consumer_config(batch_size: usize) -> async_nats::jetstream::consu
     async_nats::jetstream::consumer::pull::Config {
         durable_name: Some("tracelane-ingest".into()),
         ack_wait: std::time::Duration::from_secs(30),
-        max_deliver: 5,
+        // Queued spans can outlive many ack_wait periods during a writer stall.
+        // Keep them recoverable after restart; stream age/byte limits still apply.
+        max_deliver: -1,
         // SRE audit finding 29, 2026-09-04. This was the NATS server default
         // (1000) while INGEST_BATCH_SIZE is 2000, and the two interact: the
         // writer acks only AFTER the ClickHouse flush (`clickhouse_writer.rs`,
@@ -294,8 +296,9 @@ pub async fn run(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to deserialize span; nacking");
-                msg.ack_with(async_nats::jetstream::AckKind::Nak(None))
+                // Retrying the same malformed bytes cannot repair them.
+                tracing::warn!(error = %e, "failed to deserialize span; terminating delivery");
+                msg.ack_with(async_nats::jetstream::AckKind::Term)
                     .await
                     .ok();
             }
@@ -442,6 +445,47 @@ mod tests {
 #[cfg(test)]
 mod stream_limits_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs an exclusive disposable NATS_TEST_URL"]
+    async fn malformed_span_is_terminal_instead_of_retried_forever() {
+        let url = std::env::var("NATS_TEST_URL").unwrap();
+        let nc = async_nats::connect(&url).await.unwrap();
+        let js = async_nats::jetstream::new(nc.clone());
+        let stream = tracelane_shared::jetstream_limits::ensure_stream(&js, spans_stream_config())
+            .await
+            .unwrap();
+        let mut acks = nc
+            .subscribe("$JS.ACK.TRACELANE_SPANS.tracelane-ingest.>")
+            .await
+            .unwrap();
+        nc.flush().await.unwrap();
+        let (tx, _rx) = mpsc::channel(2);
+        let (stop, signal) = crate::shutdown::manual();
+        let task = tokio::spawn(run(url, tx, None, 2, signal, clickhouse::Client::default()));
+        js.publish(
+            format!("tracelane.spans.{}", Uuid::new_v4()),
+            "{invalid".into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), acks.next())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        js.delete_stream(&stream.cached_info().config.name)
+            .await
+            .unwrap();
+        assert_eq!(
+            ack.payload.as_ref(),
+            b"+TERM",
+            "permanently invalid JSON must not become an unlimited retry loop"
+        );
+    }
 
     /// RI-02 rule 9 (2026-09-20): every buffer that can put spans back stays SHORTER
     /// than the shortest deletion window, so a redelivery can never carry a row the

@@ -1,7 +1,7 @@
 //! Authenticated KMS lifecycle. Every mutation and its audit row commit together.
 use super::{
     KeyVault, KmsError, VaultError,
-    backend::{Backend, Config},
+    backend::{Backend, Config, KmsBackend},
     vault,
 };
 use crate::{auth::capability::Capability, server::AppState};
@@ -213,7 +213,7 @@ async fn read_inner(
     let config = vault::load(&**client, &a.tenant_id, master).await?;
     let rows = client
         .query(
-            "SELECT ciphertext_b64 FROM provider_keys WHERE tenant_id = $1",
+            "SELECT ciphertext_b64 FROM provider_keys WHERE tenant_id = $1 UNION ALL SELECT credential_ct FROM mcp_servers WHERE tenant_id=$1 AND credential_ct IS NOT NULL",
             &[a.tenant_id.as_uuid()],
         )
         .await?;
@@ -225,7 +225,7 @@ async fn read_inner(
         .count();
     let (last, error) = config
         .as_ref()
-        .map_or((None, None), |c| v.status(&a.tenant_id, c.id));
+        .map_or((None, None), |c| v.status(&a.tenant_id, c));
     let status = if config.is_some() {
         "configured"
     } else {
@@ -283,6 +283,7 @@ async fn write_inner(
     if !backend.valid() {
         return Err(Error(StatusCode::BAD_REQUEST, "invalid_field"));
     }
+    backend.authorize(&a.tenant_id)?;
     if !backend.ready() {
         return Err(Error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -312,20 +313,27 @@ async fn write_inner(
                 == serde_json::to_value(&backend.config).ok()
                 && old.backend.key_ref == backend.key_ref =>
         {
-            use super::backend::KmsBackend as _;
             Some(super::unbind_dek(
                 &a.tenant_id,
                 old.id,
-                &v.kms_call(
-                    &a.tenant_id,
-                    backend.unwrap(&a.tenant_id, old.id, &old.wrapped),
-                )
+                &v.kms_call(&a.tenant_id, async {
+                    v.check_revision(&a.tenant_id, old.revision)?;
+                    let opened = backend.unwrap(&a.tenant_id, old.id, &old.wrapped).await?;
+                    v.check_revision(&a.tenant_id, old.revision)?;
+                    Ok(opened)
+                })
                 .await?,
             )?)
         }
         Some(old) => {
             let (d, _) = v
-                .dek(&old.backend, &a.tenant_id, old.id, &old.wrapped)
+                .dek(
+                    &old.backend,
+                    &a.tenant_id,
+                    old.id,
+                    &old.wrapped,
+                    old.revision,
+                )
                 .await?;
             Some(Zeroizing::new(**d))
         }
@@ -339,25 +347,18 @@ async fn write_inner(
     if !same_dek(old.as_ref(), seen.as_ref()) {
         return Err(Error(StatusCode::CONFLICT, "kms_conflict"));
     }
-    let rows = tx
-        .query(
-            "SELECT CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END, ciphertext_b64 FROM provider_keys WHERE tenant_id = $1 FOR UPDATE",
-            &[a.tenant_id.as_uuid()],
-        )
-        .await?;
+    let rows = secret_rows(&tx, &a.tenant_id).await?;
     // Updating KMS auth/key configuration re-seals existing v4 rows atomically.
     // Initial adoption leaves platform rows for the explicit migrate action.
     if let (Some(old), Some(old_dek)) = (&old, &old_dek) {
-        for row in &rows {
-            let provider: String = row.get(0);
-            let blob: String = row.get(1);
-            if crate::byok::ByokMasterKey::kek_id_of(&blob).is_some() {
+        for (provider, blob, mcp) in &rows {
+            if crate::byok::ByokMasterKey::kek_id_of(blob).is_some() {
                 continue;
             }
-            let plain = super::open(&a.tenant_id, &provider, old.id, old_dek, &blob)
+            let plain = super::open(&a.tenant_id, provider, old.id, old_dek, blob)
                 .map_err(|_| VaultError::Invalid)?;
-            let sealed = super::seal(&a.tenant_id, &provider, id, &dek, &plain)?;
-            tx.execute("UPDATE provider_keys SET ciphertext_b64 = $3, updated_at = now() WHERE tenant_id = $1 AND (CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END) = $2",&[a.tenant_id.as_uuid(),&provider,&sealed]).await?;
+            let sealed = super::seal(&a.tenant_id, provider, id, &dek, &plain)?;
+            save_secret(&tx, &a.tenant_id, provider, &sealed, *mcp).await?;
         }
     }
     let value = serde_json::to_value(&backend.config)
@@ -385,6 +386,7 @@ async fn write_inner(
         backend,
         id,
         wrapped,
+        revision: v.revision(&a.tenant_id),
     };
     let result = summary(&new);
     audit(
@@ -397,6 +399,10 @@ async fn write_inner(
     .await?;
     tx.commit().await?;
     v.invalidate(&a.tenant_id);
+    if let Some(cache) = &state.entitlements {
+        cache.invalidate(*a.tenant_id.as_uuid()).await;
+    }
+    crate::mcp_inspection::evict(*a.tenant_id.as_uuid());
     Ok(result)
 }
 use secrecy::zeroize::Zeroizing;
@@ -422,7 +428,9 @@ async fn current_dek(
     let Some(c) = vault::load(&**client(state).await?, tenant, master).await? else {
         return Ok(None);
     };
-    let (dek, _) = v.dek(&c.backend, tenant, c.id, &c.wrapped).await?;
+    let (dek, _) = v
+        .dek(&c.backend, tenant, c.id, &c.wrapped, c.revision)
+        .await?;
     Ok(Some((c, Zeroizing::new(**dek))))
 }
 
@@ -466,11 +474,42 @@ async fn migrate(
             audit(&tx, &a, "security.kms.migrate", None, Some(result.clone())).await?;
             tx.commit().await?;
             v.invalidate(&a.tenant_id);
+            if let Some(cache) = &state.entitlements {
+                cache.invalidate(*a.tenant_id.as_uuid()).await;
+            }
+            crate::mcp_inspection::evict(*a.tenant_id.as_uuid());
             Ok(result)
         }
         .await,
     )
 }
+// Every vault-encrypted credential participates in the same atomic lifecycle.
+async fn secret_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &TenantId,
+) -> Result<Vec<(String, String, bool)>, Error> {
+    let mut rows = Vec::new();
+    for r in tx.query("SELECT CASE WHEN label='default' THEN provider_id ELSE provider_id||':'||label END,ciphertext_b64 FROM provider_keys WHERE tenant_id=$1 ORDER BY provider_id,label FOR UPDATE",&[tenant.as_uuid()]).await? {rows.push((r.get(0),r.get(1),false));}
+    for r in tx.query("SELECT 'mcp-server-credential:'||id::text,credential_ct FROM mcp_servers WHERE tenant_id=$1 AND credential_ct IS NOT NULL ORDER BY id FOR UPDATE",&[tenant.as_uuid()]).await? {rows.push((r.get(0),r.get(1),true));}
+    Ok(rows)
+}
+async fn save_secret(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    purpose: &str,
+    blob: &str,
+    mcp: bool,
+) -> Result<(), Error> {
+    let query = if mcp {
+        "UPDATE mcp_servers SET credential_ct=$3,updated_at=now() WHERE tenant_id=$1 AND 'mcp-server-credential:'||id::text=$2"
+    } else {
+        "UPDATE provider_keys SET ciphertext_b64=$3,updated_at=now() WHERE tenant_id=$1 AND (CASE WHEN label='default' THEN provider_id ELSE provider_id||':'||label END)=$2"
+    };
+    tx.execute(query, &[tenant.as_uuid(), &purpose, &blob])
+        .await?;
+    Ok(())
+}
+
 /// Re-seal within the caller's transaction; a bad row refuses the whole migration.
 async fn migrate_keys(
     tx: &tokio_postgres::Transaction<'_>,
@@ -480,13 +519,8 @@ async fn migrate_keys(
     dek: &[u8; 32],
 ) -> Result<u64, Error> {
     let mut count = 0;
-    let rows = tx.query(
-        "SELECT CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END,ciphertext_b64 FROM provider_keys WHERE tenant_id = $1 ORDER BY provider_id, label FOR UPDATE",
-        &[tenant.as_uuid()],
-    ).await?;
-    for row in rows {
-        let provider: String = row.get(0);
-        let blob: String = row.get(1);
+    let rows = secret_rows(tx, tenant).await?;
+    for (provider, blob, mcp) in rows {
         if crate::byok::ByokMasterKey::kek_id_of(&blob).is_none() {
             super::open(tenant, &provider, id, dek, &blob).map_err(|_| VaultError::Invalid)?;
             continue;
@@ -495,7 +529,7 @@ async fn migrate_keys(
             .decrypt_with_context(&blob, &crate::byok::provider_key_aad(tenant, &provider))
             .map_err(|_| VaultError::Invalid)?;
         let sealed = super::seal(tenant, &provider, id, dek, &plain)?;
-        tx.execute("UPDATE provider_keys SET ciphertext_b64=$3,updated_at=now() WHERE tenant_id = $1 AND (CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END) = $2", &[tenant.as_uuid(),&provider,&sealed]).await?;
+        save_secret(tx, tenant, &provider, &sealed, mcp).await?;
         count += 1;
     }
     Ok(count)
@@ -558,6 +592,10 @@ async fn rewrap_inner(
     .await?;
     tx.commit().await?;
     v.invalidate(&a.tenant_id);
+    if let Some(cache) = &state.entitlements {
+        cache.invalidate(*a.tenant_id.as_uuid()).await;
+    }
+    crate::mcp_inspection::evict(*a.tenant_id.as_uuid());
     Ok(result)
 }
 
@@ -608,28 +646,43 @@ async fn delete_inner(
     {
         return Err(Error(StatusCode::CONFLICT, "kms_conflict"));
     }
-    let count = match req.mode {
+    let (provider_count, mcp_count) = match req.mode {
         DeleteMode::Abandon => {
-            tx.execute(
-                "DELETE FROM provider_keys WHERE tenant_id=$1",
-                &[a.tenant_id.as_uuid()],
-            )
-            .await?
+            let mcp=tx.execute("UPDATE mcp_servers SET credential_ct=NULL,credential_last4=NULL,auth_mode='none',enabled=false,updated_at=now() WHERE tenant_id=$1 AND credential_ct IS NOT NULL", &[a.tenant_id.as_uuid()]).await?;
+            let providers = tx
+                .execute(
+                    "DELETE FROM provider_keys WHERE tenant_id=$1",
+                    &[a.tenant_id.as_uuid()],
+                )
+                .await?;
+            (providers, mcp)
         }
         DeleteMode::Unseal => {
-            let mut count = 0;
-            for row in tx.query("SELECT CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END,ciphertext_b64 FROM provider_keys WHERE tenant_id=$1 FOR UPDATE",&[a.tenant_id.as_uuid()]).await? {
-                    let provider:String=row.get(0);
-                    let blob:String=row.get(1);
-                    if crate::byok::ByokMasterKey::kek_id_of(&blob).is_some(){
-                        master.decrypt_with_context(&blob,&crate::byok::provider_key_aad(&a.tenant_id,&provider)).map_err(|_|VaultError::Invalid)?;
-                        continue}
-                    let Some((_, dek)) = &unseal else { return Err(Error(StatusCode::CONFLICT, "kms_conflict")) };
-                    let plain=super::open(&a.tenant_id,&provider,c.id,dek,&blob).map_err(|_|VaultError::Invalid)?;
-                    let sealed=master.encrypt_with_context(&plain,&crate::byok::provider_key_aad(&a.tenant_id,&provider)).map_err(|_|VaultError::Invalid)?;
-                    tx.execute("UPDATE provider_keys SET ciphertext_b64=$3,updated_at=now() WHERE tenant_id = $1 AND (CASE WHEN label = 'default' THEN provider_id ELSE provider_id || ':' || label END) = $2",&[a.tenant_id.as_uuid(),&provider,&sealed]).await?;
-                    count+=1;
+            let mut count = (0u64, 0u64);
+            for (provider, blob, mcp) in secret_rows(&tx, &a.tenant_id).await? {
+                if crate::byok::ByokMasterKey::kek_id_of(&blob).is_some() {
+                    master
+                        .decrypt_with_context(
+                            &blob,
+                            &crate::byok::provider_key_aad(&a.tenant_id, &provider),
+                        )
+                        .map_err(|_| VaultError::Invalid)?;
+                    continue;
                 }
+                let Some((_, dek)) = &unseal else {
+                    return Err(Error(StatusCode::CONFLICT, "kms_conflict"));
+                };
+                let plain = super::open(&a.tenant_id, &provider, c.id, dek, &blob)
+                    .map_err(|_| VaultError::Invalid)?;
+                let sealed = master
+                    .encrypt_with_context(
+                        &plain,
+                        &crate::byok::provider_key_aad(&a.tenant_id, &provider),
+                    )
+                    .map_err(|_| VaultError::Invalid)?;
+                save_secret(&tx, &a.tenant_id, &provider, &sealed, mcp).await?;
+                if mcp { count.1 += 1 } else { count.0 += 1 }
+            }
             count
         }
     };
@@ -647,7 +700,8 @@ async fn delete_inner(
         DeleteMode::Unseal => "unseal",
         DeleteMode::Abandon => "abandon",
     };
-    let result = json!({ "mode": mode, "provider_keys": count });
+    let result =
+        json!({ "mode": mode, "provider_keys": provider_count, "mcp_credentials":mcp_count });
     audit(
         &tx,
         a,
@@ -658,6 +712,10 @@ async fn delete_inner(
     .await?;
     tx.commit().await?;
     v.invalidate(&a.tenant_id);
+    if let Some(cache) = &state.entitlements {
+        cache.invalidate(*a.tenant_id.as_uuid()).await;
+    }
+    crate::mcp_inspection::evict(*a.tenant_id.as_uuid());
     Ok(result)
 }
 
@@ -796,6 +854,7 @@ mod tests {
             },
             id: Uuid::new_v4(),
             wrapped: b"DO-NOT-LEAK-WRAPPED-DEK".to_vec(),
+            revision: 0,
         };
         let text = summary(&c).to_string();
         assert!(!text.contains("DO-NOT-LEAK"));
@@ -942,5 +1001,576 @@ mod pg_tests {
         assert_eq!(providers.customer_managed, 2);
         assert!(report.render().contains("customer_managed_skipped=2"));
         assert_eq!(blobs(&**client, &a).await, before_rotate);
+    }
+}
+
+#[cfg(test)]
+mod mcp_lifecycle_tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres"]
+    async fn mcp_credentials_migrate_with_customer_key_and_preserve_other_tenant() {
+        use base64::Engine;
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
+        let mut client = pool.get().await.unwrap();
+        let master = crate::byok::ByokMasterKey::from_values(
+            Some(&base64::engine::general_purpose::STANDARD.encode([3; 32])),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = TenantId::from_jwt_claim(Uuid::new_v4());
+        let server = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for (tenant, id) in [(&a, server), (&b, other)] {
+            client
+                .execute(
+                    "INSERT INTO tenants(id,workos_org_id,name) VALUES($1,$2,'MCP lifecycle')",
+                    &[tenant.as_uuid(), &format!("org_{tenant}")],
+                )
+                .await
+                .unwrap();
+            let purpose = format!("mcp-server-credential:{id}");
+            let blob = master
+                .encrypt_with_context(
+                    &SecretString::from("mcp-test-secret"),
+                    &crate::byok::provider_key_aad(tenant, &purpose),
+                )
+                .unwrap();
+            client.execute("INSERT INTO mcp_servers(id,tenant_id,slug,name,url,transport,auth_mode,credential_kind,credential_ct) VALUES($1,$2,'test','Test','https://example.com','streamable_http','gateway_held','bearer',$3)",&[&id,tenant.as_uuid(),&blob]).await.unwrap();
+        }
+        let other_blob: String = client
+            .query_one(
+                "SELECT credential_ct FROM mcp_servers WHERE tenant_id=$1 AND id=$2",
+                &[b.as_uuid(), &other],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let id = Uuid::new_v4();
+        let dek = [9; 32];
+        let tx = client.transaction().await.unwrap();
+        assert_eq!(
+            migrate_keys(&tx, &a, &master, id, &dek)
+                .await
+                .unwrap_or_else(|_| panic!("migration failed")),
+            1,
+            "MCP envelopes are a KMS lifecycle consumer"
+        );
+        tx.commit().await.unwrap();
+        let migrated: String = client
+            .query_one(
+                "SELECT credential_ct FROM mcp_servers WHERE tenant_id=$1 AND id=$2",
+                &[a.as_uuid(), &server],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            super::super::open(
+                &a,
+                &format!("mcp-server-credential:{server}"),
+                id,
+                &dek,
+                &migrated
+            )
+            .unwrap()
+            .expose_secret(),
+            "mcp-test-secret"
+        );
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT credential_ct FROM mcp_servers WHERE tenant_id=$1 AND id=$2",
+                    &[b.as_uuid(), &other]
+                )
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            other_blob
+        );
+        let rotated = crate::byok_rotate::rotate(&pool, &master, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated
+                .tables
+                .iter()
+                .find(|t| t.table == "mcp_servers")
+                .unwrap()
+                .customer_managed,
+            1
+        );
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod mcp_kms_lifecycle_security_tests {
+    use super::*;
+    use crate::kms::backend::scripted::{SCRIPT, Script};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Method, Request},
+    };
+    use secrecy::ExposeSecret as _;
+    use std::{
+        cell::RefCell,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tower::ServiceExt as _;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    /// A local Vault transit double. Wrapping preserves the submitted bound DEK
+    /// so production's random-DEK roundtrip and tenant/UUID checks remain real.
+    fn transit_script(denied: Arc<AtomicBool>) -> Script {
+        Script {
+            responder: Some(Arc::new(move |request| {
+                if denied.load(Ordering::SeqCst) {
+                    return Err(KmsError::Denied);
+                }
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let key = request.url.rsplit('/').next().unwrap();
+                let value = if request.url.contains("/encrypt/") {
+                    let plaintext = body["plaintext"].as_str().unwrap();
+                    json!({"data":{"ciphertext":format!("vault:test:{key}:{plaintext}")}})
+                } else {
+                    assert!(request.url.contains("/decrypt/"));
+                    let ciphertext = body["ciphertext"].as_str().unwrap();
+                    let prefix = format!("vault:test:{key}:");
+                    let plaintext = ciphertext.strip_prefix(&prefix).ok_or(KmsError::Denied)?;
+                    json!({"data":{"plaintext":plaintext}})
+                };
+                serde_json::to_vec(&value).map_err(|_| KmsError::Unavailable)
+            })),
+            ..Script::default()
+        }
+    }
+
+    struct Fixture {
+        pool: crate::db::DbPool,
+        state: AppState,
+        a: TenantId,
+        b: TenantId,
+        upstream: MockServer,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            crate::mcp_security_tests::init_master_for_security_tests();
+            // The fingerprint key is process-global and set at boot in production; without
+            // this the tests passed only when an earlier test had installed it.
+            crate::tool_fingerprint::init_from_existing_pepper(&"07".repeat(32)).unwrap();
+            let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
+            let a = TenantId::from_jwt_claim(Uuid::new_v4());
+            let b = TenantId::from_jwt_claim(Uuid::new_v4());
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"executed"}]}}))).mount(&upstream).await;
+            let c = pool.get().await.unwrap();
+            for tenant in [&a, &b] {
+                c.execute(
+                    "INSERT INTO tenants(id,workos_org_id,name) VALUES($1,$2,'MCP KMS security')",
+                    &[tenant.as_uuid(), &format!("org_{tenant}")],
+                )
+                .await
+                .unwrap();
+                let server = Uuid::new_v4();
+                let aad = crate::byok::provider_key_aad(
+                    tenant,
+                    &format!("mcp-server-credential:{server}"),
+                );
+                let blob = crate::byok::master_key()
+                    .unwrap()
+                    .encrypt_with_context(&SecretString::from("mcp-lifecycle-test-secret"), &aad)
+                    .unwrap();
+                c.execute("INSERT INTO mcp_servers(id,tenant_id,slug,name,url,transport,auth_mode,credential_ct,credential_last4) VALUES($1,$2,'lifecycle','Lifecycle',$3,'streamable_http','gateway_held',$4,'cret')", &[&server,tenant.as_uuid(),&upstream.uri(),&blob]).await.unwrap();
+            }
+            drop(c);
+            let source = pool.clone();
+            let mut state = crate::handler_harness::test_state(
+                crate::providers::ProviderRegistry::new().unwrap(),
+            );
+            state.pg = Some(pool.clone());
+            state.entitlements = Some(Arc::new(crate::entitlement_cache::EntitlementCache::new(
+                Arc::new(move |tenant| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        let client = source.get().await?;
+                        let mut ent = crate::entitlement_cache::ResolvedEntitlements::deny_all();
+                        ent.f_customer_kms = true;
+                        ent.mcp = Some(crate::mcp_store::load(&client, &tenant).await?);
+                        Ok(ent)
+                    })
+                }),
+            )));
+            Self {
+                pool,
+                state,
+                a,
+                b,
+                upstream,
+            }
+        }
+
+        fn claims(tenant: &TenantId) -> crate::auth::Claims {
+            crate::auth::Claims {
+                tenant_id: tenant.clone(),
+                sub: format!("kms-review:{tenant}"),
+                key_scope: crate::auth::scope::KeyScope::from_column(Some(&["mcp".into()])),
+                ..crate::auth::dev_stub_claims(crate::auth::AuthMethod::JwtBearer)
+            }
+        }
+
+        async fn control(
+            &self,
+            tenant: &TenantId,
+            method: Method,
+            path: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            let _claims = crate::auth::test_claims::Guard::set(Self::claims(tenant));
+            let _access = crate::control_plane::test_overrides::Guard::new(
+                Some(Ok(Default::default())),
+                Some(Ok(true)),
+                None,
+            );
+            let response = router(self.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn configure(&self, tenant: &TenantId, key: &str) -> (StatusCode, Value) {
+            self.control(tenant,Method::PUT,"/v1/security/kms",json!({"backend":"vault_transit","key_ref":key,"params":{"url":"https://127.0.0.1","mount":"transit"},"secret":"unit-transit-token"})).await
+        }
+
+        async fn adopt(&self, tenant: &TenantId, key: &str) {
+            let configured = self.configure(tenant, key).await;
+            assert_eq!(
+                configured.0,
+                StatusCode::OK,
+                "configure failed: {}",
+                configured.1
+            );
+            let migrated = self
+                .control(
+                    tenant,
+                    Method::POST,
+                    "/v1/security/kms/migrate",
+                    json!({"confirm":true}),
+                )
+                .await;
+            assert_eq!(migrated.0, StatusCode::OK, "migrate failed: {}", migrated.1);
+            assert_eq!(migrated.1["migrated"], 1);
+            self.prove_credential(tenant).await;
+        }
+
+        async fn rows(&self, tenant: &TenantId) -> Value {
+            let c = self.pool.get().await.unwrap();
+            let server: Value = c
+                .query_one(
+                    "SELECT to_jsonb(s) FROM mcp_servers s WHERE tenant_id=$1",
+                    &[tenant.as_uuid()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let config: Option<Value> = c
+                .query_opt(
+                    "SELECT to_jsonb(k) FROM tenant_kms_configs k WHERE tenant_id=$1",
+                    &[tenant.as_uuid()],
+                )
+                .await
+                .unwrap()
+                .map(|r| r.get(0));
+            let keys: Vec<Value> = c
+                .query(
+                    "SELECT to_jsonb(k) FROM tenant_data_keys k WHERE tenant_id=$1 ORDER BY id",
+                    &[tenant.as_uuid()],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            json!({"server":server,"configuration":config,"keys":keys})
+        }
+
+        async fn prove_credential(&self, tenant: &TenantId) {
+            let c = self.pool.get().await.unwrap();
+            let snapshot = crate::mcp_store::load(&c, tenant.as_uuid()).await.unwrap();
+            let server = snapshot
+                .servers
+                .iter()
+                .find(|s| s.slug == "lifecycle")
+                .unwrap();
+            let secret = crate::mcp_proxy::credential(&snapshot, server, tenant, &HeaderMap::new())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                secret.expose_secret(),
+                "mcp-lifecycle-test-secret",
+                "fresh persisted configuration must open the credential"
+            );
+            // Also exercise the real warm entitlement reader: never manually evict it
+            // here, since a lifecycle write must refresh its MCP consumers itself.
+            let (status, body) = self.proxy(tenant).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "warm MCP dispatch after KMS change: {body}"
+            );
+            assert_eq!(body["result"]["content"][0]["text"], "executed");
+            let requests = self.upstream.received_requests().await.unwrap();
+            assert_eq!(
+                requests.last().unwrap().headers["authorization"],
+                "Bearer mcp-lifecycle-test-secret"
+            );
+        }
+
+        async fn proxy(&self, tenant: &TenantId) -> (StatusCode, Value) {
+            let _claims = crate::auth::test_claims::Guard::set(Self::claims(tenant));
+            let response = crate::mcp_proxy::router(self.state.clone()).oneshot(Request::builder().method(Method::POST).uri("/v1/mcp/lifecycle").header("authorization","Bearer test-token").header("content-type","application/json").body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{}}}).to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn block_audit(&self, action: Option<&str>) {
+            let c = self.pool.get().await.unwrap();
+            c.batch_execute("ALTER TABLE admin_audit_log DROP CONSTRAINT IF EXISTS security_kms_lifecycle_audit").await.unwrap();
+            if let Some(action) = action {
+                assert!(["security.kms.set", "security.kms.delete"].contains(&action));
+                c.batch_execute(match action {"security.kms.set"=>"ALTER TABLE admin_audit_log ADD CONSTRAINT security_kms_lifecycle_audit CHECK(action <> 'security.kms.set') NOT VALID","security.kms.delete"=>"ALTER TABLE admin_audit_log ADD CONSTRAINT security_kms_lifecycle_audit CHECK(action <> 'security.kms.delete') NOT VALID",_=>panic!("unknown fixture action")}).await.unwrap();
+            }
+        }
+
+        async fn audit_count(&self, tenant: &TenantId, action: &str) -> i64 {
+            self.pool.get().await.unwrap().query_one("SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id=$1 AND action=$2",&[tenant.as_uuid(),&action]).await.unwrap().get(0)
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres; scripted local Vault"]
+    async fn mcp_kms_configuration_replacement_and_rewrap_preserve_credentials_and_other_tenant() {
+        let _loopback = crate::handler_harness::LoopbackBypassGuard::new();
+        let denied = Arc::new(AtomicBool::new(false));
+        SCRIPT
+            .scope(RefCell::new(transit_script(denied)), async {
+                let f = Fixture::new().await;
+                f.adopt(&f.b, "tenant-b").await;
+                f.adopt(&f.a, "original").await;
+                let before = f.rows(&f.a).await;
+                let other = f.rows(&f.b).await;
+                f.block_audit(Some("security.kms.set")).await;
+                assert_eq!(
+                    f.configure(&f.a, "replacement").await.0,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                assert_eq!(
+                    f.rows(&f.a).await,
+                    before,
+                    "failed audit must roll back configuration, DEK and ciphertext together"
+                );
+                f.prove_credential(&f.a).await;
+                f.block_audit(None).await;
+                let replaced = f.configure(&f.a, "replacement").await;
+                assert_eq!(replaced.0, StatusCode::OK, "replacement: {}", replaced.1);
+                let after = f.rows(&f.a).await;
+                assert_ne!(
+                    after["server"]["credential_ct"],
+                    before["server"]["credential_ct"]
+                );
+                assert_eq!(after["configuration"]["key_ref"], "replacement");
+                let active: Vec<_> = after["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|k| k["retired_at"].is_null())
+                    .collect();
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0]["id"], replaced.1["dek_id"]);
+                assert_ne!(active[0]["id"], before["keys"][0]["id"]);
+                f.prove_credential(&f.a).await;
+                assert_eq!(f.rows(&f.b).await, other);
+                let rewrapped = f
+                    .control(
+                        &f.a,
+                        Method::POST,
+                        "/v1/security/kms/rewrap",
+                        json!({"key_ref":"rewrapped"}),
+                    )
+                    .await;
+                assert_eq!(rewrapped.0, StatusCode::OK, "rewrap: {}", rewrapped.1);
+                let final_rows = f.rows(&f.a).await;
+                assert_eq!(
+                    final_rows["server"]["credential_ct"], after["server"]["credential_ct"],
+                    "rewrap changes the wrapped DEK, not provider envelopes"
+                );
+                assert_eq!(rewrapped.1["dek_id"], replaced.1["dek_id"]);
+                assert_eq!(final_rows["configuration"]["key_ref"], "rewrapped");
+                f.prove_credential(&f.a).await;
+                f.prove_credential(&f.b).await;
+                assert_eq!(f.rows(&f.b).await, other);
+                assert_eq!(f.audit_count(&f.a, "security.kms.set").await, 2);
+                assert_eq!(f.audit_count(&f.a, "security.kms.rewrap").await, 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres; scripted local Vault"]
+    async fn mcp_kms_unseal_preserves_working_credentials_and_rolls_back_failed_audit() {
+        let _loopback = crate::handler_harness::LoopbackBypassGuard::new();
+        SCRIPT
+            .scope(
+                RefCell::new(transit_script(Arc::new(AtomicBool::new(false)))),
+                async {
+                    let f = Fixture::new().await;
+                    f.adopt(&f.b, "tenant-b").await;
+                    f.adopt(&f.a, "unseal").await;
+                    let before = f.rows(&f.a).await;
+                    let other = f.rows(&f.b).await;
+                    f.block_audit(Some("security.kms.delete")).await;
+                    let failed = f
+                        .control(
+                            &f.a,
+                            Method::DELETE,
+                            "/v1/security/kms",
+                            json!({"mode":"unseal","confirm":true}),
+                        )
+                        .await;
+                    assert_eq!(failed.0, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(f.rows(&f.a).await, before);
+                    f.prove_credential(&f.a).await;
+                    f.block_audit(None).await;
+                    let unsealed = f
+                        .control(
+                            &f.a,
+                            Method::DELETE,
+                            "/v1/security/kms",
+                            json!({"mode":"unseal","confirm":true}),
+                        )
+                        .await;
+                    assert_eq!(unsealed.0, StatusCode::OK, "unseal: {}", unsealed.1);
+                    let after = f.rows(&f.a).await;
+                    assert!(after["configuration"].is_null());
+                    assert_eq!(after["keys"], json!([]));
+                    assert_eq!(after["server"]["enabled"], true);
+                    assert_eq!(after["server"]["auth_mode"], "gateway_held");
+                    let blob = after["server"]["credential_ct"].as_str().unwrap();
+                    assert!(crate::byok::ByokMasterKey::kek_id_of(blob).is_some());
+                    let server = after["server"]["id"].as_str().unwrap();
+                    let aad = crate::byok::provider_key_aad(
+                        &f.a,
+                        &format!("mcp-server-credential:{server}"),
+                    );
+                    assert_eq!(
+                        crate::byok::master_key()
+                            .unwrap()
+                            .decrypt_with_context(blob, &aad)
+                            .unwrap()
+                            .expose_secret(),
+                        "mcp-lifecycle-test-secret"
+                    );
+                    f.prove_credential(&f.a).await;
+                    f.prove_credential(&f.b).await;
+                    assert_eq!(f.rows(&f.b).await, other);
+                    assert_eq!(f.audit_count(&f.a, "security.kms.delete").await, 1);
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres; scripted local Vault"]
+    async fn mcp_kms_abandon_clears_credentials_disables_server_without_kms_and_preserves_other_tenant()
+     {
+        let _loopback = crate::handler_harness::LoopbackBypassGuard::new();
+        let denied = Arc::new(AtomicBool::new(false));
+        SCRIPT
+            .scope(RefCell::new(transit_script(denied.clone())), async {
+                let f = Fixture::new().await;
+                f.adopt(&f.b, "tenant-b").await;
+                f.adopt(&f.a, "abandon").await;
+                let before = f.rows(&f.a).await;
+                let other = f.rows(&f.b).await;
+                denied.store(true, Ordering::SeqCst);
+                let kms_before = SCRIPT.with(|s| s.borrow().requests.len());
+                f.block_audit(Some("security.kms.delete")).await;
+                assert_eq!(
+                    f.control(
+                        &f.a,
+                        Method::DELETE,
+                        "/v1/security/kms",
+                        json!({"mode":"abandon","confirm":true})
+                    )
+                    .await
+                    .0,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                assert_eq!(
+                    f.rows(&f.a).await,
+                    before,
+                    "audit failure must restore the credential and enabled state"
+                );
+                f.block_audit(None).await;
+                let abandoned = f
+                    .control(
+                        &f.a,
+                        Method::DELETE,
+                        "/v1/security/kms",
+                        json!({"mode":"abandon","confirm":true}),
+                    )
+                    .await;
+                assert_eq!(
+                    abandoned.0,
+                    StatusCode::OK,
+                    "abandon must work with inaccessible customer KMS: {}",
+                    abandoned.1
+                );
+                assert_eq!(
+                    SCRIPT.with(|s| s.borrow().requests.len()),
+                    kms_before,
+                    "abandon must not contact KMS"
+                );
+                let after = f.rows(&f.a).await;
+                assert!(after["configuration"].is_null());
+                assert_eq!(after["keys"], json!([]));
+                assert!(after["server"]["credential_ct"].is_null());
+                assert!(after["server"]["credential_last4"].is_null());
+                assert_eq!(after["server"]["auth_mode"], "none");
+                assert_eq!(after["server"]["enabled"], false);
+                let upstream_before = f.upstream.received_requests().await.unwrap().len();
+                let refused = f.proxy(&f.a).await;
+                assert_eq!(refused.0, StatusCode::FORBIDDEN);
+                assert_eq!(refused.1["error"], "mcp_server_disabled");
+                assert_eq!(
+                    f.upstream.received_requests().await.unwrap().len(),
+                    upstream_before
+                );
+                denied.store(false, Ordering::SeqCst);
+                f.prove_credential(&f.b).await;
+                assert_eq!(f.rows(&f.b).await, other);
+                assert_eq!(f.audit_count(&f.a, "security.kms.delete").await, 1);
+            })
+            .await;
     }
 }

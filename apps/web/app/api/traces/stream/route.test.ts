@@ -5,7 +5,7 @@ const gatewayGet = vi.hoisted(() =>
 );
 const calls: Array<{ cacheKey: string }> = [];
 vi.mock("@/lib/auth", () => ({
-	requireGatewayToken: async () => ({ tenantId: "workspace" }),
+	requireSession: async () => ({ tenantId: "workspace", role: "admin" }),
 }));
 vi.mock("@/lib/gateway", () => ({
 	gatewayGet,

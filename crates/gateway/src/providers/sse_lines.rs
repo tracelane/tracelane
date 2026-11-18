@@ -22,8 +22,21 @@ pub(crate) struct LineBuffer {
 }
 
 impl LineBuffer {
-    pub(crate) fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        let max = super::translation_policy::limits().sse_line_max_bytes;
+        if self.buf.len().saturating_add(chunk.len()) > max {
+            let mut line_len = 0usize;
+            for &byte in self.buf.iter().chain(chunk) {
+                if byte == b'\n' {
+                    line_len = 0;
+                } else {
+                    line_len += 1;
+                    anyhow::ensure!(line_len <= max, "SSE line exceeds configured byte limit");
+                }
+            }
+        }
         self.buf.extend_from_slice(chunk);
+        Ok(())
     }
 
     /// Bytes of the next complete line, without its `\n` and a trailing `\r`.
@@ -85,9 +98,9 @@ mod tests {
     #[test]
     fn a_character_split_across_chunks_decodes_whole() {
         let mut lb = LineBuffer::default();
-        lb.push(b"data: price \xE2\x82");
+        lb.push(b"data: price \xE2\x82").unwrap();
         assert!(lb.next_line().is_none(), "no newline yet");
-        lb.push(b"\xAC5\r\ndata: next\n");
+        lb.push(b"\xAC5\r\ndata: next\n").unwrap();
         assert_eq!(lb.next_line().unwrap().unwrap(), "data: price €5");
         assert_eq!(lb.next_line().unwrap().unwrap(), "data: next");
         assert!(lb.next_line().is_none());
@@ -96,8 +109,8 @@ mod tests {
     #[test]
     fn lossy_path_keeps_a_split_character() {
         let mut lb = LineBuffer::default();
-        lb.push("{\"text\":\"日".as_bytes().split_at(10).0);
-        lb.push(&"{\"text\":\"日本\"}\n".as_bytes()[10..]);
+        lb.push("{\"text\":\"日".as_bytes().split_at(10).0).unwrap();
+        lb.push(&"{\"text\":\"日本\"}\n".as_bytes()[10..]).unwrap();
         assert_eq!(lb.next_line_lossy().unwrap(), "{\"text\":\"日本\"}");
     }
 
@@ -106,19 +119,38 @@ mod tests {
     #[test]
     fn a_complete_invalid_line_is_an_error() {
         let mut lb = LineBuffer::default();
-        lb.push(b"data: \xFF\xFE\n");
+        lb.push(b"data: \xFF\xFE\n").unwrap();
         assert!(lb.next_line().unwrap().is_err());
     }
 
     #[test]
     fn many_lines_in_one_chunk_and_an_unterminated_tail() {
         let mut lb = LineBuffer::default();
-        lb.push(b"a\n\nb\r\nc");
+        lb.push(b"a\n\nb\r\nc").unwrap();
         assert_eq!(lb.next_line().unwrap().unwrap(), "a");
         assert_eq!(lb.next_line().unwrap().unwrap(), "");
         assert_eq!(lb.next_line().unwrap().unwrap(), "b");
         assert!(lb.next_line().is_none());
-        lb.push(b"d\n");
+        lb.push(b"d\n").unwrap();
         assert_eq!(lb.next_line().unwrap().unwrap(), "cd");
+    }
+
+    #[test]
+    fn unterminated_sse_line_is_bounded() {
+        let mut lines = LineBuffer::default();
+        let data = vec![b'x'; 1024];
+        for _ in 0..1024 {
+            lines.push(&data).unwrap();
+        }
+        assert!(lines.push(&data).is_err());
+        assert!(lines.buf.len() <= 1_048_576);
+    }
+
+    #[test]
+    fn large_chunk_of_short_lines_is_allowed() {
+        let mut lines = LineBuffer::default();
+        let chunk = b"data: ok\n".repeat(150_000);
+        lines.push(&chunk).unwrap();
+        assert_eq!(lines.next_line().unwrap().unwrap(), "data: ok");
     }
 }

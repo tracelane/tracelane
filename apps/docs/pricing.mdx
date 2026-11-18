@@ -97,7 +97,7 @@ hard-cap.
 |---|---|---|
 | Ingest | $0.20 / GB accepted | Bytes accepted through the gateway or via OTLP — one meter, both paths. |
 | Hot indexed window | $16.00/GB-month (0–500) · $8.00 (500–2,000) · $4.50 (2,000–10,000) · $3.00 (10,000+) | Resident GB-month inside your plan's indexed window — priced as **query capacity**, not disk. |
-| Series | $0.008 / series-month | Distinct metric series (provider/model/attribute combinations) tracked this month. |
+| Series | $0.008 / series-month | Distinct combinations of span name, model, provider and API key in the billing period. |
 | Query compute | $0.15 / scan-unit | ClickHouse bytes scanned to answer your queries; 1 scan-unit = 1 GB scanned. |
 | Cold archive | $0.08 / GB-month | Resident GB-month once data ages past the indexed window, while still inside queryable history — measured as the mean daily cold GB over the month, the same basis as the hot window. Every paid tier includes 24× its monthly ingest allowance in cold (two years of included ingest); the meter bills only beyond that. History you import counts toward cold from the day it lands. |
 | Evaluations | $0.005 / judge run | Each LLM-judge run against your traces or datasets. |

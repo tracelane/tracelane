@@ -89,7 +89,7 @@ impl BedrockProvider {
                 endpoint.into(),
                 AwsCredentials {
                     access_key_id: access_key_id.into(),
-                    secret_access_key: secret_access_key.into(),
+                    secret_access_key: secrecy::SecretString::from(secret_access_key.into()),
                     session_token: None,
                 },
             )),
@@ -183,7 +183,10 @@ impl BedrockProvider {
             amz_date: &amz_date,
             date_stamp: &date_stamp,
             region: &self.region,
-            session_token: creds.session_token.as_deref(),
+            session_token: creds
+                .session_token
+                .as_ref()
+                .map(secrecy::ExposeSecret::expose_secret),
         };
         let auth_header = signed.sign(&creds);
 
@@ -258,10 +261,11 @@ impl BedrockProvider {
 
 // ── AWS credentials ─────────────────────────────────────────────────────────
 
-struct AwsCredentials {
+/// Secrets stay `SecretString` (zeroized on drop) and are exposed only inside the signer.
+pub(crate) struct AwsCredentials {
     access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
+    secret_access_key: secrecy::SecretString,
+    session_token: Option<secrecy::SecretString>,
 }
 
 impl AwsCredentials {
@@ -270,10 +274,12 @@ impl AwsCredentials {
             .map_err(|_| anyhow!("AWS_ACCESS_KEY_ID missing from environment"))?;
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
             .map_err(|_| anyhow!("AWS_SECRET_ACCESS_KEY missing from environment"))?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        let session_token = std::env::var("AWS_SESSION_TOKEN")
+            .ok()
+            .map(secrecy::SecretString::from);
         Ok(Self {
             access_key_id,
-            secret_access_key,
+            secret_access_key: secrecy::SecretString::from(secret_access_key),
             session_token,
         })
     }
@@ -281,16 +287,16 @@ impl AwsCredentials {
 
 // ── SigV4 ──────────────────────────────────────────────────────────────────
 
-struct SignableRequest<'a> {
-    method: &'a str,
-    host: &'a str,
-    path: &'a str,
-    query: &'a str,
-    payload_hash: &'a str,
-    amz_date: &'a str,
-    date_stamp: &'a str,
-    region: &'a str,
-    session_token: Option<&'a str>,
+pub(crate) struct SignableRequest<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) query: &'a str,
+    pub(crate) payload_hash: &'a str,
+    pub(crate) amz_date: &'a str,
+    pub(crate) date_stamp: &'a str,
+    pub(crate) region: &'a str,
+    pub(crate) session_token: Option<&'a str>,
 }
 
 impl<'a> SignableRequest<'a> {
@@ -298,6 +304,15 @@ impl<'a> SignableRequest<'a> {
     /// The header set sent on the wire MUST exactly match the headers
     /// listed here; any drift will produce a `SignatureDoesNotMatch`.
     fn sign(&self, creds: &AwsCredentials) -> String {
+        use secrecy::ExposeSecret;
+        self.sign_with(
+            &creds.access_key_id,
+            creds.secret_access_key.expose_secret(),
+        )
+    }
+
+    /// Sign with borrowed key material; the caller keeps ownership of the secret.
+    pub(crate) fn sign_with(&self, access_key_id: &str, secret_access_key: &str) -> String {
         // 1. Canonical request
         let mut signed_headers_pairs: Vec<(String, String)> = vec![
             ("content-type".into(), "application/json".into()),
@@ -346,11 +361,13 @@ impl<'a> SignableRequest<'a> {
         );
 
         // 3. Signing key (HMAC chain)
-        let k_secret = format!("AWS4{}", creds.secret_access_key);
-        let k_date = hmac_sha256(k_secret.as_bytes(), self.date_stamp.as_bytes());
-        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
-        let k_service = hmac_sha256(&k_region, SERVICE.as_bytes());
-        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let k_secret = secrecy::zeroize::Zeroizing::new(format!("AWS4{secret_access_key}"));
+        // Each derived key is a scoped credential: zeroize them all on drop.
+        use secrecy::zeroize::Zeroizing;
+        let k_date = Zeroizing::new(hmac_sha256(k_secret.as_bytes(), self.date_stamp.as_bytes()));
+        let k_region = Zeroizing::new(hmac_sha256(&k_date, self.region.as_bytes()));
+        let k_service = Zeroizing::new(hmac_sha256(&k_region, SERVICE.as_bytes()));
+        let k_signing = Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"));
 
         // 4. Signature
         let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
@@ -358,7 +375,7 @@ impl<'a> SignableRequest<'a> {
         format!(
             "{alg} Credential={ak}/{scope}, SignedHeaders={signed}, Signature={sig}",
             alg = SIGNING_ALGORITHM,
-            ak = creds.access_key_id,
+            ak = access_key_id,
             scope = credential_scope,
             signed = signed_headers,
             sig = signature,
@@ -366,7 +383,7 @@ impl<'a> SignableRequest<'a> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use ring::digest::{SHA256, digest};
     hex::encode(digest(&SHA256, bytes))
 }

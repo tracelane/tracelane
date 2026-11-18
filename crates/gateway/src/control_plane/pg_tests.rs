@@ -270,6 +270,7 @@ async fn og36_pg_the_route_writes_the_policy_and_its_audit_row_for_an_admin_only
         budget_usd_monthly: None,
         rate_limit_rpm: None,
         budget_reset: crate::spend::BudgetReset::Monthly,
+        key_capture: None,
         governance: None,
     };
     {
@@ -304,5 +305,116 @@ async fn og36_pg_the_route_writes_the_policy_and_its_audit_row_for_an_admin_only
     assert_eq!(
         n, 1,
         "exactly one audit row, from the admin, with the request context"
+    );
+}
+
+/// Portal links grant WorkOS admin access; issuance must pass the same live gate
+/// and durable audit write as other controls. Policy/SSO reads use scoped fixtures;
+/// accepted and refused audit effects are checked against a migrated Postgres.
+#[tokio::test]
+#[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+async fn portal_issuance_enforces_admin_policy_before_recording_audit() {
+    let pool = fresh_migrated_pool().await;
+    let c = pool.get().await.unwrap();
+    let t = tenant(&c, "portal").await;
+    let app = || {
+        super::router(pool.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                crate::preauth_limiter::PreAuthLimiter::new(60),
+                crate::preauth_limiter::layer,
+            ))
+            .layer(MockConnectInfo(
+                "198.51.100.7:4000".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+    };
+    let request = || {
+        Request::post("/v1/audit/control-changes")
+        .header("authorization", "Bearer test-token-not-a-real-jwt")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "203.0.113.7")
+        .body(Body::from(json!({"action": "workspace.portal.generate", "target_id": "org_portal", "after": {"intent": "sso"}}).to_string()))
+        .unwrap()
+    };
+    for (role, policy, sso, expected) in [
+        (Role::Owner, Err(()), None, StatusCode::SERVICE_UNAVAILABLE),
+        (
+            Role::Owner,
+            Ok(AdminAccess {
+                admin_ip_allowlist: vec!["203.0.113.0/24".into()],
+                sso_required: false,
+                ..Default::default()
+            }),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Role::Owner,
+            Ok(AdminAccess {
+                admin_ip_allowlist: vec![],
+                sso_required: true,
+                ..Default::default()
+            }),
+            Some(Ok(false)),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Role::Owner,
+            Ok(AdminAccess {
+                admin_ip_allowlist: vec![],
+                sso_required: true,
+                ..Default::default()
+            }),
+            Some(Err(())),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            Role::Member,
+            Ok(AdminAccess::default()),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Role::Owner,
+            Ok(AdminAccess {
+                admin_ip_allowlist: vec!["198.51.100.0/24".into()],
+                sso_required: true,
+                ..Default::default()
+            }),
+            Some(Ok(true)),
+            StatusCode::CREATED,
+        ),
+    ] {
+        let _policy = super::test_overrides::Guard::new(Some(policy), sso, None);
+        let _claims = crate::auth::test_claims::Guard::set(Claims {
+            tenant_id: t.clone(),
+            sub: "user_portal".into(),
+            auth_method: AuthMethod::JwtBearer,
+            role: Some(role),
+            key_scope: KeyScope::LegacyFullSurface,
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
+            governance: None,
+        });
+        let response = app().oneshot(request()).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    }
+    let rows = c.query("SELECT target_id, after_json, host(ip_addr) FROM admin_audit_log WHERE actor_workspace_id = $1 AND action = 'workspace.portal.generate'", &[t.as_uuid()]).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only allowed issuance is audited as an accepted action"
+    );
+    assert_eq!(rows[0].get::<_, String>(0), "org_portal");
+    assert_eq!(
+        rows[0].get::<_, serde_json::Value>(1),
+        json!({"intent": "sso"})
+    );
+    assert_eq!(
+        rows[0].get::<_, Option<String>>(2).as_deref(),
+        Some("198.51.100.7")
     );
 }

@@ -106,7 +106,7 @@ describe("R12 after-proof — the sidebar strands nothing", () => {
 		const html = render();
 		expect(html).toContain(`href="${SETTINGS_HREF}"`);
 		expect(html).toContain(`href="${SUPPORT_HREF}"`);
-		expect(html).toContain('href="/sign-out"');
+		expect(html).toMatch(/<button[^>]*type="button"[^>]*aria-label="Sign out"/);
 	});
 
 	it("strands nothing when collapsed to the icon rail", () => {

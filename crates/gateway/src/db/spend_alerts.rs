@@ -254,6 +254,16 @@ pub async fn get_sealed(pool: &Pool, tenant: &TenantId, id: Uuid) -> Result<Opti
 /// Pool or INSERT failure (the caller retries the crossing later).
 pub async fn enqueue(pool: &Pool, tenant: Uuid, dedup_key: &str, payload: &Value) -> Result<u64> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    enqueue_with(&**client, tenant, dedup_key, payload).await
+}
+
+/// The same outbox insert inside a caller's control transaction.
+pub async fn enqueue_with<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    tenant: Uuid,
+    dedup_key: &str,
+    payload: &Value,
+) -> Result<u64> {
     client
         .execute(
             "INSERT INTO spend_alert_events (tenant_id, channel_id, dedup_key, payload) \

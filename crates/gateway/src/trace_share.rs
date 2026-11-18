@@ -25,23 +25,22 @@
 //! non-literally-JWT but equally-authenticated source (a peppered-hash
 //! Postgres lookup there; a token-hash Postgres lookup here).
 //!
-//! ## Fails CLOSED, with exactly one exception
+//! ## Fails CLOSED for access and content decisions
 //!
 //! Every branch on this path denies on doubt: an unowned or unknown trace is
 //! 404, a malformed/expired/revoked token is 404 (the SAME 404, so the three
 //! cases are indistinguishable), a read failure is 502/500, never a
-//! best-effort guess. The ONE fail-OPEN branch is the public route's
-//! `view_count` increment — the "someone's Slack link happened to 500 the
-//! click" is a strictly worse outcome than an undercounted view, and this is
-//! the sole affordance `.claude/rules/logging.md` grants a fail-open write.
+//! best-effort guess. View-count increments and workspace display-name reads
+//! are best-effort; neither grants access or restores stripped content.
 //!
-//! ## Content never leaves this process
+//! ## Public payload boundary
 //!
-//! The public route strips every content-bearing `attributes` key (§2
-//! denylist below) from every span before serialising. There is no opt-in —
-//! `docs/reference/TRAPS.md` §11 / this repo's honesty locks forbid a public
-//! surface from carrying a customer's prompt or response under any
-//! configuration.
+//! Before serialising, the public route clears span status text and strips
+//! known body and private-identifier attributes, regardless of their JSON type.
+//! Other text attributes require an explicit allowlist entry. There is no body
+//! opt-in. Span names, workspace names, allowlisted metadata and generic numeric
+//! attributes remain visible and can themselves contain sensitive information;
+//! this filter is not a blanket guarantee that every shared value is non-sensitive.
 //!
 //! ## KNOWN SPEC-VS-CODE GAP: `rekor_entry_id`
 //!
@@ -134,6 +133,8 @@ const DENYLIST_KEYS: &[&str] = &[
     "new_context",
     "full_command",
     "file_path",
+    "mcp.session.id",
+    "gen_ai.data_source.id",
 ];
 /// Any key ENDING in one of these is also stripped (spec §2). Covers e.g.
 /// `gen_ai_input_messages` a second time (already exact-listed — redundant is
@@ -152,7 +153,8 @@ fn is_content_key(key: &str) -> bool {
 /// (`user_id`), `tracelane_business_reference`, `gen_ai_conversation_id` and the
 /// GWY-54 labels (`service_*`, `deployment_environment`) to anyone holding the link.
 /// A new text field reaches a public share only by being added here on purpose.
-/// Numbers and booleans pass for any key — they cannot carry customer text.
+/// Numbers, booleans and arrays of those pass for non-denied keys. This preserves
+/// generic metrics but does not establish that every numeric value is non-sensitive.
 const SHARE_TEXT_KEYS: &[&str] = &[
     "gen_ai_agent_name",
     "gen_ai_operation_name",
@@ -193,9 +195,7 @@ fn strip_content(attributes_json: &str) -> String {
                         | "gen_ai.prompt.version"
                         | "gen_ai.workflow.name"
                         | "gen_ai.output.type"
-                        | "gen_ai.data_source.id"
                         | "mcp.method.name"
-                        | "mcp.session.id"
                         | "mcp.protocol.version"
                         | "llm.model_name"
                         | "llm.request.model_name"
@@ -221,7 +221,25 @@ fn strip_content(attributes_json: &str) -> String {
 
 fn strip_spans_content(mut spans: Vec<SpanRow>) -> Vec<SpanRow> {
     for span in &mut spans {
-        span.attributes = strip_content(&span.attributes);
+        // No rest pattern: adding a SpanRow field must force a public-boundary
+        // decision here. The named fields below deliberately remain visible.
+        let SpanRow {
+            span_id: _,
+            parent_span_id: _,
+            name: _,
+            start_time: _,
+            end_time: _,
+            start_time_us: _,
+            duration_us: _,
+            status_code: _,
+            status_message,
+            attributes,
+            aft_ids: _,
+            intervention: _,
+        } = span;
+        *attributes = strip_content(attributes);
+        // SDKs write the exception text here too, so it is a body, not metadata.
+        status_message.clear();
     }
     spans
 }
@@ -329,8 +347,8 @@ pub trait ShareStore: Send + Sync {
     async fn list_active(&self, tenant: &TenantId, trace_id: &str) -> Result<Vec<ShareListRow>>;
 
     /// Soft-revoke (sets `revoked_at`; the row and its `view_count` survive).
-    /// `Ok(true)` iff a row matching `(tenant, trace_id, id)` with no prior
-    /// revoke was updated.
+    /// `Ok(true)` iff `(tenant, trace_id, id)` matches, including an already
+    /// revoked row. Repeats preserve the first revocation timestamp.
     async fn revoke(&self, tenant: &TenantId, trace_id: &str, id: Uuid) -> Result<bool>;
 
     /// Public lookup by token hash. `Ok(None)` covers missing, expired AND
@@ -445,9 +463,8 @@ impl ShareStore for PgShareStore {
         let affected = client
             .execute(
                 "UPDATE trace_shares
-                    SET revoked_at = now()
-                  WHERE id = $1 AND tenant_id = $2 AND trace_id = $3
-                    AND revoked_at IS NULL",
+                    SET revoked_at = COALESCE(revoked_at, now())
+                  WHERE id = $1 AND tenant_id = $2 AND trace_id = $3",
                 &[&id, tenant.as_uuid(), &trace_id],
             )
             .await
@@ -1023,7 +1040,7 @@ async fn public_share_handler(
         }
     };
 
-    // Best-effort, fail-OPEN — the ONE such branch on this path (module
+    // Best-effort, fail-OPEN — a cosmetic write on this path (module
     // header). A failure here counts, never fails the request, never logs
     // per-request (this branch only runs on an actual DB error, not on every
     // request).
@@ -1128,6 +1145,40 @@ mod tests {
     }
 
     #[test]
+    fn public_share_drops_session_and_data_source_identifiers() {
+        for identifier in [
+            serde_json::json!("private-identifier"),
+            serde_json::json!(12345),
+            serde_json::json!(true),
+            serde_json::json!([12345, false]),
+            serde_json::json!(["private-identifier"]),
+            serde_json::json!({"private": "identifier"}),
+            serde_json::Value::Null,
+        ] {
+            let input = serde_json::json!({
+                "mcp.session.id": identifier,
+                "gen_ai.data_source.id": identifier,
+                "mcp.method.name": "tools/call",
+                "custom.count": 2,
+                "custom.values": [1, true],
+            });
+            let value: serde_json::Value =
+                serde_json::from_str(&strip_content(&input.to_string())).unwrap();
+            assert!(
+                value.get("mcp.session.id").is_none(),
+                "session: {identifier}"
+            );
+            assert!(
+                value.get("gen_ai.data_source.id").is_none(),
+                "source: {identifier}"
+            );
+            assert_eq!(value["mcp.method.name"], "tools/call");
+            assert_eq!(value["custom.count"], 2);
+            assert_eq!(value["custom.values"], serde_json::json!([1, true]));
+        }
+    }
+
+    #[test]
     fn public_share_strips_unknown_string_passthrough() {
         let value: serde_json::Value = serde_json::from_str(&strip_content(r#"{"custom.label":"secret","custom.mixed":[1,"secret"],"custom.count":2,"gen_ai.tool.name":"search"}"#)).unwrap();
         assert!(value.get("custom.label").is_none());
@@ -1205,6 +1256,21 @@ mod tests {
             aft_ids: vec![],
             intervention: 0,
         }
+    }
+
+    /// B-618: `status_message` carries the same text as the denylisted
+    /// `exception_message` (SDKs call `set_status(ERROR, str(exc))`). The share
+    /// route promises no bodies, so the text goes and the status code stays.
+    #[test]
+    fn shared_spans_lose_status_text_and_keep_the_status_code() {
+        let mut failed = span("s", None, "tool", 1);
+        failed.status_code = 2;
+        failed.status_message = "private tool output in an error".to_string();
+
+        let stripped = strip_spans_content(vec![failed]);
+
+        assert_eq!(stripped[0].status_message, "");
+        assert_eq!(stripped[0].status_code, 2);
     }
 
     // ── token ────────────────────────────────────────────────────────────
@@ -1654,7 +1720,7 @@ mod tests {
         async fn revoke(&self, tenant: &TenantId, trace_id: &str, id: Uuid) -> Result<bool> {
             let mut rows = self.rows.lock().unwrap();
             for r in rows.iter_mut() {
-                if r.id == id && &r.tenant == tenant && r.trace_id == trace_id && !r.revoked {
+                if r.id == id && &r.tenant == tenant && r.trace_id == trace_id {
                     r.revoked = true;
                     return Ok(true);
                 }
@@ -1920,7 +1986,15 @@ mod tests {
         });
 
         let mut leaky = span("s1", None, "root", 0);
-        leaky.attributes = serde_json::json!({"gen_ai_input_messages": "SECRET"}).to_string();
+        leaky.attributes = serde_json::json!({
+            "gen_ai_input_messages": "SECRET",
+            "mcp.session.id": 12345,
+            "gen_ai.data_source.id": {"private": "SECRET"},
+            "custom.count": 2,
+        })
+        .to_string();
+        leaky.status_code = 2;
+        leaky.status_message = "SECRET tool output in an error".to_string();
         let reader =
             Arc::new(FakeReader::new().with_trace(&tenant.to_string(), "trace-0001", vec![leaky]));
         let state = test_state(reader, store.clone());
@@ -1931,6 +2005,12 @@ mod tests {
         let v: serde_json::Value = resp.json();
         let attrs = v["spans"][0]["attributes"].as_str().unwrap();
         assert!(!attrs.contains("SECRET"));
+        let attributes: serde_json::Value = serde_json::from_str(attrs).unwrap();
+        assert!(attributes.get("mcp.session.id").is_none());
+        assert!(attributes.get("gen_ai.data_source.id").is_none());
+        assert_eq!(attributes["custom.count"], 2);
+        assert!(!v.to_string().contains("SECRET"));
+        assert_eq!(v["spans"][0]["status_code"], 2);
 
         assert_eq!(store.rows.lock().unwrap()[0].view_count, 1);
     }
@@ -2091,5 +2171,114 @@ mod tests {
             .add_header("authorization", "Bearer dev-token")
             .await;
         assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    /// An owner's repeat revoke succeeds with 204; another workspace's link
+    /// and an unknown id remain indistinguishable 404 responses.
+    #[tokio::test]
+    async fn repeat_revoke_by_the_owner_is_204_and_another_tenant_stays_404() {
+        let _g = DevAuthGuard::new();
+        let tenant = dev_tenant();
+        let store = FakeShareStore::new();
+        let (own, _) = store
+            .mint(&tenant, "trace-0001", b"a", "u", 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let (foreign, _) = store
+            .mint(&other_tenant(), "trace-0001", b"b", "u", 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let server = test_server(FakeReader::new(), store);
+        let delete = |id: Uuid| {
+            server
+                .delete(&format!("/v1/traces/trace-0001/shares/{id}"))
+                .add_header("authorization", "Bearer dev-token")
+        };
+
+        assert_eq!(delete(own).await.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(delete(own).await.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(delete(foreign).await.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            delete(Uuid::new_v4()).await.status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            server
+                .delete(&format!("/v1/traces/wrong-trace/shares/{own}"))
+                .add_header("authorization", "Bearer dev-token")
+                .await
+                .status_code(),
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs POSTGRES_TEST_URL — run scripts/ci/run-postgres-integration.sh"]
+    async fn pg_revoke_is_idempotent_and_scoped_to_tenant_trace_and_id() {
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
+        let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
+        let other = TenantId::from_jwt_claim(Uuid::new_v4());
+        for t in [&tenant, &other] {
+            crate::db::tenants::create(
+                &pool,
+                *t.as_uuid(),
+                &format!("synthetic-share-{t}"),
+                "free",
+            )
+            .await
+            .unwrap();
+        }
+        let store = PgShareStore { pool: pool.clone() };
+        let hash = hash_token("synthetic-share-token");
+        let (id, _) = store
+            .mint(&tenant, "trace-0001", &hash, "synthetic-owner", 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.resolve(&hash).await.unwrap().is_some());
+        // None of the mismatched dimensions may revoke an otherwise live link.
+        for (t, trace, share) in [
+            (&other, "trace-0001", id),
+            (&tenant, "wrong-trace", id),
+            (&tenant, "trace-0001", Uuid::new_v4()),
+        ] {
+            assert!(!store.revoke(t, trace, share).await.unwrap());
+            assert!(store.resolve(&hash).await.unwrap().is_some());
+        }
+        assert!(store.revoke(&tenant, "trace-0001", id).await.unwrap());
+        assert!(store.resolve(&hash).await.unwrap().is_none());
+        assert!(
+            store
+                .list_active(&tenant, "trace-0001")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Pin an old timestamp: a repeat must not overwrite the original revocation.
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "UPDATE trace_shares SET revoked_at = '2000-01-01T00:00:00Z' WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert!(store.revoke(&tenant, "trace-0001", id).await.unwrap());
+        let row = client.query_one(
+            "SELECT revoked_at = '2000-01-01T00:00:00Z'::timestamptz FROM trace_shares WHERE id = $1",
+            &[&id],
+        ).await.unwrap();
+        assert!(row.get::<_, bool>(0));
+        assert!(!store.revoke(&other, "trace-0001", id).await.unwrap());
+        assert!(!store.revoke(&tenant, "wrong-trace", id).await.unwrap());
+        assert!(
+            !store
+                .revoke(&tenant, "trace-0001", Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(store.resolve(&hash).await.unwrap().is_none());
     }
 }

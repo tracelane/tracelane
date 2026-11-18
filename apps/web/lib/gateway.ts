@@ -202,6 +202,14 @@ export async function gatewayGet<T>(path: string): Promise<T> {
  */
 export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 	const { token } = await requireGatewayToken();
+	return postWithToken<T>(path, body, token);
+}
+
+async function postWithToken<T>(
+	path: string,
+	body: unknown,
+	token: string,
+): Promise<T> {
 	const base = gatewayBaseUrl();
 
 	let res: Response;
@@ -215,6 +223,7 @@ export async function gatewayPost<T>(path: string, body: unknown): Promise<T> {
 			},
 			body: JSON.stringify(body),
 			cache: "no-store",
+			redirect: "manual",
 			signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
 		});
 	} catch (err) {
@@ -465,6 +474,7 @@ export async function gatewayResponse(
 			"content-type",
 			"content-disposition",
 			"retry-after",
+			"etag",
 			"idempotency-key",
 			"x-truncated",
 		]);
@@ -481,4 +491,35 @@ export async function gatewayResponse(
 	} catch {
 		return Response.json({ code: "gateway_unreachable" }, { status: 502 });
 	}
+}
+
+/** Capture the human token BEFORE any identity mutation. Fail CLOSED if its
+ * organization differs from the SQL writer's session, or eviction is unconfirmed.
+ * Call the returned function only AFTER the revoke commits and before success.
+ */
+export async function prepareKeyRevocation(
+	expectedOrgId: string,
+	ownKeys = false,
+): Promise<() => Promise<void>> {
+	const { token, tenantId } = await requireGatewayToken();
+	if (!expectedOrgId || tenantId !== expectedOrgId) {
+		throw new Error("key_revocation_organization_mismatch");
+	}
+	return async () => {
+		const ack = await postWithToken<unknown>(
+			"/v1/keys/invalidate-cache",
+			ownKeys ? { own_keys: true } : {},
+			token,
+		);
+		if (
+			!ack ||
+			typeof ack !== "object" ||
+			Array.isArray(ack) ||
+			!("invalidated" in ack) ||
+			ack.invalidated !== true ||
+			Object.keys(ack).length !== 1
+		) {
+			throw new Error("key_revocation_unconfirmed");
+		}
+	};
 }

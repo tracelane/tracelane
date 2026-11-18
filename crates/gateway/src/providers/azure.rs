@@ -199,7 +199,7 @@ impl AzureOpenAiProvider {
             let mut lines = super::sse_lines::LineBuffer::default();
             while let Some(chunk) = byte_stream.next().await {
                 let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("stream chunk")?;
-                lines.push(&chunk);
+                lines.push(&chunk)?;
                 while let Some(line) = lines.next_line_lossy() {
                     let line = line.trim();
                     if let Some(data) = line.strip_prefix("data: ") {

@@ -445,14 +445,16 @@ pub async fn run(
 
                     // PP-O2 tail sampling — keep every error/intervention trace,
                     // rate-sample the rest. Dropped spans are never written.
+                    let mut span_blobs = Vec::new();
+                    let mut span_refs = Vec::new();
                     match sample_one(
                         &sampler,
                         span,
                         policy,
                         span_bytes,
                         day,
-                        &mut pending_blobs,
-                        &mut pending_refs,
+                        &mut span_blobs,
+                        &mut span_refs,
                     ) {
                         Some(row) => {
                             // ADR-048 D4.3: the per-trace ceiling clips a runaway
@@ -464,7 +466,7 @@ pub async fn run(
                             if ceiling.check_and_record(
                                 tenant_uuid,
                                 trace_id,
-                                row_byte_estimate(&row),
+                                row_byte_estimate(&row, &span_blobs),
                             ) == CeilingDecision::Exceeded
                             {
                                 // tenant_id included so the COGS live eval can
@@ -493,6 +495,8 @@ pub async fn run(
                                     ?policy,
                                     "writer span decision: KEPT → batched for ClickHouse"
                                 );
+                                pending_blobs.extend(span_blobs);
+                                pending_refs.extend(span_refs);
                                 batch.push(row);
                                 if let Some(m) = ack {
                                     pending_acks.push(m);
@@ -665,27 +669,31 @@ const INGEST_METER_PENDING_CAP: usize = 8_640;
 /// server-side (`meter_counters` `non_replicated_deduplication_window`,
 /// migration 28).
 async fn insert_ingest_meter_batch(client: &Client, batch: &IngestMeterBatch) -> Result<()> {
-    let mut insert = client
-        .insert("meter_counters")
-        .context("meter_counters insert init failed")?
-        .with_option("insert_deduplication_token", batch.token.as_str());
-    for (tenant_id, value) in &batch.rows {
+    tokio::time::timeout(CH_INSERT_ATTEMPT_TIMEOUT, async {
+        let mut insert = client
+            .insert("meter_counters")
+            .context("meter_counters insert init failed")?
+            .with_option("insert_deduplication_token", batch.token.as_str());
+        for (tenant_id, value) in &batch.rows {
+            insert
+                .write(&MeterCounterRow {
+                    tenant_id,
+                    day: batch.day,
+                    meter: "ingest_bytes",
+                    dim: "",
+                    value: *value,
+                    source: "ingest",
+                })
+                .await
+                .context("meter_counters row write failed")?;
+        }
         insert
-            .write(&MeterCounterRow {
-                tenant_id,
-                day: batch.day,
-                meter: "ingest_bytes",
-                dim: "",
-                value: *value,
-                source: "ingest",
-            })
+            .end()
             .await
-            .context("meter_counters row write failed")?;
-    }
-    insert
-        .end()
-        .await
-        .context("meter_counters insert commit failed")
+            .context("meter_counters insert commit failed")
+    })
+    .await
+    .context("meter_counters insert timed out")?
 }
 
 /// Flush meter 1's ingest half (spec §2.1): retry every pending batch UNCHANGED
@@ -783,7 +791,7 @@ async fn flush_blobs(
 
     if !deduped.is_empty() {
         let n = deduped.len();
-        let result: Result<()> = async {
+        let result: Result<()> = tokio::time::timeout(CH_INSERT_ATTEMPT_TIMEOUT, async {
             let mut insert = client.insert("blobs").context("blobs insert init failed")?;
             for b in &deduped {
                 insert
@@ -797,8 +805,9 @@ async fn flush_blobs(
                     .context("blobs row write failed")?;
             }
             insert.end().await.context("blobs insert commit failed")
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("blobs insert timed out")));
         if let Err(e) = result {
             tracing::warn!(error = %e, count = n, "blobs insert failed — batch left for redelivery (B-445)");
             tracelane_shared::degradation::note(
@@ -810,7 +819,7 @@ async fn flush_blobs(
 
     if !refs.is_empty() {
         let n = refs.len();
-        let result: Result<()> = async {
+        let result: Result<()> = tokio::time::timeout(CH_INSERT_ATTEMPT_TIMEOUT, async {
             let mut insert = client
                 .insert("blob_refs")
                 .context("blob_refs insert init failed")?;
@@ -826,8 +835,9 @@ async fn flush_blobs(
                     .context("blob_refs row write failed")?;
             }
             insert.end().await.context("blob_refs insert commit failed")
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("blob_refs insert timed out")));
         if let Err(e) = result {
             tracing::warn!(error = %e, count = n, "blob_refs insert failed — batch left for redelivery (B-445)");
             tracelane_shared::degradation::note(
@@ -858,13 +868,17 @@ fn federation_rows(batch: &[SpanRow]) -> Vec<crate::federation::FederationRow> {
 /// (ADR-048 D4.3). Sums the variable-length text fields plus a fixed overhead
 /// for ids / timestamps / status_code — not the exact ClickHouse-stored size,
 /// but a stable, allocation-free proxy for how much a trace is costing.
-fn row_byte_estimate(row: &SpanRow) -> u64 {
+fn row_byte_estimate(row: &SpanRow, blobs: &[PendingBlob]) -> u64 {
     const FIXED_OVERHEAD: u64 = 128; // ids + two i64 times + status_code
-    (row.attributes.len()
+    let row_bytes = (row.attributes.len()
         + row.name.len()
         + row.status_message.len()
         + row.parent_span_id.as_ref().map_or(0, |s| s.len())) as u64
-        + FIXED_OVERHEAD
+        + FIXED_OVERHEAD;
+    let blob_bytes: u64 = blobs.iter().map(|blob| blob.bytes.len() as u64).sum();
+    row_bytes
+        .saturating_add(blob_bytes)
+        .max(u64::from(row.span_bytes))
 }
 
 /// Ack one JetStream message (best-effort). A failed ack ⇒ redelivery ⇒ a
@@ -956,7 +970,17 @@ async fn flush(
     // counted 100 traces twice. With `non_replicated_deduplication_window` on
     // `spans` (migration 29) the server drops the retry BY TOKEN before any view
     // sees it. A token sent to a table without the window is accepted and ignored.
-    let token = uuid::Uuid::new_v4().to_string();
+    let token = if held.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        // A lost NATS ack can replay this batch in a new process. Bind the token
+        // to its complete rows (including tenant/span IDs), not process state.
+        // This covers identical ordered batches within the table's dedup window;
+        // changed batch boundaries or an evicted token are not deduplicated.
+        let mut hash = blake3::Hasher::new();
+        serde_json::to_writer(&mut hash, rows).context("hashing span batch for deduplication")?;
+        hash.finalize().to_hex().to_string()
+    };
     flush_with_backoff(client, rows, held, &token, &CH_INSERT_BACKOFF).await
 }
 
@@ -1161,6 +1185,165 @@ mod tests {
         }
     }
 
+    /// Local fault proof: the writer is represented by an undrained channel.
+    /// Only ack_wait is accelerated; delivery/retention limits come from boot config.
+    #[tokio::test]
+    #[ignore = "needs disposable NATS_TEST_URL and CLICKHOUSE_TEST_URL with schema.sql"]
+    async fn stalled_writer_messages_survive_restart_after_five_deliveries() {
+        use futures::StreamExt as _;
+        let nc = async_nats::connect(std::env::var("NATS_TEST_URL").unwrap())
+            .await
+            .unwrap();
+        let js = async_nats::jetstream::new(nc);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let subject = format!("proof.{suffix}");
+        let mut cfg = crate::nats_consumer::spans_stream_config();
+        cfg.name = format!("PROOF_{suffix}");
+        cfg.subjects = vec![subject.clone()];
+        let stream = js.create_stream(cfg).await.unwrap();
+        let mut cfg = crate::nats_consumer::ingest_consumer_config(2);
+        cfg.ack_wait = Duration::from_millis(25);
+        // Exercise boot reconciliation of an existing durable, not just defaults.
+        let mut old_cfg = cfg.clone();
+        old_cfg.max_deliver = 5;
+        stream.create_consumer(old_cfg).await.unwrap();
+        let consumer =
+            tracelane_shared::jetstream_limits::ensure_pull_consumer(&stream, cfg.clone())
+                .await
+                .unwrap();
+        assert_eq!(consumer.cached_info().config.max_deliver, cfg.max_deliver);
+        let span = tspan(tracelane_shared::SpanStatusCode::Ok);
+        js.publish(subject, serde_json::to_vec(&span).unwrap().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        for delivery in 1..=5 {
+            let mut messages = consumer
+                .fetch()
+                .max_messages(1)
+                .expires(Duration::from_secs(2))
+                .messages()
+                .await
+                .unwrap();
+            let msg = messages
+                .next()
+                .await
+                .expect("delivery before restart")
+                .unwrap();
+            assert_eq!(msg.info().unwrap().delivered, delivery);
+            if delivery == 1 {
+                tx.send(crate::span_envelope::SpanEnvelope::nats(span.clone(), msg))
+                    .await
+                    .unwrap();
+            }
+            // Later copies are dropped, exactly as the held-sequence consumer arm does.
+        }
+        drop(rx.recv().await.unwrap());
+        drop(consumer);
+        let restarted = tracelane_shared::jetstream_limits::ensure_pull_consumer(&stream, cfg)
+            .await
+            .unwrap();
+        let mut messages = restarted
+            .fetch()
+            .max_messages(1)
+            .expires(Duration::from_secs(2))
+            .messages()
+            .await
+            .unwrap();
+        let next = messages.next().await;
+        if next.is_none() {
+            js.delete_stream(&stream.cached_info().config.name)
+                .await
+                .unwrap();
+            panic!("queued span exhausted MaxDeliver and was not redelivered after restart");
+        }
+        let msg = next.unwrap().unwrap();
+        assert!(msg.info().unwrap().delivered > 5);
+        let recovered: TracelaneSpan = serde_json::from_slice(&msg.payload).unwrap();
+        let row = build_span_row(recovered, 96, 0, &mut Vec::new(), &mut Vec::new());
+        let ch = client_for(&std::env::var("CLICKHOUSE_TEST_URL").unwrap());
+        flush(&ch, &[row], &[]).await.unwrap();
+        msg.double_ack().await.unwrap();
+        let count: u64 = ch
+            .query("SELECT count() FROM tracelane.spans FINAL WHERE tenant_id = ? AND trace_id = ?")
+            .bind(span.tenant_id.to_string())
+            .bind(span.trace_id.to_string())
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "the recovered span reached ClickHouse");
+        js.delete_stream(&stream.cached_info().config.name)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable NATS_TEST_URL and CLICKHOUSE_TEST_URL with schema.sql"]
+    async fn redelivery_after_lost_ack_counts_span_once() {
+        use futures::StreamExt as _;
+        let nc = async_nats::connect(std::env::var("NATS_TEST_URL").unwrap())
+            .await
+            .unwrap();
+        let js = async_nats::jetstream::new(nc);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let subject = format!("proof.{suffix}");
+        let mut cfg = crate::nats_consumer::spans_stream_config();
+        cfg.name = format!("PROOF_{suffix}");
+        cfg.subjects = vec![subject.clone()];
+        let stream = js.create_stream(cfg).await.unwrap();
+        let mut cfg = crate::nats_consumer::ingest_consumer_config(2);
+        cfg.ack_wait = Duration::from_millis(25);
+        let consumer = tracelane_shared::jetstream_limits::ensure_pull_consumer(&stream, cfg)
+            .await
+            .unwrap();
+        let span = tspan(tracelane_shared::SpanStatusCode::Ok);
+        js.publish(subject, serde_json::to_vec(&span).unwrap().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let ch = client_for(&std::env::var("CLICKHOUSE_TEST_URL").unwrap());
+        for delivery in 1..=2 {
+            let mut messages = consumer
+                .fetch()
+                .max_messages(1)
+                .expires(Duration::from_secs(2))
+                .messages()
+                .await
+                .unwrap();
+            let msg = messages.next().await.unwrap().unwrap();
+            assert_eq!(msg.info().unwrap().delivered, delivery);
+            let recovered: TracelaneSpan = serde_json::from_slice(&msg.payload).unwrap();
+            let row = build_span_row(recovered, 96, 0, &mut Vec::new(), &mut Vec::new());
+            flush(&ch, &[row], std::slice::from_ref(&msg))
+                .await
+                .unwrap();
+            if delivery == 2 {
+                msg.double_ack().await.unwrap();
+            }
+            // First delivery commits but loses its ack; the next flush has no token state.
+        }
+        let count: u64 = ch
+            .query("SELECT count() FROM tracelane.spans FINAL WHERE tenant_id = ? AND trace_id = ?")
+            .bind(span.tenant_id.to_string())
+            .bind(span.trace_id.to_string())
+            .fetch_one()
+            .await
+            .unwrap();
+        let summary: u64 = ch.query("SELECT sum(span_count) FROM tracelane.trace_summaries FINAL WHERE tenant_id = ? AND trace_id = ?")
+            .bind(span.tenant_id.to_string()).bind(span.trace_id.to_string()).fetch_one().await.unwrap();
+        js.delete_stream(&stream.cached_info().config.name)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            summary, 1,
+            "a lost ack must not count the span twice in the materialized view"
+        );
+    }
+
     #[test]
     fn direct_content_is_gated_but_nats_content_is_not_regated() {
         use crate::span_envelope::SpanSource;
@@ -1262,6 +1445,223 @@ mod tests {
         assert_eq!(refs[0].span_id, "span-1");
         assert_eq!(refs[0].day, 100);
         assert_eq!(refs[0].hash, blobs[0].hash);
+    }
+
+    #[test]
+    fn trace_byte_ceiling_counts_blob_payload() {
+        use tracelane_shared::SpanStatusCode;
+        let sampler = TailSampler::with_rate(100);
+        let mut span = tspan(SpanStatusCode::Ok);
+        span.attributes
+            .extra
+            .insert("large".into(), serde_json::json!("x".repeat(2_048)));
+        let raw_bytes = resolve_span_bytes(&span);
+        let tenant = *span.tenant_id.as_uuid();
+        let trace = span.trace_id;
+        let mut blobs = Vec::new();
+        let mut refs = Vec::new();
+        let row = sample_one(
+            &sampler,
+            span,
+            SamplingPolicy::Tail,
+            raw_bytes,
+            0,
+            &mut blobs,
+            &mut refs,
+        )
+        .unwrap();
+        assert!(!blobs.is_empty());
+        assert!(
+            row_byte_estimate(&row, &blobs) >= u64::from(raw_bytes),
+            "ceiling must account for substituted content"
+        );
+        let ceiling = PerTraceCeiling::with_limits(0, 4_000);
+        assert_eq!(
+            ceiling.check_and_record(tenant, trace, row_byte_estimate(&row, &blobs)),
+            CeilingDecision::Accept
+        );
+        let mut second = tspan(SpanStatusCode::Ok);
+        second.trace_id = trace;
+        second.tenant_id = tracelane_shared::TenantId::from_jwt_claim(tenant);
+        second
+            .attributes
+            .extra
+            .insert("large".into(), serde_json::json!("y".repeat(2_048)));
+        let second_bytes = resolve_span_bytes(&second);
+        let second_row = sample_one(
+            &sampler,
+            second,
+            SamplingPolicy::Tail,
+            second_bytes,
+            0,
+            &mut blobs,
+            &mut refs,
+        )
+        .unwrap();
+        assert_eq!(
+            ceiling.check_and_record(tenant, trace, row_byte_estimate(&second_row, &blobs[1..])),
+            CeilingDecision::Accept
+        );
+        assert_eq!(
+            ceiling.check_and_record(tenant, trace, 1),
+            CeilingDecision::Exceeded,
+            "the next span must see the bytes stored by the first two"
+        );
+    }
+
+    #[test]
+    fn trace_byte_ceiling_counts_blob_even_with_small_stamp() {
+        use tracelane_shared::SpanStatusCode;
+        let sampler = TailSampler::with_rate(100);
+        let mut span = tspan(SpanStatusCode::Ok);
+        span.attributes
+            .extra
+            .insert("large".into(), serde_json::json!("x".repeat(2_048)));
+        span.attributes
+            .extra
+            .insert(GATEWAY_SPAN_BYTES_ATTR.into(), serde_json::json!(1));
+        let mut blobs = Vec::new();
+        let mut refs = Vec::new();
+        let row = sample_one(
+            &sampler,
+            span,
+            SamplingPolicy::Tail,
+            1,
+            0,
+            &mut blobs,
+            &mut refs,
+        )
+        .unwrap();
+        assert!(!blobs.is_empty());
+        assert!(row_byte_estimate(&row, &blobs) >= u64::from(blobs[0].size));
+    }
+
+    #[tokio::test]
+    async fn ceiling_rejected_span_writes_no_blob_or_ref() {
+        use tracelane_shared::SpanStatusCode;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let first = tspan(SpanStatusCode::Ok);
+        let mut rejected = tspan(SpanStatusCode::Ok);
+        rejected.trace_id = first.trace_id;
+        rejected
+            .attributes
+            .extra
+            .insert("large".into(), serde_json::json!("b".repeat(2_048)));
+        let (tx, rx) = mpsc::channel::<crate::span_envelope::SpanEnvelope>(8);
+        tx.send(crate::span_envelope::SpanEnvelope::otlp(first))
+            .await
+            .unwrap();
+        tx.send(crate::span_envelope::SpanEnvelope::otlp(rejected))
+            .await
+            .unwrap();
+        drop(tx);
+        run(
+            server.uri(),
+            "default".into(),
+            String::new(),
+            "tracelane".into(),
+            Arc::new(TailSampler::with_rate(100)),
+            Arc::new(TenantConfigCache::default_tail()),
+            Arc::new(PerTraceCeiling::with_limits(1, 0)),
+            rx,
+            2000,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| !r.url.to_string().contains("blobs")
+                && !r.url.to_string().contains("blob_refs")),
+            "ceiling-rejected span must not queue blob or ref inserts"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_auxiliary_insert_does_not_park_span_writer() {
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = client_for(&format!("http://{addr}"));
+        let batch = IngestMeterBatch {
+            token: uuid::Uuid::new_v4().to_string(),
+            day: 1,
+            rows: vec![("00000000-0000-0000-0000-000000000001".into(), 1.0)],
+        };
+        let result = tokio::time::timeout(
+            CH_INSERT_ATTEMPT_TIMEOUT + Duration::from_secs(1),
+            insert_ingest_meter_batch(&client, &batch),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a hung auxiliary insert must return an error within the span attempt budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_blob_insert_returns_within_attempt_budget() {
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = client_for(&format!("http://{addr}"));
+        let blob = PendingBlob {
+            tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+            hash: [7u8; 32],
+            bytes: "retry".into(),
+            size: 5,
+        };
+        let result = tokio::time::timeout(
+            CH_INSERT_ATTEMPT_TIMEOUT + Duration::from_secs(1),
+            flush_blobs(&client, vec![blob], vec![]),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a hung blob insert must return an error within the span attempt budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_blob_ref_insert_returns_within_attempt_budget() {
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = client_for(&format!("http://{addr}"));
+        let reference = PendingBlobRef {
+            tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+            hash: [7u8; 32],
+            span_id: "span-1".into(),
+            day: 1,
+        };
+        let result = tokio::time::timeout(
+            CH_INSERT_ATTEMPT_TIMEOUT + Duration::from_secs(1),
+            flush_blobs(&client, vec![], vec![reference]),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a hung blob-ref insert must return an error within the span attempt budget"
+        );
     }
 
     /// The same value, twice → the SAME hash (content-addressing, not

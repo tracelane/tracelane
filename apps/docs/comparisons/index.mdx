@@ -38,7 +38,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 |---|---|---|---|---|---|---|---|---|---|
 | Hot-path runtime | Rust <sup>[T1]</sup> | Python proxy (the build measured in [/benchmarks](/benchmarks)); a "Rust core" is announced on GitHub with no public build as of 2026-09-07 <sup>[1]</sup> <sup>[6]</sup> | TypeScript/Node.js <sup>[2]</sup> | Go <sup>[3]</sup> | Rust (`Helicone/ai-gateway` repository) <sup>[22]</sup> | N/A — no gateway | N/A — no self-hostable gateway runtime documented <sup>[5]</sup> | N/A — no gateway | N/A — no gateway |
 | Measured gateway overhead (p50) | **2 ms** — AIGatewayBench, CCX23, 2026-09-07 <sup>[T2]</sup> | Python proxy: 14–15 ms p50, same bench run <sup>[T2]</sup>; the announced Rust gateway has no public build, and its self-reported "8 ms P95 at 1k RPS" is not independently measured <sup>[6]</sup> | 3–4 ms p50, same bench run <sup>[T2]</sup> | 2 ms p50, same bench run <sup>[T2]</sup> | Not published <sup>[4]</sup> | — | — | — | — |
-| Providers supported | 191 <sup>[T3]</sup> | 140+ upstream vendors / ~1,892 models (its own count) <sup>[7]</sup> | Claims 1,600+ LLMs <sup>[8]</sup>; source code lists ~75 provider modules <sup>[9]</sup> — see "Portkey's provider count" below | 23+ upstream vendors (its own count) <sup>[3]</sup> | Multiple — count not documented <sup>[4]</sup> | — | — | — | — |
+| Providers supported | 205 <sup>[T3]</sup> | 140+ upstream vendors / ~1,892 models (its own count) <sup>[7]</sup> | Claims 1,600+ LLMs <sup>[8]</sup>; source code lists ~75 provider modules <sup>[9]</sup> — see "Portkey's provider count" below | 23+ upstream vendors (its own count) <sup>[3]</sup> | Multiple — count not documented <sup>[4]</sup> | — | — | — | — |
 | BYOK, 0% token markup | Yes <sup>[T3]</sup> | Yes — per-key `api_key` in config <sup>[10]</sup> | Yes — virtual keys with your own provider keys <sup>[8]</sup> | Yes — virtual keys <sup>[3]</sup> | Yes — routes through your keys <sup>[4]</sup> | — | Partial — lists an "LLM Gateway" to "control agent model calls"; BYOK not documented on that page <sup>[5]</sup> | — | — |
 | Response caching | Exact-match caching in production. Embedding-similarity caching is built but not enabled on the hosted product <sup>[T4]</sup> | Yes — exact + semantic, 8+ backends <sup>[11]</sup> | Yes — simple + semantic <sup>[12]</sup> | Yes — semantic caching <sup>[3]</sup> | Partial — caching listed as a feature; exact vs. semantic not documented <sup>[4]</sup> | Not documented | Not documented | Not documented | Not documented |
 | Rate limits + budgets per key | Yes — per-key RPM and budget, 429 on overage <sup>[T3]</sup> | Yes — per key/team/user RPM + TPM <sup>[10]</sup> | Yes — hourly/daily/per-minute on requests or tokens <sup>[12]</sup> | Yes — budget management <sup>[3]</sup> | Yes — rate limiting feature <sup>[4]</sup> | Not documented | Not documented | Not documented | Not documented |
@@ -60,7 +60,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 | Cost per request / model | Yes <sup>[T11]</sup> | Yes — per key/team/user tracking <sup>[1]</sup> | Yes — usage analytics <sup>[2]</sup> | Yes — budget management <sup>[3]</sup> | Not documented | Yes <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes <sup>[15]</sup> | Not documented |
 | In-app AI assistant over your traces | Yes — "Ask Tara", a natural-language query surface over your own traces, deployed to production <sup>[T12]</sup> | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
 | MCP server for trace access | Yes — `@tracelanedev/mcp` (published on npm, `0.3.0`), read-only and tenant-scoped: it reads through the gateway's own `/v1/*` routes with the caller's own bearer token <sup>[T13]</sup> | Not documented | Not documented | Yes — MCP for external tool integration <sup>[3]</sup> | Not documented | Not documented | Not documented | Not documented | Not documented |
-| Claude Code / coding-agent integration | Yes — two paths: an OTLP flight recorder that decodes Claude Code's native span shape, and an Anthropic-native `/v1/messages` proxy, both proven on production with real Claude Code sessions <sup>[T14]</sup> | Not documented — routing Claude models is not a coding-agent integration | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
+| Claude Code / coding-agent integration | Yes — two paths: an OTLP capture path that decodes Claude Code's native span shape, and an Anthropic-native `/v1/messages` proxy, both proven on production with real Claude Code sessions <sup>[T14]</sup> | Not documented — routing Claude models is not a coding-agent integration | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
 | Shareable trace links | Yes — a public `/s/<token>` page carrying the audit-ledger badge <sup>[T15]</sup> | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented | Not documented |
 
 ## Evals
@@ -99,7 +99,7 @@ the vendor's own marketing disagrees with itself. Read their repository yourself
 treating any of the three as ground truth: `github.com/portkey-ai/gateway/tree/main/src/providers`.
 
 For our own "205 providers" claim: it is the count of `crates/gateway/providers.tsv`
-rows (185) plus the 6 native adapters, held to that file by a guard in CI — count it
+rows (199) plus the 6 native adapters, held to that file by a guard in CI — count it
 yourself.
 
 ## Honest gaps
@@ -146,7 +146,7 @@ None of these are silent gaps — every one is stated as a limit in a public Tra
 - **[T11]** `crates/gateway/src/spend.rs` — cost-per-request tracking
 - **[T12]** "Ask Tara," the in-app natural-language query surface, shipped and deployed 2026-09-06; distinct from the MCP server (below)
 - **[T13]** `apps/mcp/src/reader.ts`, `GatewayReader` reads `/v1/*` with the caller's own bearer, tenant isolation proven against production ClickHouse; `@tracelanedev/mcp@0.3.0` published to npm 2026-09-07, confirmed by `npm view @tracelanedev/mcp version`
-- **[T14]** the Claude Code flight recorder (OTLP decoder aliases + cost backfill, deployed and proven 2026-09-06) and the Anthropic-native proxy (see [T7])
+- **[T14]** the Claude Code session capture (OTLP decoder aliases + cost backfill, deployed and proven 2026-09-06) and the Anthropic-native proxy (see [T7])
 - **[T15]** the public `/s/<token>` page, built and deployed 2026-09-06
 - **[T16]** `crates/gateway/src/dataset_routes.rs` and `crates/gateway/src/experiment_routes.rs` — datasets and experiments, proven on production
 - **[T17]** online evals with sampling, proven on production 2026-08-29, achieved 11.11% against a configured 10% rate

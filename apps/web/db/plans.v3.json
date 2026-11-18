@@ -39,8 +39,15 @@
     ]
   },
   "policy": {
+    "data_controls": {
+      "retention_days_min": 7,
+      "retention_days_max": 3650,
+      "audit_addon_min_days": 180,
+      "estimate_row_cap": 1000000
+    },
     "guardrail_hooks": { "max_hooks": 8, "concurrency": 4, "timeout_ms": 5000, "response_bytes": 65536, "max_matches": 16, "match_bytes": 256, "input_bytes": 1048576, "secret_bytes": 4096, "min_secret_bytes": 32 },
-    "guardrail_pii": { "allowlist_count": 64, "allowlist_value_bytes": 256 },
+    "guardrail_pii": { "allowlist_count": 64, "allowlist_value_bytes": 256, "custom_count": 10, "custom_pattern_bytes": 256, "custom_compiled_bytes": 262144, "custom_max_matches": 1000, "custom_max_match_bytes": 500, "_custom_comment": "GWY-63: a workspace's own regex entities in R2 (policy pii.custom). Per policy at most custom_count patterns, each at most custom_pattern_bytes of source and custom_compiled_bytes of compiled program (regex RegexBuilder::size_limit), and a bounded longest match of at most custom_max_match_bytes (UTF-8 bytes, so at most that many chars) so a match always fits the 512-char stream hold-back. Linear-time engine; no backtracking; Unicode \\b is refused (use (?-u:\\b)) because it forces the slow engine on non-ASCII text. Measured 2026-11-15 (release, regex 1.13, 2 MiB adversarial texts; patterns incl. [a-z]{60}Z, (?:[a-z0-9]{1,5}){1,40}Q, x.{100}, x[^\\n]{90}y, x(?s:.){0,120}#, an IBAN shape with (?-u:\\b)): <= 5 ms per pattern per pass, 112 ms with Unicode \\b, 15 s for a RegexSet over the same patterns (not used). At most custom_max_matches custom matches per scanned text; past it R2 fails CLOSED (DETECTOR_ERROR block), so a pattern that matches everywhere cannot grow one request's work or memory without bound." },
+    "guardrail_terms": { "_comment": "GWY-60: bounds on a workspace's own R7 topic/competitor lists (guardrail policy `terms`): per list at most list_count terms, each at most term_bytes UTF-8 bytes. Read by crates/gateway/src/guardrail/policy.rs term_limits() and the dashboard editor.", "list_count": 200, "term_bytes": 100, "min_matches_examined": 10000, "matches_per_byte": 2, "_budget_comment": "Per scan R7 examines at most max(min_matches_examined, matches_per_byte x text bytes) candidate matches. A whole-word hit stops the scan; ordinary text and padding built from one term stay far below 1 candidate per byte, so only a list of nested terms (a, aa, aaa) over text built for it reaches the budget (security review H1/M2, 2026-11-15). Over budget: block when the rule is set to Block, else a recorded fail_open." },
     "retention_sweep": {
       "delete_wait_secs": 300,
       "max_mutations_per_run": 400,

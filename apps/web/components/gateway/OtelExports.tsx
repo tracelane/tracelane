@@ -30,6 +30,7 @@ import {
 import { EmptyNote, Field, Panel, WhyDisabled, inputClass } from "./fields";
 
 export interface OtelExport {
+	format?: string;
 	id: string;
 	name: string;
 	url: string;
@@ -197,6 +198,14 @@ function CreateExport({ allowed }: { allowed: boolean }) {
 }
 
 function ExportRow({ e, allowed }: { e: OtelExport; allowed: boolean }) {
+	const format = e.format ?? "otlp";
+	const siem = format !== "otlp";
+	const names: Record<string, string> = {
+		otlp: "OTLP",
+		splunk: "Splunk HEC",
+		sentinel: "Microsoft Sentinel",
+		ocsf: "OCSF-shaped JSON",
+	};
 	const [confirm, setConfirm] = useState(false);
 	const [test, setTest] = useState<
 		| { state: "idle" }
@@ -214,7 +223,23 @@ function ExportRow({ e, allowed }: { e: OtelExport; allowed: boolean }) {
 	]);
 	return (
 		<TR>
-			<TD>{e.name}</TD>
+			<TD>
+				{e.name}
+				<span className="block text-xs text-ink-3">
+					{names[format] ?? "Unknown format"}
+				</span>
+				{siem ? (
+					<span className="block text-xs text-ink-3">
+						Bounded retries for retained, scanned records. Retention, late
+						visibility and exhausted retries can leave gaps. Counters since
+						destination creation.
+					</span>
+				) : (
+					<span className="block text-xs text-ink-3">
+						Best-effort delivery. Counters since gateway start.
+					</span>
+				)}
+			</TD>
 			<TD mono className="break-all">
 				{e.url}
 				{e.header_names.length > 0 ? (
@@ -253,7 +278,12 @@ function ExportRow({ e, allowed }: { e: OtelExport; allowed: boolean }) {
 					</Button>
 					<Button
 						size="sm"
-						disabled={!allowed || test.state === "busy"}
+						disabled={!allowed || siem || test.state === "busy"}
+						title={
+							siem
+								? "SIEM delivery is checked through background delivery status."
+								: undefined
+						}
 						aria-label={`Send a test span to ${e.name}`}
 						onClick={async () => {
 							setTest({ state: "busy" });
@@ -314,8 +344,9 @@ function ExportRow({ e, allowed }: { e: OtelExport; allowed: boolean }) {
 					}
 				>
 					<p className="text-sm text-ink-2">
-						Spans stop being sent to this collector. Nothing already delivered
-						is recalled, and Tracelane’s own trace storage is unaffected.
+						New deliveries stop being scheduled. An in-flight batch may finish.
+						Delivered records are not recalled, and source storage is
+						unaffected.
 					</p>
 				</ConfirmDialog>
 			</TD>
@@ -333,7 +364,7 @@ export function OtelExports() {
 					<Panel
 						id="otel-exports"
 						title="OTel export"
-						description="Send this workspace’s spans to your own OTLP/HTTP collector. Delivery is best-effort: in memory, retried a bounded number of times, and counters restart with the gateway."
+						description="Manage export destinations. OTLP delivery is best-effort and uses an in-memory queue. SIEM connectors: In development, not yet available. Delivery details appear per destination."
 					>
 						{!plan.export_enabled ? (
 							<EmptyNote>

@@ -226,7 +226,7 @@ export default async function SharedTracePage({ params }: Props) {
 			</div>
 
 			<footer className="border-t border-line px-6 py-6 text-center text-sm text-ink-2">
-				Recorded with Tracelane, the flight recorder for AI agents.{" "}
+				Recorded with Tracelane: rules and human approval for AI agent actions.{" "}
 				<Link
 					href="https://tracelane.dev"
 					className="font-medium text-ink underline underline-offset-2"

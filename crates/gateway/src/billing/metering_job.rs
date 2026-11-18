@@ -2437,9 +2437,10 @@ mod tests {
             count(Degradation::PolarMeterEmissionFailed) > before,
             "the refusal is counted"
         );
+        // B-615: the client re-sends a 5xx twice in-run, always under the same id.
         assert_eq!(
             received_external_ids(&down).await,
-            vec![format!("ingest_gb-cust_rev1b-{}", d(2))]
+            vec![format!("ingest_gb-cust_rev1b-{}", d(2)); 3]
         );
         assert!(
             !job_completed_on(&ch, d(1)).await.unwrap(),

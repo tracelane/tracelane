@@ -486,12 +486,17 @@ pub fn capture_decision(
     cfg: Option<&TraceContentConfig>,
     workspace: Option<crate::db::workspace_capture::WorkspaceCapture>,
     tenant_id: &tracelane_shared::TenantId,
+    key: Option<crate::db::data_controls::KeyCapture>,
+    headers: Option<&axum::http::HeaderMap>,
 ) -> ContentCapture {
     let allowlisted = cfg.is_some_and(|c| c.captures(tenant_id));
     let ws = workspace.unwrap_or_default();
+    let key = key.unwrap_or_default();
+    // Any supplied constraint suppresses capture; invalid values are refused by admission.
+    let constrained = headers.is_some_and(|h| h.contains_key("x-tracelane-zdr"));
     ContentCapture {
-        input: allowlisted || ws.input,
-        output: allowlisted || ws.output,
+        input: !constrained && (allowlisted || ws.input) && key.input.unwrap_or(true),
+        output: !constrained && (allowlisted || ws.output) && key.output.unwrap_or(true),
         max_field_bytes: cfg.map_or(DEFAULT_MAX_FIELD_BYTES, TraceContentConfig::max_field_bytes),
     }
 }
@@ -507,7 +512,7 @@ pub async fn content_capture_for(
         Some(c) => Some(c.resolved(*tenant_id.as_uuid()).await.content_capture),
         None => None,
     };
-    capture_decision(trace_content(), workspace, tenant_id)
+    capture_decision(trace_content(), workspace, tenant_id, None, None)
 }
 /// `failover::retry_policy`. One relaxed atomic load when it is reached.
 #[must_use]
@@ -2250,28 +2255,34 @@ failover:
         };
 
         // Default: a customer who never opted in captures nothing.
-        let d = capture_decision(Some(&cfg), Some(WorkspaceCapture::default()), &customer);
+        let d = capture_decision(
+            Some(&cfg),
+            Some(WorkspaceCapture::default()),
+            &customer,
+            None,
+            None,
+        );
         assert!(!d.input && !d.output, "default OFF");
         // The workspace opt-in, per half.
-        let d = capture_decision(Some(&cfg), Some(both), &customer);
+        let d = capture_decision(Some(&cfg), Some(both), &customer, None, None);
         assert!(
             d.input && d.output,
             "an owner's opt-in turns both halves on"
         );
         assert_eq!(d.max_field_bytes, 2048, "the operator's cap still applies");
-        let d = capture_decision(Some(&cfg), Some(input_only), &customer);
+        let d = capture_decision(Some(&cfg), Some(input_only), &customer, None, None);
         assert!(d.input && !d.output, "each half is independent");
         // No control plane: the workspace half is OFF even if a stale value said on.
-        let d = capture_decision(Some(&cfg), None, &customer);
+        let d = capture_decision(Some(&cfg), None, &customer, None, None);
         assert!(!d.input && !d.output, "no cache = no workspace grant");
-        let d = capture_decision(None, None, &customer);
+        let d = capture_decision(None, None, &customer, None, None);
         assert_eq!(d, ContentCapture::OFF, "no config and no cache = OFF");
         // The operator allowlist holds regardless of the workspace half.
-        let d = capture_decision(Some(&cfg), None, &listed);
+        let d = capture_decision(Some(&cfg), None, &listed, None, None);
         assert!(d.input && d.output);
         // A workspace opt-in on a deployment with no `trace_content:` block is still
         // bounded by the parser's default cap.
-        let d = capture_decision(None, Some(both), &customer);
+        let d = capture_decision(None, Some(both), &customer, None, None);
         assert!(d.input && d.output);
         assert_eq!(d.max_field_bytes, DEFAULT_MAX_FIELD_BYTES);
     }
@@ -2382,5 +2393,49 @@ failover:
                  see what IS accepted; got: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod key_capture_tests {
+    use super::*;
+    use crate::db::{data_controls::KeyCapture, workspace_capture::WorkspaceCapture};
+    fn capture(input: Option<bool>, output: Option<bool>, workspace: bool) -> ContentCapture {
+        capture_decision(
+            None,
+            Some(WorkspaceCapture {
+                input: workspace,
+                output: workspace,
+            }),
+            &crate::handler_harness::dev_tenant(),
+            Some(KeyCapture { input, output }),
+            None,
+        )
+    }
+    #[test]
+    fn og38_workspace_capture_inherited() {
+        let c = capture(None, None, true);
+        assert!(c.input && c.output);
+    }
+    #[test]
+    fn og38_key_input_off_preserves_output() {
+        let c = capture(Some(false), None, true);
+        assert!(!c.input && c.output);
+    }
+    #[test]
+    fn og38_key_output_off_preserves_input() {
+        let c = capture(None, Some(false), true);
+        assert!(c.input && !c.output);
+    }
+    #[test]
+    fn og38_key_cannot_enable_workspace_capture() {
+        let c = capture(Some(true), Some(true), false);
+        assert!(!c.input && !c.output);
+    }
+    #[test]
+    fn og38_sibling_key_inherits_capture() {
+        let a = capture(Some(false), Some(false), true);
+        let b = capture(None, None, true);
+        assert!(!a.input && !a.output && b.input && b.output);
     }
 }

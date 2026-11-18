@@ -1,7 +1,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "tracelane-web",
-	"main": ".open-next/worker.js",
+	"main": "worker.ts",
 	// nodejs_compat is mandatory: WorkOS AuthKit + node:crypto (api-key HMAC,
 	// Polar webhook verify, CMK PEM parse) resolve through it. The 2025-09-23
 	// compatibility_date also auto-populates process.env from vars/secrets, which
@@ -14,6 +14,13 @@
 	"assets": {
 		"directory": ".open-next/assets",
 		"binding": "ASSETS"
+	},
+	// PLT-54 daily usage digest to the operator (worker.ts `scheduled`). 04:00 UTC is the
+	// send; 05:30 UTC is one retry that renders the SAME body under the same idempotency key,
+	// so Resend replays instead of sending twice. Keep the first equal to
+	// lib/usage-digest.config.json send_hour_utc.
+	"triggers": {
+		"crons": ["0 4 * * *", "30 5 * * *"]
 	},
 	"observability": {
 		"enabled": true

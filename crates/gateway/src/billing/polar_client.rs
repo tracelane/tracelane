@@ -66,6 +66,26 @@ pub type BillingResult<T> = Result<T, BillingError>;
 
 const DEFAULT_BASE_URL: &str = "https://api.polar.sh/v1";
 
+/// B-615: back-off between `/events/ingest` attempts after a transient failure
+/// (3 attempts total). A transport property of one idempotent POST, not a
+/// tunable — see `specs/B-615-polar-meter-emission-transient-retry.md` §2.
+#[cfg(not(test))]
+const METER_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
+#[cfg(test)]
+const METER_RETRY_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
+
+/// A failure worth retrying: Polar 5xx, 429, or the request never got an answer.
+/// Any other 4xx (bad token, bad payload) fails the same way on every attempt.
+fn is_transient(e: &BillingError) -> bool {
+    match e {
+        BillingError::Http { status } => {
+            status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        BillingError::Network(_) => true,
+        BillingError::Shape(_) | BillingError::Config(_) => false,
+    }
+}
+
 /// Polar REST API client. Construct once at startup and re-use — the
 /// internal reqwest client carries connection pooling and the
 /// SSRF-hardened redirect policy.
@@ -159,6 +179,8 @@ impl PolarClient {
     /// 2026-09-14 with the ADR-020 recorder — every caller batches.
     ///
     /// # Errors
+    /// A chunk that fails transiently (5xx, 429, network) is first re-sent up to
+    /// twice under the same `external_id`s ([`METER_RETRY_DELAYS`], B-615).
     /// Propagates the FIRST failed chunk's HTTP/network error and does not
     /// attempt later chunks — mirrors the single-event method's all-or-
     /// nothing-per-call shape. The caller (the daily metering job) treats a
@@ -188,7 +210,18 @@ impl PolarClient {
                     })
                     .collect::<Vec<_>>()
             });
-            let _ = self.post_raw("/events/ingest", &body).await?;
+            let mut delays = METER_RETRY_DELAYS.iter();
+            loop {
+                match self.post_raw("/events/ingest", &body).await {
+                    Ok(_) => break,
+                    // B-615: safe to re-send — Polar dedupes on `external_id`.
+                    Err(e) if is_transient(&e) => match delays.next() {
+                        Some(delay) => tokio::time::sleep(*delay).await,
+                        None => return Err(e),
+                    },
+                    Err(e) => return Err(e),
+                }
+            }
         }
         Ok(())
     }
@@ -416,7 +449,10 @@ mod tests {
     }
     impl TestEnvGuard {
         fn new(base_url: &str) -> Self {
-            let _lock = ENV_LOCK.lock().expect("env lock");
+            // A failed test must not poison every later one (B-615 hit this).
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             unsafe {
                 std::env::set_var("POLAR_BASE_URL", base_url);
                 std::env::set_var("TRACELANE_SSRF_ALLOW_LOOPBACK_FOR_TESTS", "1");
@@ -680,6 +716,133 @@ mod tests {
         assert!(
             !msg.contains("polar_pat_supersecret_leak"),
             "response body leaked into error Display: {msg}"
+        );
+    }
+
+    // Bound to a const first: a `key: "<literal>"` field init reads as a
+    // credential to the gitleaks generic rule.
+    const B615_EXTERNAL_ID: &str = "ingest_gb-cust_b615-2026-10-21";
+
+    fn one_event(customer: &PolarCustomerId) -> [MeterEvent<'_>; 1] {
+        [MeterEvent {
+            name: "ingest_gb",
+            customer_id: customer,
+            value: 1.0,
+            idempotency_key: B615_EXTERNAL_ID,
+        }]
+    }
+
+    /// B-615 — a transient Polar 503 (prod, 2026-10-22 04:10 UTC) is retried in
+    /// the same run under the SAME `external_id`, instead of waiting a day.
+    #[tokio::test]
+    async fn record_meter_events_retries_a_transient_5xx() {
+        let server = MockServer::start().await;
+        let _g = TestEnvGuard::new(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        let customer = PolarCustomerId("cust_b615".into());
+        client
+            .record_meter_events(&one_event(&customer))
+            .await
+            .expect("a 503 then a 202 succeeds within the run");
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 2, "one retry, no more");
+        assert_eq!(
+            received[0].body, received[1].body,
+            "the retry re-sends the same external_id"
+        );
+    }
+
+    /// B-615 — the retry is bounded: three transient failures and the error returns.
+    #[tokio::test]
+    async fn record_meter_events_gives_up_after_three_attempts() {
+        let server = MockServer::start().await;
+        let _g = TestEnvGuard::new(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        let customer = PolarCustomerId("cust_b615".into());
+        let err = client
+            .record_meter_events(&one_event(&customer))
+            .await
+            .expect_err("Polar down for the whole run");
+        assert!(matches!(err, BillingError::Http { status } if status.as_u16() == 503));
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            3
+        );
+    }
+
+    /// B-615 — a non-transient refusal (bad token, bad payload) is NOT retried.
+    #[tokio::test]
+    async fn record_meter_events_does_not_retry_a_4xx() {
+        for status in [400u16, 401, 403, 422] {
+            let server = MockServer::start().await;
+            let _g = TestEnvGuard::new(&server.uri());
+            Mock::given(method("POST"))
+                .and(path("/events/ingest"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let client =
+                PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+            let customer = PolarCustomerId("cust_b615".into());
+            client
+                .record_meter_events(&one_event(&customer))
+                .await
+                .expect_err("a 4xx is an error");
+            assert_eq!(
+                server.received_requests().await.unwrap_or_default().len(),
+                1,
+                "{status} must not be retried"
+            );
+        }
+    }
+
+    /// B-615 — 429 is transient (rate limited), so it is retried.
+    #[tokio::test]
+    async fn record_meter_events_retries_a_429() {
+        let server = MockServer::start().await;
+        let _g = TestEnvGuard::new(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/events/ingest"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let client = PolarClient::new(secrecy::SecretString::from("polar_pat_test".to_string()));
+        let customer = PolarCustomerId("cust_b615".into());
+        client
+            .record_meter_events(&one_event(&customer))
+            .await
+            .expect("a 429 then a 202 succeeds");
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2
         );
     }
 }

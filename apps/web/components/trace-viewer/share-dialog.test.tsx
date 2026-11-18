@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * `OBS-48` — the share dialog's listing + revoke logic and the two link-row
  * shapes.
@@ -14,15 +15,26 @@
  */
 
 import {
+	SHARE_LINK_SCOPE,
+	ShareDialog,
 	type ShareLink,
 	ShareLinkRow,
+	buildReviewNote,
 	removeLink,
 	shareErrorMessage,
 	withMinted,
 } from "@/components/trace-viewer/ShareDialog";
+import { apiFetchRaw } from "@/lib/api-fetch";
+import {
+	cleanup,
+	fireEvent,
+	render,
+	screen,
+	waitFor,
+} from "@testing-library/react";
 import { createElement as h } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const LINK_A: ShareLink = {
 	id: "a",
@@ -92,6 +104,27 @@ describe("shareErrorMessage", () => {
 	});
 });
 
+describe("buildReviewNote", () => {
+	it("contains the exact public-link scope and UTC expiry", () => {
+		expect(
+			buildReviewNote(
+				"https://app.tracelane.dev/s/testtoken",
+				"2026-12-01 00:00:00",
+			),
+		).toBe(
+			[
+				"Tracelane trace review (read-only)",
+				"Link: https://app.tracelane.dev/s/testtoken",
+				"Expires: Dec 1, 2026 · 00:00 UTC",
+				"Anyone with this link can open it without signing in. Forward it only to people who should see it.",
+				SHARE_LINK_SCOPE,
+				"Prompts, responses and tool bodies are not included.",
+				"This is one trace, not proof of a complete audit ledger.",
+			].join("\n"),
+		);
+	});
+});
+
 describe("ShareLinkRow", () => {
 	it("an older link (no mintedUrl) shows created/expiry/views and Revoke, never a bare URL", () => {
 		const html = renderToStaticMarkup(
@@ -117,6 +150,7 @@ describe("ShareLinkRow", () => {
 		);
 		expect(html).toContain("https://app.tracelane.dev/s/abc123");
 		expect(html).toContain("0 views");
+		expect(html).toContain("Copy review note");
 	});
 
 	it("shows the busy label while revoking", () => {
@@ -125,4 +159,91 @@ describe("ShareLinkRow", () => {
 		);
 		expect(html).toContain("Revoking…");
 	});
+});
+
+vi.mock("@/lib/api-fetch", () => ({ apiFetchRaw: vi.fn() }));
+afterEach(() => {
+	cleanup();
+	vi.resetAllMocks();
+});
+
+describe("revoke outcomes", () => {
+	it.each([
+		{ status: 204, removed: true },
+		{ status: 404, removed: false },
+		{ status: 500, removed: false },
+	])("DELETE $status: removed=$removed", async ({ status, removed }) => {
+		vi.mocked(apiFetchRaw)
+			.mockResolvedValueOnce(new Response(JSON.stringify([LINK_A, LINK_B])))
+			.mockResolvedValueOnce(new Response(null, { status }));
+		render(h(ShareDialog, { traceId: "trace", embedded: true }));
+		const revoke = await screen.findAllByRole("button", { name: "Revoke" });
+		const first = revoke[0];
+		if (!first) throw new Error("Expected a revoke button");
+		fireEvent.click(first);
+		if (removed) {
+			await waitFor(() => expect(screen.queryByText(/12 views/)).toBeNull());
+			expect(screen.getByText(/0 views/)).toBeTruthy();
+		} else {
+			expect(await screen.findByRole("alert")).toBeTruthy();
+			expect(screen.getByText(/12 views/)).toBeTruthy();
+		}
+		expect(vi.mocked(apiFetchRaw).mock.calls).toHaveLength(2);
+	});
+
+	it("a 404 keeps the row and says the link was not revoked", async () => {
+		vi.mocked(apiFetchRaw)
+			.mockResolvedValueOnce(new Response(JSON.stringify([LINK_A, LINK_B])))
+			.mockResolvedValueOnce(new Response(null, { status: 404 }));
+		render(h(ShareDialog, { traceId: "trace", embedded: true }));
+		const revoke = await screen.findAllByRole("button", { name: "Revoke" });
+		const first = revoke[0];
+		if (!first) throw new Error("Expected a revoke button");
+		fireEvent.click(first);
+		const alert = await screen.findByRole("alert");
+		expect(alert.textContent).toContain("was not revoked");
+		expect(screen.getByText(/12 views/)).toBeTruthy();
+		expect(screen.getByText(/0 views/)).toBeTruthy();
+	});
+});
+
+describe("share link scope", () => {
+	it.each([
+		"workspace name",
+		"trace, span and agent IDs",
+		"guardrail verdicts",
+		"numeric and boolean attributes",
+		"ledger position and anchor status",
+	])("names %s", (field) => {
+		expect(SHARE_LINK_SCOPE).toContain(field);
+	});
+
+	it("an empty list never implies no live links exist anywhere", async () => {
+		vi.mocked(apiFetchRaw).mockResolvedValueOnce(
+			new Response(JSON.stringify([])),
+		);
+		render(h(ShareDialog, { traceId: "trace", embedded: true }));
+		expect(
+			await screen.findByText("No active links in your current workspace"),
+		).toBeTruthy();
+	});
+});
+
+it("renders the public-link warning and the Reviewer note label", () => {
+	const html = renderToStaticMarkup(
+		h(ShareDialog, { traceId: "trace", embedded: true }),
+	);
+	expect(html).toContain(
+		"Anyone with this link can open it without signing in, until it expires or is revoked.",
+	);
+	const row = renderToStaticMarkup(
+		h(ShareLinkRow, {
+			link: LINK_A,
+			mintedUrl: "https://app.tracelane.dev/s/token",
+			revoking: false,
+			onRevoke: vi.fn(),
+		}),
+	);
+	expect(row).toContain("Reviewer note");
+	expect(row).not.toContain("URL and expiry only");
 });

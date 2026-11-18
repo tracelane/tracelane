@@ -65,6 +65,8 @@ pub(crate) struct Limits {
     pub stop_max_bytes: usize,
     pub user_max_bytes: usize,
     pub provider_message_max_chars: usize,
+    pub sse_line_max_bytes: usize,
+    pub response_guard_max_bytes: usize,
     /// `OG-10`: the ceiling, in seconds, on an upstream `Retry-After` the gateway will
     /// honour or relay. 0 (the unparseable-table default) means "ignore the header".
     pub retry_after_max_secs: u64,
@@ -562,6 +564,8 @@ fn parse(raw: &str) -> Option<Table> {
         stop_max_bytes: field("stop_max_bytes")?,
         user_max_bytes: field("user_max_bytes")?,
         provider_message_max_chars: field("provider_message_max_chars")?,
+        sse_line_max_bytes: field("sse_line_max_bytes")?,
+        response_guard_max_bytes: field("response_guard_max_bytes")?,
         retry_after_max_secs: u64::try_from(field("retry_after_max_secs")?).ok()?,
     };
     let names = |k: &str| -> Option<Vec<String>> {
@@ -1152,6 +1156,8 @@ mod tests {
                 stop_max_bytes: 256,
                 user_max_bytes: 256,
                 provider_message_max_chars: 512,
+                sse_line_max_bytes: 1_048_576,
+                response_guard_max_bytes: 1_048_576,
                 retry_after_max_secs: 3600,
             }
         );

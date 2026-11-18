@@ -13,6 +13,10 @@
 import { db } from "@/db";
 import { tenants } from "@/db/schema";
 import { requireSession } from "@/lib/auth";
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { type Plan, resolveEntitlements } from "@/lib/entitlements";
 import { callerIsOrgAdmin } from "@/lib/workos-org";
 import { eq } from "drizzle-orm";
@@ -108,30 +112,59 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 		}
 	}
 
-	const res = await fetch("https://api.workos.com/portal/generate_link", {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${key}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			organization: session.tenantId,
-			intent: body.intent,
-		}),
-	});
-	if (!res.ok) {
+	// A portal link grants administrative access. Authorize and audit issuance
+	// before WorkOS sees it, using the gateway's existing IP and SSO policy gate.
+	// Only intent metadata is audited; the returned bearer link is never recorded.
+	const action = "workspace.portal.generate";
+	const metadata = { intent: body.intent };
+	const control = await recordControlChange(
+		action,
+		session.tenantId,
+		undefined,
+		metadata,
+	);
+	if (!control.ok) return control.response;
+
+	try {
+		const res = await fetch("https://api.workos.com/portal/generate_link", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${key}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				organization: session.tenantId,
+				intent: body.intent,
+			}),
+		});
+		if (!res.ok) throw new Error("portal generation failed");
+		const data = (await res.json()) as { link?: string };
+		if (!data.link) {
+			await recordControlChangeFailed(
+				action,
+				session.tenantId,
+				undefined,
+				metadata,
+			);
+			return NextResponse.json(
+				{ error: "portal link missing from WorkOS response" },
+				{ status: 502 },
+			);
+		}
+		return NextResponse.json({ link: data.link }, { status: 200 });
+	} catch {
+		// Fixed text only: never the WorkOS response or the link. Logged because the
+		// `.failed` audit row below is best-effort and can itself be refused.
+		console.error("[portal] WorkOS portal link generation failed");
+		await recordControlChangeFailed(
+			action,
+			session.tenantId,
+			undefined,
+			metadata,
+		);
 		return NextResponse.json(
 			{ error: "could not generate portal link" },
 			{ status: 502 },
 		);
 	}
-
-	const data = (await res.json()) as { link?: string };
-	if (!data.link) {
-		return NextResponse.json(
-			{ error: "portal link missing from WorkOS response" },
-			{ status: 502 },
-		);
-	}
-	return NextResponse.json({ link: data.link }, { status: 200 });
 }

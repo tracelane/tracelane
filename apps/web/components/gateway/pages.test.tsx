@@ -15,7 +15,7 @@ import { AdminAccess, RoleMatrix } from "./AdminAccess";
 import { ChangeLog } from "./ChangeLog";
 import { KeyPolicyManager } from "./KeyPolicyManager";
 import { ProjectsManager } from "./ProjectsManager";
-import { SlotView, scrub } from "./SlotView";
+import { SlotView } from "./SlotView";
 import { SpendAlerts } from "./SpendAlerts";
 import { json, mockFetch, mount, openDialog, when } from "./test-utils";
 
@@ -560,45 +560,87 @@ describe("Change log", () => {
 });
 
 describe("Slot page", () => {
-	// Routing is a whole-document editor: its slot stays read-only (the editors for cache
-	// and OTel export are in `slot-editors.test.tsx`).
 	const slot = {
 		id: "routing",
 		label: "Routing",
 		probe: "routing",
-		spec: "OG-11 / OG-12",
 	};
-	it("shows the route's live answer, scrubbed of anything credential-shaped", async () => {
+	it("dispatches routing to the editor instead of a JSON dump", async () => {
 		mockFetch(
 			when("GET", "/routing", () =>
 				json({
-					enabled: true,
-					headers: { Authorization: "Bearer abc" },
-					apiKey: "sk-1",
-					nested: { client_secret: "z", ttl: 4 },
+					doc: { virtual_models: {}, rules: [], key_pools: [] },
+					version: 0,
+					valid: true,
+					can_edit: true,
+					limits: {
+						max_virtual_models: 2,
+						max_targets_per_model: 2,
+						max_pool_keys_per_provider: 2,
+						doc_max_bytes: 8192,
+						rules: {
+							max_rules: 2,
+							max_arms: 3,
+							max_match_value_bytes: 128,
+							sticky_key_max_bytes: 128,
+							match_header_denylist: ["authorization"],
+						},
+						breaker: {
+							consecutive_failures_min: 1,
+							consecutive_failures_max: 10,
+							cooldown_secs_min: 1,
+							cooldown_secs_max: 300,
+						},
+					},
 				}),
 			),
 		);
 		mount(<SlotView slot={slot} />);
-		const pre = await screen.findByTestId("slot-json");
-		expect(pre.textContent).toContain('"enabled": true');
-		expect(pre.textContent).toContain('"ttl": 4');
-		expect(pre.textContent).not.toMatch(/Bearer abc|sk-1|"z"/);
-		expect(pre.textContent).toContain("[hidden]");
+		expect(
+			await screen.findByRole("button", { name: /Add virtual model/i }),
+		).toBeTruthy();
+		expect(screen.queryByTestId("slot-json")).toBeNull();
 	});
-	it("a route the gateway does not have says so; it never invents content", async () => {
+	it("a missing routing route shows the error state", async () => {
 		mockFetch(
 			when("GET", "/routing", () => new Response("{}", { status: 404 })),
 		);
 		mount(<SlotView slot={slot} />);
 		expect(
-			await screen.findByText(/does not serve GET \/v1\/routing/),
+			await screen.findByText(/gateway does not serve the routing route/i),
 		).toBeTruthy();
 		expect(screen.queryByTestId("slot-json")).toBeNull();
 	});
-	it("scrub is depth- and length-bounded", () => {
+	it("dispatches guardrail policy to the editor", async () => {
+		mockFetch(
+			when("GET", "/guardrails/policy", () =>
+				json({
+					scope: "workspace",
+					id: "00000000-0000-0000-0000-000000000001",
+					policy: null,
+					effective: {
+						R1_cost: {
+							entitled: true,
+							enabled: true,
+							override: null,
+							default_behavior: { mode: "block" },
+						},
+					},
+				}),
+			),
+		);
+		mount(
+			<SlotView
+				slot={{
+					id: "guardrails",
+					label: "Guardrail policy",
+					probe: "guardrails/policy",
+				}}
+			/>,
+		);
 		expect(
-			(scrub(Array.from({ length: 80 }, (_, i) => i)) as number[]).length,
-		).toBe(50);
+			await screen.findByRole("heading", { name: "Cost limits" }),
+		).toBeTruthy();
+		expect(screen.queryByTestId("slot-json")).toBeNull();
 	});
 });

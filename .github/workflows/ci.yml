@@ -146,6 +146,7 @@ jobs:
       python: ${{ steps.f.outputs.python }}
       code: ${{ steps.f.outputs.code }}
       live_stack: ${{ steps.f.outputs.live_stack }}
+      wasm: ${{ steps.f.outputs.wasm }}
     steps:
       - id: f
         env:
@@ -157,8 +158,8 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
-          emit() { { echo "rust=$1"; echo "web=$2"; echo "python=$3"; echo "code=$4"; echo "live_stack=$5"; } >> "$GITHUB_OUTPUT"; }
-          run_all() { echo "→ running ALL areas ($1)"; emit true true true true true; exit 0; }
+          emit() { { echo "rust=$1"; echo "web=$2"; echo "python=$3"; echo "code=$4"; echo "live_stack=$5"; echo "wasm=${6:-false}"; } >> "$GITHUB_OUTPUT"; }
+          run_all() { echo "→ running ALL areas ($1)"; emit true true true true true true; exit 0; }
 
           if [ "$EVENT" = "pull_request" ]; then base="$BASE"
           elif [ "$EVENT" = "push" ]; then base="$BEFORE"
@@ -171,7 +172,7 @@ jobs:
           [ -z "$files" ] && run_all "empty file list"
           echo "Changed files:"; echo "$files" | sed 's/^/  /'
 
-          rust=false; web=false; python=false; live_stack=false
+          rust=false; web=false; python=false; live_stack=false; wasm=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
@@ -198,6 +199,11 @@ jobs:
             case "$f" in
               crates/*|Cargo.toml|Cargo.lock|packages/verifier-rust/*) rust=true;;
             esac
+            # The browser verifier compiles packages/verifier-rust to WASM: rebuild and test it
+            # whenever either changes, so the page can never lag the CLI's verdict.
+            case "$f" in
+              packages/verifier-rust/*|packages/verifier-wasm/*|scripts/proofs/verifier-wasm-browser.mjs) wasm=true;;
+            esac
             # L2 live eval gate — only the gateway/ingest/span/CH/eval surface
             # needs the (expensive) ephemeral real stack. Docs/frontend PRs stay
             # mock-only, preserving the CI cost reduction.
@@ -208,14 +214,73 @@ jobs:
               apps/*|packages/sdk-typescript/*|packages/verifier-typescript/*|packages/cli/*|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|biome.json|tsconfig*|*.ts|*.tsx|*.jsx) web=true;;
             esac
             case "$f" in
-              evals/*|ml/*|packages/sdk-python/*|packages/verifier-python/*|scripts/ci/requirements/*|*.py|pyproject.toml|ruff.toml) python=true;;
+              # scripts/ops/*: the shell scripts there are tested by scripts/ops/tests/*.py
+              # (SRE-33 review M3 — a .sh-only change must still run its tests).
+              evals/*|ml/*|packages/sdk-python/*|packages/verifier-python/*|scripts/ci/requirements/*|scripts/ops/*|scripts/ci/run-controlplane-backup-tests.sh|*.py|pyproject.toml|ruff.toml) python=true;;
             esac
           done <<< "$files"
 
           code=false
           { [ "$rust" = true ] || [ "$web" = true ] || [ "$python" = true ]; } && code=true
           echo "→ rust=$rust web=$web python=$python code=$code live_stack=$live_stack"
-          emit "$rust" "$web" "$python" "$code" "$live_stack"
+          emit "$rust" "$web" "$python" "$code" "$live_stack" "$wasm"
+
+  # Browser verifier (AUD-33): build packages/verifier-wasm from source (web/pkg is NOT checked
+  # in, so the page cannot drift from the verifier), then its wrapper tests, clippy for both
+  # targets, and the Playwright proof (PASS/FAIL cases + zero network requests after load).
+  verifier-wasm:
+    name: Browser verifier (WASM build · tests · zero-network proof)
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      # rust-toolchain.toml pins 1.95, so cargo runs THAT toolchain, not the "stable" the action
+      # installed the target for; without this, every wasm build fails "can't find crate for core".
+      - name: wasm32 target for the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+      # ring compiles its C for wasm32 only with clang. The self-hosted runner has neither clang
+      # nor sudo, so this fetches the distro's clang without root into ~/.cache/tl-clang once
+      # (hosted runners use their system clang) and exports CC_wasm32_unknown_unknown.
+      - name: clang for ring's wasm32 C build
+        run: bash scripts/ci/ensure-clang.sh
+      - name: wasm-bindgen CLI (version pinned to the crate's wasm-bindgen)
+        run: |
+          want=$(sed -n 's/^wasm-bindgen = "=\{0,1\}\([0-9.]*\)".*/\1/p' packages/verifier-wasm/Cargo.toml)
+          have=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')
+          [ "$have" = "$want" ] || cargo install --locked wasm-bindgen-cli --version "$want"
+      - name: Build (regenerates web/pkg from source)
+        run: bash packages/verifier-wasm/build.sh
+      - name: Wrapper tests + clippy (native and wasm32)
+        working-directory: packages/verifier-wasm
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+      - name: Install pnpm
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v3.0.0
+        with:
+          version: 9
+      - name: Install Node
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Playwright (web workspace)
+        run: |
+          pnpm install --frozen-lockfile
+          if [ -n "${{ vars.CI_RUNNER }}" ]; then
+            pnpm --filter web exec playwright install chromium
+          else
+            pnpm --filter web exec playwright install --with-deps chromium
+          fi
+      - name: Browser proof (PASS, FAIL, zero network after load)
+        run: node scripts/proofs/verifier-wasm-browser.mjs
 
   # One Rust job: fmt + clippy + test share a single toolchain, checkout, and
   # cache (one rust-cache instead of the old lint/test split that cold-compiled
@@ -236,7 +301,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -298,6 +363,12 @@ jobs:
       - name: cargo clippy
         # --all-targets lints test + bench code too (audit finding P2-1).
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The published verifier declares rust-version 1.87. A let-chain (stable only from 1.88)
+      # broke that floor unnoticed until 2026-11-13 because nothing built at the floor.
+      - name: verifier MSRV (1.87)
+        run: |
+          rustup toolchain list | grep -q '^1\.87' || rustup toolchain install 1.87 --profile minimal
+          cargo +1.87 check -p tracelane-audit-verifier --all-targets
       - name: cargo test
         run: cargo test --workspace --all-features
 
@@ -338,7 +409,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -407,6 +478,10 @@ jobs:
         run: pnpm typecheck
       - name: pnpm test (Vitest)
         run: pnpm test
+      # B-133: scripts/ops/*.test.ts (the Polar reconciler and polar-sync) belong to no
+      # workspace package, so `pnpm test` never ran them; run them with apps/web's vitest.
+      - name: ops scripts (Vitest — Polar reconciler)
+        run: apps/web/node_modules/.bin/vitest run --root . scripts/ops/
 
   verifier-roundtrip:
     name: Cross-verifier round-trip (Rust · TS · Python agree — ADR-062 crown jewel)
@@ -447,7 +522,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -515,6 +590,11 @@ jobs:
         run: ruff format --check .
       - name: pytest
         run: pytest
+      # SRE-33: the control-plane backup tests need a real Postgres and `age`, which this VM
+      # does not have; the script brings both in throwaway containers and sets REQUIRE, so the
+      # tests can fail here but never skip (the plain `pytest` step above skips them).
+      - name: control-plane backup tests (real Postgres + age)
+        run: bash scripts/ci/run-controlplane-backup-tests.sh
 
   python-frameworks:
     name: Python SDK · real framework attach (B-314)
@@ -704,6 +784,18 @@ jobs:
       - name: Action SHA-pin guard (no tag-pinned `uses:`)
         if: ${{ !cancelled() }}
         run: python3 scripts/ci/check-action-sha-pins.py
+
+      - name: Workflow secret-exposure guard — selftest (prove it bites)
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-workflow-secret-exposure.py --selftest
+
+      # toJSON(secrets), secrets: inherit, pull_request_target, runner-memory reads and the
+      # wfx campaign's build-audit-xxxxxx.yml name (2026-11-10 GitHub Actions secret stealer).
+      # A tripwire for REVIEWED changes: it does not stop a pushed malicious workflow, which
+      # runs regardless of this job (closed by repository and account settings, not here).
+      - name: Workflow secret-exposure guard
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/check-workflow-secret-exposure.py
 
       - name: Workflow job-graph guard — selftest (prove a dangling need bites)
         if: ${{ !cancelled() }}
@@ -897,6 +989,11 @@ jobs:
         run: |
           python3 scripts/ci/check-self-host-schema-parity.py --selftest
           python3 scripts/ci/check-self-host-schema-parity.py
+      - name: "Fresh-install schema covers every migration (B-555)"
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/ci/check-schema-covers-migrations.py --selftest
+          python3 scripts/ci/check-schema-covers-migrations.py
       - name: "No selftest plant left in the tree"
         if: ${{ !cancelled() }}
         run: |
@@ -1077,7 +1174,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).

@@ -14,9 +14,12 @@ import {
 	recordControlChange,
 	recordControlChangeFailed,
 } from "@/lib/control-change";
+import { prepareKeyRevocation } from "@/lib/gateway";
 import { callerIsOrgAdmin } from "@/lib/workos-org";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
+
+import { withOwnerMutation } from "../team/owner-lock";
 
 interface RenameBody {
 	name: string;
@@ -160,78 +163,101 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
 	}
 
-	const admin = await callerIsOrgAdmin(key, session.tenantId, session.userId);
-	if (admin === null) {
-		return NextResponse.json(
-			{ error: "could not verify permissions" },
-			{ status: 502 },
-		);
-	}
-	if (!admin) {
-		return NextResponse.json(
-			{ error: "role_forbidden", required_role: "owner" },
-			{ status: 403 },
-		);
-	}
-
-	const [t] = await db
-		.select({ id: tenants.id, name: tenants.name })
-		.from(tenants)
-		.where(eq(tenants.workosOrgId, session.tenantId))
-		.limit(1);
-	if (!t) {
-		return NextResponse.json({ error: "tenant not found" }, { status: 404 });
-	}
-	// Type-org-name confirmation (compensating control for no re-auth, §6).
-	if ((body.confirmName ?? "").trim() !== (t.name ?? "").trim()) {
-		return NextResponse.json(
-			{ error: "name confirmation does not match" },
-			{ status: 422 },
-		);
-	}
-
-	const delBefore = { name: t.name, archived: false };
-	const delAfter = { archived: true };
-	const rec = await recordControlChange(
-		"workspace.delete",
-		session.tenantId,
-		delBefore,
-		delAfter,
-	);
-	if (!rec.ok) return rec.response;
-
-	try {
-		await db
-			.update(tenants)
-			.set({ archivedAt: new Date() })
-			.where(eq(tenants.id, t.id));
-		// B-361: this isolate's cached "not archived" read is now stale — clear
-		// it so this admin's own next request sees the archived state at once
-		// instead of waiting out the TTL (other isolates may lag; see the
-		// function doc on `invalidateOrgArchivedCache`).
-		invalidateOrgArchivedCache(session.tenantId);
-		await db
-			.update(apiKeys)
-			.set({ revokedAt: new Date() })
-			.where(
-				and(
-					eq(apiKeys.tenantId, t.id),
-					or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
-				),
+	// Share the mint/rotation lock through archive commit. Earlier mints are
+	// swept below; waiting mints recheck archived_at after taking this lock.
+	return withOwnerMutation(session.tenantId, async () => {
+		const admin = await callerIsOrgAdmin(key, session.tenantId, session.userId);
+		if (admin === null) {
+			return NextResponse.json(
+				{ error: "could not verify permissions" },
+				{ status: 502 },
 			);
-	} catch {
-		await recordControlChangeFailed(
+		}
+		if (!admin) {
+			return NextResponse.json(
+				{ error: "role_forbidden", required_role: "owner" },
+				{ status: 403 },
+			);
+		}
+
+		const [t] = await db
+			.select({ id: tenants.id, name: tenants.name })
+			.from(tenants)
+			.where(eq(tenants.workosOrgId, session.tenantId))
+			.limit(1);
+		if (!t) {
+			return NextResponse.json({ error: "tenant not found" }, { status: 404 });
+		}
+		// Type-org-name confirmation (compensating control for no re-auth, §6).
+		if ((body.confirmName ?? "").trim() !== (t.name ?? "").trim()) {
+			return NextResponse.json(
+				{ error: "name confirmation does not match" },
+				{ status: 422 },
+			);
+		}
+
+		const delBefore = { name: t.name, archived: false };
+		const delAfter = { archived: true };
+		const rec = await recordControlChange(
 			"workspace.delete",
 			session.tenantId,
 			delBefore,
 			delAfter,
 		);
-		console.error("[workspace/delete] soft-delete side effects failed");
-		return NextResponse.json({ error: "soft_delete_failed" }, { status: 502 });
-	}
+		if (!rec.ok) return rec.response;
 
-	return NextResponse.json(
-		{ archived: true, purge: "within 30 days" },
-		{ status: 200 },
-	);
+		try {
+			const confirm = await prepareKeyRevocation(session.tenantId);
+			await db
+				.update(apiKeys)
+				.set({ revokedAt: sql`now()` })
+				.where(
+					and(
+						eq(apiKeys.tenantId, t.id),
+						or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+					),
+				);
+			await confirm();
+		} catch {
+			await recordControlChangeFailed(
+				"workspace.delete",
+				session.tenantId,
+				delBefore,
+				delAfter,
+			);
+			console.error("[workspace/delete] soft-delete side effects failed");
+			return NextResponse.json(
+				{ error: "key_revocation_unconfirmed" },
+				{ status: 503 },
+			);
+		}
+
+		try {
+			await db
+				.update(tenants)
+				.set({ archivedAt: new Date() })
+				.where(eq(tenants.id, t.id));
+			// B-361: this isolate's cached "not archived" read is now stale — clear
+			// it so this admin's own next request sees the archived state at once
+			// instead of waiting out the TTL (other isolates may lag; see the
+			// function doc on `invalidateOrgArchivedCache`).
+			invalidateOrgArchivedCache(session.tenantId);
+		} catch {
+			await recordControlChangeFailed(
+				"workspace.delete",
+				session.tenantId,
+				delBefore,
+				delAfter,
+			);
+			return NextResponse.json(
+				{ error: "soft_delete_failed" },
+				{ status: 502 },
+			);
+		}
+
+		return NextResponse.json(
+			{ archived: true, purge: "within 30 days" },
+			{ status: 200 },
+		);
+	});
 }

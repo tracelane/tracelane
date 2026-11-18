@@ -132,7 +132,7 @@ above; do not add these to a single-tenant deployment.
 | `TRACELANE_REKOR_URL` | — (unset) | Transparency-log endpoint for audit anchoring. Unset or empty ⇒ batches are signed and persisted locally only, with no outbound POST. There is no default log. |
 | `TRACELANE_REKOR_ANCHOR_EVERY` | `100` | Audit events per Rekor anchor batch |
 | `TRACELANE_BILLING_RETURN_URL` | `/settings/billing` | Polar portal return URL |
-| `TRACELANE_METRICS_ADDR` | `127.0.0.1:9465` | Where the gateway serves `/metrics` (Prometheus text). Loopback by default; it is unauthenticated, so publish it only to your scraper. Ingest's exporter is the same variable, default `127.0.0.1:9464` |
+| `TRACELANE_METRICS_ADDR` | `127.0.0.1:9465` | Where the gateway serves `/metrics` (Prometheus text) and the full operator `/health` (stream positions, key-ring versions, degradation detail); the public port's `/health` returns a six-key summary only. Loopback by default; it is unauthenticated, so publish it only to your scraper and never to the internet. Ingest's exporter is the same variable, default `127.0.0.1:9464` |
 | `TRACELANE_MAX_INFLIGHT` | `2048` | Requests allowed in flight at once; the next is refused immediately with `503 overloaded` and `Retry-After: 1` |
 | `TRACELANE_REQUEST_TIMEOUT_SECS` | `300` | Ceiling on producing a response head; a streaming body is not under it. Past it the request answers `408 request_timeout` |
 | `NEXT_PUBLIC_GATEWAY_URL` | `http://localhost:8080` | Gateway URL shown in dashboard |

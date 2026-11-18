@@ -341,7 +341,7 @@ fn charge_control_rate(
 /// rev6 N1: is this refusal's log line inside the principal's refusal budget? A
 /// refused call is charged no admitted bucket (so an attacker outside the allowlist
 /// cannot drain the real principal's), so the line needs its own bound.
-fn refusal_logged(claims: &Claims) -> bool {
+pub(crate) fn refusal_logged(claims: &Claims) -> bool {
     charge_control_rate(
         &claims.tenant_id,
         Some(&claims.sub),

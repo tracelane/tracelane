@@ -212,6 +212,7 @@ pub(crate) fn view(e: &Export, tenant: Uuid) -> Value {
     };
     json!({
         "id": e.id.to_string(),
+        "format": e.format,
         "name": e.name,
         "url": store::redacted_url(&e.url),
         "header_names": e.header_names,
@@ -223,8 +224,10 @@ pub(crate) fn view(e: &Export, tenant: Uuid) -> Value {
         "last_success_at": e.last_success_at.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         "last_error_class": err,
         // Honest delivery: in memory, at-most-once with bounded retry, lost on a restart.
-        "delivery": "best_effort",
-        "counters_since": "gateway_start",
+        "delivery": if e.format == "otlp" { "best_effort" } else { "at_least_once_bounded_retry" },
+        "delivery_scope": if e.format == "otlp" { "in_memory_queue" } else { "retained_scanned_records" },
+        "delivery_limits": if e.format == "otlp" { json!(["queue_capacity", "process_restart", "retry_exhaustion"]) } else { json!(["source_retention", "late_visibility", "retry_exhaustion"]) },
+        "counters_since": if e.format == "otlp" { "gateway_start" } else { "destination_created" },
         "delivered": delivered,
         "dropped": dropped,
         "failed": failed,
@@ -272,7 +275,7 @@ async fn list_exports(State(state): State<AppState>, headers: HeaderMap) -> Resp
     ok(json!({
         "exports": list.iter().map(|e| view(e, *claims.tenant_id.as_uuid())).collect::<Vec<_>>(),
         "plan": { "export_enabled": plan.is_some(), "max_exports": plan },
-        "delivery": "best_effort",
+        "delivery": "per_destination",
     }))
 }
 
@@ -281,6 +284,8 @@ async fn list_exports(State(state): State<AppState>, headers: HeaderMap) -> Resp
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateBody {
+    #[serde(default = "default_format")]
+    format: String,
     name: String,
     url: String,
     #[serde(default)]
@@ -291,6 +296,10 @@ struct CreateBody {
     sample_ratio: Option<f64>,
     #[serde(default)]
     only_errors: Option<bool>,
+}
+
+fn default_format() -> String {
+    "otlp".into()
 }
 
 fn valid_name(raw: &str) -> Option<String> {
@@ -349,9 +358,36 @@ async fn create_export(
         Some(Err((field, message))) => return invalid(&field, &message),
     };
     // The SSRF guard at CREATE (and again on every delivery).
-    let url = match runtime::validate_url(&body.url).await {
-        Ok(u) => u,
-        Err(r) => return url_refusal(r),
+    let url = if body.format == "otlp" {
+        match runtime::validate_url(&body.url).await {
+            Ok(u) => u,
+            Err(r) => return url_refusal(r),
+        }
+    } else {
+        let Ok(kind) = crate::siem_export::connector(&body.format) else {
+            return invalid("format", "unknown export format");
+        };
+        if body.include_content == Some(true) || ratio != 1.0 || body.only_errors == Some(true) {
+            return invalid(
+                "format",
+                "SIEM delivery requires metadata-only full sampling of all statuses",
+            );
+        }
+        if crate::siem_export::credential(kind, hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .is_err()
+        {
+            return invalid(
+                "headers",
+                "SIEM delivery requires one Authorization credential",
+            );
+        }
+        if crate::siem_export::validate_destination(kind, &body.url).is_err() {
+            return invalid("url", "invalid SIEM destination URL");
+        }
+        if crate::ssrf_guard::validate_url(&body.url).await.is_err() {
+            return url_refusal(runtime::UrlRefusal::SsrfBlocked);
+        }
+        body.url.clone()
     };
     let id = Uuid::new_v4();
     let tenant = *claims.tenant_id.as_uuid();
@@ -373,6 +409,7 @@ async fn create_export(
         }
     };
     let new = NewExport {
+        format: body.format,
         id,
         name,
         url,
@@ -461,6 +498,41 @@ async fn update_export(
         return invalid("sample_ratio", "sample_ratio must be between 0 and 1");
     }
     let tenant = *claims.tenant_id.as_uuid();
+    let sealed = match store::get_sealed(pool, &claims.tenant_id, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable("read the export"),
+    };
+    if sealed.format != "otlp" {
+        if body.include_content == Some(true)
+            || body.sample_ratio.is_some_and(|r| r != 1.0)
+            || body.only_errors == Some(true)
+        {
+            return invalid(
+                "format",
+                "SIEM delivery requires metadata-only full sampling of all statuses",
+            );
+        }
+        if let Some(replacement) = &body.headers {
+            let valid = replacement
+                .as_ref()
+                .and_then(|m| runtime::validate_headers(m).ok())
+                .zip(crate::siem_export::connector(&sealed.format).ok())
+                .is_some_and(|(h, k)| {
+                    crate::siem_export::credential(
+                        k,
+                        h.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                    )
+                    .is_ok()
+                });
+            if !valid {
+                return invalid(
+                    "headers",
+                    "SIEM delivery requires one Authorization credential",
+                );
+            }
+        }
+    }
     let headers_patch = match body.headers {
         None => None,
         Some(None) => Some((None, Vec::new())),
@@ -580,6 +652,12 @@ async fn test_export(
             return unavailable("read the export");
         }
     };
+    if sealed.format != "otlp" {
+        return invalid(
+            "format",
+            "SIEM destinations are tested by background delivery status",
+        );
+    }
     let r = runtime::test_delivery(
         sealed.tenant_id,
         sealed.id,
@@ -685,6 +763,7 @@ mod tests {
     #[test]
     fn og50_the_view_never_carries_a_header_value_or_a_url_query() {
         let e = Export {
+            format: "otlp".into(),
             id: Uuid::new_v4(),
             name: "prod".into(),
             url: "https://c.example.com/v1/traces?token=SUPERSECRET".into(),

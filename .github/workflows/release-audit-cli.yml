@@ -79,7 +79,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -141,7 +141,7 @@ jobs:
             "${{ steps.stage.outputs.out }}"
 
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
         with:
           format: cyclonedx-json
           output-file: "dist/tracelane-audit-${{ matrix.target }}.sbom.cyclonedx.json"
@@ -158,7 +158,7 @@ jobs:
         # 2024-05-07) resolved, so it was not the release.yml defect, but this
         # workflow has never run once and a two-year-old Node-20 action
         # is not what its first run should exercise.
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
         with:
           files: |
             dist/tracelane-audit-${{ matrix.target }}*
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download release assets
-        uses: robinraju/release-downloader@daf26c55d821e836577a15f77d86ddc078948b05  # v1.10
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f  # v1.10
         with:
           tag: ${{ github.event.inputs.tag || github.ref_name }}
           fileName: 'tracelane-audit-*'
@@ -220,7 +220,7 @@ jobs:
       id-token: write
       contents: write
       actions: read
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563  # v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a  # v2.1.0
     with:
       base64-subjects: "${{ needs.slsa-provenance.outputs.hashes }}"
       upload-assets: true

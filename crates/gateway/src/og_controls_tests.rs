@@ -55,6 +55,7 @@ pub(crate) fn key_claims(
     Claims {
         tenant_id: tenant.clone(),
         sub: format!("apikey:{key}"),
+        key_capture: None,
         governance: tracelane_shared::key_policy::Governance::from_columns(
             project,
             None,

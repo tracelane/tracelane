@@ -35,6 +35,12 @@ serde_json = "1"
 # Error handling + structured output.
 anyhow = "1"
 
+# evidence-pack: strict parse of the reviewed control map (deny_unknown_fields)
+# and SHA-256 for deterministic OSCAL UUIDs (also the test ledger scaffold).
+# Both are already in the verifier's dependency tree.
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
 # Tempfile for streaming the NDJSON to a local path before handing
 # to verify_ledger (which takes &Path).
 tempfile = "3"
@@ -52,9 +58,8 @@ base64 = "0.22"
 # diffs on the JSON VerifyReport.
 pretty_assertions = "1"
 
-# SHA-256 only for the test scaffold that synthesises a minimal NDJSON
-# ledger fixture (write_minimal_ledger_to in src/main.rs). The verifier
-# itself does not depend on sha2 in the production tree — this is test
-# data generation only. Pinned matching the transitive resolution from
-# the verifier's signature dep tree.
-sha2 = "0.10"
+# Test-only: ring signs the tree-checkpoint (AUD-06) and evidence-pack fixtures; already in the
+# lock through the verifier, so the shipped binary gains no dependency. boon validates the
+# evidence-pack OSCAL output against the vendored NIST schema (draft-07, regex-backed).
+ring = "0.17"
+boon = "0.6"

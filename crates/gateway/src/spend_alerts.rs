@@ -169,6 +169,34 @@ impl Mail {
 /// The plain-text line an email or Slack message carries. Only numbers and labels —
 /// never a prompt or a key.
 pub(crate) fn message_text(payload: &Value) -> String {
+    if payload.get("type").and_then(Value::as_str) == Some("approval.requested") {
+        let subject = payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("a protected call")
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        if payload.get("protected") == Some(&Value::Bool(true)) {
+            let expiry = payload
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| {
+                    format!(
+                        ", expires {} UTC",
+                        t.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M")
+                    )
+                })
+                .unwrap_or_default();
+            return format!(
+                "Tracelane: approvals are waiting (first: {subject}{expiry}). Review them in Settings → Gateway → Approvals."
+            );
+        }
+        return format!(
+            "Tracelane approval requested for {subject}. Review it in Settings → Gateway → Approvals."
+        );
+    }
     let s = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
     let n = |k: &str| payload.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let who = match (
@@ -400,6 +428,55 @@ mod tests {
     use wiremock::matchers::{header_exists, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn protected_payload() -> Value {
+        serde_json::json!({"type":"approval.requested","approval_id":"a","subject":"pay","subject_kind":"tool","protected":true,"expires_at":"2026-11-09T14:05:33+00:00","queue_path":"/settings/gateway/approvals","args_preview":"SECRET-PREVIEW","amount":"1500000"})
+    }
+    #[test]
+    fn protected_approval_text_names_tool() {
+        assert!(message_text(&protected_payload()).contains("first: pay,"));
+    }
+    #[test]
+    fn protected_approval_text_includes_expiry_utc() {
+        assert!(message_text(&protected_payload()).contains("expires 2026-11-09 14:05 UTC"));
+    }
+    #[test]
+    fn protected_approval_text_points_to_queue() {
+        assert!(
+            message_text(&protected_payload())
+                .ends_with("Review them in Settings → Gateway → Approvals.")
+        );
+    }
+    #[test]
+    fn approval_text_escapes_slack_control_characters() {
+        let mut p = protected_payload();
+        p["subject"] = serde_json::json!("<!channel> <https://x|y> a&b");
+        for protected in [true, false] {
+            p["protected"] = serde_json::json!(protected);
+            let t = message_text(&p);
+            assert!(
+                t.contains("&lt;!channel&gt; &lt;https://x|y&gt; a&amp;b"),
+                "{t}"
+            );
+            assert!(!t.contains("<!channel>") && !t.contains("<https"), "{t}");
+        }
+    }
+    #[test]
+    fn legacy_approval_text_unchanged() {
+        let p = serde_json::json!({"type":"approval.requested","approval_id":"a","subject":"pay","subject_kind":"tool","queue_path":"/settings/gateway/approvals"});
+        assert_eq!(
+            message_text(&p),
+            "Tracelane approval requested for pay. Review it in Settings → Gateway → Approvals."
+        );
+    }
+    #[test]
+    fn protected_approval_text_contains_no_arguments() {
+        let t = message_text(&protected_payload());
+        assert!(
+            !t.contains("SECRET-PREVIEW") && !t.contains("1500000"),
+            "{t}"
+        );
+    }
+
     fn secret() -> SecretString {
         SecretString::from("whsec_test".to_owned())
     }
@@ -522,5 +599,15 @@ mod tests {
             "Tracelane spend alert — project p-1 reached 80% of its monthly project budget: $80.00 \
              spent of $100.00 (hard mode)."
         );
+    }
+    #[test]
+    fn mcp_approval_notification_contains_no_arguments() {
+        let text = message_text(
+            &serde_json::json!({"type":"approval.requested","subject":"delete_repo","args_preview":"private-password"}),
+        );
+        assert!(text.contains("approval"));
+        assert!(text.contains("delete_repo"));
+        assert!(!text.contains("private-password"));
+        assert!(!text.contains("budget"));
     }
 }

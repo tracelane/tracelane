@@ -49,13 +49,9 @@ const cacheView = (over: Partial<CacheView["settings"]> = {}): CacheView => ({
 });
 
 describe("slot routing", () => {
-	it("cache and otel mount their editors; routing keeps the read-only slot", async () => {
+	it("cache mounts its editor", async () => {
 		mockFetch(when("GET", "/cache", () => json(cacheView())));
-		mount(
-			<SlotView
-				slot={{ id: "cache", label: "Cache", probe: "cache", spec: "OG-51" }}
-			/>,
-		);
+		mount(<SlotView slot={{ id: "cache", label: "Cache", probe: "cache" }} />);
 		expect(await screen.findByTestId("cache-effective")).toBeTruthy();
 		expect(screen.queryByTestId("slot-json")).toBeNull();
 	});
@@ -333,5 +329,37 @@ describe("OTel export editor", () => {
 		await waitFor(() =>
 			expect(calls.some((c) => c.method === "DELETE")).toBe(true),
 		);
+	});
+});
+
+describe("SIEM destination presentation", () => {
+	it("names the format and scopes durable delivery to retained scanned records", async () => {
+		mockFetch(
+			when("GET", "/exports/otel", () =>
+				json(list([exportRow({ format: "splunk" })])),
+			),
+		);
+		mount(<OtelExports />);
+		await screen.findByText("prod collector");
+		expect(screen.getByText(/Splunk HEC/)).toBeTruthy();
+		expect(screen.getByText(/retained, scanned records/)).toBeTruthy();
+		expect(
+			screen.getByText(/Counters since destination creation/),
+		).toBeTruthy();
+	});
+	it("does not offer an OTLP test request for a SIEM destination", async () => {
+		const { calls } = mockFetch(
+			when("GET", "/exports/otel", () =>
+				json(list([exportRow({ format: "sentinel" })])),
+			),
+		);
+		mount(<OtelExports />);
+		await screen.findByText("prod collector");
+		const button = screen.getByRole("button", {
+			name: "Send a test span to prod collector",
+		});
+		expect((button as HTMLButtonElement).disabled).toBe(true);
+		fireEvent.click(button);
+		expect(calls.some((c) => c.method === "POST")).toBe(false);
 	});
 });

@@ -21,10 +21,34 @@ import { and, eq, min } from "drizzle-orm";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import Loading from "./loading";
-import { auditFingerprint, readPlatformTrustRoot } from "./trust-root";
+import {
+	auditFingerprint,
+	auditPublicKey,
+	readPlatformTrustRoot,
+} from "./trust-root";
 
 export const metadata: Metadata = { title: "Audit evidence — Tracelane" };
 export const dynamic = "force-dynamic";
+
+type TrustLookup<T> =
+	| { status: "success"; value: T }
+	| { status: "absent" }
+	| { status: "error" };
+type TrustInputError = "workspace-key" | "takeover-boundary";
+
+/** Absence is established only by a successful read. Trust read failures close the verifier. */
+async function readTrustInput<T>(
+	read: () => Promise<T | undefined>,
+): Promise<TrustLookup<T>> {
+	try {
+		const value = await read();
+		return value === undefined
+			? { status: "absent" }
+			: { status: "success", value };
+	} catch {
+		return { status: "error" };
+	}
+}
 
 async function getAuditAccess(): Promise<{
 	selfVerify: boolean;
@@ -33,6 +57,7 @@ async function getAuditAccess(): Promise<{
 	workspaceKeyCreatedAt?: string;
 	workspaceFingerprint?: string;
 	workspaceKeySinceSeq?: number;
+	trustInputError?: TrustInputError;
 }> {
 	const session = await requireSession();
 	const [row] = await db
@@ -51,44 +76,60 @@ async function getAuditAccess(): Promise<{
 	// tenant still SEEs + verifies their own chain; the export is the upsell.
 	//
 	// Resolve entitlements + audit key in parallel (both depend on tenant id).
-	const [entitlements, keyRow] = await Promise.all([
+	const [entitlements, workspaceKey] = await Promise.all([
 		resolveEntitlements(row?.id, plan),
-		row !== undefined
-			? db
-					.select({
-						pubkey: tenantAuditKeys.publicKeyB64,
-						createdAt: tenantAuditKeys.createdAt,
-					})
-					.from(tenantAuditKeys)
-					.where(eq(tenantAuditKeys.tenantId, row.id))
-					.limit(1)
-					.then(([r]) => r)
-					.catch(() => undefined)
-			: Promise.resolve(undefined),
+		readTrustInput(async () => {
+			if (!row) return undefined;
+			const [key] = await db
+				.select({
+					pubkey: tenantAuditKeys.publicKeyB64,
+					createdAt: tenantAuditKeys.createdAt,
+				})
+				.from(tenantAuditKeys)
+				.where(eq(tenantAuditKeys.tenantId, row.id))
+				.limit(1);
+			if (key) auditPublicKey(key.pubkey);
+			return key;
+		}),
 	]);
-	// AUD-29: where the workspace key took over — the first batch it signed, from the
-	// CANONICAL anchor records (ADR-078 B). The verifier then refuses a platform-signed
-	// batch at or past it even when this window holds no workspace-signed batch. A
-	// failed read leaves it unset: the in-window rule still holds, and the page says
-	// nothing it did not check.
-	const workspaceKeySinceSeq =
-		row !== undefined && keyRow?.pubkey
-			? await db
-					.select({ since: min(auditAnchorRecords.batchStartSeq) })
-					.from(auditAnchorRecords)
-					.where(
-						and(
-							eq(auditAnchorRecords.tenantId, row.id),
-							eq(auditAnchorRecords.ed25519Pubkey, keyRow.pubkey),
-						),
+	const keyRow =
+		workspaceKey.status === "success" ? workspaceKey.value : undefined;
+	// A failed prerequisite remains an error; it must never remove the boundary.
+	const takeover: TrustLookup<number> =
+		workspaceKey.status === "error"
+			? { status: "error" }
+			: await readTrustInput(async () => {
+					if (!row || !keyRow) return undefined;
+					const [record] = await db
+						.select({ since: min(auditAnchorRecords.batchStartSeq) })
+						.from(auditAnchorRecords)
+						.where(
+							and(
+								eq(auditAnchorRecords.tenantId, row.id),
+								eq(auditAnchorRecords.ed25519Pubkey, keyRow.pubkey),
+							),
+						);
+					// SQL MIN returns one row with NULL when this key has signed no batches.
+					if (record?.since === null) return undefined;
+					if (
+						!record ||
+						!Number.isSafeInteger(record.since) ||
+						record.since < 0
 					)
-					.then(([r]) => r?.since ?? undefined)
-					.catch(() => undefined)
-			: undefined;
+						throw new Error("Invalid workspace signing boundary");
+					return record.since;
+				});
 	return {
 		selfVerify: entitlements.audit_self_verify,
 		exportEntitled: entitlements.audit_ledger,
-		workspaceKeySinceSeq,
+		workspaceKeySinceSeq:
+			takeover.status === "success" ? takeover.value : undefined,
+		trustInputError:
+			workspaceKey.status === "error"
+				? "workspace-key"
+				: takeover.status === "error"
+					? "takeover-boundary"
+					: undefined,
 		tenantPubkeyB64: keyRow?.pubkey ?? "",
 		workspaceKeyCreatedAt: keyRow?.createdAt.toISOString(),
 		workspaceFingerprint: keyRow?.pubkey
@@ -103,12 +144,14 @@ interface SelfVerifyResponse {
 }
 
 async function LedgerData({
+	trustInputError,
 	tenantPubkeyB64,
 	exportEntitled,
 	...keys
 }: AuditKeyContext & {
 	tenantPubkeyB64: string;
 	exportEntitled: boolean;
+	trustInputError?: TrustInputError;
 }) {
 	// Both plans use the SAME bounded self-verify route, which includes only fully
 	// covered anchor batches. Never call the bulk export to render the page.
@@ -154,6 +197,34 @@ async function LedgerData({
 			</section>
 		);
 	}
+	if (trustInputError) {
+		return (
+			<section className="surface-card p-6" aria-live="polite">
+				<p className="text-xs font-medium uppercase tracking-widest text-ink-2">
+					CANNOT DETERMINE
+				</p>
+				<h2 className="mt-2 text-xl font-semibold">
+					Cannot verify this evidence
+				</h2>
+				<p className="mt-2 text-sm text-ink-2">
+					{trustInputError === "workspace-key"
+						? "The workspace signing key could not be read."
+						: "The workspace signing takeover boundary could not be read."}{" "}
+					Verification and the offline command are unavailable until this read
+					succeeds.
+				</p>
+				<div className="mt-5 flex gap-5 text-sm">
+					<a className="underline" href="/audit">
+						Retry verification
+					</a>
+					<a className="underline" href="/support">
+						Contact support
+					</a>
+				</div>
+			</section>
+		);
+	}
+
 	return (
 		<AuditLedgerView
 			{...keys}
@@ -304,6 +375,7 @@ export default async function AuditPage({
 						workspaceFingerprint={access.workspaceFingerprint}
 						workspaceKeyCreatedAt={access.workspaceKeyCreatedAt}
 						workspaceKeySinceSeq={access.workspaceKeySinceSeq}
+						trustInputError={access.trustInputError}
 						tenantPubkeyB64={access.tenantPubkeyB64}
 						exportEntitled={access.exportEntitled}
 					/>

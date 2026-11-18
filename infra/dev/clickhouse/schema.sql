@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS tracelane.spans
     -- margin, never a markdown — ADR-076 §3), and rows older than the column get the
     -- expression at read time so history is billable without rewriting parts.
     span_bytes       UInt32  DEFAULT toUInt32(length(attributes) + length(name) + length(status_message) + 96),
+    -- migration 13 (B-555 back-port): gateway time, so provider_us = duration_us - gateway_overhead_us.
+    gateway_overhead_us UInt32 MATERIALIZED JSONExtractUInt(attributes, 'tracelane_gateway_overhead_us'),
 
     -- OBS-01 full-text search on `name`: ngrambf_v1 (not tokenbf_v1) because the
     -- predicate is a SUBSTRING match (`LIKE '%q%'`); n=4 sets the minimum useful
@@ -567,3 +569,320 @@ SELECT tenant_id, toStartOfHour(start_time) AS bucket_hour,
 FROM tracelane.spans AS source
 WHERE coalesce(nullIf(JSONExtractString(attributes, 'gen_ai_provider_name'), ''), nullIf(JSONExtractString(attributes, 'gen_ai_system'), ''), nullIf(JSONExtractString(attributes, 'gen_ai.provider.name'), ''), JSONExtractString(attributes, 'llm.provider')) <> ''
 GROUP BY tenant_id, bucket_hour, model, api_key_id, environment, service;
+
+-- ── B-555 (2026-10-25): tables that existed only in migrations ──────────────────
+-- A fresh install (dev compose, self-host) mounts THIS file and never replays
+-- migrations, so these product tables were missing there. Exact final DDL taken
+-- from prod (SHOW CREATE TABLE, 2026-10-25), so it includes every later ALTER.
+-- scripts/ci/check-schema-covers-migrations.py keeps migrations and this file equal.
+
+CREATE TABLE IF NOT EXISTS tracelane.dataset_items
+(
+    `tenant_id` String,
+    `dataset_id` UUID,
+    `item_id` UUID,
+    `name` String DEFAULT '',
+    `input` String,
+    `system` String DEFAULT '',
+    `expected_output` Nullable(String),
+    `metadata` String DEFAULT '{}',
+    `source_trace_id` Nullable(UUID),
+    `source_span_id` String DEFAULT '',
+    `input_hash` FixedString(64),
+    `deleted` UInt8 DEFAULT 0,
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by` String,
+    `updated_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY tuple()
+ORDER BY (tenant_id, dataset_id, item_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.dataset_snapshot_items
+(
+    `tenant_id` String,
+    `snapshot_id` UUID,
+    `ordinal` UInt32,
+    `dataset_id` UUID,
+    `item_id` UUID,
+    `name` String DEFAULT '',
+    `input` String,
+    `system` String DEFAULT '',
+    `expected_output` Nullable(String),
+    `metadata` String DEFAULT '{}',
+    `input_hash` FixedString(64),
+    `source_trace_id` Nullable(UUID),
+    `source_span_id` String DEFAULT '',
+    `created_at` DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY tuple()
+ORDER BY (tenant_id, snapshot_id, ordinal)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.dataset_snapshots
+(
+    `tenant_id` String,
+    `dataset_id` UUID,
+    `snapshot_id` UUID,
+    `item_count` UInt32,
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by` String
+)
+ENGINE = MergeTree
+PARTITION BY tuple()
+ORDER BY (tenant_id, dataset_id, snapshot_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.datasets
+(
+    `tenant_id` String,
+    `dataset_id` UUID,
+    `name` String,
+    `description` String DEFAULT '',
+    `deleted` UInt8 DEFAULT 0,
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by` String,
+    `updated_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY tuple()
+ORDER BY (tenant_id, dataset_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.eval_run_items
+(
+    `tenant_id` String,
+    `eval_run_id` UUID,
+    `item_ordinal` UInt32,
+    `dataset_item_id` UUID,
+    `dataset_id` Nullable(UUID),
+    `dataset_snapshot_id` Nullable(UUID),
+    `case_name` String,
+    `status` LowCardinality(String),
+    `output` String,
+    `output_truncated` UInt8,
+    `scores` String DEFAULT '{}',
+    `score` Nullable(Float64),
+    `latency_ms` UInt32,
+    `cost_usd` Nullable(Float64),
+    `error` Nullable(String),
+    `started_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(started_at)
+ORDER BY (tenant_id, eval_run_id, item_ordinal)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.eval_runs
+(
+    `tenant_id` String,
+    `eval_run_id` UUID,
+    `prompt_version_id` UUID,
+    `eval_suite_id` UUID,
+    `started_at` DateTime64(3, 'UTC'),
+    `completed_at` Nullable(DateTime64(3, 'UTC')),
+    `status` LowCardinality(String),
+    `pass_count` UInt32,
+    `fail_count` UInt32,
+    `error_count` UInt32,
+    `duration_ms` UInt32,
+    `results_json` String
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(started_at)
+ORDER BY (tenant_id, eval_run_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.experiment_arms
+(
+    `tenant_id` String,
+    `experiment_id` UUID,
+    `arm_id` UUID,
+    `arm_label` String DEFAULT '',
+    `ordinal` UInt8,
+    `eval_run_id` Nullable(UUID),
+    `prompt_version_id` UUID,
+    `model` String,
+    `status` LowCardinality(String),
+    `created_at` DateTime64(3, 'UTC'),
+    `updated_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY tuple()
+ORDER BY (tenant_id, experiment_id, arm_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.experiments
+(
+    `tenant_id` String,
+    `experiment_id` UUID,
+    `name` String,
+    `dataset_id` UUID,
+    `snapshot_id` UUID,
+    `status` LowCardinality(String),
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by` String,
+    `updated_at` DateTime64(3, 'UTC'),
+    `item_count` UInt32 DEFAULT 0,
+    `notes` String DEFAULT ''
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY tuple()
+ORDER BY (tenant_id, experiment_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.online_eval_scores
+(
+    `tenant_id` String,
+    `trace_id` String,
+    `span_id` String,
+    `policy_id` UUID,
+    `rubric` LowCardinality(String),
+    `judge_model` LowCardinality(String),
+    `status` LowCardinality(String),
+    `score` Nullable(Float64),
+    `verdict` LowCardinality(String),
+    `reason` String,
+    `error` Nullable(String),
+    `cost_usd` Nullable(Float64),
+    `latency_ms` UInt32,
+    `scored_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(scored_at)
+ORDER BY (tenant_id, trace_id, policy_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.promotion_decisions
+(
+    `tenant_id` String,
+    `promotion_id` UUID,
+    `prompt_id` UUID,
+    `prompt_name` String,
+    `from_version_id` Nullable(UUID),
+    `to_version_id` UUID,
+    `from_env` LowCardinality(String),
+    `to_env` LowCardinality(String),
+    `eval_run_id` Nullable(UUID),
+    `decision` LowCardinality(String),
+    `decided_at` DateTime64(3, 'UTC'),
+    `decided_by_user_id` Nullable(String),
+    `notes` String
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(decided_at)
+ORDER BY (tenant_id, prompt_id, decided_at)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.prompt_canaries
+(
+    `tenant_id` String,
+    `prompt_name` String,
+    `canary_id` UUID,
+    `stable_version_id` UUID,
+    `candidate_version_id` UUID,
+    `candidate_percent` Float64,
+    `enabled` UInt8,
+    `changed_at` DateTime64(3, 'UTC'),
+    `changed_by` String
+)
+ENGINE = MergeTree
+ORDER BY (tenant_id, prompt_name, changed_at, canary_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.prompt_versions
+(
+    `tenant_id` String,
+    `prompt_version_id` UUID,
+    `prompt_id` UUID,
+    `prompt_name` String,
+    `parent_version_id` Nullable(UUID),
+    `version_number` UInt32,
+    `content` String,
+    `template_variables` Array(String),
+    `model_pin` Nullable(String),
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by_user_id` String,
+    `sha256` FixedString(64)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, prompt_id, version_number)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.prompts
+(
+    `tenant_id` String,
+    `prompt_id` UUID,
+    `name` LowCardinality(String),
+    `description` String,
+    `created_at` DateTime64(3, 'UTC'),
+    `created_by_user_id` String,
+    `archived` UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(created_at)
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, prompt_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.rollback_events
+(
+    `tenant_id` String,
+    `rollback_id` UUID,
+    `prompt_id` UUID,
+    `from_version_id` UUID,
+    `to_version_id` UUID,
+    `trigger_metric` LowCardinality(String),
+    `trigger_value` Float64,
+    `ewma_baseline` Float64,
+    `sigma_drift` Float32,
+    `rollback_mode` LowCardinality(String),
+    `fired_at` DateTime64(3, 'UTC'),
+    `confirmed_at` Nullable(DateTime64(3, 'UTC')),
+    `confirmed_by_user_id` Nullable(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(fired_at)
+ORDER BY (tenant_id, prompt_id, fired_at)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.semantic_cache
+(
+    `tenant_id` String,
+    `cache_id` UUID,
+    `model` LowCardinality(String),
+    `params_hash` FixedString(64),
+    `exact_hash` FixedString(64),
+    `embedding` Array(Float32),
+    `embedding_model` LowCardinality(String),
+    `embedding_dims` UInt16,
+    `response_json` String,
+    `prompt_tokens` UInt32,
+    `completion_tokens` UInt32,
+    `cost_usd` Float64,
+    `source_trace_id` UUID,
+    `created_at` DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, model, params_hash, created_at)
+TTL toDateTime(created_at) + toIntervalDay(7)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS tracelane.trace_content_snapshots
+(
+    `tenant_id` String,
+    `trace_id` String,
+    `span_id` String,
+    `input` String,
+    `system` String DEFAULT '',
+    `input_hash` FixedString(64),
+    `captured_at` DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(captured_at)
+PARTITION BY toYYYYMM(captured_at)
+ORDER BY (tenant_id, trace_id, span_id)
+TTL toDate(captured_at) + toIntervalDay(30)
+SETTINGS index_granularity = 8192;

@@ -52,6 +52,8 @@
 //! Production wiring is gated on CLICKHOUSE_URL: without it the route
 //! returns 503. Tests use a `MockExportReader` that yields fixed rows.
 
+pub(crate) mod action;
+
 use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
@@ -185,6 +187,14 @@ pub struct TypeCount {
 /// `ClickHouseExportReader`; tests use `MockExportReader`.
 #[async_trait::async_trait]
 pub trait AuditExportReader: Send + Sync {
+    /// Complete action evidence from one canonical snapshot. Errors fail CLOSED.
+    async fn action_bundle(
+        &self,
+        _tenant: &TenantId,
+        _resolved: &crate::entitlement_cache::ResolvedEntitlements,
+    ) -> Result<Vec<u8>> {
+        anyhow::bail!("action evidence export unsupported by reader")
+    }
     /// Return up to `limit` rows ordered by `seq` ascending. The handler
     /// streams these to the wire as NDJSON.
     async fn read_range(
@@ -373,6 +383,8 @@ impl ClickHouseExportReader {
 /// is served from the ClickHouse copy when one is configured, else from Postgres.
 pub struct PgExportReader {
     pool: deadpool_postgres::Pool,
+    action_keys: Option<Arc<crate::audit_keys::TenantAuditKeyStore>>,
+    tsa_certs: Vec<Vec<u8>>,
     /// The derived copy, for `summarize` only.
     summary_copy: Option<ClickHouseExportReader>,
 }
@@ -381,8 +393,25 @@ impl PgExportReader {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
         Self {
             pool,
+            action_keys: None,
+            tsa_certs: Vec::new(),
             summary_copy: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_action_keys(
+        mut self,
+        keys: Option<Arc<crate::audit_keys::TenantAuditKeyStore>>,
+    ) -> Self {
+        self.action_keys = keys;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_tsa_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
+        self.tsa_certs = certs;
+        self
     }
 
     /// Serve `summarize` (and only `summarize`) from the ClickHouse copy — ruling Q3.
@@ -440,6 +469,14 @@ impl PgExportReader {
 
 #[async_trait::async_trait]
 impl AuditExportReader for PgExportReader {
+    async fn action_bundle(
+        &self,
+        tenant: &TenantId,
+        resolved: &crate::entitlement_cache::ResolvedEntitlements,
+    ) -> Result<Vec<u8>> {
+        action::export(self, tenant, resolved).await
+    }
+
     async fn read_range(
         &self,
         tenant_id: &TenantId,
@@ -1304,31 +1341,35 @@ async fn handler(
     //    `auth`), so the entitlement query only ever sees the internal tenant
     //    UUID — never a raw org_id. This runs BEFORE any ClickHouse read, so an
     //    unentitled key gets zero ledger bytes.
-    match state.entitlements {
+    let resolved = match state.entitlements {
         Some(ref cache) => {
-            if !cache
-                .check(
-                    *claims.tenant_id.as_uuid(),
-                    crate::entitlement_cache::FeatureKey::AuditAddon,
-                )
-                .await
-            {
-                tracing::info!(
-                    tenant_id = %claims.tenant_id,
-                    "audit export denied — tenant lacks the audit-export entitlement"
-                );
+            let resolved = cache.resolved(*claims.tenant_id.as_uuid()).await;
+            if !resolved.has(crate::entitlement_cache::FeatureKey::AuditAddon) {
+                tracing::info!(tenant_id = %claims.tenant_id,"audit export denied — tenant lacks the audit-export entitlement");
                 return entitlement_required_response();
             }
+            resolved
         }
         None => {
-            // Fail closed: no entitlement source → refuse the paid export rather
-            // than serve a grant we cannot verify.
             tracing::error!("audit export: entitlement cache unavailable (no Postgres) — denying");
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "entitlement verification unavailable",
             );
         }
+    };
+    // ZIP is opt-in; all existing NDJSON consumers keep their original wire bytes.
+    let action_download = headers
+        .get(header::ACCEPT)
+        .is_some_and(|v| v == "application/zip");
+    if action_download && !crate::action_control::enabled(Some(&resolved)) {
+        return error_response(StatusCode::FORBIDDEN, "action_control_disabled");
+    }
+    if action_download && q.limit.is_some() {
+        return error_response(StatusCode::BAD_REQUEST, "action_bundle_limit_unsupported");
+    }
+    if action_download && (q.since.is_some() || q.until.is_some()) {
+        return error_response(StatusCode::BAD_REQUEST, "action_bundle_window_unsupported");
     }
 
     // 3. Parse + validate query window.
@@ -1336,6 +1377,36 @@ async fn handler(
     let since = parse_iso(&q.since).unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
     if since > until {
         return error_response(StatusCode::BAD_REQUEST, "since > until");
+    }
+    if action_download {
+        return match state
+            .reader
+            .action_bundle(&claims.tenant_id, &resolved)
+            .await
+        {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE, "application/zip"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=action-evidence.zip",
+                    ),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(err) => {
+                let response = action::refusal(&err);
+                if response.status() == StatusCode::TOO_MANY_REQUESTS
+                    || matches!(err.downcast_ref(), Some(action::ExportError::Busy))
+                {
+                    tracing::warn!(tenant_id=%claims.tenant_id,error=%err,"action evidence export refused");
+                } else {
+                    tracing::error!(tenant_id=%claims.tenant_id,error=%err,"action evidence export refused");
+                }
+                response
+            }
+        };
     }
     // 4. Build the NDJSON body. `?limit=N` → a single capped page (the in-browser
     //    RENDER fetch — LedgerData caps at 1000 so the dashboard never loads a
@@ -2278,11 +2349,15 @@ mod tests {
 
         /// A cache that resolves EVERY tenant to a fixed `f_audit_addon` grant.
         fn fixed_entitlement(f_audit_addon: bool) -> Arc<EntitlementCache> {
+            fixed_flags(f_audit_addon, false)
+        }
+        fn fixed_flags(f_audit_addon: bool, action_control: bool) -> Arc<EntitlementCache> {
             Arc::new(EntitlementCache::new(Arc::new(
                 move |_tenant: uuid::Uuid| {
                     Box::pin(async move {
                         Ok(ResolvedEntitlements {
                             f_audit_addon,
+                            action_control,
                             ..ResolvedEntitlements::deny_all()
                         })
                     })
@@ -2299,7 +2374,10 @@ mod tests {
 
         /// Drive the handler with an authenticated `tlane_` key. Returns
         /// `(status, body_text)`.
-        async fn call_export(entitlements: Option<Arc<EntitlementCache>>) -> (StatusCode, String) {
+        async fn call_export(
+            entitlements: Option<Arc<EntitlementCache>>,
+            accept: Option<&str>,
+        ) -> (StatusCode, String) {
             let state = ExportState {
                 reader: Arc::new(MockExportReader {
                     rows: vec![fixture_row(0), fixture_row(1)],
@@ -2318,12 +2396,196 @@ mod tests {
                     .parse()
                     .unwrap(),
             );
+            if let Some(accept) = accept {
+                headers.insert("accept", accept.parse().unwrap());
+            }
             let resp = handler(State(state), Query(query), headers).await;
+            if resp.status() == StatusCode::OK {
+                assert_eq!(resp.headers()["content-type"], "application/x-ndjson");
+                assert!(
+                    resp.headers()["content-disposition"]
+                        .to_str()
+                        .unwrap()
+                        .ends_with(".ndjson\"")
+                );
+            }
             let status = resp.status();
             let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
                 .await
                 .unwrap();
             (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        // Existing fixture bytes prove the OFF/capped branch keeps its old wire.
+        #[test]
+        fn action_flag_off_and_capped_bytes_match_legacy() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                let expected = [fixture_row(0), fixture_row(1)]
+                    .iter()
+                    .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+                    .collect::<String>();
+                for (flag, accept) in [false, true].into_iter().flat_map(|flag| {
+                    [
+                        None,
+                        Some("*/*"),
+                        Some("application/x-ndjson"),
+                        Some("application/zip, */*"),
+                    ]
+                    .map(move |a| (flag, a))
+                }) {
+                    let (status, body) = call_export(Some(fixed_flags(true, flag)), accept).await;
+                    assert_eq!(status, StatusCode::OK, "flag={flag}: {body}");
+                    assert_eq!(body, expected);
+                }
+                let state = ExportState {
+                    reader: Arc::new(MockExportReader {
+                        rows: vec![fixture_row(0), fixture_row(1)],
+                    }),
+                    entitlements: Some(fixed_flags(true, true)),
+                };
+                let response = handler(
+                    State(state),
+                    Query(ExportQuery {
+                        since: None,
+                        until: None,
+                        limit: Some(10),
+                    }),
+                    entitled_headers(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected.as_bytes());
+            });
+        }
+        #[test]
+        fn fix_accept_parity_and_zip_bounds() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                for until in [false, true] {
+                    let bound = Some("2026-10-30T12:00:00Z".to_owned());
+                    let response = handler(
+                        State(ExportState {
+                            reader: Arc::new(MockExportReader { rows: vec![] }),
+                            entitlements: Some(fixed_flags(true, true)),
+                        }),
+                        Query(ExportQuery {
+                            since: if until { None } else { bound.clone() },
+                            until: if until { bound } else { None },
+                            limit: None,
+                        }),
+                        zip_headers(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                }
+            });
+        }
+        #[test]
+        fn action_flag_on_requires_snapshot_reader() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                let (status, body) =
+                    call_export(Some(fixed_flags(true, true)), Some("application/zip")).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                assert!(body.contains("action_evidence_unavailable"), "{body}");
+                assert!(!body.contains("row_hash"));
+            });
+        }
+        #[test]
+        fn action_flag_on_rejects_invalid_explicit_dates() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                let state = ExportState {
+                    reader: Arc::new(MockExportReader {
+                        rows: vec![fixture_row(0)],
+                    }),
+                    entitlements: Some(fixed_flags(true, true)),
+                };
+                let response = handler(
+                    State(state),
+                    Query(ExportQuery {
+                        since: Some("not-a-date".into()),
+                        until: None,
+                        limit: None,
+                    }),
+                    zip_headers(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            });
+        }
+
+        fn zip_headers() -> HeaderMap {
+            let mut headers = entitled_headers();
+            headers.insert("accept", "application/zip".parse().unwrap());
+            headers
+        }
+        #[test]
+        fn action_flag_off_explicit_bundle_refuses() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                let state = ExportState {
+                    reader: Arc::new(MockExportReader {
+                        rows: vec![fixture_row(0)],
+                    }),
+                    entitlements: Some(fixed_flags(true, false)),
+                };
+                let response = handler(
+                    State(state),
+                    Query(ExportQuery {
+                        since: None,
+                        until: None,
+                        limit: None,
+                    }),
+                    zip_headers(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), br#"{"error":"action_control_disabled"}"#);
+            });
+        }
+
+        #[test]
+        fn action_flag_on_explicit_bundle_verifies_with_external_pin() {
+            let _g = env_lock();
+            let _env = DevAuthEnv::enable();
+            rt().block_on(async {
+                use tracelane_audit_verifier::action::{archive::Files, bundle};
+                struct ZipReader(Vec<u8>);
+                #[async_trait::async_trait]
+                impl AuditExportReader for ZipReader {
+                    async fn action_bundle(&self, _: &TenantId, _: &ResolvedEntitlements) -> Result<Vec<u8>> { Ok(self.0.clone()) }
+                    async fn read_range(&self, _: &TenantId, _: DateTime<Utc>, _: DateTime<Utc>, _: u32) -> Result<Vec<ExportRow>> { panic!("explicit ZIP reached NDJSON reader") }
+                }
+                let tenant = TenantId::from_jwt_claim(uuid::Uuid::from_u128(1));
+                let key = crate::audit_keys::TenantAuditKeypair::generate(tenant.clone()).unwrap();
+                let pin = key.public_key_bytes().try_into().unwrap();
+                let cp = crate::action_control::canonical_json(&serde_json::json!({"domain":"tracelane.action-head.v1","schema_version":1,"tenant_id":tenant.to_string(),"seq":null,"head_hash":null,"created_at":"2026-10-30T12:00:00Z","key_id":crate::action_control::sha(&key.public_key_bytes()),"previous_checkpoint_digest":null}).to_string()).unwrap();
+                let files: Files = [("ledger.ndjson".into(), vec![]), ("checkpoint.sig".into(), key.sign(cp.as_bytes())), ("checkpoint.json".into(), cp.into_bytes())].into();
+                let zip = bundle::seal(files).unwrap();
+                let state = ExportState { reader: Arc::new(ZipReader(zip.clone())), entitlements: Some(fixed_flags(true, true)) };
+                let response = handler(State(state), Query(ExportQuery { since: None, until: None, limit: None }), zip_headers()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], "application/zip");
+                assert_eq!(response.headers()["content-disposition"], "attachment; filename=action-evidence.zip");
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(bytes.as_ref(), zip);
+                let report = bundle::verify(&bytes, Some(pin)).unwrap();
+                assert!(report.chain && report.head);
+                assert_eq!(bundle::verify(&bytes, None).unwrap_err().code, 5);
+            });
         }
 
         // The "curl the paywall" attack: an authenticated tlane_ key
@@ -2333,7 +2595,7 @@ mod tests {
             let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
-                let (status, body) = call_export(Some(fixed_entitlement(false))).await;
+                let (status, body) = call_export(Some(fixed_entitlement(false)), None).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
                 // Typed error code + upgrade pointer — not opaque.
                 assert!(body.contains("entitlement_required"), "body: {body}");
@@ -2356,7 +2618,7 @@ mod tests {
             let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
-                let (status, body) = call_export(Some(fixed_entitlement(true))).await;
+                let (status, body) = call_export(Some(fixed_entitlement(true)), None).await;
                 assert_eq!(status, StatusCode::OK, "body: {body}");
                 assert!(
                     body.contains("claude-sonnet-4-6"),
@@ -2375,7 +2637,7 @@ mod tests {
             let _g = env_lock();
             let _env = DevAuthEnv::enable();
             rt().block_on(async {
-                let (status, body) = call_export(None).await;
+                let (status, body) = call_export(None, None).await;
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
                 assert!(
                     !body.contains("claude-sonnet-4-6"),

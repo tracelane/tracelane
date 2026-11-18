@@ -42,7 +42,7 @@ export type WelcomeResult = "sent" | "skipped" | "duplicate" | "failed";
 
 const SUBJECT = "Your Tracelane workspace is ready";
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
 	return s
 		.replace(/&/g, "&amp;")
 		.replace(/</g, "&lt;")
@@ -52,7 +52,7 @@ function escapeHtml(s: string): string {
 }
 
 /** Plain-text + minimal HTML. Every URL and step is the one the onboarding
- *  wizard and `apps/docs/quickstart.mdx` already show (spec PLT-52 §8). */
+ *  wizard and `apps/docs/quickstart.mdx` already show. */
 export function buildWelcomeEmail(workspaceName: string | null): {
 	subject: string;
 	text: string;
@@ -63,7 +63,7 @@ export function buildWelcomeEmail(workspaceName: string | null): {
 	void workspaceName;
 	const lead = "Your workspace is ready.";
 	const what =
-		"Tracelane is the flight recorder for AI agents: point an OpenAI-compatible client at our gateway and each call is recorded as a trace.";
+		"Tracelane puts rules and human approval in front of your AI agents' actions. Point an OpenAI-compatible client at our gateway and each call is recorded as a trace.";
 	const s1 = `Create an API key: Settings -> API Keys (${APP}/settings/api-keys). A key is shown once, at creation.`;
 	const s2 = `Point your client at ${GATEWAY}/v1 and use the key as its API key.`;
 	const s3 = `Open ${APP}/traces and find the call you just made.`;

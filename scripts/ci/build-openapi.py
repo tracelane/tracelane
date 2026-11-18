@@ -157,6 +157,9 @@ def build(
         for key, op in frag.get("operations", {}).items():
             method, path = key.split(" ", 1)
             module = op.get("module") or frag.get("module")
+            # A handler that delegates refusals to a helper module names it here; a code is
+            # then accepted as a literal in the handler OR one of these (never anywhere else).
+            extra = op.get("x-error-modules", [])
             if (method, path) in ops:
                 findings.append(f"fragment {fname}: {key!r} is documented twice")
             if (method, path) not in mounted:
@@ -167,9 +170,15 @@ def build(
                 findings.append(
                     f"fragment {fname}: {key!r} names module {module!r}, which does not exist"
                 )
+            for m in extra:
+                if m not in sources:
+                    findings.append(
+                        f"fragment {fname}: {key!r} names error module {m!r}, which does not exist"
+                    )
             ops[(method, path)] = (op, module)
             for code in op.get("x-error-codes", []):
-                if module in sources and f'"{code}"' not in sources[module]:
+                homes = [m for m in [module, *extra] if m in sources]
+                if homes and not any(f'"{code}"' in sources[m] for m in homes):
                     findings.append(
                         f"fragment {fname}: {key!r} lists error code {code!r}, which is not a "
                         f"string literal in {module}"
@@ -209,7 +218,7 @@ def build(
                 op["parameters"] = frag["parameters"]
             if frag.get("requestBody") is not None:
                 op["requestBody"] = {
-                    "required": True,
+                    "required": frag.get("requestBodyRequired", True),
                     "content": {"application/json": {"schema": frag["requestBody"]}},
                 }
             responses = {
@@ -332,6 +341,64 @@ def selftest() -> int:
 
     import copy
 
+    optional = copy.deepcopy(frags)
+    optional["mcp.json"]["operations"]["POST /v1/approvals/{id}/approve"][
+        "requestBodyRequired"
+    ] = False
+    optional_doc, _ = build(sources, optional)
+    if (
+        optional_doc["paths"]["/v1/approvals/{id}/approve"]["post"]["requestBody"][
+            "required"
+        ]
+        is not False
+    ):
+        print("FAIL optional approval-note body was made required")
+        rc = 1
+
+    # Real error payloads from ControlRefusal::role_forbidden and data-controls::error.
+    # This checks the object-field contract; it is not a full JSON Schema validator.
+    for path, method, status, payload in [
+        (
+            "/v1/mcp-servers",
+            "get",
+            "403",
+            {
+                "error": "role_forbidden",
+                "required_role": "admin",
+                "capability": "manage_security",
+                "upgrade_url": None,
+            },
+        ),
+        (
+            "/v1/data-controls",
+            "get",
+            "503",
+            {"error": "retention_unavailable", "message": "Unavailable"},
+        ),
+    ]:
+        schema = base_doc["paths"][path][method]["responses"][status]["content"][
+            "application/json"
+        ]["schema"]
+        if "$ref" in schema:
+            schema = base_doc["components"]["schemas"][
+                schema["$ref"].rsplit("/", 1)[-1]
+            ]
+        if not set(schema.get("required", [])).issubset(payload) or (
+            schema.get("additionalProperties") is False
+            and not set(payload).issubset(schema.get("properties", {}))
+        ):
+            print(f"FAIL actual {status} error fields rejected for {path}")
+            rc = 1
+    for name in ("McpServerRead", "McpServerPublic"):
+        schema = base_doc["components"]["schemas"][name]
+        if (
+            schema.get("additionalProperties") is not False
+            or {"credential", "credential_ct", "tenant_id"}
+            & schema["properties"].keys()
+        ):
+            print(f"FAIL sensitive field in {name}")
+            rc = 1
+
     # 1. a CONTROL_ROUTES row with no fragment
     f1 = copy.deepcopy(frags)
     for frag in f1.values():
@@ -360,6 +427,25 @@ def selftest() -> int:
         "an error code absent from the handler module blocks",
         build(sources, f3)[1],
         "not a string literal",
+    )
+    # 3b. a code in NEITHER the handler nor its named error module still blocks; a code
+    # only in the named error module passes (x-error-modules widens to exactly those files)
+    f3b = copy.deepcopy(frags)
+    f3b_op = f3b["action-control.json"]["operations"]["GET /v1/action-authority"]
+    f3b_op["x-error-codes"] = [*f3b_op["x-error-codes"], "code_that_no_handler_has"]
+    expect(
+        "an error code in neither the handler nor its x-error-modules blocks",
+        build(sources, f3b)[1],
+        "not a string literal",
+    )
+    f3c = copy.deepcopy(frags)
+    f3c["action-control.json"]["operations"]["GET /v1/action-authority"].pop(
+        "x-error-modules"
+    )
+    expect(
+        "without x-error-modules the helper module's code blocks",
+        build(sources, f3c)[1],
+        "as_of_too_recent",
     )
 
     # 4. a stale output

@@ -93,8 +93,7 @@ export default function GlobalError({
 							padding: "1.5rem",
 						}}
 					>
-						{/* Inline aperture mark — self-contained (no CSS vars), since this
-					    last-resort page can render with no stylesheet present. */}
+						{/* The shared traced mark stays visible if the root stylesheet fails. */}
 						<div
 							style={{
 								display: "flex",
@@ -103,44 +102,13 @@ export default function GlobalError({
 								gap: "0.5rem",
 							}}
 						>
-							<svg
-								viewBox="0 0 100 100"
+							<img
+								src="/brand/tracelane-mark.svg"
 								width={24}
 								height={24}
-								fill="none"
-								role="img"
-								aria-label="Tracelane"
-							>
-								{/* The aperture mark, FULL cut — 24px clears the
-								    20px threshold below which the concentric centre
-								    goes sub-pixel. Inlined rather than <Logo> because
-								    this boundary replaces the document and cannot
-								    assume globals.css or the package resolved; the
-								    price is that it is a FOURTH copy of the geometry
-								    and moves with the other three. */}
-								<path d="M 8,8 H 34 V 20 H 20 V 34 H 8 Z" fill={C.ink} />
-								<path d="M 92,8 H 66 V 20 H 80 V 34 H 92 Z" fill={C.ink} />
-								<path d="M 8,92 H 34 V 80 H 20 V 66 H 8 Z" fill={C.ink} />
-								<path d="M 92,92 H 66 V 80 H 80 V 66 H 92 Z" fill={C.ink} />
-								<path d="M 8,44 H 25.5 V 56 H 8 Z" fill={C.ink} />
-								<path d="M 74.5,44 H 92 V 56 H 74.5 Z" fill={C.ink} />
-								<circle
-									cx="50"
-									cy="50"
-									r="22"
-									fill="none"
-									stroke={C.ink}
-									strokeWidth="7"
-								/>
-								<circle
-									cx="50"
-									cy="50"
-									r="8.5"
-									fill="none"
-									stroke={C.ink}
-									strokeWidth="6"
-								/>
-							</svg>
+								alt="Tracelane"
+								style={{ display: "block", filter: "invert(1)" }}
+							/>
 							<span
 								style={{
 									fontFamily: "ui-monospace, monospace",

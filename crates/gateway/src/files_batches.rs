@@ -407,6 +407,7 @@ async fn scan_batch_rails(
         };
         let LineView { request, body, .. } = view;
         let inputs = || RequestInputs {
+            zdr_required: false,
             tenant_id: &claims.tenant_id,
             api_key_id: claims.api_key_id(),
             project_id: claims.governance.as_ref().and_then(|g| g.project_id),
@@ -661,6 +662,15 @@ pub(crate) struct FilesParsed {
 }
 
 impl Parsed for FilesParsed {
+    fn approval_body(&self, key: &[u8; 32]) -> Option<Value> {
+        match &self.mode {
+            UploadMode::Batch { raw, data, .. } => Some(serde_json::json!({
+                "provider":self.provider_id,"purpose":self.purpose,
+                "payload_fp":blake3::keyed_hash(key, &raw[data.clone()]).to_hex().to_string()
+            })),
+            UploadMode::Stream { .. } => None,
+        }
+    }
     fn model(&self) -> &str {
         "files"
     }
@@ -701,6 +711,7 @@ impl Route for FilesUpload {
     const NAME: &'static str = "files_upload";
     const AUDIT_EVENT_TYPE: &'static str = "files.upload.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::RefuseContentWrites;
     // OG-11 (a file made under key A cannot be read under key B: the `default` key only).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Files,
@@ -1329,6 +1340,30 @@ pub(crate) struct BatchParsed {
 }
 
 impl Parsed for BatchParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<Value> {
+        serde_json::from_slice(&self.raw).ok()
+    }
+    fn approval_request(
+        &self,
+        tenant: &tracelane_shared::TenantId,
+    ) -> tracelane_shared::key_policy::PolicyRequest {
+        use tracelane_shared::key_policy::{Fact, PolicyRequest, Subject};
+        let subjects = match batch_file_models(*tenant.as_uuid(), &self.input_file_id) {
+            Some(models) if !models.is_empty() => models
+                .into_iter()
+                .map(|model| Subject {
+                    model: Fact::Known(model),
+                    provider: Some(self.provider_id.to_owned()),
+                    ..Subject::unknown()
+                })
+                .collect(),
+            _ => vec![Subject::unknown()],
+        };
+        PolicyRequest {
+            subjects,
+            body_bytes: Fact::Known(self.raw.len() as u64),
+        }
+    }
     fn model(&self) -> &str {
         "batch"
     }
@@ -1363,6 +1398,7 @@ impl Route for BatchesCreate {
     const NAME: &'static str = "batches_create";
     const AUDIT_EVENT_TYPE: &'static str = "batches.create.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::RefuseContentWrites;
     // OG-11 (a batch made under key A cannot be read under key B: the `default` key only).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Batches,

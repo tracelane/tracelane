@@ -26,6 +26,7 @@ pub mod audit_chain_state;
 pub mod cache_settings;
 pub mod control_audit;
 pub mod controls;
+pub mod data_controls;
 pub mod idle_evict;
 pub mod job_guard;
 pub mod keepalive;
@@ -487,10 +488,40 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         // the gateway.
         include_str!("../../../../apps/web/db/migrations/0076_og50_otel_exports.sql"),
         include_str!("../../../../apps/web/db/migrations/0077_og11_key_labels.sql"),
+        include_str!("../../../../apps/web/db/migrations/0078_og38_data_controls.sql"),
+        include_str!("../../../../apps/web/db/migrations/0079_og40_mcp_servers.sql"),
+        include_str!("../../../../apps/web/db/migrations/0080_og41_mcp_policy.sql"),
+        include_str!("../../../../apps/web/db/migrations/0081_og42_approvals.sql"),
+        include_str!("../../../../apps/web/db/migrations/0082_og42_active_approvals.sql"),
+        include_str!("../../../../apps/web/db/migrations/0083_action_evidence_foundation.sql"),
+        include_str!("../../../../apps/web/db/migrations/0084_protected_policy_contract.sql"),
+        include_str!("../../../../apps/web/db/migrations/0085_action_execution_receipt.sql"),
+        include_str!("../../../../apps/web/db/migrations/0086_bound_human_approvals.sql"),
+        include_str!("../../../../apps/web/db/migrations/0087_protected_event_index.sql"),
+        include_str!("../../../../apps/web/db/migrations/0088_action_lifecycle_evidence.sql"),
+        include_str!("../../../../apps/web/db/migrations/0089_mcp_scope_comment.sql"),
+        include_str!("../../../../apps/web/db/migrations/0090_action_timeline_index.sql"),
+        include_str!("../../../../apps/web/db/migrations/0091_policy_activation_index.sql"),
+        include_str!("../../../../apps/web/db/migrations/0092_ops_applied_migrations.sql"),
+        include_str!("../../../../apps/web/db/migrations/0093_web_rate_limits.sql"),
+        include_str!("../../../../apps/web/db/migrations/0094_checkpoint_timestamps.sql"),
+        include_str!("../../../../apps/web/db/migrations/0095_siem_export_cursors.sql"),
+        include_str!("../../../../apps/web/db/migrations/0096_siem_export_checks.sql"),
+        include_str!("../../../../apps/web/db/migrations/0097_tenant_principal_issuers.sql"),
+        include_str!("../../../../apps/web/db/migrations/0098_tenant_principal_constraints.sql"),
+        // ACT-17: `action_tool_receipt_keys` (read in the protected reservation) and the
+        // append-only trigger list for `tool_receipt_key_registered` rows.
+        include_str!("../../../../apps/web/db/migrations/0099_act17_tool_receipt_keys.sql"),
+        include_str!("../../../../apps/web/db/migrations/0100_act17_protect_receipt_key_rows.sql"),
     ];
     for migration in MIGRATIONS {
+        // Disposable test databases use transaction-safe index builds. Production
+        // applies each CONCURRENTLY migration outside a transaction, unchanged.
+        let migration = migration
+            .replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX")
+            .replace("CREATE UNIQUE INDEX CONCURRENTLY", "CREATE UNIQUE INDEX");
         client
-            .batch_execute(migration)
+            .batch_execute(&migration)
             .await
             .with_context(|| "Drizzle migration batch failed".to_string())?;
     }

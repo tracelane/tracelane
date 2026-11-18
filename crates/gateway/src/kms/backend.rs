@@ -11,6 +11,9 @@ use tracelane_shared::TenantId;
 use uuid::Uuid;
 
 pub trait KmsBackend: Send + Sync {
+    /// Authorize the authenticated tenant before cloud access OR cached DEK use.
+    /// Fail CLOSED when delegation is not bound to this tenant.
+    fn authorize(&self, tenant: &TenantId) -> Result<(), KmsError>;
     fn wrap(
         &self,
         tenant: &TenantId,
@@ -25,7 +28,7 @@ pub trait KmsBackend: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Zeroizing<Vec<u8>>, KmsError>> + Send;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "backend",
     content = "params",
@@ -38,28 +41,37 @@ pub enum Config {
     GcpKms(Gcp),
     AzureKeyVault(Azure),
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Aws {
     pub region: String,
     pub role_arn: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vault {
     pub url: String,
     pub mount: String,
     pub role_id: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gcp {
     pub service_account: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Azure {
     pub directory_id: Uuid,
+}
+
+/// Trusted deployment policy, never populated by the customer configuration API.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalBinding {
+    tenant_id: Uuid,
+    configuration: Config,
+    key_ref: String,
 }
 
 pub struct Backend {
@@ -177,9 +189,7 @@ impl Backend {
         payload: &[u8],
         wrapping: bool,
     ) -> Result<Zeroizing<Vec<u8>>, KmsError> {
-        if !self.valid() {
-            return Err(KmsError::Denied);
-        }
+        self.authorize(tenant)?;
         let deadline = std::time::Duration::from_millis(
             limits().ok_or(KmsError::Unavailable)?.call_timeout_ms,
         );
@@ -410,6 +420,57 @@ impl Backend {
     }
 }
 impl KmsBackend for Backend {
+    fn authorize(&self, tenant: &TenantId) -> Result<(), KmsError> {
+        if !self.valid() {
+            return Err(KmsError::Denied);
+        }
+        // AWS binds AssumeRole to a tenant-derived ExternalId; Vault uses the
+        // customer's own token/AppRole secret. Shared GCP/Azure authority instead
+        // requires an independently verified, operator-only ownership binding.
+        if !matches!(self.config, Config::GcpKms(_) | Config::AzureKeyVault(_)) {
+            return Ok(());
+        }
+        let raw = env_secret("TRACELANE_KMS_PRINCIPAL_BINDINGS").map_err(|_| KmsError::Denied)?;
+        if raw.expose_secret().len() > limits().ok_or(KmsError::Unavailable)?.response_bytes {
+            return Err(KmsError::Denied);
+        }
+        let bindings: Vec<PrincipalBinding> =
+            serde_json::from_str(raw.expose_secret()).map_err(|_| KmsError::Denied)?;
+        let mut owners = std::collections::HashMap::new();
+        let mut keys = std::collections::HashMap::new();
+        let mut authorized = false;
+        for binding in bindings {
+            let principal = match &binding.configuration {
+                Config::GcpKms(p) => format!("gcp:{}", p.service_account),
+                Config::AzureKeyVault(p) => format!("azure:{}", p.directory_id),
+                _ => return Err(KmsError::Denied),
+            };
+            let backend = Backend {
+                config: binding.configuration,
+                key_ref: binding.key_ref,
+                secret: None,
+            };
+            if !backend.valid()
+                || owners
+                    .insert(principal, binding.tenant_id)
+                    .is_some_and(|owner| owner != binding.tenant_id)
+                || keys
+                    .insert(backend.key_ref.clone(), binding.tenant_id)
+                    .is_some_and(|owner| owner != binding.tenant_id)
+            {
+                return Err(KmsError::Denied);
+            }
+            authorized |= binding.tenant_id == *tenant.as_uuid()
+                && backend.config == self.config
+                && backend.key_ref == self.key_ref;
+        }
+        if authorized {
+            Ok(())
+        } else {
+            Err(KmsError::Denied)
+        }
+    }
+
     async fn wrap(&self, tenant: &TenantId, id: Uuid, payload: &[u8]) -> Result<Vec<u8>, KmsError> {
         Ok(self.crypt(tenant, id, payload, true).await?.to_vec())
     }
@@ -530,7 +591,11 @@ async fn send(
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
         });
-        s.replies.pop_front().expect("unexpected KMS HTTP call")
+        if let Some(responder) = &s.responder {
+            responder(s.requests.last().expect("just recorded KMS request"))
+        } else {
+            s.replies.pop_front().expect("unexpected KMS HTTP call")
+        }
     }) {
         return response.map(Zeroizing::new);
     }
@@ -783,7 +848,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod scripted {
+pub(crate) mod scripted {
     use super::*;
     pub struct Request {
         pub url: String,
@@ -791,11 +856,15 @@ mod scripted {
         pub content_type: String,
         pub headers: Vec<(String, String)>,
     }
+    pub type Responder =
+        std::sync::Arc<dyn Fn(&Request) -> Result<Vec<u8>, KmsError> + Send + Sync>;
     #[derive(Default)]
     pub struct Script {
         pub env: std::collections::HashMap<String, String>,
         pub replies: std::collections::VecDeque<Result<Vec<u8>, KmsError>>,
         pub requests: Vec<Request>,
+        /// Dynamic local KMS double for probes whose DEK and UUID are generated at runtime.
+        pub responder: Option<Responder>,
     }
     tokio::task_local! { pub static SCRIPT: std::cell::RefCell<Script>; }
 }
@@ -869,6 +938,12 @@ mod protocol_tests {
         ];
         for backend in configs {
             let mut script = Script::default();
+            if matches!(backend.config, Config::GcpKms(_) | Config::AzureKeyVault(_)) {
+                script.env.insert(
+                    "TRACELANE_KMS_PRINCIPAL_BINDINGS".into(),
+                    json!([binding(&backend, &tenant)]).to_string(),
+                );
+            }
             script.env.insert(
                 "TRACELANE_KMS_AWS_ACCESS_KEY_ID".into(),
                 "UNITOPERATOR".into(),
@@ -1014,6 +1089,334 @@ mod protocol_tests {
                             }
                         }
                     });
+                })
+                .await;
+        }
+    }
+    fn cloud_fixture(azure: bool) -> Backend {
+        Backend {
+            config: if azure {
+                Config::AzureKeyVault(Azure {
+                    directory_id: Uuid::from_u128(42),
+                })
+            } else {
+                Config::GcpKms(Gcp {
+                    service_account: "customer@fixture.iam.gserviceaccount.com".into(),
+                })
+            },
+            key_ref: if azure {
+                "https://customer.vault.azure.net/keys/key/version".into()
+            } else {
+                "projects/fixture/locations/global/keyRings/ring/cryptoKeys/key".into()
+            },
+            secret: None,
+        }
+    }
+    fn binding(backend: &Backend, tenant: &TenantId) -> Value {
+        json!({"tenant_id":tenant.to_string(),"configuration":backend.config,"key_ref":backend.key_ref})
+    }
+    fn cloud_script(backend: &Backend, owner: &TenantId, payload: &[u8]) -> Script {
+        let mut s = Script::default();
+        s.env.insert(
+            "TRACELANE_KMS_PRINCIPAL_BINDINGS".into(),
+            json!([binding(backend, owner)]).to_string(),
+        );
+        s.env.insert("TRACELANE_KMS_GCP_SERVICE_ACCOUNT".into(), json!({"client_email":"operator@fixture.iam.gserviceaccount.com","private_key":fixture_pem()}).to_string());
+        s.env
+            .insert("TRACELANE_KMS_AZURE_CLIENT_ID".into(), "unit-client".into());
+        s.env.insert(
+            "TRACELANE_KMS_AZURE_CLIENT_SECRET".into(),
+            "unit-secret".into(),
+        );
+        for wrapping in [true, false] {
+            let bytes = if wrapping {
+                b"ciphertext".as_slice()
+            } else {
+                payload
+            };
+            s.replies
+                .push_back(reply(json!({"access_token":"unit-token"})));
+            if matches!(backend.config, Config::GcpKms(_)) {
+                s.replies
+                    .push_back(reply(json!({"accessToken":"unit-impersonated"})));
+                s.replies.push_back(reply(if wrapping {
+                    json!({"ciphertext":B64.encode(bytes)})
+                } else {
+                    json!({"plaintext":B64.encode(bytes)})
+                }));
+            } else {
+                s.replies
+                    .push_back(reply(json!({"value":B64URL.encode(bytes)})));
+            }
+        }
+        s
+    }
+    async fn registration(azure: bool, other_tenant: bool) {
+        let backend = cloud_fixture(azure);
+        let caller = TenantId::from_jwt_claim(Uuid::new_v4());
+        let owner = if other_tenant {
+            TenantId::from_jwt_claim(Uuid::new_v4())
+        } else {
+            caller.clone()
+        };
+        let id = Uuid::new_v4();
+        let payload = super::super::bound_dek(&caller, id, &[7; 32]);
+        SCRIPT
+            .scope(
+                RefCell::new(cloud_script(&backend, &owner, &payload)),
+                async {
+                    // Actual PUT registration probe, with a cloud that permits the shared identity.
+                    let result =
+                        super::super::vault::wrap_probe(&backend, &caller, id, &[7; 32]).await;
+                    if other_tenant {
+                        assert_eq!(
+                            result,
+                            Err(KmsError::Denied),
+                            "customer A must not enroll B's delegation"
+                        );
+                        SCRIPT.with(|s| assert!(s.borrow().requests.is_empty()));
+                    } else {
+                        assert!(result.is_ok());
+                        SCRIPT.with(|s| assert!(s.borrow().replies.is_empty()));
+                    }
+                },
+            )
+            .await;
+    }
+    #[tokio::test]
+    async fn gcp_registration_rejects_other_tenant() {
+        registration(false, true).await;
+    }
+    #[tokio::test]
+    async fn azure_registration_rejects_other_tenant() {
+        registration(true, true).await;
+    }
+    #[tokio::test]
+    async fn bound_gcp_registration() {
+        registration(false, false).await;
+    }
+    #[tokio::test]
+    async fn bound_azure_registration() {
+        registration(true, false).await;
+    }
+
+    async fn policy_result(
+        backend: &Backend,
+        tenant: &TenantId,
+        policy: Option<String>,
+    ) -> Result<(), KmsError> {
+        let mut script = Script::default();
+        if let Some(policy) = policy {
+            script
+                .env
+                .insert("TRACELANE_KMS_PRINCIPAL_BINDINGS".into(), policy);
+        }
+        SCRIPT
+            .scope(RefCell::new(script), async {
+                let result = backend.authorize(tenant);
+                SCRIPT.with(|s| assert!(s.borrow().requests.is_empty()));
+                result
+            })
+            .await
+    }
+    fn distinct_cloud(azure: bool) -> Backend {
+        let mut b = cloud_fixture(azure);
+        match &mut b.config {
+            Config::GcpKms(p) => p.service_account = "second@other.iam.gserviceaccount.com".into(),
+            Config::AzureKeyVault(p) => p.directory_id = Uuid::from_u128(43),
+            _ => unreachable!(),
+        }
+        b.key_ref = b
+            .key_ref
+            .replace("customer.", "second.")
+            .replace("projects/fixture/", "projects/other/");
+        b
+    }
+    #[tokio::test]
+    async fn binding_allows_same_tenant_rotation() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let old = cloud_fixture(azure);
+            let mut new = cloud_fixture(azure);
+            new.key_ref.push_str("-rotated");
+            let policy = json!([binding(&old, &t), binding(&new, &t)]).to_string();
+            assert_eq!(policy_result(&old, &t, Some(policy.clone())).await, Ok(()));
+            assert_eq!(policy_result(&new, &t, Some(policy)).await, Ok(()));
+        }
+    }
+    #[tokio::test]
+    async fn binding_allows_identical_duplicates() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let b = cloud_fixture(azure);
+            assert_eq!(
+                policy_result(
+                    &b,
+                    &t,
+                    Some(json!([binding(&b, &t), binding(&b, &t)]).to_string())
+                )
+                .await,
+                Ok(())
+            );
+        }
+    }
+    #[tokio::test]
+    async fn binding_allows_distinct_tenants() {
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let first = cloud_fixture(azure);
+            let second = distinct_cloud(azure);
+            let policy = json!([binding(&first, &a), binding(&second, &b)]).to_string();
+            assert_eq!(
+                policy_result(&first, &a, Some(policy.clone())).await,
+                Ok(())
+            );
+            assert_eq!(policy_result(&second, &b, Some(policy)).await, Ok(()));
+        }
+    }
+    #[tokio::test]
+    async fn binding_missing_is_denied() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            for policy in [None, Some("[]".into()), Some("".into())] {
+                assert_eq!(
+                    policy_result(&cloud_fixture(azure), &t, policy).await,
+                    Err(KmsError::Denied)
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn binding_malformed_is_denied() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let b = cloud_fixture(azure);
+            let good = binding(&b, &t);
+            let mut unknown = good.clone();
+            unknown["allow_all"] = json!(true);
+            let mut tenant = good.clone();
+            tenant["tenant_id"] = json!("org_not_a_uuid");
+            let mut params = good.clone();
+            params["configuration"]["params"]["tenant_id"] = json!(t.to_string());
+            let mut invalid_key = good.clone();
+            invalid_key["key_ref"] = json!("https://169.254.169.254/key");
+            let mut unsupported = good.clone();
+            unsupported["configuration"] = json!({"backend":"vault_transit","params":{"url":"https://vault.example.com","mount":"transit"}});
+            for policy in [
+                "not-json".into(),
+                "{}".into(),
+                "[null]".into(),
+                json!([unknown]).to_string(),
+                json!([tenant]).to_string(),
+                json!([params]).to_string(),
+                json!([good.clone(), invalid_key]).to_string(),
+                json!([good, unsupported]).to_string(),
+            ] {
+                assert_eq!(
+                    policy_result(&b, &t, Some(policy)).await,
+                    Err(KmsError::Denied)
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn binding_wrong_key_is_denied() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let b = cloud_fixture(azure);
+            let mut policy = binding(&b, &t);
+            policy["key_ref"] = json!(format!("{}-other", b.key_ref));
+            assert_eq!(
+                policy_result(&b, &t, Some(json!([policy]).to_string())).await,
+                Err(KmsError::Denied)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn binding_wrong_principal_is_denied() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let b = cloud_fixture(azure);
+            let mut other = distinct_cloud(azure);
+            other.key_ref.clone_from(&b.key_ref);
+            assert_eq!(
+                policy_result(&b, &t, Some(json!([binding(&other, &t)]).to_string())).await,
+                Err(KmsError::Denied)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn binding_conflicting_owner_is_denied() {
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let first = cloud_fixture(azure);
+            let mut second = cloud_fixture(azure);
+            second.key_ref.push_str("-other");
+            let policy = json!([binding(&first, &a), binding(&second, &b)]).to_string();
+            assert_eq!(
+                policy_result(&first, &a, Some(policy.clone())).await,
+                Err(KmsError::Denied)
+            );
+            assert_eq!(
+                policy_result(&second, &b, Some(policy)).await,
+                Err(KmsError::Denied)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn binding_conflicting_key_is_denied() {
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let first = cloud_fixture(azure);
+            let mut second = distinct_cloud(azure);
+            second.key_ref.clone_from(&first.key_ref);
+            let policy = json!([binding(&first, &a), binding(&second, &b)]).to_string();
+            assert_eq!(
+                policy_result(&first, &a, Some(policy.clone())).await,
+                Err(KmsError::Denied)
+            );
+            assert_eq!(
+                policy_result(&second, &b, Some(policy)).await,
+                Err(KmsError::Denied)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn binding_oversized_is_denied() {
+        let t = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = cloud_fixture(false);
+        let mut policy = json!([binding(&b, &t)]).to_string();
+        // Valid JSON followed by legal whitespace still exceeds the bound.
+        policy.push_str(&" ".repeat(limits().unwrap().response_bytes));
+        assert_eq!(
+            policy_result(&b, &t, Some(policy)).await,
+            Err(KmsError::Denied)
+        );
+    }
+    #[tokio::test]
+    async fn binding_unwrap_rejects_other_tenant_without_transport() {
+        let a = TenantId::from_jwt_claim(Uuid::new_v4());
+        let b = TenantId::from_jwt_claim(Uuid::new_v4());
+        for azure in [false, true] {
+            let backend = cloud_fixture(azure);
+            let mut script = Script::default();
+            script.env.insert(
+                "TRACELANE_KMS_PRINCIPAL_BINDINGS".into(),
+                json!([binding(&backend, &b)]).to_string(),
+            );
+            SCRIPT
+                .scope(RefCell::new(script), async {
+                    assert_eq!(
+                        backend
+                            .unwrap(&a, Uuid::new_v4(), b"ciphertext")
+                            .await
+                            .unwrap_err(),
+                        KmsError::Denied
+                    );
+                    SCRIPT.with(|s| assert!(s.borrow().requests.is_empty()));
                 })
                 .await;
         }

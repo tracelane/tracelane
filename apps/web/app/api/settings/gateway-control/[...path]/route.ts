@@ -40,7 +40,7 @@ async function relay(upstream: Response): Promise<NextResponse> {
 			return new NextResponse(null, { status: 204, headers: noStore });
 		}
 		const headers = new Headers(noStore);
-		for (const h of ["content-type", "content-disposition"]) {
+		for (const h of ["content-type", "content-disposition", "etag"]) {
 			const v = upstream.headers.get(h);
 			if (v) headers.set(h, v);
 		}
@@ -109,6 +109,10 @@ async function handle(
 	await requireGatewayToken();
 
 	const target = `/v1/${joined}${req.nextUrl.search}`;
+	const documentVersion =
+		(joined === "routing" || joined === "guardrails/policy") && verb === "PUT"
+			? req.headers.get("if-match")
+			: null;
 	if (verb === "GET" || verb === "DELETE") {
 		return relay(await gatewayResponse(target, { method: verb }));
 	}
@@ -137,7 +141,10 @@ async function handle(
 	return relay(
 		await gatewayResponse(target, {
 			method: verb,
-			headers: { "content-type": "application/json" },
+			headers: {
+				"content-type": "application/json",
+				...(documentVersion ? { "if-match": documentVersion } : {}),
+			},
 			body: text.trim() === "" ? "{}" : text,
 		}),
 	);

@@ -121,7 +121,7 @@ pub(crate) async fn workspace_spend_baseline_from_clickhouse(
                 tracing::warn!(
                     error = %e,
                     tenant_id = %tenant_id,
-                    "workspace spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (OG-22 fail-closed)"
+                    "workspace spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (fail-closed)"
                 );
             }
             None
@@ -176,7 +176,7 @@ pub(crate) async fn spend_baseline_from_clickhouse(
                 tracing::warn!(
                     error = %e,
                     tenant_id = %tenant_id,
-                    "per-key spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (OG-22 fail-closed)"
+                    "per-key spend baseline ClickHouse read failed — spend UNKNOWN, the hard budget refuses (fail-closed)"
                 );
             }
             None

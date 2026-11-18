@@ -314,6 +314,8 @@ function copyAiDisclosure(outputDir: string, repoRoot: string): PackItem {
 
 function writeModelRegistry(outputDir: string): PackItem {
 	const registry = {
+		basis:
+			"Static example provider inventory; not an attestation of models configured or used by this tenant.",
 		generatedAt: new Date().toISOString(),
 		models: [
 			{
@@ -337,21 +339,6 @@ function writeModelRegistry(outputDir: string): PackItem {
 				dataProcessing: "Input/output text via BYOK",
 				// 365 — same bytes, same table, same reason as above.
 				retentionDays: 365,
-			},
-			{
-				id: "tracelane/trajectory-guard-v1",
-				provider: "Tracelane (internal)",
-				purpose: "Trajectory anomaly detection — predictive guardrail",
-				dataProcessing: "Span metadata only, no content",
-				retentionDays: 0,
-			},
-			{
-				id: "tracelane/slm-judge-v1",
-				provider:
-					"Tracelane (internal, distilled from Llama-Guard + NemoGuard)",
-				purpose: "Flow adherence + hallucination grounding",
-				dataProcessing: "Request/response text (tenant-scoped)",
-				retentionDays: 0,
 			},
 		],
 	};
@@ -409,23 +396,22 @@ function writeGuardrailEvidence(outputDir: string, repoRoot: string): PackItem {
 	const content = [
 		"# Predictive Guardrail Evidence — EU AI Act Art. 12 §4",
 		"",
-		"Tracelane implements 10 inline predictors as risk mitigation measures:",
+		"Static source inventory of selected predictive controls. This generated file",
+		"does not attest tenant enablement, deployed models or legal conformity.",
 		"",
-		"| Predictor | AFT ID | Intervention | Source |",
-		"|---|---|---|---|",
-		"| McpHashWatcher | AFT-MCP-RUGPULL-001 | Block | mcp_hash_watcher.rs |",
-		"| TaintTracker | AFT-TAINT-LETHAL-001 | Warn/Block | taint_tracker.rs |",
-		"| StuckLoopDetector | AFT-A2UI-STUCKLOOP-001 | Warn | stuck_loop.rs |",
-		"| PromptInjectionDetector | AFT-PI-CASCADE-001 | Warn | prompt_injection.rs |",
-		"| A2aValidator | AFT-A2A-LIFECYCLE-001 | Warn | a2a_validator.rs |",
-		"| A2uiValidator | AFT-A2UI-CATALOG-001 | Block | a2ui_validator.rs |",
-		"| BrowserPassiveObserver | AFT-A2UI-CAPTCHA-001 | Warn | browser_capture.rs |",
-		"| CaptchaPreemptor | AFT-A2UI-CAPTCHA-001 | Warn | captcha.rs |",
-		"| TrajectoryGuard | AFT-TRAJ-ANOMALY-001 | Warn/Block | trajectory_guard.rs |",
-		"| SlmJudge | AFT-PI-CASCADE-001 | Warn/Block | slm_judge.rs |",
+		"| Predictor | AFT ID | Source |",
+		"|---|---|---|",
+		"| McpHashWatcher | AFT-MCP-RUGPULL-001 | mcp_hash_watcher.rs |",
+		"| TaintTracker | AFT-TAINT-LETHAL-001 | taint_tracker.rs |",
+		"| StuckLoopDetector | AFT-A2UI-STUCKLOOP-001 | stuck_loop.rs |",
+		"| PromptInjectionDetector | AFT-PI-CASCADE-001 | prompt_injection.rs |",
+		"| A2aValidator | AFT-A2A-LIFECYCLE-001 | a2a_validator.rs |",
+		"| A2uiValidator | AFT-A2UI-CATALOG-001 | a2ui_validator.rs |",
+		"| BrowserPassiveObserver | AFT-A2UI-CAPTCHA-001 | browser_capture.rs |",
+		"| CaptchaPreemptor | AFT-A2UI-CAPTCHA-001 | captcha.rs |",
+		"| ToolSchemaValidator | AFT-TOOL-SCHEMA-001 | tool_schema_validator.rs |",
 		"",
-		"All predictors run inline on every request. A Block decision returns HTTP 403",
-		"with `X-Tracelane-Block: <aft_id>`. Warn decisions tag the span and continue.",
+		"Activation and response handling depend on the configured runtime and tenant policy.",
 		"",
 		"Full taxonomy: `spec/aft-1/aft-1.md`.",
 	].join("\n");

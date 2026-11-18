@@ -825,8 +825,8 @@ async fn set38_audit_failure_rolls_the_edit_back() -> Result<()> {
 }
 
 /// B-586 / SET-38 B6 — a revoke through the gateway ends a WARM key on its very
-/// next request. Differential: the legacy row-only `revoke()` (what the web
-/// Drizzle UPDATE did) leaves the warm key authenticating.
+/// next request. Differential: an uncoordinated SQL UPDATE leaves the warm key
+/// authenticating until tenant invalidation or its absolute lease expires.
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn b586_gateway_revoke_ends_a_warm_key_on_its_next_request() -> Result<()> {
@@ -848,13 +848,27 @@ async fn b586_gateway_revoke_ends_a_warm_key_on_its_next_request() -> Result<()>
             .is_some()
     );
 
-    revoke(&pool, legacy.api_key.id).await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE api_keys SET revoked_at = clock_timestamp() WHERE id = $1",
+            &[&legacy.api_key.id],
+        )
+        .await?;
     assert!(
         lookup_tenant_by_key_body(&pool, legacy_body)
             .await?
             .is_some(),
         "falsification: a row-only revoke leaves the warm key working (B-586)"
     );
+    invalidate_tenant(&tenant).await;
+    assert!(
+        lookup_tenant_by_key_body(&pool, legacy_body)
+            .await?
+            .is_none()
+    );
+    // Tenant invalidation also drops valid grants; cold verification restores them.
+    assert!(lookup_tenant_by_key_body(&pool, &body).await?.is_some());
 
     // Another tenant cannot revoke it.
     let other_id = Uuid::new_v4();
@@ -1164,40 +1178,19 @@ async fn create_tenant_and_lookup_by_api_key() -> Result<()> {
     let unknown = db::api_keys::lookup_tenant_by_key_body(&pool, "nope_does_not_exist").await?;
     assert!(unknown.is_none(), "unknown key body must return None");
 
-    // ── Revocation, and the bound it actually carries ───────────────────────
-    //
-    // This block used to assert `after_revoke.is_none()` immediately. That
-    // asserts a guarantee the product DELIBERATELY DOES NOT MAKE, and it is why
-    // this test failed the first time it was ever executed (2026-08-14).
-    //
-    // `revoke()` writes `revoked_at` and does NOT touch the positives-only auth
-    // cache. made that explicit after `pg_notify`-based invalidation was
-    // measured unreliable against an autosuspending Neon compute (110
-    // drop/reconnect cycles in 21 h): **the cache TTL IS the revocation bound,
-    // and it is 60 s** (`DEFAULT_AUTH_CACHE_TTL_SECS`). Confirmed against
-    // production the same day — a deleted key returned 200 at t+45 s and 401
-    // from t+60 s.
-    //
-    // So the honest assertion is in two halves: the row is revoked, and the
-    // cache is what may still answer until it expires.
+    // Gateway-owned revocation (including the integration helper) acknowledges
+    // only after eviction. Raw SQL's bounded window is exercised separately above.
     db::api_keys::revoke(&pool, created.id).await?;
-    let still_cached = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    let after_revoke = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
     assert!(
-        still_cached.is_some(),
-        "documented bound: a revoked key may still resolve from the positives-only \
-         auth cache for up to DEFAULT_AUTH_CACHE_TTL_SECS. If this now fails, \
-         revocation became immediate — a GOOD change, but update this pin and \
-         the B-178 note rather than deleting the assertion."
+        after_revoke.is_none(),
+        "the next request must reject a revoked key"
     );
-
-    // Drop the cached entry and the revocation must be visible at once, which
-    // proves the row itself is genuinely revoked and only the cache was holding
-    // it — the discriminating half.
-    db::api_keys::invalidate(db::api_keys::peppered_lookup(&key_body)?).await;
-    let after_invalidate = db::api_keys::lookup_tenant_by_key_body(&pool, &key_body).await?;
+    db::api_keys::revoke(&pool, created.id).await?;
     assert!(
-        after_invalidate.is_none(),
-        "once the cache entry is gone, a revoked api key must not resolve"
+        db::api_keys::lookup_tenant_by_key_body(&pool, &key_body)
+            .await?
+            .is_none()
     );
 
     Ok(())
@@ -3009,6 +3002,7 @@ async fn og50_exports_round_trip_are_sealed_isolated_and_audited() -> Result<()>
     let other = og23_tenant(&pool, "og50-b").await?;
     let client = pool.get().await?;
     let new = |name: &str, sealed: Option<&str>| NewExport {
+        format: "otlp".into(),
         id: Uuid::new_v4(),
         name: name.into(),
         url: "https://collector.example.com/v1/traces?token=URLSECRET".into(),
@@ -3179,6 +3173,27 @@ async fn og32_rotation_rewraps_both_adapter_bound_credentials() -> Result<()> {
             "azure_content_safety",
             "https://unit.cognitiveservices.azure.com",
         ),
+        // GWY-64: the rotation consumer keys on the stored kind string, so new adapters
+        // re-wrap with no rotation change.
+        (
+            "azure_prompt_shields",
+            "https://unit.cognitiveservices.azure.com",
+        ),
+        ("openai_moderation", "https://api.openai.com/v1/moderations"),
+        // GWY-66.
+        (
+            "bedrock_guardrails",
+            "https://bedrock-runtime.eu-central-1.amazonaws.com",
+        ),
+        // GWY-68.
+        ("presidio", "https://presidio.unit.example/analyze"),
+        // GWY-67.
+        (
+            "google_model_armor",
+            "https://modelarmor.europe-west4.rep.googleapis.com",
+        ),
+        // GWY-71.
+        ("typesafe_jev", "https://api.typesafe.ai/v1/systemone"),
     ] {
         let id = Uuid::new_v4();
         let aad = byok::guardrail_hook_aad(&tenant, &format!("{kind}:{id}:{endpoint}"));
@@ -3188,13 +3203,30 @@ async fn og32_rotation_rewraps_both_adapter_bound_credentials() -> Result<()> {
             adapter["thresholds"] =
                 serde_json::json!({"Hate":4,"SelfHarm":4,"Sexual":4,"Violence":4});
         }
+        if kind == "bedrock_guardrails" {
+            adapter["region"] = serde_json::json!("eu-central-1");
+            adapter["guardrail_id"] = serde_json::json!("abc123");
+            adapter["guardrail_version"] = serde_json::json!("1");
+        }
+        if kind == "google_model_armor" {
+            adapter = serde_json::json!({"kind":kind,"project":"acme-prod",
+                "location":"europe-west4","template":"tl-default"});
+        }
+        if kind == "typesafe_jev" {
+            adapter = serde_json::json!({"kind":kind,"model":"jev-1.14",
+                "policy":"Does `text` ask for money?","threshold":0.5});
+        }
+        if kind == "presidio" {
+            adapter = serde_json::json!({"kind":kind,"language":"en","entities":["PERSON"],
+                "score_threshold":0.5,"action":"redact"});
+        }
         let config = serde_json::json!({"endpoint":endpoint,"adapter":adapter,"pre":true,"post":false,"timeout_ms":1000});
         pool.get().await?.execute("INSERT INTO guardrail_hooks (tenant_id,id,config,ciphertext_b64,updated_by) VALUES ($1,$2,$3,$4,'test')",&[&tenant,&id,&config,&sealed]).await?;
         rows.push((id, aad));
     }
     let report = byok_rotate::rotate(&pool, &current, false).await?;
     assert_eq!(report.remaining(), 0);
-    assert_eq!(report.tables.iter().map(|t| t.rewrapped).sum::<u64>(), 2);
+    assert_eq!(report.tables.iter().map(|t| t.rewrapped).sum::<u64>(), 8);
     for (id, aad) in rows {
         let value: String = pool
             .get()
@@ -3211,5 +3243,607 @@ async fn og32_rotation_rewraps_both_adapter_bound_credentials() -> Result<()> {
             secret.expose_secret()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_mint_after_account_erasure_is_refused() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let tenant_id = Uuid::new_v4();
+    db::tenants::create(&pool, tenant_id, "erased-minter", "free").await?;
+    let tenant = tracelane_shared::TenantId::from_jwt_claim(tenant_id);
+    let _ = init_pepper(&"11".repeat(32));
+    let user = "b605-erased-user";
+    pool.get()
+        .await?
+        .execute("SELECT erase_account_pii($1)", &[&user])
+        .await?;
+    let result = mint(
+        &pool,
+        &tenant,
+        "late-key",
+        Some(user),
+        MintOptions::default(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a mint after the durable deletion marker must be refused"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_human_mint_requires_active_membership_proof() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let tenant_id = Uuid::new_v4();
+    db::tenants::create(&pool, tenant_id, "removed-minter", "free").await?;
+    let tenant = tracelane_shared::TenantId::from_jwt_claim(tenant_id);
+    let _ = init_pepper(&"11".repeat(32));
+    let mut actor = db::control_audit::Actor::system("b605-removed-member");
+    actor.auth_method = "workos_session";
+    let result = mint_as(
+        &pool,
+        &tenant,
+        "late-key",
+        Some(&actor.sub),
+        MintOptions::default(),
+        &actor,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a JWT alone must not mint after membership removal"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_rotation_after_account_erasure_is_refused() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let tenant_id = Uuid::new_v4();
+    db::tenants::create(&pool, tenant_id, "erased-rotation", "free").await?;
+    let tenant = tracelane_shared::TenantId::from_jwt_claim(tenant_id);
+    let _ = init_pepper(&"11".repeat(32));
+    let user = "b605-erased-rotator";
+    let key = mint(&pool, &tenant, "source", Some(user), MintOptions::default()).await?;
+    pool.get()
+        .await?
+        .execute("SELECT erase_account_pii($1)", &[&user])
+        .await?;
+    let result = rotate(&pool, &tenant, key.api_key.id, "other-owner", 1).await;
+    assert!(
+        result.is_err(),
+        "rotation must not recreate keys owned by an erased account"
+    );
+    Ok(())
+}
+
+struct B605Membership {
+    active: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    pause: bool,
+}
+
+impl B605Membership {
+    fn new(pause: bool) -> Self {
+        Self {
+            active: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            pause,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl db::api_keys::ActiveMembership for B605Membership {
+    async fn verify(&self, _user: &str, _org: &str) -> Result<()> {
+        self.entered.notify_one();
+        if self.pause {
+            self.release.notified().await;
+        }
+        anyhow::ensure!(
+            self.active.load(std::sync::atomic::Ordering::SeqCst),
+            "membership removed"
+        );
+        Ok(())
+    }
+}
+
+async fn b605_race_fixture() -> Result<(deadpool_postgres::Pool, tracelane_shared::TenantId, String)>
+{
+    let pool = test_pool().await?;
+    let id = Uuid::new_v4();
+    db::tenants::create(&pool, id, "b605-mint-removal-race", "free").await?;
+    let org = format!("org_b605_{}", id.simple());
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE tenants SET workos_org_id = $2 WHERE id = $1",
+            &[&id, &org],
+        )
+        .await?;
+    let _ = db::api_keys::init_pepper(&"11".repeat(32));
+    Ok((pool, tracelane_shared::TenantId::from_jwt_claim(id), org))
+}
+
+// Observe actual server lock state, not elapsed wall time. Each call uses an
+// autocommit SELECT so pg_stat_activity snapshots cannot hide a later waiter.
+async fn b605_wait_for_lock_waiter(pool: &deadpool_postgres::Pool, holder: i32) -> Result<()> {
+    let observer = pool.get().await?;
+    loop {
+        let waiting: bool = observer
+            .query_one(
+                "SELECT EXISTS (
+                SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                WHERE a.datname = current_database() AND l.locktype = 'advisory'
+                  AND NOT l.granted AND $1 = ANY(pg_blocking_pids(l.pid))
+            )",
+                &[&holder],
+            )
+            .await?
+            .get(0);
+        if waiting {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn b605_no_live_keys(pool: &deadpool_postgres::Pool, user: &str) -> Result<()> {
+    let active: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT count(*) FROM api_keys WHERE minted_by = $1
+         AND (revoked_at IS NULL OR revoked_at > now())",
+            &[&user],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        active, 0,
+        "removed member must have no surviving active key"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_removal_first_blocks_mint_until_membership_is_gone() -> Result<()> {
+    let (pool, tenant, org) = b605_race_fixture().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        use db::api_keys::*;
+        let user = "b605-removal-first";
+        let membership = std::sync::Arc::new(B605Membership::new(false));
+        let mut removal_client = pool.get().await?;
+        let removal = removal_client.transaction().await?;
+        let holder: i32 = removal
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        removal
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!("tracelane:owners:{org}")],
+            )
+            .await?;
+        // This is the vulnerable interval: the initial revocation is complete,
+        // while WorkOS still considers the member active.
+        removal
+            .execute(
+                "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+                &[&user],
+            )
+            .await?;
+        let mint_pool = pool.clone();
+        let mint_membership = membership.clone();
+        let mut mint_task = tokio::spawn(async move {
+            let mut actor = db::control_audit::Actor::system(user);
+            actor.auth_method = "workos_session";
+            mint_as_with_membership(
+                &mint_pool,
+                &tenant,
+                "concurrent",
+                Some(user),
+                MintOptions::default(),
+                &actor,
+                Some(mint_membership.as_ref()),
+            )
+            .await
+        });
+        tokio::select! {
+            outcome = &mut mint_task => {
+                anyhow::bail!("mint completed while removal owned the lock: {outcome:?}");
+            }
+            waiting = b605_wait_for_lock_waiter(&pool, holder) => waiting?,
+        }
+        membership
+            .active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        removal
+            .execute(
+                "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+                &[&user],
+            )
+            .await?;
+        removal.commit().await?;
+        assert!(
+            mint_task.await?.is_err(),
+            "membership deleted before lock release must refuse mint"
+        );
+        b605_no_live_keys(&pool, user).await
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_mint_first_holds_removal_lock_until_key_commits() -> Result<()> {
+    let (pool, tenant, org) = b605_race_fixture().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        use db::api_keys::*;
+        let user = "b605-mint-first";
+        let membership = std::sync::Arc::new(B605Membership::new(true));
+        let mint_membership = membership.clone();
+        let mint_pool = pool.clone();
+        let mint_task = tokio::spawn(async move {
+            let mut actor = db::control_audit::Actor::system(user);
+            actor.auth_method = "workos_session";
+            mint_as_with_membership(
+                &mint_pool,
+                &tenant,
+                "concurrent",
+                Some(user),
+                MintOptions::default(),
+                &actor,
+                Some(mint_membership.as_ref()),
+            )
+            .await
+        });
+        membership.entered.notified().await;
+        // Membership proof is paused inside mint's transaction. The org lock
+        // must already be held and remain held through INSERT/audit/COMMIT.
+        let holder: i32 = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+             WHERE a.datname = current_database() AND l.locktype = 'advisory'
+               AND l.granted ORDER BY l.pid LIMIT 1",
+                &[],
+            )
+            .await?
+            .get(0);
+        let removal_pool = pool.clone();
+        let removal_membership = membership.clone();
+        let mut removal_task = tokio::spawn(async move {
+            let mut client = removal_pool.get().await?;
+            let tx = client.transaction().await?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!("tracelane:owners:{org}")],
+            )
+            .await?;
+            removal_membership
+                .active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let revoked = tx
+                .execute(
+                    "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+                    &[&user],
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<u64, anyhow::Error>(revoked)
+        });
+        tokio::select! {
+            outcome = &mut removal_task => {
+                anyhow::bail!("removal completed before in-flight mint committed: {outcome:?}");
+            }
+            waiting = b605_wait_for_lock_waiter(&pool, holder) => waiting?,
+        }
+        membership.release.notify_one();
+        let key = mint_task.await??;
+        assert_eq!(
+            removal_task.await??,
+            1,
+            "removal must see and revoke the committed mint"
+        );
+        b605_no_live_keys(&pool, user).await?;
+        assert!(
+            lookup_tenant_by_key_body(&pool, key.raw_key.strip_prefix("tlane_").unwrap())
+                .await?
+                .is_none()
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_account_marker_committed_during_mint_lock_wait_is_seen() -> Result<()> {
+    let (pool, tenant, _org) = b605_race_fixture().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        use db::api_keys::*;
+        let user = "b605-account-marker-race";
+        let membership = std::sync::Arc::new(B605Membership::new(false));
+        let mut eraser_client = pool.get().await?;
+        let eraser = eraser_client.transaction().await?;
+        let holder: i32 = eraser.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        eraser.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&user]).await?;
+        let mint_pool = pool.clone();
+        let mut mint_task = tokio::spawn(async move {
+            let mut actor = db::control_audit::Actor::system(user);
+            actor.auth_method = "workos_session";
+            mint_as_with_membership(&mint_pool, &tenant, "concurrent", Some(user),
+                MintOptions::default(), &actor, Some(membership.as_ref())).await
+        });
+        tokio::select! {
+            outcome = &mut mint_task => {
+                anyhow::bail!("mint completed while account erasure owned the identity lock: {outcome:?}");
+            }
+            waiting = b605_wait_for_lock_waiter(&pool, holder) => waiting?,
+        }
+        eraser.execute("SELECT erase_account_pii($1)", &[&user]).await?;
+        eraser.commit().await?;
+        assert!(mint_task.await?.is_err(), "post-lock marker query must see newly committed erasure");
+        b605_no_live_keys(&pool, user).await
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_account_cache_eviction_rejects_own_keys_in_every_workspace_only() -> Result<()> {
+    use db::api_keys::*;
+    let pool = test_pool().await?;
+    let _ = init_pepper(&"11".repeat(32));
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    db::tenants::create(&pool, a, "account-cache-a", "free").await?;
+    db::tenants::create(&pool, b, "account-cache-b", "free").await?;
+    let a = tracelane_shared::TenantId::from_jwt_claim(a);
+    let b = tracelane_shared::TenantId::from_jwt_claim(b);
+    let user = "b605-cache-erasure-user";
+    let own_a = mint(&pool, &a, "own-a", Some(user), MintOptions::default()).await?;
+    let own_b = mint(&pool, &b, "own-b", Some(user), MintOptions::default()).await?;
+    let other = mint(
+        &pool,
+        &b,
+        "other",
+        Some("b605-other-user"),
+        MintOptions::default(),
+    )
+    .await?;
+    for key in [&own_a, &own_b, &other] {
+        assert!(
+            lookup_tenant_by_key_body(&pool, key.raw_key.strip_prefix("tlane_").unwrap())
+                .await?
+                .is_some()
+        );
+    }
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+            &[&user],
+        )
+        .await?;
+    invalidate_owned(&pool, user).await?;
+    for key in [&own_a, &own_b] {
+        assert!(
+            lookup_tenant_by_key_body(&pool, key.raw_key.strip_prefix("tlane_").unwrap())
+                .await?
+                .is_none(),
+            "account key must reject after acknowledged eviction"
+        );
+    }
+    assert!(
+        lookup_tenant_by_key_body(&pool, other.raw_key.strip_prefix("tlane_").unwrap())
+            .await?
+            .is_some()
+    );
+    invalidate_owned(&pool, user).await?;
+    assert!(
+        lookup_tenant_by_key_body(&pool, other.raw_key.strip_prefix("tlane_").unwrap())
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_removed_actor_cannot_rotate_another_members_key() -> Result<()> {
+    use db::api_keys::*;
+    let (pool, tenant, _) = b605_race_fixture().await?;
+    let key = mint(
+        &pool,
+        &tenant,
+        "other-member-key",
+        Some("b605-other-owner"),
+        MintOptions::default(),
+    )
+    .await?;
+    let mut actor = db::control_audit::Actor::system("b605-removed-actor");
+    actor.auth_method = "workos_session";
+    let result = rotate(&pool, &tenant, key.api_key.id, &actor, 24).await;
+    assert!(
+        result.is_err(),
+        "a stale human JWT must not rotate another member's key without live membership proof"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_erased_actor_cannot_rotate_another_members_key() -> Result<()> {
+    use db::api_keys::*;
+    let (pool, tenant, _) = b605_race_fixture().await?;
+    let key = mint(
+        &pool,
+        &tenant,
+        "other-member-key",
+        Some("b605-other-owner"),
+        MintOptions::default(),
+    )
+    .await?;
+    let actor = "b605-erased-rotator";
+    pool.get()
+        .await?
+        .execute("SELECT erase_account_pii($1)", &[&actor])
+        .await?;
+    let result = rotate(&pool, &tenant, key.api_key.id, actor, 24).await;
+    assert!(
+        result.is_err(),
+        "an erased actor must not rotate another member's key"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_human_rotation_checks_live_membership_and_allows_active_member() -> Result<()> {
+    use db::api_keys::*;
+    let (pool, tenant, _) = b605_race_fixture().await?;
+    let key = mint(
+        &pool,
+        &tenant,
+        "other-member-key",
+        Some("b605-other-owner"),
+        MintOptions::default(),
+    )
+    .await?;
+    let mut actor = db::control_audit::Actor::system("b605-human-rotator");
+    actor.auth_method = "workos_session";
+    let membership = B605Membership::new(false);
+    membership
+        .active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        rotate_with_membership(
+            &pool,
+            &tenant,
+            key.api_key.id,
+            &actor,
+            24,
+            Some(&membership)
+        )
+        .await
+        .is_err()
+    );
+    membership
+        .active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let successor = rotate_with_membership(
+        &pool,
+        &tenant,
+        key.api_key.id,
+        &actor,
+        24,
+        Some(&membership),
+    )
+    .await?
+    .unwrap();
+    let owner: Option<String> = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT minted_by FROM api_keys WHERE id = $1",
+            &[&successor.minted.api_key.id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(owner.as_deref(), Some("b605-other-owner"));
+    assert!(
+        lookup_tenant_by_key_body(
+            &pool,
+            successor.minted.raw_key.strip_prefix("tlane_").unwrap()
+        )
+        .await?
+        .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn b605_archive_first_blocks_mint_and_rechecks_committed_archive() -> Result<()> {
+    let (pool, tenant, org) = b605_race_fixture().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        use db::api_keys::*;
+        let user = "b605-archive-first";
+        let membership = std::sync::Arc::new(B605Membership::new(false));
+        let mut removal_client = pool.get().await?;
+        let removal = removal_client.transaction().await?;
+        let holder: i32 = removal
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        removal
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!("tracelane:owners:{org}")],
+            )
+            .await?;
+        // This is the vulnerable interval: the initial revocation is complete,
+        // while WorkOS still considers the member active.
+        removal
+            .execute(
+                "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+                &[&user],
+            )
+            .await?;
+        let mint_pool = pool.clone();
+        let mint_membership = membership.clone();
+        let mint_tenant = tenant.clone();
+        let mut mint_task = tokio::spawn(async move {
+            let mut actor = db::control_audit::Actor::system(user);
+            actor.auth_method = "workos_session";
+            mint_as_with_membership(
+                &mint_pool,
+                &mint_tenant,
+                "concurrent",
+                Some(user),
+                MintOptions::default(),
+                &actor,
+                Some(mint_membership.as_ref()),
+            )
+            .await
+        });
+        tokio::select! {
+            outcome = &mut mint_task => {
+                anyhow::bail!("mint completed while removal owned the lock: {outcome:?}");
+            }
+            waiting = b605_wait_for_lock_waiter(&pool, holder) => waiting?,
+        }
+        removal.execute("UPDATE tenants SET archived_at = now() WHERE id = $1", &[tenant.as_uuid()]).await?;
+        removal
+            .execute(
+                "UPDATE api_keys SET revoked_at = now() WHERE minted_by = $1",
+                &[&user],
+            )
+            .await?;
+        removal.commit().await?;
+        assert!(
+            mint_task.await?.is_err(),
+            "archive committed before lock release must refuse mint even while membership remains active"
+        );
+        assert!(membership.active.load(std::sync::atomic::Ordering::SeqCst));
+        b605_no_live_keys(&pool, user).await
+    })
+    .await??;
     Ok(())
 }

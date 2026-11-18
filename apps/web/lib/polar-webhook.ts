@@ -225,11 +225,21 @@ export type PlanResolution =
 // cancelled lost the month they had paid for at once, and one who changed their
 // mind stayed on Free. `subscription.revoked` is the event where access ends.
 const REVOKE_EVENT = /\.revoked$/;
-const CANCEL_STATUSES = new Set(["canceled", "revoked", "unpaid"]);
+// Polar statuses that are NOT held and that we expect (B-624). A not-held status
+// outside this set still resolves to free, but is logged: an unknown status on a
+// paying customer is a silent downgrade otherwise.
+const KNOWN_NOT_HELD = new Set([
+	"canceled",
+	"revoked",
+	"unpaid",
+	"incomplete",
+	"incomplete_expired",
+]);
 
 /**
- * Resolve the target plan from a subscription event. A `canceled` / `revoked`
- * / `unpaid` STATUS, or the `.revoked` event → free. A known `lookup_key` →
+ * Resolve the target plan from a subscription event. Any present STATUS that
+ * is not held (held = active, trialing, past_due; B-624), or the `.revoked`
+ * event → free. A known `lookup_key` →
  * that plan + its interval (including a `.canceled` event whose status is
  * still `active` — the plan runs to `ends_at`). Anything else → unknown
  * (caller acks 200 so Polar stops retrying, and logs it; add-on keys are
@@ -240,9 +250,21 @@ export function resolvePlan(opts: {
 	status?: string | null;
 	lookupKey?: string | null;
 }): PlanResolution {
-	const canceled =
-		REVOKE_EVENT.test(opts.eventType) ||
-		(opts.status != null && CANCEL_STATUSES.has(opts.status));
+	// B-624: a present status grants the plan only when the subscription is
+	// HELD — the same set `classifyLive` uses (active, trialing, past_due).
+	// `incomplete` / `incomplete_expired` (first payment not taken) and any
+	// status Polar adds later resolve to free: fail closed on an entitlement.
+	// A MISSING status keeps the previous behaviour (the key decides).
+	const notHeld =
+		opts.status != null &&
+		!(isActiveStatus(opts.status) || isPastDueStatus(opts.status));
+	if (notHeld && !KNOWN_NOT_HELD.has(opts.status as string)) {
+		console.warn(
+			"[polar-webhook] unrecognised subscription status — resolved to free:",
+			logSafe(opts.status),
+		);
+	}
+	const canceled = REVOKE_EVENT.test(opts.eventType) || notHeld;
 	if (canceled) return { kind: "free", lookupKey: "free_v1" };
 
 	const key = opts.lookupKey ?? null;

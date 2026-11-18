@@ -94,3 +94,42 @@ identifying the offending `seq` + which check failed.
 ## Output formats
 
 `text` and `json` carry the full verification report. A PDF format is not available.
+
+## Control-mapping pack
+
+Source-built Rust CLI only; the npm and PyPI verifiers do not provide this command.
+
+```bash
+tracelane-audit evidence-pack --file evidence.zip --pubkey tenant-public-key.txt --out pack/
+```
+
+The command runs the same offline action-ZIP verification as `verify`. If verification fails it exits with the same code and writes nothing. If it passes it writes three files into a new or empty directory: `controls.csv`, `oscal-component-definition.json` (OSCAL 1.1.2) and `summary.html`.
+
+The pack maps a fixed, reviewed list of control topics (`evidence/control-map.json`: EU AI Act Articles 12 and 19, OCC Bulletin 2026-54, the FINOS AI Governance Framework and the RBI FREE-AI report) to what one verified bundle carries. Each row is `partial` or `not covered`, names the bundle evidence and the source line of the check, and states its gap.
+
+**It is a mapping, not an assessment.** It carries no per-record inclusion proof and no signed attestation that a time range holds every record. A verified bundle shows that rows 0 to the signed head are contiguous under the key you supplied; it does not show that every event was recorded. Every output file repeats these limits. Requirement text is paraphrased; read the source before relying on a row.
+
+## Action ZIP timestamps
+
+Gateway timestamp acquisition: **In development, not yet available**. The source-built Rust verifier supports the offline checks below; the npm and PyPI verifiers do not provide this action-ZIP timestamp command.
+
+The Rust action-bundle verifier accepts an optional `checkpoint.tsr` RFC 3161 response. The CLI checks it without network access:
+
+```bash
+tracelane-audit verify --offline --file evidence.zip --pubkey tenant-public-key.txt \
+  --tsa-cert independently-obtained-tsa.der
+```
+
+Repeat `--tsa-cert` for multiple trusted TSA leaf certificates (DER or PEM). Obtain these public certificates independently; certificates embedded in the bundle do not establish trust. A missing token reports `timestamped: false` and JSON `gen_time: null`. A valid token reports `timestamped: true` and the TSA's authenticated generation time. A well-formed token without a matching external TSA pin reports `timestamped: false`, `timestamp_reason: "tsa_unpinned"` and `gen_time: null`. A wrong imprint or malformed token fails. A pin matches only when it is the exact certificate the token binds (issuer, serial and SigningCertificateV2 hash); a token whose binding names no supplied pin reports `tsa_unpinned`, the same as a stripped token, because the bundle manifest is unsigned. When a pin matches, signature, purpose and validity failures fail. A `--tsa-cert` that is not a PEM or DER X.509 certificate is a trust-input error (exit 5). The supported signature algorithms are RSA PKCS#1 SHA-256 and ECDSA P-256 SHA-256, with SHA-256 imprint and SigningCertificateV2 binding.
+
+Certificate validity is checked at generation time, including fractional seconds. Historical tokens can remain valid after a certificate later expires. No online revocation status is fetched or claimed. These options require a local action ZIP. Timestamp validation failures use exit code 4; the tenant checkpoint key's missing/wrong trust uses code 5. Older action-bundle verifier versions reject the new optional member; use a version supporting timestamp responses for these exports.
+
+Bundles also carry `checkpoints.ndjson`: every signed checkpoint for the workspace, in order, ending at the covering head, with optional `timestamps/<sha256 of statement>.tsr` tokens. The verifier checks each signature against the same pinned key, each link to the previous checkpoint, that time and sequence never go backwards, and that an equal sequence never carries a different head hash; any break fails. It reports the number of checkpoints and the longest interval between two. Add `--max-gap SECONDS` to list every longer interval as a gap: a period in which the recorder signed nothing. Set it to your heartbeat cadence plus slack. A gap shows missing signed evidence of liveness; it does not by itself prove that records were lost. An export carries the most recent window of the chain (up to 2000 checkpoints); the report gives the signed start of that window and says whether it reaches the workspace's first checkpoint, and gaps are measured only inside it. A bundle without the member reports the chain as absent, and `--max-gap` on such a bundle fails rather than passing unchecked.
+
+## Action ZIP COSE statement
+
+The gateway includes this member in every action evidence bundle it exports. The source-built Rust verifier supports the offline check below; the npm and PyPI verifiers do not read action ZIPs.
+
+The Rust action-bundle verifier accepts an optional `checkpoint.cose` member: a COSE_Sign1 message (RFC 9052) whose payload is the exact bytes of `checkpoint.json`, signed with the same workspace Ed25519 key. Its protected header carries the algorithm (EdDSA), content type `application/json`, a `kid` equal to the checkpoint `key_id`, and CWT Claims with `iss` (`urn:uuid:<workspace id>`) and `sub` (`tracelane.action-head.v1`). The header layout is aligned to the Signed Statement format of draft-ietf-scitt-architecture-22. It is a signed statement only: there is no Receipt and no Transparency Service registration, and no conformance with that draft is claimed.
+
+The check uses the same external `--pubkey` and no network access. A member that verifies reports `COSE statement: true` (JSON `cose_statement: true`). A bundle without the member reports `false`; the bundle manifest is unsigned, so a removed member cannot be told apart from one never produced. A member that is not the expected encoding of `checkpoint.json` fails with exit code 4, and one whose signature does not verify under the supplied key fails with code 5. `checkpoint.sig` is still required and checked first. Older action-bundle verifier versions reject the new optional member.

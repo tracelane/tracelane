@@ -32,6 +32,7 @@
 # planted temp tree, which is why it is left as-is rather than hardened to $ROOT.
 
 set -euo pipefail
+GUARD_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-raw-ch-exceptions.py"
 
 usage() {
     cat <<'EOF'
@@ -375,6 +376,9 @@ PY
         if { grep -qE '^use clickhouse(::|;)' "$f" 2>/dev/null || \
              grep -qE '\.fetch(_all|_one|_optional)?::<' "$f" 2>/dev/null; } && \
            grep -qE '\.query\s*[<\(]' "$f" 2>/dev/null; then
+            # Resolve test-only modules, or prove each executed read uses its
+            # immutable capped binding. A nearby cap marker is insufficient.
+            if python3 "$GUARD_HELPER" "$f"; then continue; fi
             echo "VIOLATION (rust): $f uses clickhouse crate and calls .query directly" >&2
             echo "  → use crates/gateway/src/clickhouse_query.rs::TenantQuery (ADR-031)" >&2
             violations=$((violations + 1))
@@ -449,6 +453,7 @@ selftest() {
     trap 'rm -rf "$selftest_tmp"' EXIT
 
     echo "no-raw-ch-query.sh --selftest"
+    python3 "$GUARD_HELPER" --selftest || return 2
 
     # 1. NEGATIVE CONTROL — a clean tree must pass, or the guard is a wall.
     _fixture "$tmp/clean" >/dev/null

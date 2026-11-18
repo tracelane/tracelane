@@ -57,13 +57,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	const session = await requireSession();
 
 	// Rate-limit: 20 invites / 5 min per tenant, 10 / 5 min per IP. Cheap burst
-	// suppression; the seat cap is the hard bound (see lib/rate-limit.ts).
+	// suppression shared across isolates; seat eligibility is enforced below.
 	const ip = clientIp(request.headers);
-	if (
-		!rateLimit(`invite:t:${session.tenantId}`, 20, 5 * 60_000) ||
-		!rateLimit(`invite:ip:${ip}`, 10, 5 * 60_000)
-	) {
-		return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+	try {
+		if (
+			!(await rateLimit(`invite:t:${session.tenantId}`, 20, 5 * 60_000)) ||
+			!(await rateLimit(`invite:ip:${ip}`, 10, 5 * 60_000))
+		) {
+			return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+		}
+	} catch {
+		return NextResponse.json(
+			{ error: "rate_limit_unavailable" },
+			{ status: 503 },
+		);
 	}
 
 	let body: InviteBody;

@@ -777,10 +777,15 @@ async fn scores_handler(
     )
     .sql_with_settings();
 
-    let mut query = crate::clickhouse_query::ch_client(url)
-        .query(&sql)
-        .bind(claims.tenant_id.to_string())
-        .bind(hours);
+    let mut query = crate::retention_sweep::read_client(
+        &crate::clickhouse_query::ch_client(url),
+        Some(&state.entitlements),
+        &claims.tenant_id,
+    )
+    .await
+    .query(&sql)
+    .bind(claims.tenant_id.to_string())
+    .bind(hours);
     if let Some(ref t) = q.trace_id {
         query = query.bind(t.clone());
     }
@@ -905,7 +910,12 @@ async fn summary_handler(
         }
     };
 
-    let ch = crate::clickhouse_query::ch_client(url);
+    let ch = crate::retention_sweep::read_client(
+        &crate::clickhouse_query::ch_client(url),
+        Some(&state.entitlements),
+        &claims.tenant_id,
+    )
+    .await;
 
     let scores_sql = crate::clickhouse_query::TenantQuery::new(
         "SELECT toUInt64(countIf(status = 'scored')) AS scored, \

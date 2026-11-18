@@ -74,6 +74,7 @@ pub(crate) fn test_state_with_chain(
         // `semantic_cache`'s module tests rather than implicitly here.
         semantic_cache: None,
         audit_chain: Arc::clone(&audit_chain),
+        action_signer: None,
         rate_limiter: Arc::new(RateLimiter::new()),
 
         quota_ch_url: None,
@@ -101,6 +102,7 @@ pub(crate) fn test_state_with_chain(
         hotpath: crate::hotpath::Config::default(),
         failover: None,
         pg: None,
+        paused_evidence: None,
         // BILL-01: no ClickHouse in the test state, so no meter sink either —
         // the same OSS self-host shape `quota_ch_url: None` above already
         // states. `meters::global()` returning `None` here is what
@@ -1613,6 +1615,52 @@ mod tests {
 
     fn text_of(v: Option<&serde_json::Value>) -> String {
         v.map(serde_json::Value::to_string).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn og38_required_suppresses_allowlisted_capture() {
+        let _bypass = LoopbackBypassGuard::new();
+        let upstream = chat_answering(GWY53_ANSWER).await;
+        let mut state = test_state(registry_pointing_ollama_at(upstream.uri()));
+        state.entitlements = Some(entitlements_with_capture(true, true, false));
+        state
+            .zdr
+            .store(std::sync::Arc::new(crate::zdr::ZdrCapabilities::from_rows(
+                [("ollama".to_owned(), "default".to_owned())],
+            )));
+        let trace_id = uuid::Uuid::new_v4();
+        let mut headers = authed_with_trace(trace_id);
+        headers.insert("x-tracelane-zdr", "required".parse().unwrap());
+        let response = chat_completions_handler(
+            State(state),
+            headers,
+            Json(json!({
+                "model":"ollama/llama3", "messages":[{"role":"user","content":GWY53_PROMPT}]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spans = crate::otlp_emit::test_sink::for_trace(trace_id);
+        let span = spans.first().expect("successful call must emit a span");
+        assert!(
+            span.attributes.gen_ai_input_messages.is_none(),
+            "ZDR must suppress input despite workspace capture"
+        );
+        assert!(
+            span.attributes.gen_ai_output_messages.is_none(),
+            "ZDR must suppress output despite workspace capture"
+        );
+        assert_eq!(span.attributes.gen_ai_usage_input_tokens, Some(3));
+        assert_eq!(span.attributes.gen_ai_usage_output_tokens, Some(5));
+        assert_eq!(
+            span.attributes
+                .extra
+                .get("tracelane_zdr_capture_suppressed"),
+            Some(&json!(true))
+        );
     }
 
     /// Row 1 — the default: a workspace that did not opt in stores no text, and a

@@ -1,0 +1,523 @@
+{
+ "_what": "GWY-60 R7 measurement on the labelled corpus (20 configured + 12 default R7 cases). Both runs used the same corpus bytes (corpus_blake3); 'before' is the pre-GWY-60 substring matcher (HEAD r7_topic_competitor.rs restored for one run), 'after' is the whole-word, whitespace-normalised matcher.",
+ "date_utc": "2026-11-15",
+ "command": "cargo test -p gateway --bin gateway -- labelled_r7 --nocapture",
+ "corpus_blake3": "082097dbe21a2b4390bd3ef9d7f4978eddbaa154eb4c80f4cb7151d5881959c7",
+ "before": {
+  "profiles": [
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 3,
+     "fp": 5,
+     "not_applicable": 1,
+     "tn": 5,
+     "tp": 7
+    },
+    "false_negative_rate": 0.3,
+    "false_positive_rate": 0.5,
+    "n": 20,
+    "profile": "configured"
+   },
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 6,
+     "fp": 0,
+     "not_applicable": 12,
+     "tn": 6,
+     "tp": 0
+    },
+    "false_negative_rate": 1.0,
+    "false_positive_rate": 0.0,
+    "n": 12,
+    "profile": "default"
+   }
+  ],
+  "predictions": [
+   {
+    "id": "r7_denied_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_denied_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_case_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_case_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_competitor_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_competitor_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_response_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_response_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_spacing_configured",
+    "outcome": "allow",
+    "positive": true,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_spacing_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_paraphrase_configured",
+    "outcome": "allow",
+    "positive": true,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_paraphrase_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_clean_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_clean_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_compound_configured",
+    "outcome": "redact",
+    "positive": false,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_compound_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_empty_configured",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_empty_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_unicode_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_unicode_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_partial_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_partial_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_ordinary_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_possessive_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_parenthesised_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_newline_split_configured",
+    "outcome": "allow",
+    "positive": true,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_sentence_end_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_prefix_compound_configured",
+    "outcome": "redact",
+    "positive": false,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_identifier_configured",
+    "outcome": "redact",
+    "positive": false,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_prefixed_topic_configured",
+    "outcome": "block",
+    "positive": false,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_plural_compound_configured",
+    "outcome": "redact",
+    "positive": false,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_ordinary_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   }
+  ]
+ },
+ "after": {
+  "profiles": [
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 1,
+     "fp": 0,
+     "not_applicable": 1,
+     "tn": 10,
+     "tp": 9
+    },
+    "false_negative_rate": 0.1,
+    "false_positive_rate": 0.0,
+    "n": 20,
+    "profile": "configured"
+   },
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 6,
+     "fp": 0,
+     "not_applicable": 12,
+     "tn": 6,
+     "tp": 0
+    },
+    "false_negative_rate": 1.0,
+    "false_positive_rate": 0.0,
+    "n": 12,
+    "profile": "default"
+   }
+  ],
+  "predictions": [
+   {
+    "id": "r7_denied_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_denied_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_case_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_case_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_competitor_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_competitor_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_response_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_response_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_spacing_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_spacing_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_paraphrase_configured",
+    "outcome": "allow",
+    "positive": true,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_paraphrase_default",
+    "outcome": "not_applicable",
+    "positive": true,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_clean_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_clean_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_compound_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_compound_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_empty_configured",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_empty_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_unicode_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_unicode_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_partial_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_partial_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   },
+   {
+    "id": "r7_ordinary_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_possessive_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_parenthesised_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_newline_split_configured",
+    "outcome": "block",
+    "positive": true,
+    "profile": "configured",
+    "reason": "TOPIC_DENIED"
+   },
+   {
+    "id": "r7_sentence_end_configured",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "configured",
+    "reason": "COMPETITOR_MENTION"
+   },
+   {
+    "id": "r7_prefix_compound_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_identifier_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_prefixed_topic_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_plural_compound_configured",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "configured",
+    "reason": null
+   },
+   {
+    "id": "r7_ordinary_default",
+    "outcome": "not_applicable",
+    "positive": false,
+    "profile": "default",
+    "reason": null
+   }
+  ]
+ },
+ "remaining_miss": "r7_paraphrase_configured: a semantic paraphrase of a forbidden topic. A term list cannot catch it; that needs a classifier (later slice)."
+}

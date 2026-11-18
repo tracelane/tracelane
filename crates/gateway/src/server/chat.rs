@@ -547,6 +547,8 @@ async fn chat_completions_handler_with_labels(
         super::config::trace_content(),
         entitlements.as_deref().map(|e| e.content_capture),
         tenant_id,
+        claims.key_capture,
+        Some(&headers),
     );
     let cache_end_user = identity.end_user_id.clone();
     let cache_caller = crate::cache_controls::CacheCaller {
@@ -1116,7 +1118,7 @@ async fn chat_completions_handler_with_labels(
     // OG-51 / OG-38: a request that REQUIRES zero data retention neither reads from nor writes
     // into the response cache — a stored answer is a retained answer, on both tiers.
     let cache_policy = if zdr_constraint.is_some() {
-        cache_policy.suspend()
+        cache_policy.suspend_for_zdr()
     } else {
         cache_policy
     };
@@ -1194,6 +1196,7 @@ async fn chat_completions_handler_with_labels(
         let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
+                zdr_required: headers.contains_key("x-tracelane-zdr"),
                 tenant_id,
                 api_key_id: claims.api_key_id(),
                 project_id: claims.governance.as_ref().and_then(|g| g.project_id),

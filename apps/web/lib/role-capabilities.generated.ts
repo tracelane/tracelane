@@ -24,7 +24,9 @@ export type CapabilitySlug =
 	| "manage_security"
 	| "read_control_audit"
 	| "manage_controls"
-	| "grant_admin_scope";
+	| "grant_admin_scope"
+	| "manage_mcp"
+	| "approve_tool_calls";
 
 export type RoleFlags = {
 	admin: boolean;
@@ -183,6 +185,20 @@ export const ROLE_CAPABILITIES: Record<CapabilitySlug, RoleFlags> = {
 		unrecognised: false,
 	},
 	grant_admin_scope: {
+		admin: true,
+		developer: false,
+		viewer: false,
+		billing: false,
+		unrecognised: false,
+	},
+	manage_mcp: {
+		admin: true,
+		developer: false,
+		viewer: false,
+		billing: false,
+		unrecognised: false,
+	},
+	approve_tool_calls: {
 		admin: true,
 		developer: false,
 		viewer: false,

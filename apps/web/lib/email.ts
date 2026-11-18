@@ -75,6 +75,11 @@ export async function sendEmail(input: SendEmailInput): Promise<boolean> {
 				...(input.replyTo ? { reply_to: input.replyTo } : {}),
 			}),
 		});
+		// 409 under an Idempotency-Key: Resend already holds a message for this key
+		// (a lost response, or a retry whose body drifted). The message exists, so it is
+		// delivered from the caller's point of view; re-sending is exactly what the key
+		// forbids. Without a key a 409 stays a failure.
+		if (res.status === 409 && input.idempotencyKey) return true;
 		if (!res.ok) {
 			// Never log the response body — provider error JSON can echo the
 			// request, and this runs on the same paths `.claude/rules/security.md`'s

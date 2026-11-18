@@ -18,9 +18,11 @@
 //!   `exception_type` / `exception_message` (never duplicated when the span already carries
 //!   one, as a decoded span does).
 //! - **Content** — with `include_content = false` the content-bearing attributes
-//!   ([`CONTENT_ATTRIBUTES`]) and the exception message are NOT encoded at all: they are
-//!   skipped while the attributes are walked, never copied and then removed. `true` exports
-//!   only what the span already holds — a span captured with content OFF carries none.
+//!   ([`CONTENT_ATTRIBUTES`]), status text and content-bearing event values are omitted.
+//!   Untyped extra attributes retain only numbers, booleans and arrays of those values;
+//!   event text is limited to explicit metadata keys and unknown event names become `event`.
+//!   Typed span metadata, operation names and identifiers remain: this is not anonymization.
+//!   `true` preserves the recorded span, including its captured content.
 //!
 //! Pure and allocation-bounded by the span: no I/O, no clock, no global state.
 
@@ -59,6 +61,39 @@ pub const CONTENT_ATTRIBUTES: &[&str] = &[
     "tracelane_retrieval_documents",
     "exception_message",
 ];
+
+/// A content key is denied before considering its JSON shape, so numbers or
+/// objects cannot bypass the same boundary that drops text.
+fn content_attribute(key: &str) -> bool {
+    CONTENT_ATTRIBUTES.contains(&key)
+        || super::content::is_content_key(key)
+        || matches!(
+            key,
+            "exception.message" | "exception.stacktrace" | "explanation"
+        )
+        || key.ends_with(".explanation")
+}
+
+fn non_text_metadata(value: &Value) -> bool {
+    match value {
+        Value::Number(_) | Value::Bool(_) => true,
+        Value::Array(values) => values.iter().all(|v| v.is_number() || v.is_boolean()),
+        _ => false,
+    }
+}
+
+fn event_metadata(key: &str, value: &Value) -> bool {
+    if content_attribute(key) {
+        return false;
+    }
+    match key {
+        "exception.type"
+        | "gen_ai.evaluation.name"
+        | "score.label"
+        | "gen_ai.evaluation.score.label" => value.is_string(),
+        _ => non_text_metadata(value),
+    }
+}
 
 /// Attributes that become structure rather than a plain attribute.
 const STRUCTURAL: &[&str] = &[
@@ -205,11 +240,16 @@ pub fn encode_span(span: &TracelaneSpan, include_content: bool) -> Span {
             if STRUCTURAL.contains(&field.as_str()) {
                 continue;
             }
-            if !include_content && CONTENT_ATTRIBUTES.contains(&field.as_str()) {
+            let key = export_key(field);
+            if !include_content
+                && (content_attribute(field)
+                    || content_attribute(&key)
+                    || (span.attributes.extra.contains_key(field) && !non_text_metadata(value)))
+            {
                 continue;
             }
             if let Some(v) = to_any(value) {
-                attributes.push(kv(export_key(field), v));
+                attributes.push(kv(key, v));
             }
         }
     }
@@ -223,11 +263,17 @@ pub fn encode_span(span: &TracelaneSpan, include_content: bool) -> Span {
         .flatten()
         .map(|e| Event {
             time_unix_nano: e.time_unix_us.saturating_mul(1000),
-            name: e.name.clone(),
+            name: if include_content
+                || matches!(e.name.as_str(), "exception" | "gen_ai.evaluation.result")
+            {
+                e.name.clone()
+            } else {
+                "event".to_owned()
+            },
             attributes: e
                 .attributes
                 .iter()
-                .filter(|(k, _)| include_content || k.as_str() != "exception.message")
+                .filter(|(k, v)| include_content || event_metadata(k, v))
                 .filter_map(|(k, v)| to_any(v).map(|v| kv(k.clone(), v)))
                 .collect(),
             dropped_attributes_count: 0,
@@ -286,7 +332,11 @@ pub fn encode_span(span: &TracelaneSpan, include_content: bool) -> Span {
                 SpanStatusCode::Error => OtlpCode::Error as i32,
                 SpanStatusCode::Unset => OtlpCode::Unset as i32,
             },
-            message: span.status.message.clone().unwrap_or_default(),
+            message: if include_content {
+                span.status.message.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
         }),
         ..Default::default()
     }
@@ -341,6 +391,124 @@ pub fn encode_request(span: &TracelaneSpan, include_content: bool) -> ExportTrac
 
 #[cfg(test)]
 mod tests {
+
+    /// Every text-capable `SpanAttributes` field is CLASSIFIED: in `CONTENT_ATTRIBUTES`
+    /// (dropped when content is off) or in this reviewed list (exported, then PII-redacted by
+    /// the gateway tap). Typed fields use a denylist, so an unclassified new field would export
+    /// by default — the default-open shape of `.claude/rules/tenancy.md`. Security review of
+    /// #236, finding B. Reviewed 2026-11-10: none of these holds customer content.
+    #[test]
+    fn every_text_field_of_span_attributes_is_classified() {
+        const REVIEWED_NON_CONTENT: &[&str] = &[
+            "tracelane_metadata",
+            "tracelane_tags",
+            "tracelane_labels_dropped",
+            "otlp_pending",
+            "exception_type",
+            "tracelane_events",
+            "tracelane_links",
+            "gen_ai_system",
+            "gen_ai_request_model",
+            "gen_ai_operation_name",
+            "gen_ai_provider_name",
+            "gen_ai_response_model",
+            "gen_ai_response_id",
+            "gen_ai_response_finish_reasons",
+            "tracelane_model_substitution",
+            "gen_ai_agent_name",
+            "tracelane_client_name",
+            "tracelane_agent_name_source",
+            "tracelane_usage_cost_origin",
+            "tracelane_semantic_cache_tier",
+            "tracelane_eval_run_id",
+            "tracelane_experiment_id",
+            "tracelane_eval_role",
+            "tracelane_semantic_cache_source_trace_id",
+            "tracelane_api_key_id",
+            "tracelane_project_id",
+            "tracelane_rejection_reason",
+            "gen_ai_agent_version",
+            "gen_ai_conversation_id",
+            "openinference_span_kind",
+            "gen_ai_tool_call_id",
+            "gen_ai_tool_call_arg_fp",
+            "error_type",
+            "service_name",
+            "service_version",
+            "deployment_environment",
+            "tracelane_attrs_dropped",
+            "tracelane_content_withheld",
+            "tracelane_aft_id",
+            "tracelane_intervention",
+            "tracelane_failover_from",
+            "tracelane_dispatch_attempts",
+            "tracelane_mcp_tool_hash",
+            "tracelane_mcp_server_url",
+            "tracelane_kya_agent_id",
+            "tracelane_kya_human_authorizer",
+            "tracelane_business_reference",
+            "user_id",
+            "tracelane_request_tool_choice_mode",
+            "tracelane_request_tool_choice_function",
+            "tracelane_request_tool_names",
+            "tracelane_response_tool_names",
+            "tracelane_response_tool_arg_fps",
+            "tracelane_zdr_eligible_providers",
+            "tracelane_request_tool_definitions_hash",
+            "tracelane_request_deployment_id",
+            "tracelane_request_extra_keys",
+            "tracelane_misconfig_flags",
+            "extra",
+        ];
+        let src = include_str!("../span.rs");
+        let start = src
+            .find("pub struct SpanAttributes {")
+            .expect("SpanAttributes in span.rs");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end of SpanAttributes")];
+        let mut scanned = 0;
+        let mut unclassified = Vec::new();
+        for line in body.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            if name.contains(' ') || name.contains('(') {
+                continue; // `pub struct …` header, not a field
+            }
+            scanned += 1;
+            let text_capable = [
+                "String",
+                "Value",
+                "SpanEvent",
+                "SpanLink",
+                "RetrievalDocument",
+                "Intervention",
+                "DispatchAttempt",
+                "PendingAttributes",
+                "Dropped",
+            ]
+            .iter()
+            .any(|t| ty.contains(t));
+            if text_capable
+                && !CONTENT_ATTRIBUTES.contains(&name)
+                && !REVIEWED_NON_CONTENT.contains(&name)
+            {
+                unclassified.push(name.to_owned());
+            }
+        }
+        assert!(
+            scanned >= 100,
+            "scanned {scanned} fields: the parser lost the struct"
+        );
+        assert!(
+            unclassified.is_empty(),
+            "classify these SpanAttributes fields as CONTENT_ATTRIBUTES (dropped when content is \
+             off) or REVIEWED_NON_CONTENT (exported, PII-redacted): {unclassified:?}"
+        );
+    }
+
     use super::*;
     use crate::otlp::decode::map_otlp_to_tracelane_spans;
     use crate::{SpanAttributes, SpanStatus, TenantId};
@@ -521,6 +689,120 @@ mod tests {
         bare.attributes.exception_message = None;
         let t = String::from_utf8_lossy(&encode_request(&bare, true).encode_to_vec()).into_owned();
         assert!(!t.contains("secret"));
+    }
+
+    #[test]
+    fn no_content_export_omits_status_events_and_untyped_text_from_entire_protobuf() {
+        let mut s = span();
+        s.status.message = Some("PRIVATE_STATUS_921".into());
+        s.attributes.extra.insert(
+            "custom.payload".into(),
+            serde_json::json!({"text": "PRIVATE_EXTRA_921"}),
+        );
+        s.attributes
+            .extra
+            .insert("custom.count".into(), serde_json::json!(17));
+        s.attributes.tracelane_events = Some(vec![
+            crate::span::SpanEvent { name: "exception".into(), time_unix_us: 11, attributes: [
+                ("exception.type".into(), serde_json::json!("ValueError")),
+                ("exception.message".into(), serde_json::json!("PRIVATE_MESSAGE_921")),
+                ("exception.stacktrace".into(), serde_json::json!("PRIVATE_STACK_921")),
+                ("custom.count".into(), serde_json::json!(3)),
+                ("exception.escaped".into(), serde_json::json!(true)),
+            ].into() },
+            crate::span::SpanEvent { name: "gen_ai.evaluation.result".into(), time_unix_us: 12, attributes: [
+                ("explanation".into(), serde_json::json!("PRIVATE_EXPLANATION_921")),
+                ("gen_ai.evaluation.explanation".into(), serde_json::json!({"text": "PRIVATE_NESTED_921"})),
+                ("gen_ai.evaluation.score.value".into(), serde_json::json!(0.8)),
+                ("gen_ai.evaluation.name".into(), serde_json::json!("quality")),
+            ].into() },
+            crate::span::SpanEvent { name: "PRIVATE_EVENT_NAME_921".into(), time_unix_us: 13, attributes: [
+                ("custom.payload".into(), serde_json::json!(["PRIVATE_EVENT_ARRAY_921", {"text":"PRIVATE_EVENT_OBJECT_921"}])),
+            ].into() },
+        ]);
+        let off = encode_request(&s, false).encode_to_vec();
+        let on = encode_request(&s, true).encode_to_vec();
+        for secret in [
+            "PRIVATE_STATUS_921",
+            "PRIVATE_EXTRA_921",
+            "PRIVATE_MESSAGE_921",
+            "PRIVATE_STACK_921",
+            "PRIVATE_EXPLANATION_921",
+            "PRIVATE_NESTED_921",
+            "PRIVATE_EVENT_NAME_921",
+            "PRIVATE_EVENT_ARRAY_921",
+            "PRIVATE_EVENT_OBJECT_921",
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&off).contains(secret),
+                "{secret} leaked"
+            );
+            assert!(
+                String::from_utf8_lossy(&on).contains(secret),
+                "content-on lost {secret}"
+            );
+        }
+        let encoded = encode_span(&s, false);
+        assert_eq!(
+            encoded.status.as_ref().unwrap().code,
+            OtlpCode::Error as i32
+        );
+        assert!(encoded.status.as_ref().unwrap().message.is_empty());
+        assert!(matches!(
+            attr(&encoded, "custom.count").and_then(|v| v.value.as_ref()),
+            Some(V::IntValue(17))
+        ));
+        assert!(
+            encoded.events[0]
+                .attributes
+                .iter()
+                .any(|a| a.key == "exception.type")
+        );
+        assert!(
+            encoded.events[0]
+                .attributes
+                .iter()
+                .any(|a| a.key == "custom.count")
+        );
+        assert!(
+            encoded.events[1]
+                .attributes
+                .iter()
+                .any(|a| a.key == "gen_ai.evaluation.score.value")
+        );
+        assert_eq!(encoded.events[2].name, "event");
+    }
+
+    #[test]
+    fn no_content_event_keys_cannot_bypass_filter_with_numeric_or_structured_values() {
+        for value in [
+            serde_json::json!("private"),
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!([1, true]),
+            serde_json::json!({"private": 1}),
+            serde_json::Value::Null,
+        ] {
+            let mut s = span();
+            s.attributes.tracelane_events = Some(vec![crate::span::SpanEvent {
+                name: "gen_ai.evaluation.result".into(),
+                time_unix_us: 1,
+                attributes: [
+                    "exception.message",
+                    "exception.stacktrace",
+                    "explanation",
+                    "gen_ai.evaluation.explanation",
+                    "gen_ai.input.messages",
+                ]
+                .into_iter()
+                .map(|key| (key.into(), value.clone()))
+                .collect(),
+            }]);
+            assert!(
+                encode_span(&s, false).events[0].attributes.is_empty(),
+                "content key retained for {value}"
+            );
+        }
     }
 
     #[test]

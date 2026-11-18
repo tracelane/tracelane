@@ -13,6 +13,7 @@ pub(crate) struct Context {
     end_user: Option<String>,
     labels: tracelane_shared::labels::Labels,
     zdr: bool,
+    approval: Option<(Arc<crate::entitlement_cache::ResolvedEntitlements>, bool)>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -64,11 +65,21 @@ impl Context {
                 &state.rate_card.load().policy.request_labels,
             )
             .0,
+            approval: None,
             zdr: matches!(
                 crate::zdr::constraint_from_headers(headers),
                 Ok(Some(crate::zdr::Constraint::Required))
             ),
         }
+    }
+
+    pub(crate) fn with_approval(
+        mut self,
+        ent: Option<Arc<crate::entitlement_cache::ResolvedEntitlements>>,
+        approved: bool,
+    ) -> Self {
+        self.approval = ent.map(|e| (e, approved));
+        self
     }
 
     pub(crate) async fn check(
@@ -161,6 +172,38 @@ impl Context {
         let resolve = |m: &str, ws| {
             crate::admission::routed_policy_resolve(m, ws, ent.as_deref(), self.plan.as_deref())
         };
+        if let Some(snapshot) = ent.as_ref().and_then(|e| e.mcp.as_ref()) {
+            let names = resolve(model, false).names;
+            let key = claims
+                .api_key_id()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok());
+            if snapshot.model_rules.iter().any(|r| {
+                r.key_id.is_none_or(|k| Some(k) == key)
+                    && names
+                        .iter()
+                        .any(|n| tracelane_shared::key_policy::glob_match(&r.model_glob, n))
+            }) {
+                let authorised = self.approval.as_ref().is_some_and(|(original, approved)| {
+                    let fresh = self.state.entitlements.as_ref().is_some_and(|cache| {
+                        cache.is_current(*claims.tenant_id.as_uuid(), original)
+                    });
+                    let request = crate::mcp_policy::resolved_request(
+                        self.request.clone(),
+                        Some(original),
+                        self.plan.as_deref(),
+                    );
+                    *approved
+                        && fresh
+                        && request.subjects.iter().any(|s| match &s.model {
+                            Fact::Known(n) => names.contains(n),
+                            _ => false,
+                        })
+                });
+                if !authorised {
+                    return Err(denied(403, "approval_required"));
+                }
+            }
+        }
         let controls = ent.as_ref().map(|e| e.controls.as_ref());
         if let Some(c) = controls {
             crate::controls::check_request(c, &request, self.end_user.as_deref(), &resolve)

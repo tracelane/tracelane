@@ -108,8 +108,8 @@ pub(crate) use quota::{
 };
 pub(crate) use spans::{
     CallerIdentity, CapturedInput, CapturedOutput, GatewayTiming, RequestConfig, RouteMeta,
-    ServedMeta, SpanUsageMeta, build_gateway_span, build_prompt_resolution_span, record_key_spend,
-    spawn_span_publish,
+    ServedMeta, SpanUsageMeta, bounded_tool_names, build_gateway_span,
+    build_prompt_resolution_span, record_key_spend, spawn_span_publish, store_safe,
 };
 #[allow(unused_imports)]
 pub(crate) use stream::DROP_COUNTER_TEST_LOCK;
@@ -196,6 +196,7 @@ pub struct AppState {
     /// to somebody who never asked for one.
     pub semantic_cache: Option<Arc<crate::semantic_cache::SemanticCache>>,
     pub audit_chain: Arc<AuditChain>,
+    pub action_signer: Option<Arc<crate::action_control::execution::AttestationSigner>>,
     pub rate_limiter: Arc<RateLimiter>,
     /// ClickHouse URL the GWY-43 per-key/workspace spend baselines rehydrate
     /// from on (re)start / month rollover, so a restart or blue-green deploy
@@ -286,6 +287,9 @@ pub struct AppState {
     /// the same pool for the readers not yet converted; the static is deleted
     /// when its last reader is gone (migrate → contract).
     pub pg: Option<crate::db::DbPool>,
+    /// ACT-06a: queue for signed pause-refusal evidence; `Some` iff `pg` is. Its ONE worker is
+    /// spawned at boot.
+    pub paused_evidence: Option<crate::action_control::paused_evidence::PausedEvidence>,
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -542,18 +546,42 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             );
         }
     }
+    // AUD-32: signed liveness checkpoints. Unset = off. A bad value refuses boot (it is
+    // operator config, and a silent default would either keep Neon awake or never beat).
+    let heartbeat_raw = std::env::var("TRACELANE_ACTION_HEARTBEAT_SECS").ok();
+    if let Some(period) = crate::action_control::heartbeat::period_from(heartbeat_raw.as_deref())? {
+        match (pg.clone(), tenant_audit_keys.clone(), entitlements.clone()) {
+            (Some(pool), Some(keys), Some(cache)) => {
+                crate::action_control::heartbeat::spawn(pool, keys, cache, period);
+                tracing::info!(period_secs = period.as_secs(), "action heartbeat enabled");
+            }
+            _ => tracing::warn!(
+                "TRACELANE_ACTION_HEARTBEAT_SECS set but Postgres, the BYOK master key or the \
+                 entitlement cache is unavailable; heartbeats are OFF"
+            ),
+        }
+    }
 
     let rekor_key_b64 = config
         .rekor_signing_key
         .as_ref()
         .map(secrecy::ExposeSecret::expose_secret);
+    let action_key = std::env::var_os("TRACELANE_ACTION_ATTESTATION_KEY")
+        .map(|v| {
+            v.into_string()
+                .map(secrecy::SecretString::from)
+                .map_err(|_| anyhow::anyhow!("attestation_signer_unavailable"))
+        })
+        .transpose()?;
+    let action_signer =
+        crate::action_control::execution::AttestationSigner::configured(action_key, rekor_key_b64)?;
     let audit_chain = Arc::new(
         AuditChain::with_tenant_keys(
             config.rekor_anchor_every,
             rekor_key_b64,
             config.clickhouse_url.as_deref(),
             pg.clone(),
-            tenant_audit_keys,
+            tenant_audit_keys.clone(),
         )
         .context("failed to initialise audit chain")?,
     );
@@ -1027,10 +1055,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // `nats` client the rest of the gateway uses (`crates/gateway/src/rejection_metrics.rs`).
     let rejection_metrics = Arc::new(crate::rejection_metrics::RejectionRegistry::new());
     crate::rejection_metrics::spawn(Arc::clone(&rejection_metrics), nats.clone());
+    let paused_evidence = match pg.clone() {
+        Some(pool) => {
+            let (handle, rx) = crate::action_control::paused_evidence::PausedEvidence::new()?;
+            crate::action_control::paused_evidence::spawn_worker(
+                handle.clone(),
+                rx,
+                pool,
+                Arc::clone(&audit_chain),
+            );
+            Some(handle)
+        }
+        None => None,
+    };
     let state = AppState {
         providers,
         semantic_cache,
         audit_chain,
+        action_signer: action_signer.map(Arc::new),
         rate_limiter,
         quota_ch_url: config.clickhouse_url.clone(),
         meters,
@@ -1054,6 +1096,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         hotpath: crate::hotpath::Config::from_env(),
         failover: self::config::failover(),
         pg,
+        paused_evidence,
     };
 
     // `/health` is mounted LAST, outside the admission layers (B-389) — see the
@@ -1325,7 +1368,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     "audit export reads the canonical ledger (Postgres); the summary reads the ClickHouse copy"
                 );
                 std::sync::Arc::new(
-                    crate::audit_export::PgExportReader::new(pool).with_summary_copy(ch_reader),
+                    crate::audit_export::PgExportReader::new(pool)
+                        .with_action_keys(tenant_audit_keys.clone())
+                        .with_tsa_certs(crate::checkpoint_timestamp::load_pins().unwrap_or_else(|_| {
+                            tracelane_shared::degradation::note(tracelane_shared::degradation::Degradation::CheckpointTimestampFailed);
+                            // Fail OPEN (rule 10): no pins means tokens report `tsa_unpinned`
+                            // and exports still verify; the counter says the pins are broken.
+                            Vec::new()
+                        }))
+                        .with_summary_copy(ch_reader),
                 )
             }
             None => std::sync::Arc::new(ch_reader),
@@ -1506,12 +1557,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         app = app.merge(crate::routing::routes::router(state.clone()));
         // GWY-53: the owner's content-capture opt-in, ledgered. Same Postgres gate.
         app = app.merge(crate::workspace_capture_routes::router(state.clone()));
+        app = app.merge(crate::mcp_proxy::router(state.clone()));
+        app = app.merge(crate::mcp_routes::router(state.clone()));
+        if let Some(pool) = &state.pg {
+            crate::approvals::spawn_sweeper(pool.clone(), Arc::clone(&state.audit_chain));
+            crate::mcp_inspection::spawn_flusher(pool.clone());
+            crate::checkpoint_timestamp::spawn(pool.clone());
+        }
         // OG-51: the workspace's response-cache controls (mode, TTL, namespace, invalidate).
         app = app.merge(crate::cache_routes::router(state.clone()));
+        app = app.merge(crate::data_controls_routes::router(state.clone()));
         // OG-50: the workspace's OTLP span exports, and the ONE background task that serves them
         // (directory refresh + status flush), off the request path.
         app = app.merge(crate::otel_export_routes::router(state.clone()));
         crate::otel_export::spawn(pg.clone(), state.entitlements.clone());
+        crate::siem_export::worker::spawn(
+            pg.clone(),
+            config
+                .clickhouse_url
+                .as_ref()
+                .map(crate::clickhouse_query::ch_client),
+            state.entitlements.clone(),
+        );
 
         // The WRITE path for R3 rug-pull detection. The read path
         // (registry_loader), the table and the comparison all shipped earlier;
@@ -1608,7 +1675,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         app = app.merge(crate::annotation_routes::routes().with_state(ann_state));
         tracing::info!(
             "annotations mounted at /v1/traces/{{trace_id}}/annotations; \
-             EVL-29 queues at /v1/annotation-queues/*"
+             annotation queues at /v1/annotation-queues/*"
         );
 
         // DSH-01 in-app inbox. Same Postgres gate.
@@ -2288,6 +2355,18 @@ pub(crate) fn health_body(
     })
 }
 
+/// Public health is an allowlist: future operator fields must stay private.
+fn health_summary(full: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": full["status"],
+        "service": full["service"],
+        "capture_healthy": full["capture_healthy"],
+        "spans_dropped": full["spans_dropped"],
+        "degraded_open": full["degraded_open"],
+        "audit_attestation_healthy": full["audit_attestation_healthy"],
+    })
+}
+
 #[instrument]
 
 /// A1 — capture completeness, exposed where an operator can actually see it.
@@ -2308,6 +2387,15 @@ pub(crate) fn health_body(
 ///   STICKY: once anything has been lost, this stays false until the process restarts,
 ///   because "we lost data" does not stop being true when the cause clears.
 async fn health_handler() -> impl IntoResponse {
+    Json(health_summary(&current_health_body()))
+}
+
+/// Operator detail is mounted only on the separate metrics listener.
+pub(crate) async fn health_detail_handler() -> impl IntoResponse {
+    Json(current_health_body())
+}
+
+fn current_health_body() -> serde_json::Value {
     use tracelane_shared::degradation::{Degradation, count};
     let capture_enabled = CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     // Both drop causes, summed: "publish was never wired" and "publish was wired and
@@ -2330,11 +2418,7 @@ async fn health_handler() -> impl IntoResponse {
         count(Degradation::AuditAgeSweepSkipped),
         tracelane_shared::degradation::is_open(Degradation::AuditAgeSweepSkipped),
     );
-    Json(health_body(
-        capture_enabled,
-        spans_dropped,
-        audit_backfill_failures,
-    ))
+    health_body(capture_enabled, spans_dropped, audit_backfill_failures)
 }
 
 /// TEST-ONLY: `/v1/auth/whoami` alone, for a test that mounts it behind the real B-594 layer.
@@ -2435,6 +2519,135 @@ pub(crate) use embeddings::embeddings_handler;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn health_unmarked_public_and_head_preserve_liveness() {
+        use tower::ServiceExt;
+        let router = Router::new().route("/health", get(health_handler));
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in [
+            "spans_stream",
+            "audit_backlog",
+            "byok_ring",
+            "prompt_guard_configured",
+            "degraded",
+        ] {
+            assert!(
+                body.get(key).is_none(),
+                "unmarked public request leaked {key}"
+            );
+        }
+        assert_eq!(body.as_object().unwrap().len(), 6);
+        for proxied in [false, true] {
+            let mut request = axum::http::Request::builder().method("HEAD").uri("/health");
+            if proxied {
+                request = request.header("Forwarded", "");
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn health_summary_preserves_values_and_rejects_future_fields() {
+        for (capture, dropped, failures) in [(true, 0, 0), (false, 0, 0), (true, 7, 3)] {
+            let mut full = health_body(capture, dropped, failures);
+            full["future_private_field"] = serde_json::json!({"private": "sentinel"});
+            let summary = health_summary(&full);
+            assert_eq!(summary.as_object().unwrap().len(), 6);
+            for key in [
+                "status",
+                "service",
+                "capture_healthy",
+                "spans_dropped",
+                "degraded_open",
+                "audit_attestation_healthy",
+            ] {
+                assert_eq!(summary[key], full[key], "changed {key}");
+            }
+            assert!(summary.get("future_private_field").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn health_proxy_markers_hide_operator_details() {
+        use tower::ServiceExt;
+        for header in [
+            "Cf-Connecting-Ip",
+            "X-Forwarded-For",
+            "Forwarded",
+            "X-Real-Ip",
+            "cF-cOnNeCtInG-iP",
+        ] {
+            for value in ["", "192.0.2.1"] {
+                let response = Router::new()
+                    .route("/health", get(health_handler))
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/health")
+                            .header(header, value)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                for private in [
+                    "spans_stream",
+                    "audit_backlog",
+                    "byok_ring",
+                    "prompt_guard_configured",
+                    "degraded",
+                ] {
+                    assert!(body.get(private).is_none(), "{header}: leaked {private}");
+                }
+                let keys: Vec<_> = body
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    keys,
+                    [
+                        "audit_attestation_healthy",
+                        "capture_healthy",
+                        "degraded_open",
+                        "service",
+                        "spans_dropped",
+                        "status"
+                    ]
+                );
+            }
+        }
+    }
 
     // ── A1: capture completeness ────────────────────────────────────────────
     // The gateway used to answer 200 while dropping every span, and nothing said

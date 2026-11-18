@@ -67,9 +67,14 @@ describe("isProxiedControlRoute", () => {
 		);
 		expect(writes).toContain("POST controls/pause");
 		expect(writes).toContain("POST controls/revoke-all-keys");
-		// Routing and guardrail policy are whole-document editors: read-only here. Only the
-		// cache (OG-51) and OTel export (OG-50) pages write, and only these routes.
-		expect(writes.some((w) => /routing|guardrails/.test(w))).toBe(false);
+		// Whole-document editors use only their exact PUT paths.
+		expect(writes.filter((w) => /routing|guardrails/.test(w)).sort()).toEqual([
+			// Guardrail integrations: one hook per id, created or removed whole.
+			"DELETE guardrails/hooks/*",
+			"PUT guardrails/hooks/*",
+			"PUT guardrails/policy",
+			"PUT routing",
+		]);
 		expect(writes.filter((w) => /cache|exports/.test(w)).sort()).toEqual([
 			"DELETE exports/otel/*",
 			"PATCH exports/otel/*",
@@ -82,6 +87,21 @@ describe("isProxiedControlRoute", () => {
 });
 
 describe("describeRefusal", () => {
+	it("explains an approval digest the server could not honour", () => {
+		const r = describeRefusal(400, { error: "descriptor_unsupported" });
+		expect(r.kind).toBe("invalid");
+		expect(r.message).toMatch(/can't be decided from this view/);
+	});
+	it("explains a request whose details are past retention", () => {
+		const r = describeRefusal(409, { error: "descriptor_expired" });
+		expect(r.kind).toBe("conflict");
+		expect(r.message).toMatch(/past retention/);
+	});
+	it("asks for a re-review when the bound request changed", () => {
+		const r = describeRefusal(409, { error: "descriptor_mismatch" });
+		expect(r.kind).toBe("conflict");
+		expect(r.message).toMatch(/changed/);
+	});
 	it("names the role a 403 needs", () => {
 		const r = describeRefusal(403, {
 			error: "role_forbidden",
@@ -214,5 +234,29 @@ describe("policy form <-> document", () => {
 		expect(summarizePolicy(null)).toMatch(/not restricted/);
 		expect(summarizePolicy(doc)).toMatch(/600 req\/min/);
 		expect(summarizePolicy(doc)).toMatch(/\$500 rolling_7d \(soft\)/);
+	});
+});
+
+describe("guardrail hook routes", () => {
+	it("proxies the guardrail hook routes", () => {
+		const id = "11111111-1111-4111-8111-111111111111";
+		expect(isProxiedControlRoute("GET", "guardrails/hooks")).toBe(true);
+		expect(isProxiedControlRoute("PUT", `guardrails/hooks/${id}`)).toBe(true);
+		expect(isProxiedControlRoute("DELETE", `guardrails/hooks/${id}`)).toBe(
+			true,
+		);
+	});
+	it("does not proxy broader guardrail hook paths", () => {
+		for (const [verb, path] of [
+			["POST", "guardrails/hooks"],
+			["DELETE", "guardrails/hooks"],
+			["PUT", "guardrails/hooks"],
+			["GET", "guardrails/hooks/a/b"],
+			["PUT", "guardrails/hooks/a/test"],
+			["GET", "guardrails/hooks/..%2fkeys"],
+			["PATCH", "guardrails/hooks/abc"],
+		] as const) {
+			expect(isProxiedControlRoute(verb, path), `${verb} ${path}`).toBe(false);
+		}
 	});
 });

@@ -28,6 +28,7 @@ import {
 	availabilityTargetForPlanKey,
 } from "@/app/slo/budget";
 import { RangeControl } from "@/components/RangeControl";
+import { InvestigationFocus } from "@/components/dashboard/InvestigationFocus";
 import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
 import { WorkspaceGlance } from "@/components/dashboard/WorkspaceGlance";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
@@ -704,6 +705,26 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			    until the fan-out resolved. The warming banner stays, because it is the
 			    one piece of this header region that IS data-derived (`dash`). */}
 			{dash && <WarmingBanner />}
+
+			<InvestigationFocus
+				windowLabel={rLabel}
+				modelErrorCount={totalErrors}
+				requestCount={totalRequests}
+				modelErrorDataAvailable={!dash && !usingFallback}
+				modelErrorsHref={href("/traces", { status: "error" })}
+				signatureDataAvailable={sig !== null}
+				topSignature={
+					topSigs[0]
+						? {
+								id: topSigs[0].signature_id,
+								hits: topSigs[0].your_hits,
+								href: href("/traces", {
+									signature_id: topSigs[0].signature_id,
+								}),
+							}
+						: undefined
+				}
+			/>
 
 			{/*
 			 * P0.6 — the operational KPI row.

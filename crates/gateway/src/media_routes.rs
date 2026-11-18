@@ -166,6 +166,43 @@ impl Parsed for MediaParsed {
     fn request_json(&self) -> &Value {
         &self.view
     }
+    fn approval_body(&self, key: &[u8; 32]) -> Option<Value> {
+        if !self.kind.multipart() {
+            return serde_json::from_slice(&self.raw).ok();
+        }
+        // Keep every part header and byte, but exclude the transport's random
+        // delimiter so an SDK can rebuild the identical form on an approved retry.
+        let boundary = crate::multipart_scan::boundary_of(&self.content_type).ok()?;
+        let open = format!("--{boundary}\r\n");
+        let close = format!("--{boundary}--");
+        let mut hash = blake3::Hasher::new_keyed(key);
+        let mut after_crlf = true;
+        for line in self.raw.split_inclusive(|b| *b == b'\n') {
+            // A bare LF inside a file does not introduce a multipart delimiter.
+            if after_crlf && line == open.as_bytes() {
+                hash.update(&[0, 0]);
+            } else if after_crlf && line.strip_suffix(b"\r\n").unwrap_or(line) == close.as_bytes() {
+                hash.update(&[0, 1]);
+            } else {
+                hash.update(&[1]);
+                hash.update(&(line.len() as u64).to_le_bytes());
+                hash.update(line);
+            }
+            after_crlf = line.ends_with(b"\r\n");
+        }
+        let content_type = self
+            .content_type
+            .split(';')
+            .filter(|p| {
+                !p.split_once('=')
+                    .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("boundary"))
+            })
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(";");
+        Some(json!({"request":self.view,"content_type":content_type,
+            "payload_fp":hash.finalize().to_hex().to_string()}))
+    }
     /// `OG-20`: one call on the route's own provider; media generates no tokens, so an
     /// output cap does not apply. The input estimate covers the texts the rails scan.
     fn policy_request(&self) -> tracelane_shared::key_policy::PolicyRequest {
@@ -382,6 +419,7 @@ macro_rules! media_route {
             const NAME: &'static str = $name;
             const AUDIT_EVENT_TYPE: &'static str = $event;
             const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
             // OG-11 (no virtual models; the key comes from the provider's pool).
             const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
                 wire: crate::routing::Wire::Media,
@@ -732,6 +770,7 @@ where
     if !rail_texts.is_empty() {
         let texts: Vec<&str> = rail_texts.iter().map(String::as_str).collect();
         if let Err(refusal) = run_request_rails(
+            headers.contains_key("x-tracelane-zdr"),
             &state,
             &claims,
             correlation_id,

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'none'; img-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify an action evidence bundle — Tracelane</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<h1>Verify an action evidence bundle</h1>
+<p>This page checks a Tracelane action evidence ZIP with the Tracelane Rust verifier, compiled to WebAssembly and run in this browser tab. The files you choose are read locally and are not uploaded. After the page has loaded it makes no network requests; its content security policy forbids them.</p>
+
+<section id="drop" aria-label="Inputs">
+<p class="hint">Drop files anywhere in this box, or choose them below.</p>
+<div class="row">
+<label for="zip">Evidence ZIP</label>
+<input id="zip" type="file" accept=".zip,application/zip">
+<span id="zip-name" class="name"></span>
+</div>
+<div class="row">
+<label for="key-file">Workspace public key</label>
+<input id="key-file" type="file" accept=".txt,.pub,.key,text/plain">
+<textarea id="key" rows="2" spellcheck="false" autocomplete="off" aria-label="Workspace public key, base64 or 64 hex characters" placeholder="or paste the key: base64, or 64 hex characters"></textarea>
+</div>
+<div class="row">
+<label for="tsa">TSA certificates (optional)</label>
+<input id="tsa" type="file" multiple accept=".der,.pem,.crt,.cer">
+<span id="tsa-name" class="name"></span>
+</div>
+<p class="hint">Obtain the public key, and any timestamp authority (TSA) certificate, from a source you trust that is independent of the bundle. Keys and certificates inside the bundle are never used to establish trust.</p>
+</section>
+
+<section aria-label="Result">
+<p id="status" role="status" aria-live="polite">Starting the verifier…</p>
+<div id="result" hidden>
+<p id="verdict"></p>
+<p id="meaning"></p>
+<p id="detail"></p>
+<table id="report"><caption>Verifier report, as the verifier produced it</caption><tbody></tbody></table>
+</div>
+</section>
+
+<section>
+<h2>What a PASS shows</h2>
+<ul>
+<li>Every file in the ZIP matches the hash listed in the bundle manifest.</li>
+<li>The ledger rows form an unbroken hash chain with gap-free sequence numbers, from the first row to the signed head.</li>
+<li>The checkpoint that covers the chain head carries a valid Ed25519 signature under the public key you supplied.</li>
+<li>The recorded action events are consistent with each other, and recorded policy decisions replay to the same result from the policy and evidence in the bundle. Decisions that cannot be replayed are listed under <code>actions.not_replayable</code>.</li>
+<li>If you supplied a TSA certificate and the bundle has a timestamp token bound to it: the token is valid and <code>gen_time</code> is the authority's stated time.</li>
+</ul>
+<h2>What it does not show</h2>
+<ul>
+<li>That the record is complete. A hash chain shows that the rows present were not altered or reordered. It cannot show that every event was recorded, or that rows after the signed head were not withheld.</li>
+<li>That the recorded events are true, or that the recorded policy was the right policy. Replay shows consistency with the recorded policy only.</li>
+<li>That the public key belongs to the workspace. That depends on how you obtained the key.</li>
+<li>Row times. Each row's <code>event_time</code> is not covered by the row hash. Without a pinned timestamp, the checkpoint time is the signer's own statement.</li>
+<li>Certificate revocation. No revocation status is fetched or checked.</li>
+<li>Any legal or regulatory conclusion. The result is technical evidence about this file.</li>
+</ul>
+<h2>Result codes</h2>
+<p>These match the exit codes of the <code>tracelane-audit</code> command-line verifier. 4: the bundle format or a proof in it is invalid. 5: trust input is missing or wrong (the public key or a TSA certificate). 6: the recorded action events are inconsistent.</p>
+</section>
+</main>
+<script type="module" src="verify.js"></script>
+</body>
+</html>

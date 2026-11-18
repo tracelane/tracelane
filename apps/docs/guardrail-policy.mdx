@@ -1,0 +1,75 @@
+---
+title: Your patterns, lists and guardrail vendors
+description: Add your own sensitive-data patterns and topic lists to the gateway's guardrails, and plug in the guardrail service you already run, on your own key.
+classification: PUBLIC
+---
+
+The gateway's guardrails check requests and responses inline (see
+[Agent-tool safety guardrails](/predictive-guardrails)). This page covers the three things
+you configure yourself, in the dashboard under **Settings › Gateway**:
+
+| Tab | What you set |
+|---|---|
+| **Guardrail policy** | Your own sensitive-data patterns, and your denied-topic and competitor lists |
+| **Guardrail integrations** | A guardrail service you already run, called on your key |
+
+Every change is recorded in the control-change log with who made it.
+
+## Your own sensitive-data patterns
+
+Under **Secrets and personal data**, add named regular expressions, for example an
+employee ID `EMP-\d{6}`. Each pattern has its own action:
+
+- **Observe**: the match is recorded and the request continues.
+- **Redact**: the match is replaced with a redaction marker before the model or your users see it.
+- **Block**: the request is refused.
+
+Patterns apply to requests, responses and streamed output. Up to 10 patterns per policy, each at most 256 bytes.
+
+## Denied topics and competitor names
+
+Under **Topic and competitor terms**, add up to 200 terms per list, each at most 100
+bytes. Matching is whole-word and case-insensitive; in scripts written without spaces
+(Chinese, Japanese, Thai and similar) a term matches anywhere in the text.
+
+- **Denied topics** are observed by default. Set the rule to **Block** to refuse matching requests.
+- **Competitor names** in a response are replaced with `[COMPETITOR]`. In a request they are
+  recorded, not rewritten or refused.
+
+A scoped rule (for one API key or project) that sets no lists of its own keeps the
+workspace lists.
+
+## Bring your own guardrail service
+
+Under **Guardrail integrations**, connect one of:
+
+- Lakera Guard
+- OpenAI Moderation
+- Azure Content Safety
+- Azure Prompt Shields
+- AWS Bedrock Guardrails
+- Google Cloud Model Armor
+- Microsoft Presidio (self-hosted)
+- **Your own endpoint**: Tracelane sends each request to your HTTPS endpoint, signed with
+  your secret, and follows its allow, deny or redact answer.
+
+Each integration runs on **your** credentials, so the vendor is your processor, not
+ours. Up to 8 integrations per workspace. Each integration has its own timeout, up to 5
+seconds (the dashboard suggests 2).
+
+### When the service does not answer
+
+Each integration states its failure mode:
+
+- **Closed** (the default): if the service times out or errors, the request is refused.
+- **Open**: the request continues and the failure is recorded.
+
+Presidio is closed only. For Model Armor, a service-account key that Google rejects
+refuses the request whatever the failure mode, and the rejection is remembered for five
+minutes, so later requests are refused at once instead of waiting on the token service.
+
+## Plans
+
+Secrets-and-personal-data and topic rules are paid-plan rails. Without a control plane
+(an open-source self-host with no Postgres) they resolve to the free tier. See
+[Pricing](/pricing).

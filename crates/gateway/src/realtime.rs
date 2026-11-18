@@ -123,6 +123,11 @@ pub(crate) struct RealtimeParsed {
 }
 
 impl Parsed for RealtimeParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<Value> {
+        Some(
+            serde_json::json!({"model":self.model,"upstream_model":self.upstream_model,"provider":self.provider_id}),
+        )
+    }
     fn model(&self) -> &str {
         &self.model
     }
@@ -162,6 +167,7 @@ impl Route for Realtime {
     const NAME: &'static str = "realtime";
     const AUDIT_EVENT_TYPE: &'static str = "realtime.session";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     // OG-11 (no virtual models; the pool key is chosen once, at session start).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Realtime,
@@ -743,7 +749,7 @@ async fn serve(
         Ok(admitted) => {
             let jwt_expiry =
                 JwtExpiry::of(&admitted.claims, Realtime::credential(&headers).as_deref());
-            open_session(state, ws, admitted, limits, credential, jwt_expiry).await
+            open_session(state, ws, admitted, limits, credential, jwt_expiry, headers).await
         }
         Err(refusal) => Realtime::refuse(refusal),
     }
@@ -757,6 +763,7 @@ async fn open_session(
     limits: RealtimeLimits,
     credential: Option<secrecy::SecretString>,
     jwt_expiry: JwtExpiry,
+    headers: HeaderMap,
 ) -> Response {
     let crate::admission::Admitted {
         claims,
@@ -773,6 +780,16 @@ async fn open_session(
     let tenant_id = claims.tenant_id.clone();
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
     let provider_id = parsed.provider_id;
+    if let Err(d) = crate::zdr::gate(
+        &headers,
+        &state.zdr.load(),
+        provider_id,
+        crate::zdr::ZdrBinding::Gated,
+    ) {
+        dispatch_guard.abort(d.code, None);
+        return coded(StatusCode::BAD_REQUEST, d.code, &d.message);
+    }
+
     if !state
         .guardrail
         .realtime_policy_supported(
@@ -972,8 +989,11 @@ async fn open_session(
         crate::server::config::trace_content(),
         entitlements.as_deref().map(|e| e.content_capture),
         &tenant_id,
+        claims.key_capture,
+        Some(&headers),
     );
     let ctx = SessionCtx {
+        zdr_required: headers.contains_key("x-tracelane-zdr"),
         state,
         claims,
         identity,
@@ -1038,6 +1058,7 @@ fn session_refusal(
 // ── The session ──────────────────────────────────────────────────────────────
 
 struct SessionCtx {
+    zdr_required: bool,
     state: AppState,
     claims: crate::auth::Claims,
     identity: CallerIdentity,
@@ -2249,6 +2270,7 @@ async fn rail_request(
 ) -> Option<Ending> {
     use std::sync::atomic::Ordering;
     let inputs = crate::guardrail::RequestInputs {
+        zdr_required: ctx.zdr_required,
         tenant_id: &ctx.claims.tenant_id,
         api_key_id: ctx.claims.api_key_id(),
         project_id: ctx.claims.governance.as_ref().and_then(|g| g.project_id),
@@ -2528,6 +2550,13 @@ fn on_response_done(
         ),
     ] {
         a.extra.insert(k.to_owned(), v);
+    }
+    if ctx.zdr_required {
+        span.attributes.tracelane_zdr_required = Some(true);
+        span.attributes.extra.insert(
+            "tracelane_zdr_capture_suppressed".into(),
+            serde_json::json!(true),
+        );
     }
     // Transcripts only, never audio; the workspace capture setting decides.
     let inputs = std::mem::take(&mut pending.input);
@@ -2875,6 +2904,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

@@ -32,10 +32,18 @@ told apart from one whose selftest passed (`check-guard-selftests.py`).
 
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 import re
 import sys
 import tempfile
+
+_spec = importlib.util.spec_from_file_location(
+    "banned_patterns", pathlib.Path(__file__).with_name("check-banned-patterns.py")
+)
+assert _spec and _spec.loader
+_bp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_bp)
 
 CAP_MARKERS = re.compile(
     r"capped\(|capped_sql\(|candidate_sql\(|ceiling\(|TenantQuery::new\(|sql_with_settings\(\)"
@@ -45,11 +53,28 @@ CH_FILE = re.compile(
     r"clickhouse::Client|ClickhouseClient|ch_client\(|\.fetch_all::<|\.fetch_one::<"
 )
 BEFORE, AFTER, PG_AFTER = 25, 4, 10
+MOD_DECL = re.compile(
+    r'(?m)^[ \t]*(?:#\[path\s*=\s*"([^"]+)"\]\s*)?'
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
+)
+
+
+def test_lines_in(stripped: str) -> set[int]:
+    # A conjunction requiring `test` is also test-only; never exempt `any(test, ...)`.
+    stripped = re.sub(
+        r"#\[cfg\(all\(test,\s*[^()]*\)\)\]",
+        lambda m: "#[cfg(test)]" + "\n" * m[0].count("\n"),
+        stripped,
+    )
+    return _bp.test_lines(stripped)
 
 
 def scan_file(path: pathlib.Path) -> list[tuple[int, str]]:
     src = path.read_text(encoding="utf-8", errors="replace")
-    non_test = src.split("#[cfg(test)]")[0]
+    test_lines = test_lines_in(_bp.strip_comments_and_strings(src))
+    non_test = "\n".join(
+        "" if n in test_lines else line for n, line in enumerate(src.split("\n"), 1)
+    )
     if not CH_FILE.search(non_test):
         return []
     lines = non_test.split("\n")
@@ -74,9 +99,43 @@ def scan_file(path: pathlib.Path) -> list[tuple[int, str]]:
     return out
 
 
+def test_only_modules(paths: list[pathlib.Path]) -> set[pathlib.Path]:
+    """Resolve test-only declarations; production inclusion always wins."""
+    test_modules, production_modules = set(), set()
+    for f in paths:
+        src = f.read_text(encoding="utf-8", errors="replace")
+        stripped = _bp.strip_comments_and_strings(src)
+        test_lines = test_lines_in(stripped)
+        code_lines = stripped.split("\n")
+        for m in MOD_DECL.finditer(src):
+            line = src.count("\n", 0, m.start(2)) + 1
+            if not re.search(r"\bmod\s+" + m[2] + r"\s*;", code_lines[line - 1]):
+                continue  # a declaration quoted in a comment/string is not a module
+            modules = test_modules if line in test_lines else production_modules
+            if m[1]:
+                modules.add((f.parent / m[1]).resolve())
+            else:
+                base = (
+                    f.parent
+                    if f.name in ("main.rs", "lib.rs", "mod.rs")
+                    else f.with_suffix("")
+                )
+                modules.update(
+                    (
+                        (base / (m[2] + ".rs")).resolve(),
+                        (base / m[2] / "mod.rs").resolve(),
+                    )
+                )
+    return test_modules - production_modules
+
+
 def scan_tree(root: pathlib.Path) -> list[str]:
     findings: list[str] = []
-    for f in sorted((root / "crates" / "gateway" / "src").rglob("*.rs")):
+    paths = sorted((root / "crates" / "gateway" / "src").rglob("*.rs"))
+    test_modules = test_only_modules(paths)
+    for f in paths:
+        if f.resolve() in test_modules:
+            continue
         for ln, text in scan_file(f):
             findings.append(
                 f"{f.relative_to(root)}:{ln}: uncapped ClickHouse read — {text[:90]}"
@@ -146,6 +205,68 @@ def selftest() -> int:
         else:
             print(f"  ✗ the planted uncapped SELECT was NOT refused (got {got})")
             fails += 1
+        cases = [
+            (
+                "inline test item",
+                "#[cfg(test)]\nmod tests {" + FIXTURE_BAD + "}\n",
+                False,
+            ),
+            (
+                "test conjunction",
+                "#[cfg(all(test, debug_assertions))]\nmod tests {"
+                + FIXTURE_BAD
+                + "}\n",
+                False,
+            ),
+            (
+                "production disjunction",
+                "#[cfg(any(test, debug_assertions))]\nmod reads {"
+                + FIXTURE_BAD
+                + "}\n",
+                True,
+            ),
+            (
+                "production after test item",
+                "#[cfg(test)]\nmod tests {}\n" + FIXTURE_BAD,
+                True,
+            ),
+            (
+                "test string with unmatched brace",
+                '#[cfg(test)]\nfn test() { let s = "{"; }\n' + FIXTURE_BAD,
+                True,
+            ),
+        ]
+        for label, source, blocked in cases:
+            (src / "case.rs").write_text(source)
+            got = scan_file(src / "case.rs")
+            if bool(got) != blocked:
+                print(f"  ✗ {label}: wanted blocked={blocked}, got {got}")
+                fails += 1
+            else:
+                print(f"  ✓ {label}: {'BLOCKS' if blocked else 'PASS'}")
+        (src / "case.rs").unlink()
+        for declaration in (
+            '#[cfg(test)]\n#[path = "fixture.rs"]\nmod fix_tests;\n',
+            "#[cfg(test)]\nmod fixture;\n",
+        ):
+            (src / "main.rs").write_text(declaration)
+            (src / "fixture.rs").write_text(FIXTURE_BAD)
+            got = scan_tree(root)
+            if any("fixture.rs:" in g for g in got):
+                print(f"  ✗ external cfg(test) module was flagged: {got}")
+                fails += 1
+            else:
+                print("  ✓ external cfg(test) module: PASS")
+            # A test-looking filename, or a second production inclusion, is no exemption.
+            (src / "main.rs").write_text(
+                declaration + '#[path = "fixture.rs"]\nmod production;\n'
+            )
+            got = scan_tree(root)
+            if not any("fixture.rs:" in g for g in got):
+                print("  ✗ production inclusion of the same file was NOT refused")
+                fails += 1
+            else:
+                print("  ✓ production inclusion of the same file: BLOCKS")
         # the real tree must be clean — a red baseline makes the plants vacuous
         real = scan_tree(pathlib.Path.cwd())
         if real:

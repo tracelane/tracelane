@@ -20,7 +20,10 @@
 import { db } from "@/db";
 import { apiKeys, tenants, users } from "@/db/schema";
 import { invalidateOrgArchivedCache, requireSession } from "@/lib/auth";
+import { prepareKeyRevocation } from "@/lib/gateway";
 import {
+	type OrgMembership,
+	countsAsOwner,
 	isPrivilegedRole,
 	listMemberships,
 	listUserMemberships,
@@ -131,6 +134,37 @@ async function deleteWorkosIdentity(
 	return NextResponse.json({ deleted: true, orgDeleted }, { status: 200 });
 }
 
+/** Global deletion needs a complete identity-wide scope, even with a selected org. */
+async function membershipScope(
+	key: string,
+	userId: string,
+): Promise<string[] | null> {
+	try {
+		const memberships = await listUserMemberships(key, userId);
+		if (
+			memberships === null ||
+			memberships.some(
+				(m) =>
+					!m ||
+					typeof m.organization_id !== "string" ||
+					!m.organization_id ||
+					m.user_id !== userId,
+			)
+		)
+			return null;
+		return [...new Set(memberships.map((m) => m.organization_id))].sort();
+	} catch {
+		return null;
+	}
+}
+
+function membershipUnavailable(): NextResponse {
+	return NextResponse.json(
+		{ error: "could not verify membership" },
+		{ status: 502 },
+	);
+}
+
 export async function DELETE(request: NextRequest): Promise<NextResponse> {
 	const key = process.env.WORKOS_API_KEY;
 	if (!key) {
@@ -163,62 +197,161 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 		);
 	}
 
-	// A missing selected org can also be a stale session after provisioning.
-	// Verify actual memberships before deciding that no workspace safeguards apply.
-	let orgId = session.tenantId;
+	const orgs = await membershipScope(key, session.userId);
+	if (orgs === null) return membershipUnavailable();
+	const orgId = session.tenantId;
+	if (!orgId && orgs.length > 0) {
+		return NextResponse.json(
+			{ error: "organization_selection_required" },
+			{ status: 409 },
+		);
+	}
+	if (orgId && !orgs.includes(orgId)) {
+		return NextResponse.json({ error: "not_a_member" }, { status: 403 });
+	}
 	if (!orgId) {
-		const memberships = await listUserMemberships(key, session.userId);
-		if (
-			memberships === null ||
-			memberships.some(
-				(m) => !m.organization_id || m.user_id !== session.userId,
+		// No current membership does not prove that live API keys are gone.
+		// An unscoped session cannot obtain the tenant-bound gateway acknowledgement.
+		const [ownedKey] = await db
+			.select({ id: apiKeys.id })
+			.from(apiKeys)
+			.where(
+				and(
+					eq(apiKeys.mintedBy, session.userId),
+					or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+				),
 			)
-		) {
-			return NextResponse.json(
-				{ error: "could not verify membership" },
-				{ status: 502 },
-			);
-		}
-		const orgs = [...new Set(memberships.map((m) => m.organization_id))];
-		if (orgs.length > 1) {
+			.limit(1);
+		if (ownedKey)
 			return NextResponse.json(
 				{ error: "organization_selection_required" },
 				{ status: 409 },
 			);
-		}
-		orgId = orgs[0];
-	}
-	if (!orgId) {
 		const erasureError = await eraseLocalIdentity(session.userId);
 		if (erasureError) return erasureError;
+		const [lateKey] = await db
+			.select({ id: apiKeys.id })
+			.from(apiKeys)
+			.where(
+				and(
+					eq(apiKeys.mintedBy, session.userId),
+					or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+				),
+			)
+			.limit(1);
+		if (lateKey)
+			return NextResponse.json(
+				{ error: "key_revocation_unconfirmed" },
+				{ status: 503 },
+			);
 		return deleteWorkosIdentity(key, session.userId, false);
 	}
 
 	const verifiedOrgId = orgId;
-	return withOwnerMutation(verifiedOrgId, async () => {
-		const members = await listMemberships(key, verifiedOrgId);
-		if (members === null) {
-			return NextResponse.json(
-				{ error: "could not verify membership" },
-				{ status: 502 },
-			);
-		}
-		const owners = members.filter((m) => isPrivilegedRole(m.role.slug));
-		const soleUser = members.length <= 1;
-		const isOwner = members.some(
-			(m) => m.user_id === session.userId && isPrivilegedRole(m.role.slug),
-		);
-
-		// Case 2: last owner with other members → block (must transfer first).
-		if (!soleUser && isOwner && owners.length <= 1) {
+	return withOwnerMutation(orgs, async () => {
+		// Recheck after acquiring every workspace lock: the identity's scope may
+		// have changed while waiting. Never expand locks in a different order.
+		const current = await membershipScope(key, session.userId);
+		if (current === null) return membershipUnavailable();
+		if (
+			current.length !== orgs.length ||
+			current.some((org, i) => org !== orgs[i])
+		) {
 			return NextResponse.json(
 				{
-					error: "last_owner_protected",
-					detail: "transfer ownership before deleting your account",
+					error: "membership_changed",
+					detail: "Workspace memberships changed. Refresh and retry.",
 				},
 				{ status: 409 },
 			);
 		}
+		const allMembers = new Map<string, OrgMembership[]>();
+		let otherSoleWorkspace = false;
+		for (const org of orgs) {
+			let members: OrgMembership[] | null;
+			try {
+				members = await listMemberships(key, org);
+			} catch {
+				return membershipUnavailable();
+			}
+			if (
+				members === null ||
+				new Set(members.map((m) => m?.user_id)).size !== members.length ||
+				members.some(
+					(m) =>
+						!m ||
+						m.organization_id !== org ||
+						typeof m.user_id !== "string" ||
+						!m.user_id ||
+						typeof m.role?.slug !== "string",
+				)
+			)
+				return membershipUnavailable();
+			const self = members.find((m) => m.user_id === session.userId);
+			if (!self) return membershipUnavailable();
+			// Workspace deletion retains its WorkOS membership until purge. An
+			// archived workspace is cleaned up only if no live keys remain. The
+			// shared owner lock also excludes gateway mint/rotation during this check.
+			if (org !== verifiedOrgId) {
+				const [tenant] = await db
+					.select({ id: tenants.id, archivedAt: tenants.archivedAt })
+					.from(tenants)
+					.where(eq(tenants.workosOrgId, org))
+					.limit(1);
+				if (tenant?.archivedAt) {
+					const [liveKey] = await db
+						.select({ tenantId: apiKeys.tenantId })
+						.from(apiKeys)
+						.where(
+							and(
+								eq(apiKeys.tenantId, tenant.id),
+								or(
+									isNull(apiKeys.revokedAt),
+									gt(apiKeys.revokedAt, sql`now()`),
+								),
+							),
+						)
+						.limit(1);
+					if (liveKey)
+						return NextResponse.json(
+							{ error: "key_revocation_unconfirmed" },
+							{ status: 503 },
+						);
+					allMembers.set(org, members);
+					continue;
+				}
+			}
+			const owners = members.filter(countsAsOwner);
+			if (
+				members.length > 1 &&
+				isPrivilegedRole(self.role.slug) &&
+				owners.length <= 1
+			) {
+				return NextResponse.json(
+					{
+						error: "last_owner_protected",
+						detail:
+							"Transfer ownership in every workspace before deleting your account.",
+					},
+					{ status: 409 },
+				);
+			}
+			if (members.length === 1 && org !== verifiedOrgId)
+				otherSoleWorkspace = true;
+			allMembers.set(org, members);
+		}
+		// The selected session cannot authorize another tenant's complete key
+		// invalidation. Require explicit cleanup instead of orphaning that tenant.
+		if (otherSoleWorkspace)
+			return NextResponse.json(
+				{
+					error: "workspace_cleanup_required",
+					detail:
+						"Delete your other sole-member workspaces before deleting your account.",
+				},
+				{ status: 409 },
+			);
+		const soleUser = allMembers.get(verifiedOrgId)?.length === 1;
 
 		// Resolve the internal tenant id once (for key-revoke + archive).
 		const [t] = await db
@@ -227,36 +360,66 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
 			.where(eq(tenants.workosOrgId, verifiedOrgId))
 			.limit(1);
 
+		// Account deletion is global: revoke this user's keys in EVERY workspace.
+		// A sole-user workspace also loses keys minted by other/unknown actors.
+		let revokeAndConfirm: () => Promise<void>;
+		try {
+			const confirmOwn = await prepareKeyRevocation(verifiedOrgId, true);
+			const confirmTenant = soleUser
+				? await prepareKeyRevocation(verifiedOrgId)
+				: null;
+			revokeAndConfirm = async () => {
+				await db
+					.update(apiKeys)
+					.set({ revokedAt: sql`now()` })
+					.where(
+						and(
+							or(
+								eq(apiKeys.mintedBy, session.userId),
+								soleUser && t ? eq(apiKeys.tenantId, t.id) : undefined,
+							),
+							or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
+						),
+					);
+				await confirmOwn();
+				await confirmTenant?.();
+			};
+			await revokeAndConfirm();
+		} catch {
+			return NextResponse.json(
+				{ error: "key_revocation_unconfirmed" },
+				{ status: 503 },
+			);
+		}
+
 		const erasureError = await eraseLocalIdentity(session.userId);
 		if (erasureError) return erasureError;
+		// The durable deletion marker now refuses later mints under the identity
+		// lock. Drain any mint which committed before the eraser acquired it.
+		try {
+			await revokeAndConfirm();
+		} catch {
+			return NextResponse.json(
+				{ error: "key_revocation_unconfirmed" },
+				{ status: 503 },
+			);
+		}
 
-		if (soleUser) {
-			// Case 1: sole user → this IS org deletion. Soft-delete + revoke all keys.
-			if (t) {
-				try {
-					await db
-						.update(tenants)
-						.set({ archivedAt: new Date() })
-						.where(eq(tenants.id, t.id));
-					// B-361: same-isolate immediacy for the acting user; see the
-					// function doc on `invalidateOrgArchivedCache` for the
-					// cross-isolate staleness this deliberately accepts.
-					invalidateOrgArchivedCache(verifiedOrgId);
-					await db
-						.update(apiKeys)
-						.set({ revokedAt: new Date() })
-						.where(
-							and(
-								eq(apiKeys.tenantId, t.id),
-								or(
-									isNull(apiKeys.revokedAt),
-									gt(apiKeys.revokedAt, sql`now()`),
-								),
-							),
-						);
-				} catch {
-					console.error("[account/delete] org soft-delete side effects failed");
-				}
+		if (soleUser && t) {
+			try {
+				await db
+					.update(tenants)
+					.set({ archivedAt: new Date() })
+					.where(eq(tenants.id, t.id));
+				// B-361: same-isolate immediacy for the acting user; see the
+				// function doc on `invalidateOrgArchivedCache` for the
+				// cross-isolate staleness this deliberately accepts.
+				invalidateOrgArchivedCache(verifiedOrgId);
+			} catch {
+				return NextResponse.json(
+					{ error: "could not archive organization" },
+					{ status: 503 },
+				);
 			}
 		}
 

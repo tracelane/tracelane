@@ -152,13 +152,17 @@ fn candidates_sql(max_sessions: usize) -> String {
 impl IncidentStore for ClickHouseIncidentStore {
     async fn spans(&self, tenant: &TenantId, id: &str) -> Result<Vec<IncidentSpan>> {
         let sql = TenantQuery::new(SPANS_SQL, PlanTier::Free).sql_with_settings();
-        Ok(self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(id)
-            .fetch_all()
-            .await?)
+        Ok(crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            tenant,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant.to_string())
+        .bind(id)
+        .fetch_all()
+        .await?)
     }
     async fn candidates(
         &self,
@@ -173,18 +177,22 @@ impl IncidentStore for ClickHouseIncidentStore {
         };
         let sql =
             TenantQuery::new(candidates_sql(max_sessions), PlanTier::Free).sql_with_settings();
-        Ok(self
-            .ch
-            .query(&sql)
-            .bind(tenant.to_string())
-            .bind(failing.start_us)
-            .bind(hours)
-            .bind(failing.start_us)
-            .bind(key)
-            .bind(identity)
-            .bind(cap as u64)
-            .fetch_all()
-            .await?)
+        Ok(crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            tenant,
+        )
+        .await
+        .query(&sql)
+        .bind(tenant.to_string())
+        .bind(failing.start_us)
+        .bind(hours)
+        .bind(failing.start_us)
+        .bind(key)
+        .bind(identity)
+        .bind(cap as u64)
+        .fetch_all()
+        .await?)
     }
     async fn labels(
         &self,
@@ -784,6 +792,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         };
         let _guard = crate::auth::test_claims::Guard::set(claims);

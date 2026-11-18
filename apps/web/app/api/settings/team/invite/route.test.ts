@@ -17,6 +17,7 @@ import type { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
+	rateLimit: vi.fn(),
 	db: null as DbMock | null,
 	session: { tenantId: "org_SESSION", userId: "user_1", email: "a@b.co" },
 	unlimitedSeats: true,
@@ -37,6 +38,10 @@ const refused = (status: number, error: string) => ({
 	response: Response.json({ error }, { status }),
 });
 
+vi.mock("@/lib/rate-limit", async (original) => ({
+	...(await original<typeof import("@/lib/rate-limit")>()),
+	rateLimit: h.rateLimit,
+}));
 vi.mock("@/lib/control-change", () => ({
 	recordControlChange: ctl.record,
 	recordControlChangeFailed: ctl.failed,
@@ -44,6 +49,7 @@ vi.mock("@/lib/control-change", () => ({
 }));
 
 beforeEach(() => {
+	h.rateLimit.mockReset().mockResolvedValue(true);
 	ctl.record.mockReset();
 	ctl.record.mockResolvedValue({ ok: true });
 	ctl.failed.mockReset();
@@ -79,8 +85,7 @@ function setDb(results: unknown[]): void {
 	h.db = makeDbMock(results);
 }
 
-// Unique IP per call so the module-global per-IP rate limiter never trips
-// across tests (rate-limiting is not the unit under test here).
+// Distinct IPs make each request's limiter key explicit in assertions.
 let ipCounter = 0;
 function req(body: unknown): NextRequest {
 	ipCounter += 1;
@@ -306,4 +311,51 @@ describe("POST /api/settings/team/invite — seat enforcement", () => {
 		expect(res.status).toBe(422);
 		expect(spy).not.toHaveBeenCalled();
 	});
+});
+
+describe("durable limiter responses", () => {
+	beforeEach(() => {
+		vi.stubEnv("WORKOS_API_KEY", "test-fixture");
+		h.db = makeDbMock([]);
+	});
+	async function limited(scope: "tenant" | "ip") {
+		h.rateLimit.mockResolvedValueOnce(scope === "ip");
+		if (scope === "ip") h.rateLimit.mockResolvedValueOnce(false);
+		const fetcher = stubWorkos({ members: 1, pending: 0 });
+		const request = req({ email: "fixture@example.com" });
+		const response = await POST(request);
+		expect(response.status).toBe(429);
+		expect(await response.json()).toEqual({ error: "rate_limited" });
+		expect(h.rateLimit).toHaveBeenNthCalledWith(
+			1,
+			`invite:t:${h.session.tenantId}`,
+			20,
+			300_000,
+		);
+		if (scope === "ip")
+			expect(h.rateLimit).toHaveBeenNthCalledWith(
+				2,
+				`invite:ip:${request.headers.get("x-forwarded-for")}`,
+				10,
+				300_000,
+			);
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(h.db?.cursor()).toBe(0);
+		expect(ctl.record).not.toHaveBeenCalled();
+	}
+	async function unavailable(scope: "tenant" | "ip") {
+		if (scope === "ip") h.rateLimit.mockResolvedValueOnce(true);
+		h.rateLimit.mockRejectedValueOnce(new Error("private DB detail"));
+		const fetcher = stubWorkos({ members: 1, pending: 0 });
+		const response = await POST(req({ email: "fixture@example.com" }));
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({ error: "rate_limit_unavailable" });
+		expect(fetcher).not.toHaveBeenCalled();
+		expect(h.db?.cursor()).toBe(0);
+		expect(ctl.record).not.toHaveBeenCalled();
+	}
+	it("invite_tenant_limit_durable", () => limited("tenant"));
+	it("invite_ip_limit_durable", () => limited("ip"));
+	it("invite_store_down_503", () => unavailable("tenant"));
+	it("invite_ip_store_down_503", () => unavailable("ip"));
 });

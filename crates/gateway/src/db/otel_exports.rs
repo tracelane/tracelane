@@ -32,6 +32,7 @@ pub fn aad(tenant: Uuid, id: Uuid) -> Vec<u8> {
 /// One export as a route lists it. **No sealed blob, no header value** — names only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Export {
+    pub format: String,
     pub id: Uuid,
     pub name: String,
     pub url: String,
@@ -52,10 +53,11 @@ pub struct Export {
 
 const COLUMNS: &str = "id, name, url, header_names, enabled, include_content, sample_ratio, \
      only_errors, status, last_success_at, last_error_class, delivered, dropped, failed, \
-     created_at, updated_at";
+     created_at, updated_at, format";
 
 fn from_row(r: &tokio_postgres::Row) -> Export {
     Export {
+        format: r.get(16),
         id: r.get(0),
         name: r.get(1),
         url: r.get(2),
@@ -80,6 +82,7 @@ fn from_row(r: &tokio_postgres::Row) -> Export {
 #[must_use]
 pub fn audit_view(e: &Export) -> serde_json::Value {
     json!({
+        "format": e.format,
         "name": e.name,
         "url": redacted_url(&e.url),
         "header_names": e.header_names,
@@ -128,6 +131,7 @@ pub async fn list(pool: &Pool, tenant: &TenantId) -> Result<Vec<Export>> {
 /// An export to insert. The id is chosen by the caller so the sealed headers' AAD can bind it.
 #[derive(Debug, Clone)]
 pub struct NewExport {
+    pub format: String,
     pub id: Uuid,
     pub name: String,
     pub url: String,
@@ -140,7 +144,7 @@ pub struct NewExport {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateOutcome {
-    Created(Export),
+    Created(Box<Export>),
     LimitReached { max: usize },
 }
 
@@ -180,8 +184,8 @@ pub async fn create(
         .query_one(
             &format!(
                 "INSERT INTO otel_exports (id, tenant_id, name, url, headers_enc, header_names, \
-                   include_content, sample_ratio, only_errors, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING {COLUMNS}"
+                   include_content, sample_ratio, only_errors, created_by, format) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING {COLUMNS}"
             ),
             &[
                 &new.id,
@@ -194,6 +198,7 @@ pub async fn create(
                 &new.sample_ratio,
                 &new.only_errors,
                 &actor,
+                &new.format,
             ],
         )
         .await
@@ -215,7 +220,7 @@ pub async fn create(
     tx.commit()
         .await
         .context("otel_exports create commit failed")?;
-    Ok(CreateOutcome::Created(export))
+    Ok(CreateOutcome::Created(Box::new(export)))
 }
 
 /// A validated merge patch. Absent = unchanged. `headers` replaces BOTH the sealed map and
@@ -273,7 +278,8 @@ pub async fn update(
                    only_errors = $6, \
                    headers_enc = CASE WHEN $7 THEN $8::text ELSE headers_enc END, \
                    header_names = CASE WHEN $7 THEN $9::text[] ELSE header_names END, \
-                   updated_at = now() \
+                   delivery_attempts = CASE WHEN $10 THEN 0 ELSE delivery_attempts END, \
+                   retry_at = CASE WHEN $10 THEN now() ELSE retry_at END, lease_token = NULL, lease_until = 'epoch', updated_at = now() \
                  WHERE tenant_id = $1 AND id = $2 RETURNING {COLUMNS}"
             ),
             &[
@@ -286,6 +292,7 @@ pub async fn update(
                 &set_headers,
                 &headers_enc,
                 &header_names,
+                &(patch.enabled == Some(true)),
             ],
         )
         .await
@@ -352,6 +359,7 @@ pub async fn delete(pool: &Pool, tenant: &TenantId, id: Uuid, actor: &str) -> Re
 /// One export with its sealed headers, for a delivery.
 #[derive(Debug, Clone)]
 pub struct Sealed {
+    pub format: String,
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub url: String,
@@ -364,10 +372,11 @@ pub struct Sealed {
 }
 
 const SEALED_COLUMNS: &str = "id, tenant_id, url, headers_enc, enabled, include_content, \
-     sample_ratio, only_errors, updated_at";
+     sample_ratio, only_errors, updated_at, format";
 
 fn sealed_from_row(r: &tokio_postgres::Row) -> Sealed {
     Sealed {
+        format: r.get(9),
         id: r.get(0),
         tenant_id: r.get(1),
         url: r.get(2),
@@ -482,6 +491,7 @@ mod tests {
         );
         assert_eq!(redacted_url("not a url"), "…");
         let e = Export {
+            format: "otlp".into(),
             id: Uuid::new_v4(),
             name: "n".into(),
             url: "https://c.example.com/v1/traces?key=abc".into(),

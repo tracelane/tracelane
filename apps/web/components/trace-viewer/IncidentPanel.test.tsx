@@ -77,7 +77,25 @@ it("renders evidence, uncertainty and the selected-span link", async () => {
 	expect(
 		await screen.findByRole("heading", { name: "Incident packet" }),
 	).toBeTruthy();
+	expect(
+		await screen.findByRole("heading", { name: "What happened" }),
+	).toBeTruthy();
+	expect(screen.getByRole("heading", { name: "What changed" })).toBeTruthy();
+	expect(
+		screen.getByRole("heading", {
+			name: "Explanations: evidence and uncertainty",
+		}),
+	).toBeTruthy();
 	expect(await screen.findByText("uncertain", { exact: true })).toBeTruthy();
+	expect(
+		screen.getByText(
+			"Captured differences are observations, not proof of causation.",
+		),
+	).toBeTruthy();
+	expect(
+		screen.getByRole("heading", { name: "Next action: regression fixture" }),
+	).toBeTruthy();
+	expect(screen.getByRole("heading", { name: "Task outcome" })).toBeTruthy();
 	expect(
 		screen.getByRole("link", { name: "failed" }).getAttribute("href"),
 	).toBe("/traces/trace?span=failed");
@@ -144,4 +162,14 @@ it("renders permission errors with a retry rather than an empty packet", async (
 		await screen.findByRole("button", { name: "Retry incident" }),
 	).toBeTruthy();
 	expect(screen.queryByText("no failing signal recorded")).toBeNull();
+});
+
+it("hides the causation caption without explanation items", async () => {
+	data.explanations.items = [];
+	data.explanations.note = "No explanations captured.";
+	mount();
+	expect(await screen.findByText("No explanations captured.")).toBeTruthy();
+	expect(
+		screen.queryByText(/Captured differences are observations/),
+	).toBeNull();
 });

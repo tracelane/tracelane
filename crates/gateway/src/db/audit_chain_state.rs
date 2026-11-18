@@ -163,7 +163,7 @@ pub struct AtomicBatchAppend {
     /// the caller passed, in order. Anything not listed was already appended
     /// (a redelivery) and consumed no seq.
     pub kept: Vec<usize>,
-    /// ADR-078 (B): the rows exactly as COMMITTED to the canonical Postgres
+    /// ADR-078 (B): canonical rows (uncommitted for the caller-transaction API) in the Postgres
     /// ledger in this transaction — handed back so the caller can write the
     /// derived ClickHouse copy AFTER commit (fail-open, counted), never before.
     pub rows: Vec<super::ledger::AuditLogRow>,
@@ -225,19 +225,46 @@ where
     if count == 0 {
         return Ok(None);
     }
-    if let Some(ids) = dedup {
-        anyhow::ensure!(
-            ids.len() == count,
-            "append_atomic_batch: {} event ids for {count} events",
-            ids.len()
-        );
-    }
     let mut client = pool.get().await.context("acquire pg client")?;
     let tx = client
         .transaction()
         .await
         .context("begin audit append tx")?;
+    let outcome =
+        append_atomic_batch_tx(&tx, tenant_id, genesis_prev_hash, dedup, count, build_rows).await?;
+    if outcome.is_some() {
+        tx.commit().await.context("commit audit append tx")?;
+    } else {
+        tx.rollback()
+            .await
+            .context("rollback duplicate audit append tx")?;
+    }
+    Ok(outcome)
+}
 
+/// Append within an OUTER transaction, without commit or after-commit effects.
+/// The returned range is a candidate until that transaction commits successfully.
+/// # Errors
+/// Fail CLOSED. The caller MUST roll back its outer transaction on any error,
+/// including builder validation errors, so business state and dedup cannot escape.
+#[tracing::instrument(skip_all)]
+pub async fn append_atomic_batch_tx<F>(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    genesis_prev_hash: [u8; 32],
+    dedup: Option<&[String]>,
+    count: usize,
+    build_rows: F,
+) -> Result<Option<AtomicBatchAppend>>
+where
+    F: FnOnce(u64, [u8; 32], &[usize]) -> Result<Vec<super::ledger::AuditLogRow>>,
+{
+    if count == 0 {
+        return Ok(None);
+    }
+    if let Some(ids) = dedup {
+        anyhow::ensure!(ids.len() == count, "event ID count mismatch");
+    }
     // ADR-069 idempotency: on the async consumer path, dedup on `event_id` INSIDE
     // the tx so a JetStream redelivery consumes no seq and writes no row (the
     //  dup-seq class). ONE statement for the whole batch; `RETURNING` names
@@ -275,7 +302,6 @@ where
                 .collect();
             kept.sort_unstable();
             if kept.is_empty() {
-                tx.rollback().await.ok();
                 return Ok(None);
             }
             kept
@@ -323,7 +349,9 @@ where
     prev_hash.copy_from_slice(last_row_hash_bytes);
     // `last_seq + 1`: -1 -> 0 (genesis), N -> N+1. A negative other than -1
     // (corrupt) makes this negative -> try_into fails -> fail closed.
-    let first_seq: u64 = (last_seq + 1)
+    let first_seq: u64 = last_seq
+        .checked_add(1)
+        .context("audit sequence exhausted")?
         .try_into()
         .context("audit_chain_state.last_seq is corrupt (negative)")?;
 
@@ -336,16 +364,43 @@ where
         rows.len()
     );
     let mut row_hashes: Vec<[u8; 32]> = Vec::with_capacity(n);
-    for r in &rows {
+    for (i, r) in rows.iter().enumerate() {
+        let expected_seq = first_seq
+            .checked_add(i as u64)
+            .context("audit sequence overflow")?;
+        anyhow::ensure!(
+            expected_seq <= i64::MAX as u64,
+            "audit sequence exceeds Postgres bigint"
+        );
+        let expected_prev = match row_hashes.last() {
+            Some(hash) => *hash,
+            None => prev_hash,
+        };
+        anyhow::ensure!(
+            r.tenant_id == tenant_id.to_string() && r.seq == expected_seq,
+            "ledger builder crossed tenant or sequence boundary"
+        );
+        anyhow::ensure!(
+            super::ledger::decode_hash_hex(&r.prev_hash)? == expected_prev,
+            "ledger builder broke predecessor linkage"
+        );
         row_hashes.push(
             super::ledger::decode_hash_hex(&r.row_hash)
                 .context("built row_hash is not a 32-byte hex hash")?,
         );
     }
-    super::ledger::insert_rows_tx(&tx, &rows)
+    let inserted = super::ledger::insert_rows_tx(tx, &rows)
         .await
         .context("canonical audit_log_rows write")?;
-    let last_seq_new = first_seq + (n as u64 - 1);
+    anyhow::ensure!(
+        inserted == n as u64,
+        "canonical audit_log_rows write inserted {inserted} of {n} rows — refusing to advance the head"
+    );
+    let last_seq_new = first_seq
+        .checked_add(n as u64 - 1)
+        .context("audit sequence exhausted")?;
+    let last_seq_pg =
+        i64::try_from(last_seq_new).context("audit sequence exceeds Postgres bigint")?;
     let head = row_hashes[n - 1];
 
     // (4) Advance the head to the END of the batch.
@@ -353,17 +408,10 @@ where
         "UPDATE audit_chain_state \
          SET last_seq = $2, last_row_hash = $3, updated_at = now() \
          WHERE tenant_id = $1",
-        &[
-            tenant_id.as_uuid(),
-            &(last_seq_new as i64),
-            &head.as_slice(),
-        ],
+        &[tenant_id.as_uuid(), &last_seq_pg, &head.as_slice()],
     )
     .await
     .context("advance audit_chain_state head")?;
-
-    // (5) Commit — releases the FOR UPDATE lock.
-    tx.commit().await.context("commit audit append tx")?;
 
     Ok(Some(AtomicBatchAppend {
         first_seq,

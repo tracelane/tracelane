@@ -25,10 +25,10 @@ ignore:
   # (grype fix versions: none). A Rust binary never calls strfmon — ring/aws-lc/tokio
   # do not, and the gateway has no libc formatting call site. Pinned by VULN ID, not by
   # package: a different glibc CVE must fail this scan.
-  # REVIEW: 2026-11-07 — drop this the day the base image ships a fixed glibc.
+  # REVIEW: 2026-12-13 (re-verified 2026-11-12 UTC: runtime base still chainguard/glibc-dynamic@sha256:57e5704…) — drop this the day the base image ships a fixed glibc.
   - vulnerability: CVE-2026-19499
   # All Go stdlib CVEs come from the vendored esbuild dev-tool binary.
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (re-verified 2026-11-12 UTC: esbuild 0.25.4/0.28.x still in pnpm-lock.yaml)
   - package:
       type: go-module
   # rustls-webpki 0.102.x — transitive via async-nats 0.42 (NATS URL is
@@ -37,19 +37,20 @@ ignore:
   # osv-scanner.toml; real fix = the async-nats >=0.47 upgrade. By-name (not a
   # single GHSA) because Grype reports several webpki advisories under aliases
   # that don't match the RUSTSEC/OSV ids the other scanners list.
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (premise re-verified 2026-11-12 UTC against the lockfiles)
   - package:
       name: rustls-webpki
+      version: 0.102.8
   # vitest — dev/test tooling only, never shipped in any product artifact. Grype catalogs
   # it from pnpm-lock.yaml (not just node_modules), so the exclude below is insufficient.
   # Still needed for GHSA-82fw-gwwq-j7x9 (fix 4.1.11, a major). The `vite` ignore was REMOVED
   # 2026-10-03: vitest 3.2.7 now resolves vite 7.3.6 (package.json overrides).
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (premise re-verified 2026-11-12 UTC against the lockfiles)
   - package:
       name: vitest
   # @vitest/mocker — GHSA-82fw-gwwq-j7x9, the redirect-mock path traversal; same
   # precondition (a Vite dev server / browser mode) we never run. Mirrors osv-scanner.toml.
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (premise re-verified 2026-11-12 UTC against the lockfiles)
   - package:
       name: "@vitest/mocker"
   # brace-expansion 2.1.4 carries the backported CVE-2026-14257 fix (EXPANSION_MAX_LENGTH),
@@ -66,7 +67,7 @@ ignore:
   # (2.1.4, 5.0.9) are above their branch's fix, so `pnpm audit` no longer reports it.
   # This rule stays only because Grype carries its own vulnerability DB and may still
   # hold the flat range; delete it the first time a Grype run reports it as unused.
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (premise re-verified 2026-11-12 UTC against the lockfiles)
   - vulnerability: GHSA-mh99-v99m-4gvg
     package:
       name: brace-expansion
@@ -88,21 +89,22 @@ ignore:
   # feature. The only real fix is opentelemetry-proto 0.27 -> ~0.32, a five-minor jump
   # on the decoder in the ingest hot path, to patch code we never execute.
   # UNBLOCKING CONDITION: bump when opentelemetry-proto is upgraded for another reason.
-  # REVIEW: 2026-11-07
+  # REVIEW: 2026-12-13 (premise re-verified 2026-11-12 UTC against the lockfiles)
   - vulnerability: GHSA-w9wp-h8wv-79jx
     package:
       name: opentelemetry_sdk
 
-  # @hono/node-server 1.19.14 — SUPPRESSED, not fixed.
-  # Reason it does not apply: purely transitive (via the MCP SDK), patched only in the
-  # 2.x MAJOR. Forcing a major on a transitive dep we do not control, in an app whose
-  # tests would not catch a runtime break, is a worse risk than the moderate itself.
-  # UNBLOCKING CONDITION: revisit when apps/mcp has real test
-  # coverage — until then a forced major is unverifiable.
-  # REVIEW: 2026-11-07
-  - vulnerability: GHSA-frvp-7c67-39w9
+  # @hono/node-server 1.19.17 — GHSA-rmxm-3fg6-px4f (moderate): `serveStatic` decodes the request
+  # path twice. Fixed only in 2.1.3, a major the MCP SDK does not resolve. Not reachable here:
+  # no `serveStatic` call in apps/, crates/ or packages/, nor in @modelcontextprotocol/sdk 1.32.2's
+  # dist (checked 2026-11-12 UTC). Names the ADVISORY so any other one on the package still fires.
+  # UNBLOCKING CONDITION: the MCP SDK resolves @hono/node-server >= 2.1.3.
+  # REVIEW: 2026-12-13
+  - vulnerability: GHSA-rmxm-3fg6-px4f
     package:
       name: "@hono/node-server"
+  # @hono/node-server GHSA-frvp-7c67-39w9: mute REMOVED 2026-11-12 UTC — the lockfile now resolves
+  # 1.19.17, above the 1.19.15 fix (OSV range), so the ignore was unused.
 
   # esbuild GHSA-67mh-4wv8-2f99 / GHSA-g7r4-m6w7-qqqr: mutes REMOVED 2026-10-03 — package.json
   # pnpm.overrides now resolves esbuild to 0.25.4 / 0.28.1, above both fixes.

@@ -15,6 +15,13 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+**A clearer homepage.** tracelane.dev now leads with one message — rules and human approval for
+AI agent actions — and shows the real product: the approval queue, tool rules, a trace, the change
+history, the pause control, guardrail verdicts and spend by key, captured from the app over demo data.
+Plans are shown as cards that link to the full pricing page. A new narrated product tour, built
+from the same screens, replaces the September film and plays from the top of the homepage and /demo/.
+New tagline: "Agents act. People decide."
+
 **Pricing v3 — six usage meters, five tiers.** Billing moves from a trace-count quota to
 six continuous per-unit meters (ingest, hot indexed window, series, query compute, cold
 archive, evaluations), each with its own included allowance and no rollover. Ingest is

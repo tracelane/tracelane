@@ -1,0 +1,74 @@
+{
+  "date_utc": "2026-11-17",
+  "note": "Re-run for the investor-readiness wave. Same corpus; predictions unchanged against baseline-2026-11-15, r2-gwy63-2026-11-15 and r7-gwy60-2026-11-15 (120 of 120 identical). Synthetic, developer-visible fixtures: not a recall claim (README).",
+  "base_commit": "origin/main 3ffda39 + B-640 branch d8729ae (no guardrail code change)",
+  "command": "cargo test -p gateway --bin gateway guardrail::labelled_eval -- --nocapture --test-threads=1",
+  "exit_code": 0,
+  "corpus_blake3": "76f36daaa3ec7ada464b1b5788aa1fcf2a5228cad7ccebdb807175a2669be5d2",
+  "overall": {
+    "tp": 41,
+    "fn": 18,
+    "fp": 1,
+    "tn": 60,
+    "fnr": 0.305,
+    "fpr": 0.016
+  },
+  "per_rail": {
+    "R1": {
+      "tp": 6,
+      "fn": 0,
+      "fp": 0,
+      "tn": 8,
+      "fnr": 0.0,
+      "fpr": 0.0
+    },
+    "R2": {
+      "tp": 12,
+      "fn": 2,
+      "fp": 0,
+      "tn": 13,
+      "fnr": 0.143,
+      "fpr": 0.0
+    },
+    "R3": {
+      "tp": 5,
+      "fn": 3,
+      "fp": 1,
+      "tn": 6,
+      "fnr": 0.375,
+      "fpr": 0.143
+    },
+    "R4": {
+      "tp": 2,
+      "fn": 1,
+      "fp": 0,
+      "tn": 5,
+      "fnr": 0.333,
+      "fpr": 0.0
+    },
+    "R5": {
+      "tp": 3,
+      "fn": 3,
+      "fp": 0,
+      "tn": 6,
+      "fnr": 0.5,
+      "fpr": 0.0
+    },
+    "R6": {
+      "tp": 4,
+      "fn": 2,
+      "fp": 0,
+      "tn": 6,
+      "fnr": 0.333,
+      "fpr": 0.0
+    },
+    "R7": {
+      "tp": 9,
+      "fn": 7,
+      "fp": 0,
+      "tn": 16,
+      "fnr": 0.438,
+      "fpr": 0.0
+    }
+  }
+}

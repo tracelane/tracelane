@@ -1,0 +1,114 @@
+{
+ "_what": "GWY-63 R2 custom-entity measurement. 'before' = the same 10 custom-profile cases evaluated with no custom pattern (the only behaviour before GWY-63: a workspace could not define one); 'after' = one workspace pattern (?-u:\\\\b)EMP-[0-9]{6}(?-u:\\\\b), action redact. Built-in R2 profiles are unchanged from baseline-2026-11-15.json.",
+ "date_utc": "2026-11-15",
+ "command": "cargo test -p gateway --bin gateway -- labelled_r2 --nocapture",
+ "corpus_blake3": "76f36daaa3ec7ada464b1b5788aa1fcf2a5228cad7ccebdb807175a2669be5d2",
+ "before": {
+  "profiles": [
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 5,
+     "fp": 0,
+     "not_applicable": 0,
+     "tn": 5,
+     "tp": 0
+    },
+    "false_negative_rate": 1.0,
+    "false_positive_rate": 0.0,
+    "n": 10,
+    "profile": "custom"
+   }
+  ]
+ },
+ "after": {
+  "profiles": [
+   {
+    "counts": {
+     "fail_open": 0,
+     "fn": 0,
+     "fp": 0,
+     "not_applicable": 0,
+     "tn": 5,
+     "tp": 5
+    },
+    "false_negative_rate": 0.0,
+    "false_positive_rate": 0.0,
+    "n": 10,
+    "profile": "custom"
+   }
+  ],
+  "predictions": [
+   {
+    "id": "r2_custom_plain",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "custom",
+    "reason": "PII_CUSTOM"
+   },
+   {
+    "id": "r2_custom_parenthesised",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "custom",
+    "reason": "PII_CUSTOM"
+   },
+   {
+    "id": "r2_custom_two",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "custom",
+    "reason": "PII_CUSTOM"
+   },
+   {
+    "id": "r2_custom_line_start",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "custom",
+    "reason": "PII_CUSTOM"
+   },
+   {
+    "id": "r2_custom_sentence_end",
+    "outcome": "redact",
+    "positive": true,
+    "profile": "custom",
+    "reason": "PII_CUSTOM"
+   },
+   {
+    "id": "r2_custom_short",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "custom",
+    "reason": null
+   },
+   {
+    "id": "r2_custom_long",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "custom",
+    "reason": null
+   },
+   {
+    "id": "r2_custom_prefixed",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "custom",
+    "reason": null
+   },
+   {
+    "id": "r2_custom_case",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "custom",
+    "reason": null
+   },
+   {
+    "id": "r2_custom_words",
+    "outcome": "allow",
+    "positive": false,
+    "profile": "custom",
+    "reason": null
+   }
+  ]
+ }
+}

@@ -1,4 +1,5 @@
 "use client";
+import { SignOutButton } from "@/components/SignOutButton";
 import { Button } from "@tracelanedev/ui";
 
 /**
@@ -98,12 +99,9 @@ export function EmailChangeForm({ email }: { email: string }) {
 					verification goes there, so check that you can receive mail at it
 					before you sign out.
 				</p>
-				<a
-					href="/sign-out"
-					className="inline-block rounded-card border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink"
-				>
+				<SignOutButton className="inline-block rounded-card border border-line px-3 py-1.5 text-xs font-medium text-ink-2 transition-colors hover:border-line-2 hover:text-ink">
 					Sign out
-				</a>
+				</SignOutButton>
 			</section>
 		);
 	}

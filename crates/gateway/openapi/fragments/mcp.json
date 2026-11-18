@@ -1,0 +1,2261 @@
+{
+  "module": "crates/gateway/src/mcp_routes.rs",
+  "operations": {
+    "GET /v1/mcp-servers": {
+      "summary": "List registered MCP servers.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "servers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/McpServerRead"
+                }
+              },
+              "limits": {
+                "type": "object",
+                "properties": {
+                  "max_servers_per_workspace": {
+                    "type": "integer"
+                  },
+                  "max_request_bytes": {
+                    "type": "integer"
+                  },
+                  "max_response_bytes": {
+                    "type": "integer"
+                  },
+                  "call_timeout_secs": {
+                    "type": "integer"
+                  },
+                  "max_event_bytes": {
+                    "type": "integer"
+                  },
+                  "max_legacy_sessions_per_workspace": {
+                    "type": "integer"
+                  },
+                  "max_pending_calls_per_session": {
+                    "type": "integer"
+                  },
+                  "max_tool_list_pages": {
+                    "type": "integer"
+                  },
+                  "max_header_bytes": {
+                    "type": "integer"
+                  },
+                  "max_name_chars": {
+                    "type": "integer"
+                  },
+                  "max_url_bytes": {
+                    "type": "integer"
+                  },
+                  "max_slug_chars": {
+                    "type": "integer"
+                  },
+                  "legacy_session_secs": {
+                    "type": "integer"
+                  },
+                  "legacy_event_buffer": {
+                    "type": "integer"
+                  },
+                  "max_legacy_sessions_total": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_servers_per_workspace",
+                  "max_request_bytes",
+                  "max_response_bytes",
+                  "call_timeout_secs",
+                  "max_event_bytes",
+                  "max_legacy_sessions_per_workspace",
+                  "max_pending_calls_per_session",
+                  "max_tool_list_pages",
+                  "max_header_bytes",
+                  "max_name_chars",
+                  "max_url_bytes",
+                  "max_slug_chars",
+                  "legacy_session_secs",
+                  "legacy_event_buffer",
+                  "max_legacy_sessions_total"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "servers",
+              "limits"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control"
+    },
+    "GET /v1/mcp-servers/{id}": {
+      "summary": "Read a registered MCP server.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "$ref": "#/components/schemas/McpServerRead"
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Server not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "POST /v1/mcp-servers": {
+      "summary": "Create or update an MCP server.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "$ref": "#/components/schemas/McpServerPublic"
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Server not found on update.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Server limit or concurrent credential/server configuration change.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "streamable_http",
+              "legacy_sse"
+            ]
+          },
+          "auth_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "gateway_held",
+              "passthrough"
+            ]
+          },
+          "credential_kind": {
+            "type": "string",
+            "enum": [
+              "bearer",
+              "header"
+            ]
+          },
+          "credential_header": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Credential is write-only. PATCH merges omitted fields with stored state. Creation defaults to streamable_http, no authentication, bearer credential kind and enabled. URL and custom header names are validated; server count and string sizes are bounded by configured limits."
+    },
+    "PATCH /v1/mcp-servers/{id}": {
+      "summary": "Create or update an MCP server.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "$ref": "#/components/schemas/McpServerPublic"
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Server not found on update.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Server limit or concurrent credential/server configuration change.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "streamable_http",
+              "legacy_sse"
+            ]
+          },
+          "auth_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "gateway_held",
+              "passthrough"
+            ]
+          },
+          "credential_kind": {
+            "type": "string",
+            "enum": [
+              "bearer",
+              "header"
+            ]
+          },
+          "credential_header": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "description": "Credential is write-only. PATCH merges omitted fields with stored state. Creation defaults to streamable_http, no authentication, bearer credential kind and enabled. URL and custom header names are validated; server count and string sizes are bounded by configured limits.",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "DELETE /v1/mcp-servers/{id}": {
+      "summary": "Archive an MCP server.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "archived": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "archived"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Server not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "POST /v1/mcp-servers/{id}/test": {
+      "summary": "Discover tools from a registered MCP server.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "tools": {
+                "type": "integer"
+              },
+              "tool_names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "tools",
+              "tool_names"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Server not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "502": {
+          "description": "Invalid upstream MCP response or discovery failure.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "GET /v1/mcp-policy": {
+      "summary": "Read MCP policy and rule settings.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "policy": {
+                "$ref": "#/components/schemas/McpPolicy"
+              },
+              "rules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "server_id": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "key_id": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "tool_glob": {
+                      "type": "string"
+                    },
+                    "action": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "server_id",
+                    "key_id",
+                    "tool_glob",
+                    "action",
+                    "reason"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "model_rules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "model_glob": {
+                      "type": "string"
+                    },
+                    "key_id": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "ttl_secs": {
+                      "anyOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "model_glob",
+                    "key_id",
+                    "ttl_secs"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "limits": {
+                "type": "object",
+                "properties": {
+                  "max_rules_per_workspace": {
+                    "type": "integer"
+                  },
+                  "tool_glob_max_chars": {
+                    "type": "integer"
+                  },
+                  "reason_max_chars": {
+                    "type": "integer"
+                  },
+                  "observer_max_tracked": {
+                    "type": "integer"
+                  },
+                  "observer_max_name_len": {
+                    "type": "integer"
+                  },
+                  "observer_flush_secs": {
+                    "type": "integer"
+                  },
+                  "pin_cache_ttl_secs": {
+                    "type": "integer"
+                  },
+                  "verify_timeout_ms": {
+                    "type": "integer"
+                  },
+                  "preview_window_hours": {
+                    "type": "integer"
+                  },
+                  "preview_max_window_hours": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_rules_per_workspace",
+                  "tool_glob_max_chars",
+                  "reason_max_chars",
+                  "observer_max_tracked",
+                  "observer_max_name_len",
+                  "observer_flush_secs",
+                  "pin_cache_ttl_secs",
+                  "verify_timeout_ms",
+                  "preview_window_hours",
+                  "preview_max_window_hours"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "policy",
+              "rules",
+              "model_rules",
+              "keys",
+              "limits"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control"
+    },
+    "PUT /v1/mcp-policy": {
+      "summary": "Update MCP policy.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "$ref": "#/components/schemas/McpPolicy"
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "$ref": "#/components/schemas/McpPolicy"
+      }
+    },
+    "GET /v1/mcp-policy/preview": {
+      "summary": "Preview observed MCP policy blocks.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "would_block": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "stats_unavailable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "since",
+              "would_block",
+              "stats_unavailable"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      ],
+      "description": "Defaults to the configured preview window; the maximum age is also configured. Missing or failing statistics return 200 with would_block null and stats_unavailable true."
+    },
+    "GET /v1/mcp-tool-rules": {
+      "summary": "List MCP tool rules.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "rules": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/McpRuleRead"
+                }
+              }
+            },
+            "required": [
+              "rules"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control"
+    },
+    "POST /v1/mcp-tool-rules": {
+      "summary": "Create an MCP tool rule.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Key or server not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Configured rule limit reached.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "tool_glob": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny",
+              "require_approval"
+            ]
+          },
+          "server_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "description": "String reason; non-string values currently normalize to an empty string."
+          }
+        },
+        "required": [
+          "tool_glob",
+          "action"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "DELETE /v1/mcp-tool-rules/{id}": {
+      "summary": "Remove an MCP tool rule.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "removed"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Rule not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "GET /v1/mcp-tools": {
+      "summary": "List observed MCP tool definitions.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "tools": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRead"
+                }
+              }
+            },
+            "required": [
+              "tools"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "server",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "POST /v1/mcp-tools/approve": {
+      "summary": "Approve an observed tool definition.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "approved": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "approved"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Tool observation not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "def_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_id",
+          "tool_name",
+          "def_hash"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "DELETE /v1/mcp-tools/{server_id}/{tool_name}": {
+      "summary": "Remove an approved tool pin.",
+      "tags": [
+        "mcp"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "removed"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Tool pin not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "server_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        {
+          "name": "tool_name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "GET /v1/approvals": {
+      "summary": "List approval requests.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "approvals": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/McpApprovalListRow"
+                }
+              },
+              "pending": {
+                "type": "integer"
+              },
+              "held_now": {
+                "type": "integer"
+              },
+              "next_cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "approvals",
+              "pending",
+              "held_now",
+              "next_cursor"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "denied",
+              "expired",
+              "consumed"
+            ]
+          }
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "description": "RFC3339 timestamp followed by | and a UUID."
+          }
+        }
+      ],
+      "description": "Defaults to pending status and the configured page size; limit is capped at the configured maximum."
+    },
+    "GET /v1/approvals/{id}": {
+      "summary": "Read an approval request.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/McpApprovalRead"
+              },
+              {
+                "$ref": "#/components/schemas/McpApprovalPoll"
+              }
+            ]
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Approval not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "429": {
+          "description": "Polling rate limit reached.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "description": "Control actors receive the sanitized approval row. The requesting API key may poll its own request within the same tenant and receives only id, status and expiry fields; this path is rate limited.",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    },
+    "POST /v1/approvals/{id}/approve": {
+      "summary": "Decide an approval request.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "approved"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Approval not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Expired, mismatched or already decided approval.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "description": "Note length is configuration-bounded. Protected approvals require verified human-session evidence and separation of duties; capability membership alone is insufficient.",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "requestBodyRequired": false
+    },
+    "POST /v1/approvals/{id}/deny": {
+      "summary": "Decide an approval request.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "denied"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Approval not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Expired, mismatched or already decided approval.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "description": "Note length is configuration-bounded. Protected approvals require verified human-session evidence and separation of duties; capability membership alone is insufficient.",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "requestBodyRequired": false
+    },
+    "GET /v1/approvals/settings": {
+      "summary": "Read approval settings.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "settings": {
+                "$ref": "#/components/schemas/McpApprovalSettings"
+              },
+              "limits": {
+                "type": "object",
+                "properties": {
+                  "hold_secs": {
+                    "type": "integer"
+                  },
+                  "model_hold_secs": {
+                    "type": "integer"
+                  },
+                  "default_ttl_secs": {
+                    "type": "integer"
+                  },
+                  "max_ttl_secs": {
+                    "type": "integer"
+                  },
+                  "grant_ttl_secs": {
+                    "type": "integer"
+                  },
+                  "max_pending_per_workspace": {
+                    "type": "integer"
+                  },
+                  "max_held_per_workspace": {
+                    "type": "integer"
+                  },
+                  "max_held_total": {
+                    "type": "integer"
+                  },
+                  "sweep_secs": {
+                    "type": "integer"
+                  },
+                  "sweep_batch": {
+                    "type": "integer"
+                  },
+                  "preview_max_bytes": {
+                    "type": "integer"
+                  },
+                  "note_max_chars": {
+                    "type": "integer"
+                  },
+                  "list_page_size": {
+                    "type": "integer"
+                  },
+                  "max_list_page_size": {
+                    "type": "integer"
+                  },
+                  "capacity_retry_secs": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "hold_secs",
+                  "model_hold_secs",
+                  "default_ttl_secs",
+                  "max_ttl_secs",
+                  "grant_ttl_secs",
+                  "max_pending_per_workspace",
+                  "max_held_per_workspace",
+                  "max_held_total",
+                  "sweep_secs",
+                  "sweep_batch",
+                  "preview_max_bytes",
+                  "note_max_chars",
+                  "list_page_size",
+                  "max_list_page_size",
+                  "capacity_retry_secs"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "settings",
+              "limits"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control"
+    },
+    "PUT /v1/approvals/settings": {
+      "summary": "Update approval settings.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "$ref": "#/components/schemas/McpApprovalSettings"
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "$ref": "#/components/schemas/McpApprovalSettings"
+      },
+      "description": "TTL must be positive and no larger than the configured maximum."
+    },
+    "GET /v1/approval-rules": {
+      "summary": "List model approval rules.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "rules": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/McpModelRuleRead"
+                }
+              },
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "limits": {
+                "type": "object",
+                "properties": {
+                  "tool_glob_max_chars": {
+                    "type": "integer"
+                  },
+                  "max_ttl_secs": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "tool_glob_max_chars",
+                  "max_ttl_secs"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "rules",
+              "keys",
+              "limits"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control"
+    },
+    "POST /v1/approval-rules": {
+      "summary": "Create a model approval rule.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Key not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "409": {
+          "description": "Configured rule limit reached.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "model_glob": {
+            "type": "string"
+          },
+          "key_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ttl_secs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "model_glob"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Optional TTL may not exceed the configured maximum."
+    },
+    "DELETE /v1/approval-rules/{id}": {
+      "summary": "Remove a model approval rule.",
+      "tags": [
+        "approvals"
+      ],
+      "responses": {
+        "200": {
+          "description": "Successful response.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "removed"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid JSON, identifier, query parameter or field.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "401": {
+          "description": "Unauthorized.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "403": {
+          "description": "Control policy or capability denied.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "Request exceeds the configured limit.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "Control store or dependency unavailable.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "404": {
+          "description": "Rule not found.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-envelope": "control",
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ]
+    }
+  }
+}

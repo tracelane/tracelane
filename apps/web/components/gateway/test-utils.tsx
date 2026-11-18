@@ -28,7 +28,12 @@ export const json = (data: unknown, status = 200) =>
 		headers: { "content-type": "application/json" },
 	});
 
-export type Call = { url: string; method: string; body: unknown };
+export type Call = {
+	url: string;
+	method: string;
+	body: unknown;
+	ifMatch: string | null;
+};
 type Handler = (c: Call) => Response | Promise<Response> | undefined;
 
 /** Install a scripted fetch; the first handler returning a Response wins. */
@@ -39,6 +44,7 @@ export function mockFetch(...handlers: Handler[]) {
 			url: String(input),
 			method: init?.method ?? "GET",
 			body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			ifMatch: new Headers(init?.headers).get("if-match"),
 		};
 		calls.push(call);
 		for (const h of handlers) {
@@ -63,11 +69,14 @@ export function mount(ui: ReactNode, role: string | null = "owner") {
 	const client = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
-	return render(
-		<QueryClientProvider client={client}>
-			<RoleProvider role={role}>{ui}</RoleProvider>
-		</QueryClientProvider>,
-	);
+	return {
+		...render(
+			<QueryClientProvider client={client}>
+				<RoleProvider role={role}>{ui}</RoleProvider>
+			</QueryClientProvider>,
+		),
+		client,
+	};
 }
 
 /** The one `<dialog>` that is open (every ConfirmDialog keeps its shell in the DOM). */

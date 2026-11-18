@@ -29,7 +29,12 @@ vi.mock("next/headers", () => ({
 }));
 
 import { ATTESTATION_HEADER } from "./client-ip-attestation";
-import { gatewayDelete, gatewayPostText, gatewayResponse } from "./gateway";
+import {
+	gatewayDelete,
+	gatewayPostText,
+	gatewayResponse,
+	prepareKeyRevocation,
+} from "./gateway";
 
 const originalFetch = global.fetch;
 afterEach(() => {
@@ -142,4 +147,83 @@ describe("gatewayResponse — OG-36 client-IP attestation (M4)", () => {
 		expect(cap.get().get("authorization")).toBe("Bearer jwt-x");
 		expect(cap.get().has(ATTESTATION_HEADER)).toBe(false);
 	});
+
+	it("preserves the guardrail policy ETag while filtering unrelated headers", async () => {
+		global.fetch = vi.fn(
+			async () =>
+				new Response('{"policy":null}', {
+					status: 200,
+					headers: { etag: '"policy-version"', "x-private": "drop" },
+				}),
+		) as unknown as typeof fetch;
+		const res = await gatewayResponse("/v1/guardrails/policy", {
+			method: "GET",
+		});
+		expect(res.headers.get("etag")).toBe('"policy-version"');
+		expect(res.headers.get("x-private")).toBeNull();
+	});
+});
+
+describe("prepareKeyRevocation", () => {
+	it("captures the session token and requires an exact acknowledgement", async () => {
+		global.fetch = vi.fn(async () => Response.json({ invalidated: true }));
+		const confirm = await prepareKeyRevocation("org_x");
+		expect(global.fetch).not.toHaveBeenCalled();
+		await expect(confirm()).resolves.toBeUndefined();
+		expect(global.fetch).toHaveBeenCalledWith(
+			"http://localhost:8080/v1/keys/invalidate-cache",
+			expect.objectContaining({
+				method: "POST",
+				body: "{}",
+				cache: "no-store",
+				redirect: "manual",
+				headers: expect.objectContaining({ authorization: "Bearer jwt-x" }),
+				signal: expect.any(AbortSignal),
+			}),
+		);
+	});
+	it("rejects a different SQL organization before mutation or fetch", async () => {
+		global.fetch = vi.fn();
+		await expect(prepareKeyRevocation("org_other")).rejects.toThrow(
+			"organization_mismatch",
+		);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+	it.each([
+		null,
+		{},
+		{ invalidated: false },
+		{ invalidated: "true" },
+		[{ invalidated: true }],
+		{ invalidated: true, tenant: "other" },
+	])("refuses malformed acknowledgement %j", async (body) => {
+		global.fetch = vi.fn(async () => Response.json(body));
+		const confirm = await prepareKeyRevocation("org_x");
+		await expect(confirm()).rejects.toThrow("key_revocation_unconfirmed");
+	});
+	it.each([302, 401, 403, 404, 503])(
+		"refuses HTTP %i including older gateways",
+		async (status) => {
+			global.fetch = vi.fn(async () => new Response("{}", { status }));
+			const confirm = await prepareKeyRevocation("org_x");
+			await expect(confirm()).rejects.toMatchObject({ status });
+		},
+	);
+	it("refuses transport failure", async () => {
+		global.fetch = vi.fn(async () => {
+			throw new Error("offline");
+		});
+		const confirm = await prepareKeyRevocation("org_x");
+		await expect(confirm()).rejects.toMatchObject({ status: 503 });
+	});
+});
+
+it("self-cache acknowledgement sends no caller-selected identity or workspace list", async () => {
+	global.fetch = vi.fn(async () => Response.json({ invalidated: true }));
+	const confirm = await prepareKeyRevocation("org_x", true);
+	await confirm();
+	expect(global.fetch).toHaveBeenCalledWith(
+		"http://localhost:8080/v1/keys/invalidate-cache",
+		expect.objectContaining({ body: '{"own_keys":true}' }),
+	);
 });

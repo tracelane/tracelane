@@ -367,6 +367,7 @@ async fn og31_cold_snapshot_cannot_silently_drop_hooks() {
     let request = crate::media_common::text_view("gpt-4o", &["hello"]);
     let result = engine
         .evaluate_request(super::RequestInputs {
+            zdr_required: false,
             tenant_id: &tenant,
             api_key_id: None,
             project_id: None,

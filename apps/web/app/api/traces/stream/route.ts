@@ -16,10 +16,11 @@
  */
 
 import plans from "@/db/plans.v3.json";
-import { requireGatewayToken } from "@/lib/auth";
+import { requireSession } from "@/lib/auth";
 import { forwardParams, gatewayGet } from "@/lib/gateway";
 import { streamQueryWithDeadline } from "@/lib/query-deadline";
-import type { NextRequest } from "next/server";
+import { roleCan } from "@/lib/role-capabilities.generated";
+import { type NextRequest, NextResponse } from "next/server";
 
 // SSE must not be statically cached or buffered.
 export const dynamic = "force-dynamic";
@@ -36,10 +37,11 @@ type TraceSummary = {
 };
 
 export async function GET(req: NextRequest): Promise<Response> {
-	// Mint the session token (and get the org id for the cache key). The actual
-	// read re-mints inside gatewayGet — withAuth is request-scoped so this is
-	// cheap.
-	const { tenantId } = await requireGatewayToken();
+	// Authorize before the cache emits any rows; the gateway check comes later.
+	const { tenantId, role } = await requireSession();
+	if (!roleCan(role, "read_traces")) {
+		return NextResponse.json({ error: "forbidden" }, { status: 403 });
+	}
 
 	// Forward the active dashboard filters so the live feed matches the filtered
 	// list the user is looking at — never a silent filter mismatch. The gateway

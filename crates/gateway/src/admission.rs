@@ -98,31 +98,33 @@ pub(crate) enum Step {
     /// the first charge and the ledger row. Fail-CLOSED. (`source_ips` is enforced
     /// earlier still, at authentication.)
     Policy = 6,
+    /// Registered tools and durable human approvals, before limits or ledger work.
+    Tools = 7,
     /// `OG-21`: RPM / TPM buckets of the workspace, project and key layers (and their
     /// per-end-user and per-model buckets) — all must have room, charged all-or-none.
     /// After the policy (a denied model never charges a bucket), before the first USD
     /// charge. Fail-CLOSED.
-    Limits = 7,
+    Limits = 8,
     /// GWY-43: the credential.s own monthly USD ceiling. THIS is the first
     /// charge (BILL-01 deleted the trace-count quota that used to hold this
     /// position).
-    KeyBudget = 8,
+    KeyBudget = 9,
     /// GWY-43: the workspace.s monthly USD ceiling.
-    WorkspaceBudget = 9,
+    WorkspaceBudget = 10,
     /// `OG-22`: the policy budgets (workspace / project / key / end user; hard or soft;
     /// calendar or rolling). A hard budget with UNKNOWN spend refuses. Fail-CLOSED.
-    Budgets = 10,
+    Budgets = 11,
     /// The predictive layer. OBSERVE-first: a would-be block is recorded and the
     /// request proceeds unless `TRACELANE_PREDICTIVE_ENFORCE=1`.
-    Predictive = 11,
+    Predictive = 12,
     /// The tamper-evident ledger row. Fail-CLOSED; last, so an `Err` from this
     /// pipeline always means "no row landed".
-    Audit = 12,
+    Audit = 13,
 }
 
 /// Every step, in order. `run` marks each one as it enters it, and
 /// [`Progress::enter`] refuses a step that is not strictly later than the last.
-pub(crate) const ORDER: [Step; 13] = [
+pub(crate) const ORDER: [Step; 14] = [
     Step::Auth,
     Step::Scope,
     Step::Parse,
@@ -130,6 +132,7 @@ pub(crate) const ORDER: [Step; 13] = [
     Step::Controls,
     Step::RateLimit,
     Step::Policy,
+    Step::Tools,
     Step::Limits,
     Step::KeyBudget,
     Step::WorkspaceBudget,
@@ -148,7 +151,7 @@ const _: () = {
     assert!(
         (Step::Parse as u8) < (Step::Policy as u8)
             && (Step::Policy as u8) < (Step::KeyBudget as u8),
-        "OG-20: the policy reads the PARSED request and refuses before the first charge"
+        "the policy reads the PARSED request and refuses before the first charge"
     );
     assert!(
         (Step::KeyBudget as u8) < (Step::Audit as u8),
@@ -161,17 +164,20 @@ const _: () = {
     assert!(
         (Step::Entitlements as u8) < (Step::Controls as u8)
             && (Step::Controls as u8) < (Step::RateLimit as u8),
-        "OG-25: a paused / blocked request is refused before it costs a bucket token"
+        "a paused / blocked request is refused before it costs a bucket token"
     );
     assert!(
         (Step::Policy as u8) < (Step::Limits as u8)
             && (Step::Limits as u8) < (Step::KeyBudget as u8)
             && (Step::Budgets as u8) < (Step::Audit as u8),
-        "OG-21 / OG-22: limits after the policy, budgets before the ledger row"
+        "limits after the policy, budgets before the ledger row"
+    );
+    assert!(
+        (Step::Policy as u8) < (Step::Tools as u8) && (Step::Tools as u8) < (Step::Limits as u8)
     );
     // ORDER is complete and strictly increasing — the list and the enum agree.
     assert!(
-        ORDER.len() == 13,
+        ORDER.len() == 14,
         "every Step must appear in ORDER exactly once"
     );
     let mut i = 1;
@@ -220,11 +226,24 @@ impl Progress {
 
 /// What PARSE produced, as the pipeline needs to see it.
 pub(crate) trait Parsed {
+    fn mcp(&self) -> Option<&crate::mcp_proxy::McpRequest> {
+        None
+    }
     /// The model the CALLER asked for — verbatim, before any alias rewrite.
     fn model(&self) -> &str;
     /// The request as JSON, for the predictive layer (which reads `messages[*]`
     /// off the raw body) and for the body half of the caller identity (OBS-20).
     fn request_json(&self) -> &serde_json::Value;
+    /// The complete execution payload used only when model approvals are configured.
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<serde_json::Value> {
+        // A predictive view can omit executable fields. Routes explicitly bind
+        // their complete payload; an unknown representation cannot earn a grant.
+        None
+    }
+    /// Deferred executions resolve their tenant-owned models at execution time.
+    fn approval_request(&self, _tenant: &tracelane_shared::TenantId) -> PolicyRequest {
+        self.policy_request()
+    }
     /// `OG-20`: what this route knows about the request, for a key policy. Called ONLY
     /// when the caller carries a policy, so a route may compute here (an estimate, a
     /// re-encoding) without costing anyone else anything.
@@ -343,12 +362,20 @@ pub(crate) trait Route: Sized {
     type Body;
     /// What [`Route::parse`] produces.
     type Parsed: Parsed;
+    fn mcp_body(_body: &Self::Body) -> Option<&crate::mcp_proxy::McpRequest> {
+        None
+    }
+    /// Optional MCP request metadata trace context. HTTP traceparent keeps precedence.
+    fn meta_traceparent(_body: &Self::Body) -> Option<&str> {
+        None
+    }
     /// For log lines — never a user-visible string.
     const NAME: &'static str;
     /// The ledger row's `event_type`.
     const AUDIT_EVENT_TYPE: &'static str;
     /// `OG-51`: what this route does with the response cache. Required — see [`CacheScope`].
     const CACHE: CacheScope;
+    const ZDR: crate::zdr::ZdrBinding;
     /// The scope the key must carry (A13). `chat` for every generating route;
     /// `OG-08`'s passthrough names `passthrough`, which a legacy `NULL`-scope key
     /// does NOT hold (`KeyScope::allows`). A route that needs a different scope
@@ -358,11 +385,29 @@ pub(crate) trait Route: Sized {
     /// OPAQUE body (`OG-08` passthrough: no request guardrails, said in the API docs)
     /// — the `Predictive` step is still entered, in order, and simply observes nothing.
     const INSPECTS_BODY: bool = true;
+    const AUDITED: bool = true;
     /// `OG-11`: what this route may do with the workspace routing document — virtual
     /// models (which providers), key pools, fallthrough. REQUIRED, with no default, so a
     /// new dispatch route does not build until it declares one (`OG-11` §2, the wire
     /// table).
     const ROUTING: crate::routing::RoutingScope;
+
+    /// Called once, only when the `Controls` step refuses a PAUSED workspace, before that
+    /// refusal returns; `claims` is an authenticated identity. A route that keeps signed
+    /// evidence of refusals (MCP protected tools) records it here. SYNCHRONOUS BY DESIGN:
+    /// Controls runs before RateLimit, so this may do in-process work only (no database, no
+    /// `await`); durable writes belong to a background worker fed by a bounded queue.
+    /// Default: nothing.
+    /// # Errors
+    /// None; fail-OPEN. The refusal never depends on this hook.
+    fn paused_refusal_evidence(
+        _state: &AppState,
+        _claims: &Claims,
+        _entitlements: Option<&Arc<ResolvedEntitlements>>,
+        _parsed: &Self::Parsed,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) {
+    }
 
     /// The credential, as `Bearer …`. `None` ⇒ 401 with the wire's own wording.
     fn credential(headers: &HeaderMap) -> Option<String>;
@@ -1234,15 +1279,50 @@ async fn run<R: Route>(
     body: R::Body,
     claims: Claims,
     request_start: chrono::DateTime<chrono::Utc>,
-    mut progress: Progress,
-    mut timer: crate::hotpath::StageTimer,
+    progress: Progress,
+    timer: crate::hotpath::StageTimer,
     gate: Option<PreBodyGate>,
 ) -> Result<Admitted<R>, Refusal> {
     // Trace identity — W3C `traceparent` first (joins the caller's own trace and
     // parents our span under theirs, ADR-075 / B-311), then the legacy
     // `x-trace-id`, then a fresh UUID.
-    let (trace_id, inbound_parent) = crate::trace_context::resolve_trace_identity(headers);
+    let (trace_id, inbound_parent) =
+        crate::trace_context::resolve_trace_identity_with_meta(headers, R::meta_traceparent(&body));
 
+    let refused_mcp = R::mcp_body(&body)
+        .and_then(|request| crate::mcp_proxy::RefusedMcp::new(request, &claims, headers));
+    let result = run_steps::<R>(
+        state,
+        headers,
+        body,
+        claims,
+        request_start,
+        progress,
+        timer,
+        gate,
+        trace_id,
+        inbound_parent,
+    )
+    .await;
+    if let (Some(context), Err(reason)) = (refused_mcp, &result) {
+        context.emit(state, trace_id, inbound_parent, request_start, reason);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_steps<R: Route>(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: R::Body,
+    claims: Claims,
+    request_start: chrono::DateTime<chrono::Utc>,
+    mut progress: Progress,
+    mut timer: crate::hotpath::StageTimer,
+    gate: Option<PreBodyGate>,
+    trace_id: Uuid,
+    inbound_parent: Option<Uuid>,
+) -> Result<Admitted<R>, Refusal> {
     // ── Scope (A13). Immediately after auth and BEFORE anything expensive. ──
     // A key scoped `read` (the shape you hand an external auditor) must not be
     // able to spend the tenant's provider budget. Here rather than at dispatch
@@ -1271,6 +1351,16 @@ async fn run<R: Route>(
     // until here. ──
     progress.enter(Step::Parse);
     let mut parsed = R::parse(body).map_err(Refusal::Malformed)?;
+    let zdr = crate::zdr::route_constraint(headers, R::ZDR).map_err(Refusal::Control)?;
+    // The predictive sidecar has no verified retention contract. Refuse rather than
+    // silently disable a configured detector or transmit constrained content to it.
+    if zdr.is_some() && R::INSPECTS_BODY && crate::predictive::prompt_guard::is_configured() {
+        return Err(Refusal::Control(crate::zdr::denial(
+            "zdr_unsatisfiable",
+            "auxiliary_retention_unverified",
+        )));
+    }
+
     // All five caller-supplied identity values, read ONCE and bounded ONCE
     // (`CallerIdentity::from_headers`). Three of them used to be read raw while
     // `x-business-reference` was bounded — B-368 — and the block was duplicated
@@ -1411,6 +1501,13 @@ async fn run<R: Route>(
             );
             return Err(match r {
                 crate::controls::ControlRefusal::Paused { since } => {
+                    R::paused_refusal_evidence(
+                        state,
+                        &claims,
+                        entitlements.as_ref(),
+                        &parsed,
+                        since,
+                    );
                     Refusal::Control(paused_denial(since))
                 }
                 crate::controls::ControlRefusal::Blocked(d) => Refusal::Policy(d),
@@ -1507,6 +1604,50 @@ async fn run<R: Route>(
     // ── Limits (OG-21). RPM / TPM buckets of every layer that sets `limits` — all must
     // have room, charged all-or-none in one critical section. A TPM reservation is
     // parked for its span, which reconciles it (`server::record_key_spend`). ──
+    progress.enter(Step::Tools);
+    let mut approval_granted = false;
+    let tools_required = parsed.mcp().is_some()
+        || entitlements
+            .as_ref()
+            .and_then(|e| e.mcp.as_ref())
+            .map_or(state.pg.is_some(), |s| !s.model_rules.is_empty());
+    if tools_required
+        && let Some(approver) = crate::mcp_policy::enforce(
+            state,
+            headers,
+            &claims,
+            crate::mcp_policy::ToolsRequest {
+                model: parsed.model().to_owned(),
+                body: {
+                    if parsed.mcp().is_some() {
+                        serde_json::Value::Null
+                    } else {
+                        let key =
+                            crate::tool_fingerprint::workspace_key(tenant_id).ok_or_else(|| {
+                                crate::mcp_policy::refusal(503, "approval_unavailable")
+                            })?;
+                        use secrecy::ExposeSecret;
+                        parsed.approval_body(key.expose_secret()).map_or(
+                            serde_json::Value::Null,
+                            |payload| serde_json::json!({"route":R::NAME,"payload":payload}),
+                        )
+                    }
+                },
+                policy_request: crate::mcp_policy::resolved_request(
+                    parsed.approval_request(tenant_id),
+                    entitlements.as_deref(),
+                    route_plan.as_deref(),
+                ),
+                mcp: parsed.mcp().cloned(),
+            },
+            entitlements.as_ref(),
+            trace_id,
+        )
+        .await?
+    {
+        identity.human_authorizer = Some(approver);
+        approval_granted = true;
+    }
     progress.enter(Step::Limits);
     let ws_policy = controls
         .as_deref()
@@ -1821,6 +1962,14 @@ async fn run<R: Route>(
     // refuses the append with the same 503, and the refused event consumes no seq.
     progress.enter(Step::Audit);
     let mut audit_payload = R::audit_payload(&parsed, trace_id, warn_aft_id);
+    if let Some(mcp) = parsed.mcp()
+        && let Some(args) = mcp.envelope["params"].get("arguments")
+    {
+        let key = crate::tool_fingerprint::workspace_key(tenant_id)
+            .ok_or_else(|| crate::mcp_policy::refusal(503, "fingerprint_unavailable"))?;
+        audit_payload["argument_fingerprint"] =
+            serde_json::json!(crate::tool_fingerprint::with_key(&key, &args.to_string()));
+    }
     // Customer business reference (wedge item 5), when supplied — ties the
     // tamper-evident record to a business event. Inserted ONLY when present so an
     // ordinary row's canonical payload is byte-unchanged (a perpetual
@@ -1835,7 +1984,13 @@ async fn run<R: Route>(
         actor: claims.sub.clone(),
         payload: audit_payload,
     };
-    if let Err(err) = state.audit_chain.publish(audit_event).await {
+    // Protected calls are audited here too: a call refused before reservation (no
+    // idempotency key, no signer, credential/pin failure, policy changed) would
+    // otherwise leave no record at all. The publish completes before the
+    // reservation transaction opens, so the two never contend for the chain head.
+    if R::AUDITED
+        && let Err(err) = state.audit_chain.publish(audit_event).await
+    {
         tracing::error!(error = %err, "audit publish failed — refusing request (fail-closed)");
         return Err(Refusal::AuditUnavailable);
     }
@@ -1848,7 +2003,7 @@ async fn run<R: Route>(
     // client that hangs up must leave one too (B-375 b): arm the guard NOW, not
     // at the dispatch boundary — the BYOK lookup and the guardrail verdict both
     // await, and a cancel inside either used to record nothing.
-    let dispatch_guard = DispatchGuard::arm(
+    let mut dispatch_guard = DispatchGuard::arm(
         state,
         tenant_id,
         trace_id,
@@ -1857,17 +2012,23 @@ async fn run<R: Route>(
         &identity,
         request_start,
     );
-    let attempt_security = Arc::new(crate::routing::attempt::Context::new(
-        state,
-        &claims,
-        headers,
-        parsed.policy_request(),
-        route_plan.clone(),
-        identity.end_user_id.clone(),
-        R::credential(headers)
-            .filter(|value| value.trim_start().starts_with("Bearer tlane_"))
-            .map(|value| Arc::new(secrecy::SecretString::from(value))),
-    ));
+    if !R::AUDITED {
+        dispatch_guard.disarm();
+    }
+    let attempt_security = Arc::new(
+        crate::routing::attempt::Context::new(
+            state,
+            &claims,
+            headers,
+            parsed.policy_request(),
+            route_plan.clone(),
+            identity.end_user_id.clone(),
+            R::credential(headers)
+                .filter(|value| value.trim_start().starts_with("Bearer tlane_"))
+                .map(|value| Arc::new(secrecy::SecretString::from(value))),
+        )
+        .with_approval(entitlements.clone(), approval_granted),
+    );
     Ok(Admitted {
         attempt_security,
         identity,
@@ -2211,6 +2372,9 @@ pub(crate) struct ChatParsed {
 }
 
 impl Parsed for ChatParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<serde_json::Value> {
+        Some(self.body.clone())
+    }
     fn model(&self) -> &str {
         &self.request.model
     }
@@ -2259,6 +2423,7 @@ impl Route for Chat {
     const NAME: &'static str = "chat";
     const AUDIT_EVENT_TYPE: &'static str = "chat.completions.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Serves;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Chat,
         virtual_models: crate::routing::VirtualSupport::AnyProvider,
@@ -2338,6 +2503,9 @@ pub(crate) struct EmbeddingsParsed {
 }
 
 impl Parsed for EmbeddingsParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<serde_json::Value> {
+        Some(self.body.clone())
+    }
     fn model(&self) -> &str {
         &self.request.model
     }
@@ -2371,6 +2539,7 @@ impl Route for Embeddings {
     const NAME: &'static str = "embeddings";
     const AUDIT_EVENT_TYPE: &'static str = "embeddings.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Refuses;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     // OG-11: one concrete target only — vector dimensions must not change mid-index.
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Embeddings,

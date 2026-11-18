@@ -11,7 +11,7 @@
 //! `ArcSwap`. Three flag families:
 //!   - `kill.predictive.<name>` — disable one predictor fleet-wide, where `<name>`
 //!     is the predictor's EXACT `fn name()` string (`pr8-lite-argument-drift`,
-//!     `slm_judge`, `trajectory_guard`, …). Keys are matched verbatim; a key that
+//!     `tool-schema-validator`, `tool-definition-drift`, …). Keys are matched verbatim; a key that
 //!     names no registered predictor is reported at boot by
 //!     `PredictiveLayer::with_kill_switch` as an `error!` and is otherwise INERT
 //!     (B-237: `argdrift` was documented for a predictor named
@@ -457,7 +457,7 @@ mod tests {
     fn unconfigured_serves_safe_defaults() {
         let ks = KillSwitch::disabled();
         // Predictors stay on (not killed); upstreams available; no canary.
-        assert!(!ks.predictive_killed("slm_judge"));
+        assert!(!ks.predictive_killed("tool-schema-validator"));
         assert!(!ks.upstream_killed("openai"));
         assert!(!ks.canary_enabled("new-router"));
         // Explicit amplify-path default is honoured.
@@ -467,12 +467,12 @@ mod tests {
     #[test]
     fn set_flags_are_read() {
         let mut m = HashMap::new();
-        m.insert("kill.predictive.slm_judge".to_string(), true);
+        m.insert("kill.predictive.tool-schema-validator".to_string(), true);
         m.insert("kill.upstream.anthropic".to_string(), true);
         m.insert("flag.canary.new-router".to_string(), true);
         let ks = KillSwitch::with_flags(m);
-        assert!(ks.predictive_killed("slm_judge"));
-        assert!(!ks.predictive_killed("trajectory_guard")); // unset → default off
+        assert!(ks.predictive_killed("tool-schema-validator"));
+        assert!(!ks.predictive_killed("tool-definition-drift")); // unset → default off
         assert!(ks.upstream_killed("anthropic"));
         assert!(!ks.upstream_killed("openai"));
         assert!(ks.canary_enabled("new-router"));

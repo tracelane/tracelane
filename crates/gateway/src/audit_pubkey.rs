@@ -11,14 +11,17 @@
 //! **Public by design (rider 3).** A public key is public: there is no secret
 //! here and no existence oracle beyond the already-opaque tenant UUID (v4, not
 //! enumerable). No auth, so an auditor holding only the export + the tenant id can
-//! fetch ground truth. **Rate-limited** (a process-global token bucket) as DoS
-//! defense-in-depth — the same no-unspoofable-peer-IP constraint as the WorkOS
-//! webhook cap (axum::serve without connect-info), so a global bucket is the right
-//! shape.
+//! fetch ground truth. Workspace requests use the canonical TCP-peer/trusted-proxy
+//! source contract, bounded per-source buckets and a separate global store-work
+//! budget. Confirmed misses alone enter a size/TTL-bounded negative cache; policy
+//! lives in `translation_policy.v1.json` (`audit_pubkey`). Platform-key/OpenAPI
+//! retain their own shared in-memory rate budget and never consume store tokens.
+
+mod abuse;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -30,19 +33,20 @@ use std::sync::Arc;
 use crate::auth::workos_webhook::WebhookRateLimiter;
 use crate::rate_limiter::RateLimitDecision;
 
-/// Default budget: 600 lookups/min globally (10/s) — generous for occasional
-/// auditor fetches, tight enough to bound abuse of the unauthenticated GET.
+/// Existing in-memory platform-key/OpenAPI budget. Workspace store limits live
+/// separately in the reference policy.
 const DEFAULT_PUBKEY_RATE_PER_MIN: u32 = 600;
 
 #[derive(Clone)]
 pub struct PubkeyState {
-    /// Process-global token bucket (a generic limiter reused here — the endpoint
-    /// has the same no-peer-IP constraint as the webhook cap).
+    /// In-memory platform-key/OpenAPI budget, isolated from workspace lookups.
     pub rate: Arc<WebhookRateLimiter>,
     /// AUD-29: the PLATFORM key's public half (base64 raw 32 bytes), derived and
     /// self-checked at boot by `audit::platform_pubkey_b64`. `None` = no global
     /// signing key configured (or it failed the self-check) → the route says so.
     pub platform_pubkey_b64: Option<Arc<str>>,
+    store: Arc<dyn PubkeyStore>,
+    abuse: Option<Arc<abuse::Abuse>>,
 }
 
 impl PubkeyState {
@@ -51,6 +55,10 @@ impl PubkeyState {
         Self {
             rate: Arc::new(WebhookRateLimiter::new(DEFAULT_PUBKEY_RATE_PER_MIN)),
             platform_pubkey_b64: None,
+            store: Arc::new(PostgresStore(crate::db::global_pool().cloned())),
+            abuse: abuse::Policy::shipped()
+                .map(abuse::Abuse::new)
+                .map(Arc::new),
         }
     }
 
@@ -134,18 +142,32 @@ async fn platform_handler(State(state): State<PubkeyState>) -> Response {
         .into_response()
 }
 
-async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>) -> Response {
-    if let RateLimitDecision::Throttle { retry_after_secs } = state.rate.check() {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", retry_after_secs.to_string())],
-            Json(serde_json::json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-    }
+/// # Errors
+/// Fail-CLOSED: invalid input is 400, exhausted limits are 429, and unavailable
+/// trust data is 5xx. Only confirmed absence is 404. No stale trust fallback.
+async fn handler(
+    State(state): State<PubkeyState>,
+    Query(q): Query<PubkeyQuery>,
+    request: Request,
+) -> Response {
+    let mut response = workspace_lookup(&state, q, request).await;
+    // Never allow intermediary negative caching to outlive our bounded TTL.
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
 
+/// # Errors
+/// Fail-CLOSED on bounds, checkout/SQL failures and timeout. Error/cancellation
+/// cannot create cached absence. A full cache evicts an entry; the next read is
+/// still gated. Slots bound admitted lookup futures; the global rate also bounds
+/// attempts when a dropped Postgres future's server-side query is still finishing.
+async fn workspace_lookup(state: &PubkeyState, q: PubkeyQuery, request: Request) -> Response {
     // The tenant id is untrusted input → parse to a real UUID and bind as UUID
-    // (never string-concatenate into SQL). A bad id is a 400, not a 500.
+    // (never string-concatenate into SQL). Reject before source admission so
+    // malformed input cannot allocate or refresh per-source state.
     let tenant_uuid = match uuid::Uuid::parse_str(q.tenant_id.trim()) {
         Ok(u) => u,
         Err(_) => {
@@ -157,59 +179,42 @@ async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>)
         }
     };
 
-    let Some(pool) = crate::db::global_pool() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "unavailable" })),
-        )
-            .into_response();
+    let Some(abuse) = &state.abuse else {
+        return unavailable(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(err) => {
-            tracing::warn!(error = %err, "audit pubkey: pg connection failed");
-            return internal();
-        }
-    };
-    let row = match client
-        .query_opt(
-            "SELECT public_key_b64, COALESCE(anchor_pubkey_spki_b64, '') \
-             FROM tenant_audit_keys WHERE tenant_id = $1",
-            &[&tenant_uuid],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(error = %err, "audit pubkey lookup failed");
-            return internal();
-        }
-    };
-    let Some(row) = row else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no audit key for tenant" })),
-        )
-            .into_response();
-    };
+    let policy = crate::providers::translation_policy::auth_throttle_policy();
+    let source = crate::preauth_limiter::peer_of(request.extensions())
+        .map_or(crate::preauth_limiter::SourceKey::UNKNOWN, |peer| {
+            crate::preauth_limiter::source_of(request.headers(), Some(peer), policy)
+        });
+    let started = abuse.now();
+    if let Err(retry_after) = abuse.source(source, started) {
+        return throttled(retry_after);
+    }
 
-    let ed25519_pubkey_b64: String = row.get(0);
-    let anchor_ecdsa_spki_b64: String = row.get(1);
-    // AUD-29: from the CANONICAL anchor store (ADR-078 B). Fail-CLOSED: a failed read
-    // is a 500, never a `null` that would widen the platform key's accepted range.
-    let workspace_key_since_seq: Option<i64> = match client
-        .query_one(
-            "SELECT MIN(batch_start_seq) FROM audit_anchor_records \
-             WHERE tenant_id = $1 AND ed25519_pubkey = $2",
-            &[&tenant_uuid, &ed25519_pubkey_b64],
-        )
-        .await
-    {
-        Ok(r) => r.get(0),
-        Err(err) => {
-            tracing::warn!(error = %err, "audit pubkey: workspace-key since-seq lookup failed");
-            return internal();
+    if abuse.missing(tenant_uuid, started) {
+        return missing();
+    }
+    // Non-queuing: there is no unbounded waiter or per-UUID lock map.
+    let Ok(_slot) = abuse.slots.try_acquire() else {
+        return throttled(1);
+    };
+    if let RateLimitDecision::Throttle { retry_after_secs } = abuse.store_rate.check() {
+        return throttled(retry_after_secs);
+    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(abuse.policy.lookup_timeout_ms),
+        state.store.lookup(tenant_uuid),
+    )
+    .await;
+    let (ed25519_pubkey_b64, anchor_ecdsa_spki_b64, workspace_key_since_seq) = match result {
+        Ok(Ok(Some(key))) => key,
+        Ok(Ok(None)) => {
+            abuse.confirm_missing(tenant_uuid, started);
+            return missing();
         }
+        Ok(Err(status)) => return unavailable(status),
+        Err(_) => return unavailable(StatusCode::SERVICE_UNAVAILABLE),
     };
     let ed25519_fingerprint_sha256 = fingerprint_of_b64(&ed25519_pubkey_b64);
     let anchor_ecdsa_fingerprint_sha256 = if anchor_ecdsa_spki_b64.is_empty() {
@@ -229,6 +234,88 @@ async fn handler(State(state): State<PubkeyState>, Query(q): Query<PubkeyQuery>)
     .into_response()
 }
 
+type StoredKey = (String, String, Option<i64>);
+
+#[async_trait::async_trait]
+trait PubkeyStore: Send + Sync {
+    /// # Errors
+    /// Fail-CLOSED: a failed key or takeover read is an error, never absence.
+    async fn lookup(&self, tenant: uuid::Uuid) -> Result<Option<StoredKey>, StatusCode>;
+}
+
+struct PostgresStore(Option<crate::db::DbPool>);
+
+#[async_trait::async_trait]
+impl PubkeyStore for PostgresStore {
+    async fn lookup(&self, tenant: uuid::Uuid) -> Result<Option<StoredKey>, StatusCode> {
+        let pool = self.0.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let client = pool.get().await.map_err(|err| {
+            tracing::warn!(error = %err, "audit pubkey: pg connection failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let row = client
+            .query_opt(
+                "SELECT public_key_b64, COALESCE(anchor_pubkey_spki_b64, '') \
+             FROM tenant_audit_keys WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "audit pubkey lookup failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let key: String = row
+            .try_get(0)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let anchor: String = row
+            .try_get(1)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let since: Option<i64> = client
+            .query_one(
+                "SELECT MIN(batch_start_seq) FROM audit_anchor_records \
+             WHERE tenant_id = $1 AND ed25519_pubkey = $2",
+                &[&tenant, &key],
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "audit pubkey: workspace-key since-seq lookup failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .try_get(0)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Some((key, anchor, since)))
+    }
+}
+
+fn throttled(retry_after: u32) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", retry_after.to_string())],
+        Json(serde_json::json!({ "error": "rate_limited" })),
+    )
+        .into_response()
+}
+
+fn unavailable(status: StatusCode) -> Response {
+    let error = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        "internal"
+    } else {
+        "unavailable"
+    };
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+fn missing() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "no audit key for tenant" })),
+    )
+        .into_response()
+}
+
 /// SHA-256 hex fingerprint of the bytes a base64 string decodes to. Empty on a
 /// malformed base64 (never panics on stored data).
 fn fingerprint_of_b64(b64: &str) -> String {
@@ -246,16 +333,8 @@ fn fingerprint_of_b64(b64: &str) -> String {
     }
 }
 
-fn internal() -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": "internal" })),
-    )
-        .into_response()
-}
-
 /// OG-60 — `GET /v1/openapi.json`: the control API's OpenAPI description. Mounted here so it
-/// shares this module's public-by-design posture AND its process-global rate bucket (a route
+/// shares the platform-key route's public posture and in-memory rate bucket (a route
 /// of route shapes holds no tenant data); the body and its throttle live in `openapi_route`.
 async fn openapi_handler(State(state): State<PubkeyState>) -> Response {
     crate::openapi_route::respond(&state.rate)
@@ -311,3 +390,7 @@ mod tests {
         assert_eq!(fingerprint_of_b64("!!!not base64!!!"), "");
     }
 }
+
+#[cfg(test)]
+#[path = "audit_pubkey/tests.rs"]
+mod abuse_tests;

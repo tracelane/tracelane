@@ -31,7 +31,7 @@ export interface ApiKeyRow {
 	mintedBy?: string | null;
 	/**
 	 * A13. `null` means the key was minted BEFORE scopes existed and carries the
-	 * full API surface — rendered as "Full access (legacy)" rather than as an
+	 * full API surface — rendered as "Legacy access" rather than as an
 	 * empty list, because "no scopes" and "all scopes" are opposite meanings and
 	 * showing a blank cell for the permissive one would be dangerously wrong.
 	 */
@@ -89,6 +89,11 @@ export function canEditKeyLimits(viewer: KeyViewer, row: ApiKeyRow): boolean {
 /** The closed scope vocabulary, mirrored from `tracelane_shared::api_scope`. */
 const SCOPES: { value: string; label: string; hint: string }[] = [
 	{
+		value: "mcp",
+		label: "MCP",
+		hint: "Call connected tools through the gateway. Requires an explicit grant.",
+	},
+	{
 		value: "chat",
 		label: "Chat",
 		hint: "Send completions through the gateway",
@@ -117,7 +122,7 @@ const SCOPES: { value: string; label: string; hint: string }[] = [
 
 /** Human label for a key's capability. */
 function scopeLabel(scope: string[] | null | undefined): string {
-	if (scope == null) return "Full access (legacy)";
+	if (scope == null) return "Legacy access";
 	if (scope.length === 0) return "No access";
 	return scope
 		.map((v) => SCOPES.find((s) => s.value === v)?.label ?? v)
@@ -416,11 +421,13 @@ function NewKeyModal({
 // RENDERED MARKUP that no scope arrives pre-granted. Testing the state array
 // would pass while the checkboxes said otherwise (TRAPS §34).
 export function CreateKeyDialog({
+	mayGrantMcp = false,
 	onClose,
 	onCreate,
 	pending,
 	error,
 }: {
+	mayGrantMcp?: boolean;
 	onClose: () => void;
 	onCreate: (input: CreateKeyInput) => void;
 	pending: boolean;
@@ -513,24 +520,26 @@ export function CreateKeyDialog({
 					<legend className="text-xs font-medium text-ink-2 mb-1">
 						Scope — what this key may do
 					</legend>
-					{SCOPES.map((sc) => (
-						<label
-							key={sc.value}
-							className="flex items-start gap-2 text-xs text-ink cursor-pointer"
-						>
-							<input
-								type="checkbox"
-								checked={scope.includes(sc.value)}
-								onChange={() => toggle(sc.value)}
-								disabled={pending}
-								className="mt-0.5"
-							/>
-							<span>
-								<span className="font-medium">{sc.label}</span>
-								<span className="text-ink-2"> — {sc.hint}</span>
-							</span>
-						</label>
-					))}
+					{SCOPES.filter((sc) => sc.value !== "mcp" || mayGrantMcp).map(
+						(sc) => (
+							<label
+								key={sc.value}
+								className="flex items-start gap-2 text-xs text-ink cursor-pointer"
+							>
+								<input
+									type="checkbox"
+									checked={scope.includes(sc.value)}
+									onChange={() => toggle(sc.value)}
+									disabled={pending}
+									className="mt-0.5"
+								/>
+								<span>
+									<span className="font-medium">{sc.label}</span>
+									<span className="text-ink-2"> — {sc.hint}</span>
+								</span>
+							</label>
+						),
+					)}
 					{scope.length === 0 && (
 						<p className="text-2xs text-danger-ink">
 							Pick at least one — a key with no scope can do nothing.
@@ -994,7 +1003,7 @@ export function ApiKeyManager({
 											}
 											title={
 												key.scope == null
-													? "Minted before scopes existed — carries the full API surface. Use Edit limits to narrow it in place."
+													? "Minted before scopes existed. MCP and passthrough require explicit grants. Use Edit limits to choose scopes."
 													: undefined
 											}
 										>
@@ -1109,6 +1118,7 @@ export function ApiKeyManager({
 
 			{editing && canEditKeyLimits(viewer, editing) && (
 				<KeyEditDrawer
+					mayGrantMcp={viewer.role === "owner" || viewer.role === "admin"}
 					key={editing.id}
 					row={editing}
 					onClose={() => setKeyId(null)}
@@ -1127,6 +1137,7 @@ export function ApiKeyManager({
 			<Toast message={notice} onDismiss={() => setNotice(null)} />
 			{showCreate && (
 				<CreateKeyDialog
+					mayGrantMcp={viewer.role === "owner" || viewer.role === "admin"}
 					onClose={() => {
 						setShowCreate(false);
 						createMutation.reset();

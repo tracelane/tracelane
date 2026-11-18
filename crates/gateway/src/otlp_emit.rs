@@ -50,14 +50,14 @@ pub fn emit_operation_exception(
 
 /// Emits a `gen_ai.evaluation.result` event (v1.38, ADR-032).
 ///
-/// This is where SLM-judge / predictive eval scores land (§9.5). `score` is the
+/// Schema for future measured evaluation scores (§9.5). `score` is the
 /// numeric result for `evaluation_name` (e.g. `hallucination`, `flow_adherence`);
 /// `label` is the optional categorical verdict (e.g. `pass`/`fail`).
 ///
-/// Not yet wired to a caller: the SLM judge (`predictive/slm_judge.rs`) returns
-/// placeholder scores until its ONNX model lands (a pre-existing 🟡 item, out of this reconciliation's scope). This emitter is
-/// the v1.41 landing point and will be called from the judge path once it
-/// produces real scores. Verified by a unit test below.
+/// Not wired to a production caller. The constant SLM placeholder was retired;
+/// its removal does not create real evaluation scores. This emitter retains the
+/// v1.41 event shape for a future measured producer. The unit test below verifies
+/// formatting only, not model inference or live score emission.
 #[allow(dead_code)]
 pub fn emit_evaluation_result(
     tenant_id: &TenantId,

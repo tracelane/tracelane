@@ -279,6 +279,10 @@ pub enum RailError {
     /// A detector panicked; caught at the dispatcher seam via `catch_unwind`.
     #[error("rail detector panicked")]
     DetectorPanic,
+    /// A detector stopped at its work budget (GWY-60: R7's match budget) instead of
+    /// scanning an input shaped to make it run unbounded.
+    #[error("rail detector exceeded its work budget")]
+    WorkBudgetExceeded,
     /// A dependency (e.g. the pinned-hash store) was unavailable.
     ///
     /// No production rail constructs this today — same as `ConfigMissing`
@@ -297,7 +301,9 @@ impl RailError {
             #[cfg(test)]
             RailError::ConfigMissing(_) => reason_codes::CONFIG_MISSING,
             RailError::Timeout => reason_codes::RAIL_TIMEOUT,
-            RailError::DetectorPanic => reason_codes::DETECTOR_ERROR,
+            RailError::DetectorPanic | RailError::WorkBudgetExceeded => {
+                reason_codes::DETECTOR_ERROR
+            }
             #[cfg(test)]
             RailError::DependencyUnavailable(_) => reason_codes::DEPENDENCY_UNAVAILABLE,
         }
@@ -384,6 +390,8 @@ pub mod reason_codes {
     // ── R7 topic / competitor ──────────────────────────────────────────────
     pub const TOPIC_DENIED: &str = "TOPIC_DENIED";
     pub const COMPETITOR_MENTION: &str = "COMPETITOR_MENTION";
+    /// A workspace-defined regex entity matched (GWY-63).
+    pub const PII_CUSTOM: &str = "PII_CUSTOM";
 
     // ── R8 prompt injection (heuristic) ────────────────────────────────────
     pub const INJECTION_DIRECT: &str = "INJECTION_DIRECT";

@@ -266,6 +266,7 @@ async fn og30_absent_and_invalid_policy_keep_the_security_default() {
         let result = state
             .guardrail
             .scan_request(super::RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: None,
                 project_id: None,
@@ -621,4 +622,125 @@ async fn og33_realtime_and_batches_cannot_bypass_enforcing_classes() {
             .await
     );
     assert!(!s.guardrail.batch_policy(tenant, None, None).await.1);
+}
+
+fn custom_pii(action: &str) -> Value {
+    json!({"rails":{"R2_secrets_pii":{"mode":"block","pii":{"classes":{},
+        "custom":[{"name":"employee_id","pattern":"EMP-[0-9]{6}","action":action}]}}}})
+}
+
+#[tokio::test]
+async fn gwy63_custom_block_refuses_before_upstream() {
+    use axum::{Json, extract::State};
+    let _b = crate::handler_harness::LoopbackBypassGuard::new();
+    let upstream = crate::handler_harness::chat_ok_mock().await;
+    let s = state(
+        crate::handler_harness::test_state(crate::handler_harness::registry_pointing_ollama_at(
+            upstream.uri(),
+        )),
+        custom_pii("block"),
+    );
+    let response = crate::server::chat_completions_handler(State(s), crate::handler_harness::authed(), Json(json!({"model":"ollama/llama3","messages":[{"role":"user","content":"look up EMP-123456"}]}))).await;
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let value = crate::handler_harness::body_json(response).await;
+    assert_eq!(value["reason_code"], "PII_CUSTOM", "{value}");
+    assert!(!value.to_string().contains("EMP-123456"));
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gwy63_custom_redact_never_reaches_upstream() {
+    use axum::{Json, extract::State};
+    let _b = crate::handler_harness::LoopbackBypassGuard::new();
+    let upstream = crate::handler_harness::chat_ok_mock().await;
+    let s = state(
+        crate::handler_harness::test_state(crate::handler_harness::registry_pointing_ollama_at(
+            upstream.uri(),
+        )),
+        custom_pii("redact"),
+    );
+    let response = crate::server::chat_completions_handler(State(s), crate::handler_harness::authed(), Json(json!({"model":"ollama/llama3","messages":[{"role":"user","content":"look up EMP-123456"}]}))).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let sent = upstream.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    let body = String::from_utf8_lossy(&sent[0].body).to_string();
+    assert!(!body.contains("EMP-123456"), "{body}");
+    assert!(body.contains("TL_REDACT:custom_employee_id"), "{body}");
+}
+
+#[tokio::test]
+async fn gwy63_custom_redact_reaches_companion_egress() {
+    let s = state(
+        crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap()),
+        custom_pii("redact"),
+    );
+    let tenant = crate::handler_harness::dev_tenant();
+    let mut body =
+        json!({"messages":[{"role":"user","content":"EMP-123456 and person@example.com"}]});
+    assert_eq!(
+        s.guardrail
+            .companion_r2(&tenant, None, None, &mut body)
+            .await,
+        Ok(true)
+    );
+    let text = body.to_string();
+    assert!(!text.contains("EMP-123456"), "{text}");
+    assert!(
+        !text.contains("person@example.com"),
+        "built-in defaults still apply"
+    );
+}
+
+#[tokio::test]
+async fn gwy63_custom_redact_applies_to_streamed_output_split_across_chunks() {
+    use super::{GuardStep, ResponseGuard, ResponseInputs, SessionState};
+    let s = state(
+        crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap()),
+        custom_pii("redact"),
+    );
+    let mut guard = ResponseGuard::new(
+        s.guardrail,
+        ResponseInputs {
+            hooks: None,
+            hook_events: Default::default(),
+            tenant_id: crate::handler_harness::dev_tenant(),
+            api_key_id: None,
+            project_id: None,
+            correlation_id: ulid::Ulid::new(),
+            system_prompt: None,
+            model: "gpt-4o".into(),
+            session: SessionState::fresh(None),
+            actor: "unit-test".into(),
+            expected_format: None,
+        },
+        Vec::new(),
+    );
+    let mut text = String::new();
+    for piece in ["your badge is EMP-12", "3456, keep it safe"] {
+        match guard.on_delta(piece, None).await {
+            GuardStep::Emit(t) => text.push_str(&t),
+            GuardStep::Block { .. } => panic!("redaction must not block"),
+        }
+    }
+    match guard.on_end(None).await {
+        GuardStep::Emit(t) => text.push_str(&t),
+        GuardStep::Block { .. } => panic!("redaction must not block"),
+    }
+    assert!(!text.contains("EMP-123456"), "{text}");
+    assert!(text.contains("[REDACTED:custom_employee_id]"), "{text}");
+}
+
+#[tokio::test]
+async fn gwy63_review_h2_realtime_cannot_bypass_enforcing_custom_entities() {
+    let s = state(
+        crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap()),
+        custom_pii("block"),
+    );
+    let tenant = *crate::handler_harness::dev_tenant().as_uuid();
+    assert!(
+        !s.guardrail
+            .realtime_policy_supported(tenant, None, None)
+            .await,
+        "an enforcing custom entity must refuse realtime like an enforcing class"
+    );
 }

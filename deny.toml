@@ -45,6 +45,13 @@ ignore = [
  "RUSTSEC-2026-0098",
  "RUSTSEC-2026-0099",
  "RUSTSEC-2026-0104",
+ # RUSTSEC-2026-0382 rustls-webpki 0.102.8 (distrusted intermediates): same async-nats 0.42
+ # path; the 0.103 copy is upgraded to 0.103.17 in this change. Fix = async-nats >=0.47.
+ "RUSTSEC-2026-0382",
+ # RUSTSEC-2026-0387 crypto-bigint 0.5.5 (non-constant-time ops): only via p256 0.13 ECDSA
+ # VERIFY in tracelane-audit-verifier, whose inputs (signature, public key, message) are all
+ # public, so a timing leak reveals nothing secret. Fix = elliptic-curve 0.14 / p256 0.14.
+ "RUSTSEC-2026-0387",
  # rustls-pemfile — informational/deprecated.
  "RUSTSEC-2025-0134",
  # paste / bincode — unmaintained transitive crates (no fix path).

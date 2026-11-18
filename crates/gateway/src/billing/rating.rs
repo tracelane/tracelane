@@ -239,6 +239,7 @@ impl SpendSpikePolicy {
 /// once and this default is used), never a silent literal price.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
+    pub data_controls: Option<crate::db::data_controls::Policy>,
     pub workspace_glance: WorkspaceGlancePolicy,
     pub trace_reads: TraceReadPolicy,
     pub attempt_records_since: Option<String>,
@@ -383,6 +384,7 @@ impl Default for Policy {
     /// no row for a key, which this module warns about once when it happens.
     fn default() -> Self {
         Self {
+            data_controls: crate::db::data_controls::Policy::embedded(),
             workspace_glance: WorkspaceGlancePolicy::default(),
             trace_reads: TraceReadPolicy::embedded(),
             trace_reads_tenant_key_multiplier: serde_json::from_str::<serde_json::Value>(
@@ -567,6 +569,7 @@ impl Policy {
             }
         };
         Self {
+            data_controls: raw.get("data_controls").and_then(|v| serde_json::from_str::<crate::db::data_controls::Policy>(v).ok()).filter(|p| p.valid()),
             workspace_glance: raw
                 .get("workspace_glance")
                 .and_then(|value| serde_json::from_str::<WorkspaceGlancePolicy>(value).ok())
@@ -1447,6 +1450,7 @@ mod tests {
     fn policy_from_raw_preserves_display_defaults_and_fails_closed_for_strict_keys() {
         let p = Policy::from_raw(&HashMap::new());
         let expected = Policy {
+            data_controls: None,
             attempt_records_since: None,
             // This existing strict policy also refuses an embedded fallback.
             incident_regression: None,

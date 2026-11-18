@@ -49,7 +49,142 @@ pub struct ToolAnalyticsState {
 }
 
 pub fn routes() -> Router<ToolAnalyticsState> {
-    Router::new().route("/v1/query/tool-analytics", get(handler))
+    Router::new()
+        .route("/v1/query/tool-analytics", get(handler))
+        .route("/v1/mcp-usage", get(mcp_usage))
+}
+
+#[derive(Debug, Deserialize)]
+struct McpUsageQuery {
+    since: Option<String>,
+    until: Option<String>,
+    group_by: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, clickhouse::Row)]
+struct McpUsageRow {
+    dimension: String,
+    calls: u64,
+    errors: u64,
+    p95_ms: Option<f64>,
+    refused: u64,
+    awaiting_approval: u64,
+    would_block: u64,
+    total_calls: u64,
+    group_count: u64,
+}
+
+fn mcp_usage_sql(group: &str, usage: &crate::mcp_policy::McpUsageLimits) -> Option<String> {
+    let dimension = match group {
+        "total" => "'all'",
+        "server" => "JSONExtractString(attributes, 'tracelane.mcp.server')",
+        "tool" => "JSONExtractString(attributes, 'gen_ai.tool.name')",
+        "key" => "JSONExtractString(attributes, 'tracelane_api_key_id')",
+        _ => return None,
+    };
+    let excluded = usage
+        .latency_excluded_methods
+        .iter()
+        .map(|method| format!("'{}'", method.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let eligible = format!("JSONExtractString(attributes, 'mcp.method.name') NOT IN ({excluded})");
+    Some(format!(
+        "SELECT {dimension} AS dimension, \
+         toUInt64(count()) AS calls, \
+         toUInt64(countIf(status_code = 2)) AS errors, \
+         if(countIf({eligible}) >= {min_samples}, toNullable(quantileIf(0.95)(duration_us, {eligible}) / 1000.0), NULL) AS p95_ms, \
+         toUInt64(countIf(intervention = 2)) AS refused, \
+         toUInt64(countIf(JSONExtractString(attributes, 'error_type') = 'approval_required')) AS awaiting_approval, \
+         toUInt64(countIf(arrayExists(v -> startsWith(JSONExtractString(v, 'outcome'), 'would_'), JSONExtractArrayRaw(attributes, 'tracelane.mcp.verdicts')))) AS would_block, \
+         toUInt64(sum(count()) OVER ()) AS total_calls, \
+         toUInt64(count() OVER ()) AS group_count \
+         FROM tracelane.spans FINAL \
+         WHERE tenant_id = ? AND JSONExtractString(attributes, 'mcp.method.name') != '' \
+         AND start_time >= toDateTime(?) AND start_time <= toDateTime(?) \
+         GROUP BY dimension ORDER BY calls DESC LIMIT ?",
+        min_samples = usage.min_samples_for_p95
+    ))
+}
+
+async fn mcp_usage(
+    State(state): State<ToolAnalyticsState>,
+    Query(q): Query<McpUsageQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok()) else {
+        return crate::mcp_proxy::error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let claims = match crate::auth::validate_authorization(auth).await {
+        Ok(claims) => claims,
+        Err(e) => return crate::mcp_proxy::error(crate::auth::failure_status(&e), "auth_failed"),
+    };
+    if !claims.allows_spend_read() {
+        return crate::mcp_proxy::error(StatusCode::FORBIDDEN, "usage_access_required");
+    }
+    let Ok(settings) = crate::mcp_policy::settings() else {
+        return crate::mcp_proxy::error(StatusCode::SERVICE_UNAVAILABLE, "mcp_policy_invalid");
+    };
+    let now = chrono::Utc::now().timestamp();
+    let since = match parse_rfc3339_secs(q.since.as_deref()) {
+        Ok(Some(t)) => t,
+        Ok(None) => now - i64::from(settings.spans.usage.window_default_hours) * 3600,
+        Err(()) => return crate::mcp_proxy::error(StatusCode::BAD_REQUEST, "invalid_since"),
+    };
+    let until = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(Some(t)) => t,
+        Ok(None) => now,
+        Err(()) => return crate::mcp_proxy::error(StatusCode::BAD_REQUEST, "invalid_until"),
+    };
+    if since > until
+        || until > now
+        || until - since > i64::from(settings.spans.usage.window_max_days) * 86400
+    {
+        return crate::mcp_proxy::error(StatusCode::BAD_REQUEST, "window_too_large");
+    }
+    let can_read_recorded = claims.allows_scope(crate::auth::scope::Scope::Read);
+    let group = q
+        .group_by
+        .as_deref()
+        .unwrap_or(if can_read_recorded { "server" } else { "total" });
+    if group != "total" && !can_read_recorded {
+        return crate::mcp_proxy::error(StatusCode::FORBIDDEN, "trace_read_access_required");
+    }
+    let Some(sql) = mcp_usage_sql(group, &settings.spans.usage) else {
+        return crate::mcp_proxy::error(StatusCode::BAD_REQUEST, "invalid_group_by");
+    };
+    let tier =
+        crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &claims.tenant_id)
+            .await;
+    let ch = crate::retention_sweep::read_client(
+        &state.ch,
+        state.entitlements.as_deref(),
+        &claims.tenant_id,
+    )
+    .await;
+    let sql = capped_sql(&sql, tier);
+    let rows: Vec<McpUsageRow> = match ch
+        .query(&sql)
+        .bind(claims.tenant_id.to_string())
+        .bind(since)
+        .bind(until)
+        .bind(settings.spans.usage.max_groups)
+        .fetch_all()
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(error = %err, "MCP usage read failed");
+            return crate::mcp_proxy::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mcp_usage_unavailable",
+            );
+        }
+    };
+    let total_calls = rows.first().map_or(0, |row| row.total_calls);
+    let group_count = rows.first().map_or(0, |row| row.group_count);
+    let partial = rows.len() < group_count as usize;
+    Json(serde_json::json!({"since":since,"until":until,"group_by":group,"rows":rows,"partial":partial,"total_calls":total_calls,"group_count":group_count})).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,7 +418,13 @@ async fn handler(
     let tier =
         crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &claims.tenant_id)
             .await;
-    match read(&state.ch, tier, &tenant, window, limit).await {
+    let ch = crate::retention_sweep::read_client(
+        &state.ch,
+        state.entitlements.as_deref(),
+        &claims.tenant_id,
+    )
+    .await;
+    match read(&ch, tier, &tenant, window, limit).await {
         Ok(analytics) => Json(analytics).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "tool-analytics query failed");
@@ -295,6 +436,68 @@ async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_usage_requires_authorization() {
+        use tower::ServiceExt;
+        let state = ToolAnalyticsState {
+            ch: clickhouse::Client::default(),
+            entitlements: None,
+        };
+        let request = axum::http::Request::builder()
+            .uri("/v1/mcp-usage")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn mcp_usage_sql_is_tenant_first_and_uses_only_known_dimensions() {
+        let usage = &crate::mcp_policy::settings().unwrap().spans.usage;
+        for group in ["total", "server", "tool", "key"] {
+            let sql = mcp_usage_sql(group, usage).unwrap();
+            assert!(
+                sql.contains("FROM tracelane.spans FINAL WHERE tenant_id = ? AND"),
+                "{sql}"
+            );
+            assert!(sql.contains("LIMIT ?"), "{sql}");
+            assert_eq!(sql.matches('?').count(), 4, "{sql}");
+        }
+        assert!(mcp_usage_sql("tenant_id", usage).is_none());
+        assert!(
+            mcp_usage_sql("total", usage)
+                .unwrap()
+                .contains("'all' AS dimension")
+        );
+        assert!(
+            mcp_usage_sql("total", usage)
+                .unwrap()
+                .contains("countIf(intervention = 2)")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_usage_billing_role_cannot_read_recorded_dimensions() {
+        use tower::ServiceExt;
+        let mut billing = crate::auth::dev_stub_claims(crate::auth::AuthMethod::JwtBearer);
+        billing.role = Some(crate::auth::Role::Billing);
+        assert!(billing.allows_spend_read());
+        let _auth = crate::auth::test_claims::Guard::set(billing);
+        for group in ["server", "tool", "key"] {
+            let state = ToolAnalyticsState {
+                ch: clickhouse::Client::default(),
+                entitlements: None,
+            };
+            let request = axum::http::Request::builder()
+                .uri(format!("/v1/mcp-usage?group_by={group}"))
+                .header("authorization", "Bearer fixture")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = routes().with_state(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{group}");
+        }
+    }
 
     #[test]
     fn sql_is_tenant_first_and_bounded_by_tool_name() {
@@ -451,3 +654,7 @@ mod clickhouse_roundtrip {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tool_analytics_fix_tests.rs"]
+mod fix_tests;

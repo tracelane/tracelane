@@ -44,6 +44,11 @@ const MAX_KEY_NAME_LEN: usize = 128;
 /// `async_trait` is fine — CLAUDE.md bans it only on the gateway hot path.
 #[async_trait::async_trait]
 pub trait KeyMinter: Send + Sync {
+    /// Discard only keys minted by this validated human subject, across workspaces.
+    async fn invalidate_owned_cache(&self, _subject: &str) -> Result<()> {
+        anyhow::bail!("owned cache invalidation unavailable")
+    }
+
     async fn rotation_grace_hours(&self) -> Result<i64>;
     async fn rotate(
         &self,
@@ -90,6 +95,152 @@ pub trait KeyMinter: Send + Sync {
     ) -> Option<f64>;
 }
 
+struct WorkosMembership;
+
+#[derive(Debug, thiserror::Error)]
+enum WorkosMembershipError {
+    #[error("membership verification unavailable; retry later")]
+    Unavailable,
+    #[error("active membership required")]
+    Inactive,
+}
+
+impl WorkosMembershipError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Inactive => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("key issuance unavailable: WORKOS_API_KEY is missing or empty")]
+struct MissingWorkosApiKey;
+
+// Absence of the gateway identity integration differs from a broken integration.
+// Presence (even an empty/invalid value) fails closed; never infer self-host
+// mode merely from a missing management API credential.
+fn workos_membership_credentials() -> Result<Option<secrecy::SecretString>> {
+    use secrecy::ExposeSecret as _;
+    let configured = [
+        "WORKOS_CLIENT_ID",
+        "WORKOS_JWKS_URL",
+        "WORKOS_ISSUER",
+        "WORKOS_AUDIENCE",
+        "WORKOS_WEBHOOK_SECRET",
+        "WORKOS_API_KEY",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    if !configured {
+        return Ok(None);
+    }
+    std::env::var("WORKOS_API_KEY")
+        .ok()
+        .map(secrecy::SecretString::from)
+        .filter(|key| !key.expose_secret().trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| MissingWorkosApiKey.into())
+}
+
+pub(crate) fn warn_missing_workos_membership_credentials() {
+    if workos_membership_credentials().is_err() {
+        tracing::warn!(
+            "WorkOS is configured but WORKOS_API_KEY is missing or empty; human API key issuance is disabled"
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct MembershipPage {
+    data: Vec<Membership>,
+}
+
+#[derive(Deserialize)]
+struct Membership {
+    user_id: String,
+    organization_id: String,
+    status: String,
+}
+
+fn active_membership(page: &MembershipPage, user: &str, org: &str) -> bool {
+    page.data
+        .iter()
+        .any(|m| m.user_id == user && m.organization_id == org && m.status == "active")
+}
+
+#[async_trait::async_trait]
+impl crate::db::api_keys::ActiveMembership for WorkosMembership {
+    async fn verify(&self, user: &str, org: &str) -> Result<()> {
+        use secrecy::ExposeSecret as _;
+        let Some(key) = workos_membership_credentials()? else {
+            // Existing self-host JWT/bootstrap authorization remains in force.
+            // The store still checks archive/deletion state under its locks.
+            return Ok(());
+        };
+
+        let mut url =
+            reqwest::Url::parse("https://api.workos.com/user_management/organization_memberships")?;
+        // WorkOS filters by BOTH identifiers and returns active memberships by default.
+        // Still validate the returned identity/status; an empty or malformed page refuses.
+        url.query_pairs_mut()
+            .append_pair("user_id", user)
+            .append_pair("organization_id", org);
+        verify_workos_membership(
+            user,
+            org,
+            std::time::Duration::from_millis(
+                crate::control_plane::policy()
+                    .admin_access
+                    .sso_lookup_timeout_ms,
+            ),
+            async {
+                let pinned = crate::ssrf_guard::validate_url_pinned(url.as_str()).await?;
+                let client = pinned
+                    .pin(crate::ssrf_guard::safe_client_builder())
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+                client
+                    .get(url)
+                    .bearer_auth(key.expose_secret())
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("membership lookup failed: {}", e.without_url()))
+            },
+        )
+        .await
+    }
+}
+
+// Keep the request and body read inside one deadline. The transport is injectable
+// so outage and membership refusals can be exercised without contacting WorkOS.
+async fn verify_workos_membership(
+    user: &str,
+    org: &str,
+    timeout: std::time::Duration,
+    lookup: impl std::future::Future<Output = Result<reqwest::Response>>,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        let response = lookup
+            .await
+            .map_err(|_| WorkosMembershipError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(WorkosMembershipError::Unavailable.into());
+        }
+        let page: MembershipPage = response
+            .json()
+            .await
+            .map_err(|_| WorkosMembershipError::Unavailable)?;
+        if !active_membership(&page, user, org) {
+            return Err(WorkosMembershipError::Inactive.into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| WorkosMembershipError::Unavailable)?
+}
+
 /// OG-35: the full request actor the handler scoped
 /// (`control_audit::scoped`, after `require_control`), else the `sub` the trait
 /// passed as a system actor. Either way the store RECORDS; only the request id,
@@ -110,6 +261,10 @@ pub struct PgKeyMinter {
 
 #[async_trait::async_trait]
 impl KeyMinter for PgKeyMinter {
+    async fn invalidate_owned_cache(&self, subject: &str) -> Result<()> {
+        crate::db::api_keys::invalidate_owned(&self.pool, subject).await
+    }
+
     async fn rotation_grace_hours(&self) -> Result<i64> {
         crate::db::api_keys::rotation_grace_hours(&self.pool).await
     }
@@ -121,7 +276,19 @@ impl KeyMinter for PgKeyMinter {
         grace_hours: i64,
     ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
         let actor = audit_actor(actor);
-        crate::db::api_keys::rotate(&self.pool, tenant, id, &actor, grace_hours).await
+        if actor.auth_method == "workos_session" {
+            crate::db::api_keys::rotate_with_membership(
+                &self.pool,
+                tenant,
+                id,
+                &actor,
+                grace_hours,
+                Some(&WorkosMembership),
+            )
+            .await
+        } else {
+            crate::db::api_keys::rotate(&self.pool, tenant, id, &actor, grace_hours).await
+        }
     }
     async fn mint(
         &self,
@@ -132,8 +299,16 @@ impl KeyMinter for PgKeyMinter {
     ) -> Result<MintedKey> {
         match crate::db::control_audit::current() {
             Some(actor) => {
-                crate::db::api_keys::mint_as(&self.pool, tenant, name, minted_by, opts, &actor)
-                    .await
+                crate::db::api_keys::mint_as_with_membership(
+                    &self.pool,
+                    tenant,
+                    name,
+                    minted_by,
+                    opts,
+                    &actor,
+                    Some(&WorkosMembership),
+                )
+                .await
             }
             // No request scope: still recorded, as the minter (`mint`'s system actor).
             None => crate::db::api_keys::mint(&self.pool, tenant, name, minted_by, opts).await,
@@ -240,6 +415,7 @@ pub struct KeyRoutesState {
 /// `POST /v1/keys` request body.
 #[derive(Debug, Deserialize)]
 struct CreateKeyBody {
+    capture: Option<serde_json::Value>,
     name: String,
     /// A13. Omitted ⇒ the full set, spelled out (see `db::api_keys::mint`).
     /// An UNRECOGNISED slug is a 400 here rather than a silent drop: at mint
@@ -289,6 +465,7 @@ struct CreateKeyBody {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateKeyResponse {
+    capture: Option<serde_json::Value>,
     /// Only on rotation: the OLD key's retirement time, not the successor's.
     #[serde(skip_serializing_if = "Option::is_none")]
     old_key_revoked_at: Option<String>,
@@ -333,6 +510,7 @@ pub fn routes() -> Router<KeyRoutesState> {
     Router::new()
         .route("/v1/keys", post(create_key_handler))
         .route("/v1/keys/rotation-policy", get(rotation_policy_handler))
+        .route("/v1/keys/invalidate-cache", post(invalidate_cache_handler))
         .route("/v1/keys/{id}/rotate", post(rotate_key_handler))
         // SET-38 (read + edit in place) and B-586 (revoke through the gateway, so
         // the in-process auth cache is invalidated). `rotation-policy` above is a
@@ -487,6 +665,7 @@ fn can_revoke_keys(claims: &crate::auth::Claims) -> bool {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KeyView {
+    capture: Option<serde_json::Value>,
     id: String,
     name: String,
     key_prefix: String,
@@ -530,6 +709,7 @@ impl From<KeyRecord> for KeyView {
             environment: r.environment,
             policy: r.policy,
             cache: r.cache,
+            capture: r.capture,
         }
     }
 }
@@ -651,6 +831,8 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchKeyBody {
+    #[serde(default, deserialize_with = "present")]
+    capture: Option<Option<serde_json::Value>>,
     #[serde(default, deserialize_with = "present")]
     name: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
@@ -779,6 +961,24 @@ fn validate_patch(
             ));
         }
     }
+    if let Some(capture) = body.capture {
+        patch.capture = Some(
+            capture
+                .map(|v| {
+                    serde_json::from_value::<crate::db::data_controls::KeyCapture>(v)
+                        .map(|v| serde_json::json!(v))
+                        .map_err(|_| {
+                            Box::new(json_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_field",
+                                "capture must contain only boolean input/output fields",
+                                Some("capture"),
+                            ))
+                        })
+                })
+                .transpose()?,
+        );
+    }
     match body.cache {
         None => {}
         Some(None) => patch.cache = Some(None),
@@ -840,6 +1040,7 @@ fn touches_governance(patch: &KeyPatch) -> bool {
         // OG-51: removing a cache narrowing WIDENS the cache, so a key's cache document is an
         // owner decision like its policy — a member must not undo what an owner set.
         || patch.cache.is_some()
+        || patch.capture.is_some()
 }
 
 /// `PATCH /v1/keys/{id}` — edit a key's limits in place (SET-38). Order: auth →
@@ -900,6 +1101,9 @@ async fn update_key_handler(
         Ok(p) => p,
         Err(r) => return *r,
     };
+    if patch.capture.is_some() && !claims.can(crate::auth::capability::Capability::EditPolicies) {
+        return role_forbidden("owner");
+    }
     // H1 (security review 2026-10-02): `passthrough` forwards raw, unscanned bodies to a
     // provider, so only a verified owner may put it in a key's scope set — never a member,
     // even on a key they minted. Checked before the store, so a refusal changes nothing.
@@ -995,6 +1199,63 @@ fn environment_needs_project() -> Response {
         "an environment label needs a project — set project_id too",
         Some("environment"),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvalidateCacheBody {
+    #[serde(default)]
+    own_keys: bool,
+}
+
+/// POST /v1/keys/invalidate-cache. Tenant and optional own-key subject come only
+/// from validated claims. No body identity or key material is accepted.
+/// Fail CLOSED: only a recognized human session in this tenant may request an
+/// eviction; normal control-plane admission applies before any cache mutation.
+async fn invalidate_cache_handler(
+    State(state): State<KeyRoutesState>,
+    headers: HeaderMap,
+    Json(body): Json<InvalidateCacheBody>,
+) -> Response {
+    let claims = match claims_from_auth(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if claims.auth_method != crate::auth::AuthMethod::JwtBearer || !can_read_keys(&claims) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "human_session_required",
+            "a recognized workspace user session is required",
+            None,
+        );
+    }
+    if let Err(refusal) = crate::control_plane::require_control(
+        &claims,
+        crate::control_plane::incident(crate::auth::capability::Capability::ViewKeys),
+        &headers,
+    )
+    .await
+    {
+        return refusal.into_response();
+    }
+    if body.own_keys {
+        if state
+            .minter
+            .invalidate_owned_cache(&claims.sub)
+            .await
+            .is_err()
+        {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "key_revocation_unconfirmed",
+                "key revocation could not be confirmed",
+                None,
+            );
+        }
+    } else {
+        crate::db::api_keys::invalidate_tenant(&claims.tenant_id).await;
+    }
+    Json(serde_json::json!({ "invalidated": true })).into_response()
 }
 
 /// `DELETE /v1/keys/{id}` — B-586: revoke through the gateway so the in-process
@@ -1135,7 +1396,16 @@ async fn rotate_key_handler(
             .rotate(&claims.tenant_id, id, &claims.sub, grace),
     )
     .await
-    .map_err(|_| {
+    .map_err(|err| {
+        if err.is::<MissingWorkosApiKey>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                MissingWorkosApiKey.to_string(),
+            );
+        }
+        if let Some(err) = err.downcast_ref::<WorkosMembershipError>() {
+            return (err.status(), err.to_string());
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to rotate API key".into(),
@@ -1170,6 +1440,7 @@ async fn rotate_key_handler(
             project_id: result.options.project_id.map(|p| p.to_string()),
             environment: result.options.environment,
             policy: result.options.policy,
+            capture: result.options.capture,
         }),
     )
         .into_response())
@@ -1456,7 +1727,26 @@ async fn create_key_handler(
             )
         })?),
     };
-    if (project_id.is_some() || environment.is_some() || policy.is_some())
+    let capture = body
+        .capture
+        .map(|v| {
+            serde_json::from_value::<crate::db::data_controls::KeyCapture>(v)
+                .map(|v| serde_json::json!(v))
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid capture settings".to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
+    if capture.is_some() && !claims.can(crate::auth::capability::Capability::EditPolicies) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::auth::role_forbidden_json("owner"),
+        ));
+    }
+    if (project_id.is_some() || environment.is_some() || policy.is_some() || capture.is_some())
         && !crate::project_routes::may_manage_governance(&claims)
     {
         return Err((
@@ -1474,11 +1764,12 @@ async fn create_key_handler(
         project_id,
         environment: environment.clone(),
         policy: policy.clone(),
+        capture: capture.clone(),
     };
 
     // Record the minting user (WorkOS `sub`) so §3 member-removal can revoke
-    // exactly this user's keys. API-key / dev auth has an `apikey:`/`dev-stub`
-    // sub — harmless to store; it just won't match a WorkOS user_id on removal.
+    // exactly this user's keys. API-key / master / dev subjects are retained as
+    // provenance, but bound human approvals reject those nonhuman creator values.
     let minted_by = claims.sub.clone();
     let minted = crate::db::control_audit::scoped(
         control.audit.clone(),
@@ -1486,6 +1777,15 @@ async fn create_key_handler(
     )
     .await
     .map_err(|err| {
+        if err.is::<MissingWorkosApiKey>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                MissingWorkosApiKey.to_string(),
+            );
+        }
+        if let Some(err) = err.downcast_ref::<WorkosMembershipError>() {
+            return (err.status(), err.to_string());
+        }
         // OG-23: an assignment the store refused is the caller's to fix, not a 500.
         if let Some(a) = err.downcast_ref::<crate::db::api_keys::AssignmentError>() {
             use crate::db::api_keys::AssignmentError as A;
@@ -1540,6 +1840,7 @@ async fn create_key_handler(
             project_id: project_id.map(|p| p.to_string()),
             environment,
             policy,
+            capture,
         }),
     ))
 }
@@ -1734,6 +2035,7 @@ mod tests {
             project_id: None,
             environment: None,
             policy: None,
+            capture: None,
         }
     }
 
@@ -2110,6 +2412,7 @@ mod tests {
                 project_id: None,
                 environment: None,
                 policy: None,
+                capture: None,
             }),
         )
         .await
@@ -2141,6 +2444,7 @@ mod tests {
                 project_id: None,
                 environment: None,
                 policy: None,
+                capture: None,
             }),
         )
         .await
@@ -2171,6 +2475,7 @@ mod tests {
                 project_id: None,
                 environment: None,
                 policy: None,
+                capture: None,
             }),
         )
         .await
@@ -2209,10 +2514,12 @@ mod set38_tests {
         Update(String, Uuid, String, KeyPatch, String),
         Revoke(String, Uuid, String),
         Spend(String, Uuid),
+        InvalidateOwned(String),
     }
 
     struct EditMock {
         calls: Arc<Mutex<Vec<Call>>>,
+        issuance_error: Mutex<Option<anyhow::Error>>,
         update: Mutex<Option<Result<UpdateOutcome>>>,
         revoke: Mutex<Option<Result<Option<DateTime<Utc>>>>>,
         found: bool,
@@ -2237,12 +2544,24 @@ mod set38_tests {
             project_id: None,
             environment: None,
             policy: None,
+            capture: None,
             cache: None,
         }
     }
 
     #[async_trait::async_trait]
     impl KeyMinter for EditMock {
+        async fn invalidate_owned_cache(&self, subject: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::InvalidateOwned(subject.to_owned()));
+            if !self.found {
+                anyhow::bail!("test store unavailable");
+            }
+            Ok(())
+        }
+
         async fn rotation_grace_hours(&self) -> Result<i64> {
             anyhow::bail!("unused")
         }
@@ -2253,7 +2572,12 @@ mod set38_tests {
             _: &str,
             _: i64,
         ) -> Result<Option<crate::db::api_keys::RotatedKey>> {
-            anyhow::bail!("unused")
+            Err(self
+                .issuance_error
+                .lock()
+                .unwrap()
+                .take()
+                .expect("issuance error fixture"))
         }
         async fn mint(
             &self,
@@ -2262,7 +2586,12 @@ mod set38_tests {
             _: Option<&str>,
             _: crate::db::api_keys::MintOptions,
         ) -> Result<MintedKey> {
-            anyhow::bail!("unused")
+            Err(self
+                .issuance_error
+                .lock()
+                .unwrap()
+                .take()
+                .expect("issuance error fixture"))
         }
         async fn get_key(&self, tenant: &TenantId, id: Uuid) -> Result<Option<KeyRecord>> {
             self.calls
@@ -2332,6 +2661,7 @@ mod set38_tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let m = Arc::new(EditMock {
             calls: calls.clone(),
+            issuance_error: Mutex::new(None),
             update: Mutex::new(None),
             revoke: Mutex::new(None),
             found,
@@ -2354,6 +2684,7 @@ mod set38_tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }
@@ -2419,6 +2750,152 @@ mod set38_tests {
             .filter(|c| matches!(c, Call::Update(..)))
             .cloned()
             .collect()
+    }
+
+    async fn membership_failure_mapping(case: &str, rotate: bool) {
+        let lookup = async {
+            match case {
+                "timeout" => std::future::pending::<Result<reqwest::Response>>().await,
+                "network" => {
+                    // A real reset connection; the request error includes a URL
+                    // which must never reach the caller. No process-global env.
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let server = tokio::spawn(async move {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        drop(socket);
+                    });
+                    let error = reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .unwrap()
+                        .get(format!(
+                            "http://{address}/private-workos-path?token=test-secret"
+                        ))
+                        .send()
+                        .await
+                        .expect_err("connection reset must fail");
+                    assert!(
+                        error.url().is_some(),
+                        "exercise URL-bearing transport failure"
+                    );
+                    server.await.unwrap();
+                    Err(error.into())
+                }
+                _ => {
+                    let (status, body) = match case {
+                        "non_2xx" => (503, "test-secret http://private-workos-path"),
+                        "http_403" => (403, "test-secret http://private-workos-path"),
+                        "malformed" => (200, "invalid json test-secret"),
+                        "inactive" => (
+                            200,
+                            r#"{"data":[{"user_id":"user_owner","organization_id":"org_test","status":"inactive"}]}"#,
+                        ),
+                        "empty" => (200, r#"{"data":[]}"#),
+                        _ => panic!("unknown membership fixture"),
+                    };
+                    Ok(axum::http::Response::builder()
+                        .status(status)
+                        .body(body)
+                        .unwrap()
+                        .into())
+                }
+            }
+        };
+        let error = verify_workos_membership(
+            "user_owner",
+            "org_test",
+            std::time::Duration::from_secs(1),
+            lookup,
+        )
+        .await
+        .expect_err("verification must fail closed");
+        let (minter, _) = mock();
+        *minter.issuance_error.lock().unwrap() = Some(error);
+        let _claims = test_claims::Guard::set(owner());
+        let state = KeyRoutesState {
+            minter: minter.clone(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer unit-test-token-not-real".parse().unwrap(),
+        );
+        let error = if rotate {
+            rotate_key_handler(
+                State(state),
+                headers,
+                Path(Uuid::parse_str(KEY).unwrap()),
+                Json(RotateKeyBody {
+                    grace_hours: Some(0),
+                }),
+            )
+            .await
+            .expect_err("rotation must refuse")
+        } else {
+            create_key_handler(
+                State(state),
+                headers,
+                Json(serde_json::from_str(r#"{"name":"must refuse","scope":["read"]}"#).unwrap()),
+            )
+            .await
+            .expect_err("mint must refuse")
+        };
+        assert!(
+            minter.issuance_error.lock().unwrap().is_none(),
+            "handler reached membership result"
+        );
+        let (status, message) = if matches!(case, "inactive" | "empty") {
+            (StatusCode::FORBIDDEN, "active membership required")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "membership verification unavailable; retry later",
+            )
+        };
+        assert_eq!(error.0, status, "{case}, rotate={rotate}");
+        assert_eq!(
+            error.1, message,
+            "no provider URL, body, or credentials may escape"
+        );
+    }
+
+    macro_rules! membership_mapping_test {
+        ($name:ident, $case:literal, $rotate:literal) => {
+            #[tokio::test]
+            async fn $name() {
+                membership_failure_mapping($case, $rotate).await;
+            }
+        };
+    }
+    membership_mapping_test!(membership_timeout_mint, "timeout", false);
+    membership_mapping_test!(membership_timeout_rotate, "timeout", true);
+    membership_mapping_test!(membership_network_mint, "network", false);
+    membership_mapping_test!(membership_network_rotate, "network", true);
+    membership_mapping_test!(membership_non_2xx_mint, "non_2xx", false);
+    membership_mapping_test!(membership_non_2xx_rotate, "non_2xx", true);
+    membership_mapping_test!(membership_http_403_mint, "http_403", false);
+    membership_mapping_test!(membership_http_403_rotate, "http_403", true);
+    membership_mapping_test!(membership_malformed_mint, "malformed", false);
+    membership_mapping_test!(membership_malformed_rotate, "malformed", true);
+    membership_mapping_test!(membership_inactive_mint, "inactive", false);
+    membership_mapping_test!(membership_inactive_rotate, "inactive", true);
+    membership_mapping_test!(membership_empty_mint, "empty", false);
+    membership_mapping_test!(membership_empty_rotate, "empty", true);
+
+    #[tokio::test]
+    async fn membership_active_response_is_accepted() {
+        let response = axum::http::Response::builder().status(200).body(
+            r#"{"data":[{"user_id":"user_owner","organization_id":"org_test","status":"active"}]}"#
+        ).unwrap().into();
+        verify_workos_membership(
+            "user_owner",
+            "org_test",
+            std::time::Duration::from_secs(1),
+            async { Ok(response) },
+        )
+        .await
+        .unwrap();
     }
 
     // ── PATCH: who may edit ────────────────────────────────────────────────
@@ -2626,6 +3103,14 @@ mod set38_tests {
     /// that the budget and prompt / dataset / experiment / online-eval write gates refuse.
     /// The mintable sets are derived from the mint gate itself (every subset of every
     /// scope), so a scope added later is covered without editing this test.
+    #[test]
+    fn og38_key_capture_patch_accepts_typed_overrides() {
+        let body =
+            serde_json::from_value::<PatchKeyBody>(serde_json::json!({"capture":{"input":false}}));
+        assert!(body.is_ok(), "a key capture override must be accepted");
+        assert!(validate_patch(body.unwrap(), chrono::Utc::now()).is_ok());
+    }
+
     #[test]
     fn rev5_h1_no_key_a_developer_can_mint_reaches_budgets_or_prompt_writes() {
         use tracelane_shared::api_scope::Scope;
@@ -2978,6 +3463,7 @@ mod set38_tests {
                 project_id: None,
                 environment: None,
                 policy: None,
+                capture: None,
                 cache: None,
             }
         );
@@ -3141,6 +3627,155 @@ mod set38_tests {
         );
     }
 
+    #[tokio::test]
+    async fn cache_invalidation_requires_human_and_closed_body() {
+        for who in [
+            None,
+            Some(api_key_itself()),
+            Some(operator()),
+            Some(roleless_jwt()),
+            Some(claims(AuthMethod::Mtls, None, "test-mtls")),
+        ] {
+            let expected = if who.is_none() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            let (m, _) = mock();
+            let (status, _) = send(m, who, "POST", "/v1/keys/invalidate-cache", "{}").await;
+            assert_eq!(status, expected);
+        }
+        let (m, _) = mock();
+        let (status, _) = send(
+            m,
+            Some(owner()),
+            "POST",
+            "/v1/keys/invalidate-cache",
+            r#"{"tenant_id":"other"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn cache_invalidation_is_idempotent() {
+        use crate::db::api_keys::{
+            lookup_tenant_by_key_body, revocation_lease_tests::warm_test_key,
+        };
+        for who in [owner(), member(), viewer()] {
+            let body_a = format!("unit-test-handler-a-{}", Uuid::new_v4());
+            let body_b = format!("unit-test-handler-b-{}", Uuid::new_v4());
+            let other = TenantId::from_jwt_claim(Uuid::new_v4());
+            let pool = warm_test_key(&who.tenant_id, &body_a).await;
+            warm_test_key(&other, &body_b).await;
+            assert!(
+                lookup_tenant_by_key_body(&pool, &body_a)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            for _ in 0..2 {
+                let (m, _) = mock();
+                let (status, body) = send(
+                    m,
+                    Some(who.clone()),
+                    "POST",
+                    "/v1/keys/invalidate-cache",
+                    "{}",
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, serde_json::json!({ "invalidated": true }));
+                assert!(
+                    !matches!(lookup_tenant_by_key_body(&pool, &body_a).await, Ok(Some(_))),
+                    "acknowledged handler eviction must reject the next auth lookup"
+                );
+                assert!(
+                    lookup_tenant_by_key_body(&pool, &body_b)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            crate::db::api_keys::invalidate_tenant(&other).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn own_cache_invalidation_uses_only_human_subject_and_refuses_store_failure() {
+        let (m, calls) = mock();
+        let (status, body) = send(
+            m,
+            Some(member()),
+            "POST",
+            "/v1/keys/invalidate-cache",
+            r#"{"own_keys":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"invalidated": true}));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![Call::InvalidateOwned("user_member".into())]
+        );
+        for body in [
+            r#"{"own_keys":true,"subject":"other-user"}"#,
+            r#"{"own_keys":true,"tenant_id":"other"}"#,
+        ] {
+            let (m, calls) = mock();
+            let (status, _) =
+                send(m, Some(member()), "POST", "/v1/keys/invalidate-cache", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        let (m, calls) = mock();
+        let (status, _) = send(
+            m,
+            Some(api_key_itself()),
+            "POST",
+            "/v1/keys/invalidate-cache",
+            r#"{"own_keys":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(calls.lock().unwrap().is_empty());
+        let (m, _) = mock_with(false, None);
+        let (status, _) = send(
+            m,
+            Some(member()),
+            "POST",
+            "/v1/keys/invalidate-cache",
+            r#"{"own_keys":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn membership_proof_requires_matching_active_identity() {
+        for (user, org, status, expected) in [
+            ("user", "org", "active", true),
+            ("other", "org", "active", false),
+            ("user", "other", "active", false),
+            ("user", "org", "inactive", false),
+            ("user", "org", "pending", false),
+        ] {
+            let page: MembershipPage = serde_json::from_value(serde_json::json!({"data": [{"user_id":user,"organization_id":org,"status":status}]})).unwrap();
+            assert_eq!(active_membership(&page, "user", "org"), expected);
+        }
+        assert!(!active_membership(
+            &MembershipPage { data: vec![] },
+            "user",
+            "org"
+        ));
+        assert!(
+            serde_json::from_value::<MembershipPage>(
+                serde_json::json!({"data":[{"user_id":"user","organization_id":"org"}]})
+            )
+            .is_err()
+        );
+    }
+
     // ── DELETE /v1/keys/{id} (B-586) ───────────────────────────────────────
 
     #[tokio::test]
@@ -3193,5 +3828,250 @@ mod set38_tests {
         let (s, body) = send(m, Some(owner()), "DELETE", &key_path(), "").await;
         assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"], "not_revoked");
+    }
+}
+
+#[cfg(test)]
+mod issuance_config_tests {
+    use super::*;
+
+    // Run environment-sensitive proofs in their own process, so parallel auth
+    // tests cannot remove WORKOS_CLIENT_ID while issuance is being exercised.
+    fn isolated(name: &str, configured: bool) -> bool {
+        if std::env::var("B605_ISSUANCE_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name, "--ignored", "--nocapture"])
+            .env("B605_ISSUANCE_CHILD", name);
+        for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("WORKOS_")) {
+            cmd.env_remove(key);
+        }
+        if configured {
+            cmd.env("WORKOS_CLIENT_ID", "client_issuance_test");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    async fn fixture() -> Result<(PgKeyMinter, TenantId)> {
+        let url = std::env::var("POSTGRES_TEST_URL")?;
+        let config: tokio_postgres::Config = url.parse()?;
+        let (admin, connection) = config.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(connection);
+        let name = format!("issuance_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await?;
+        let mut config = config;
+        config.dbname(&name);
+        let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+        let pool = deadpool_postgres::Pool::builder(manager)
+            .max_size(4)
+            .build()?;
+        crate::db::apply_migrations(&pool).await?;
+        let id = uuid::Uuid::new_v4();
+        crate::db::tenants::create(&pool, id, "self-host issuance", "free").await?;
+        let _ = crate::db::api_keys::init_pepper(&"11".repeat(32));
+        Ok((
+            PgKeyMinter {
+                pool,
+                ch_url: None,
+                entitlements: None,
+            },
+            TenantId::from_jwt_claim(id),
+        ))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn no_workos_jwt_and_bootstrap_mint_and_rotate() -> Result<()> {
+        if isolated(
+            "key_routes::issuance_config_tests::no_workos_jwt_and_bootstrap_mint_and_rotate",
+            false,
+        ) {
+            return Ok(());
+        }
+        let (minter, tenant) = fixture().await?;
+        for org in ["self-host-local", "org_self_host_fixture"] {
+            minter
+                .pool
+                .get()
+                .await?
+                .execute(
+                    "UPDATE tenants SET workos_org_id = $2 WHERE id = $1",
+                    &[tenant.as_uuid(), &org],
+                )
+                .await?;
+            for method in ["workos_session", "self_host_master_key"] {
+                let mut actor = crate::db::control_audit::Actor::system("self-host-user");
+                actor.auth_method = method;
+                let key = crate::db::control_audit::scoped(
+                    actor.clone(),
+                    minter.mint(
+                        &tenant,
+                        "self-host key",
+                        Some(&actor.sub),
+                        crate::db::api_keys::MintOptions::default(),
+                    ),
+                )
+                .await?;
+                assert!(
+                    crate::db::api_keys::lookup_tenant_by_key_body(
+                        &minter.pool,
+                        key.raw_key.strip_prefix("tlane_").unwrap()
+                    )
+                    .await?
+                    .is_some()
+                );
+                let successor = crate::db::control_audit::scoped(
+                    actor.clone(),
+                    minter.rotate(&tenant, key.api_key.id, &actor.sub, 0),
+                )
+                .await?
+                .unwrap();
+                assert!(
+                    crate::db::api_keys::lookup_tenant_by_key_body(
+                        &minter.pool,
+                        successor.minted.raw_key.strip_prefix("tlane_").unwrap()
+                    )
+                    .await?
+                    .is_some()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn configured_workos_missing_api_key_refuses_issuance() -> Result<()> {
+        if isolated(
+            "key_routes::issuance_config_tests::configured_workos_missing_api_key_refuses_issuance",
+            true,
+        ) {
+            return Ok(());
+        }
+        let (minter, tenant) = fixture().await?;
+        let mut actor = crate::db::control_audit::Actor::system("user_configured");
+        actor.auth_method = "workos_session";
+        let existing = crate::db::api_keys::mint(
+            &minter.pool,
+            &tenant,
+            "existing",
+            Some(&actor.sub),
+            crate::db::api_keys::MintOptions::default(),
+        )
+        .await?;
+        let claims = crate::auth::Claims {
+            tenant_id: tenant.clone(),
+            sub: actor.sub.clone(),
+            auth_method: crate::auth::AuthMethod::JwtBearer,
+            role: Some(crate::auth::Role::Owner),
+            key_scope: tracelane_shared::api_scope::KeyScope::LegacyFullSurface,
+            budget_usd_monthly: None,
+            rate_limit_rpm: None,
+            budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
+            governance: None,
+        };
+        let _claims = crate::auth::test_claims::Guard::set(claims);
+        let pool = minter.pool.clone();
+        let state = KeyRoutesState {
+            minter: Arc::new(minter),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer unit-test-token-not-real".parse().unwrap(),
+        );
+        let body: CreateKeyBody =
+            serde_json::from_str(r#"{"name":"must refuse","scope":["read"]}"#)?;
+        let error = create_key_handler(State(state.clone()), headers.clone(), Json(body))
+            .await
+            .expect_err("issuance must refuse");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error.1.contains("WORKOS_API_KEY"),
+            "clear API error required: {}",
+            error.1
+        );
+        let error = rotate_key_handler(
+            State(state.clone()),
+            headers,
+            Path(existing.api_key.id),
+            Json(RotateKeyBody {
+                grace_hours: Some(0),
+            }),
+        )
+        .await
+        .expect_err("rotation must refuse");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error.1.contains("WORKOS_API_KEY"),
+            "clear API error required: {}",
+            error.1
+        );
+        let minter = state.minter;
+        for org in ["configured-local", "org_configured_fixture"] {
+            pool.get()
+                .await?
+                .execute(
+                    "UPDATE tenants SET workos_org_id = $2 WHERE id = $1",
+                    &[tenant.as_uuid(), &org],
+                )
+                .await?;
+            let error = crate::db::control_audit::scoped(
+                actor.clone(),
+                minter.mint(
+                    &tenant,
+                    "must refuse",
+                    Some(&actor.sub),
+                    crate::db::api_keys::MintOptions::default(),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("WORKOS_API_KEY"),
+                "clear missing-variable error required: {error}"
+            );
+            let error = crate::db::control_audit::scoped(
+                actor.clone(),
+                minter.rotate(&tenant, existing.api_key.id, &actor.sub, 0),
+            )
+            .await
+            .err()
+            .expect("rotation must refuse");
+            assert!(
+                error.to_string().contains("WORKOS_API_KEY"),
+                "clear missing-variable error required: {error}"
+            );
+        }
+        let row = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*), count(revoked_at) FROM api_keys WHERE tenant_id = $1",
+                &[tenant.as_uuid()],
+            )
+            .await?;
+        assert_eq!(
+            row.get::<_, i64>(0),
+            1,
+            "failed issuance must not insert any key"
+        );
+        assert_eq!(
+            row.get::<_, i64>(1),
+            0,
+            "failed rotation must not retire existing key"
+        );
+        Ok(())
     }
 }

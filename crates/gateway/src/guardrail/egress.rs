@@ -1965,8 +1965,35 @@ mod wire_tests {
         if r2 { grant_r2(s) } else { s }
     }
 
+    /// B-619: a `MockServer` whose drop never runs on the test's runtime. wiremock's
+    /// `Drop` is `futures::executor::block_on(verify())`; `verify` takes a tokio `RwLock`,
+    /// which consumes the task's cooperative budget, and once a test has spent it tokio defers
+    /// the wake to the runtime that `block_on` is blocking — the test hung forever (`q1_*`
+    /// alone, every run, on main). Dropped servers wait in a thread-local and are dropped when
+    /// the test thread exits, outside any runtime.
+    pub(super) struct Upstream(Option<MockServer>);
+    thread_local! {
+        static DROPPED_UPSTREAMS: std::cell::RefCell<Vec<MockServer>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    impl std::ops::Deref for Upstream {
+        type Target = MockServer;
+        fn deref(&self) -> &MockServer {
+            self.0
+                .as_ref()
+                .expect("an Upstream is never deref'd after drop")
+        }
+    }
+    impl Drop for Upstream {
+        fn drop(&mut self) {
+            if let Some(server) = self.0.take() {
+                DROPPED_UPSTREAMS.with(|d| d.borrow_mut().push(server));
+            }
+        }
+    }
+
     /// Drive `body` through `wire`'s real handler as a fresh tenant holding every BYOK key.
-    async fn send(wire: Wire, r2: bool, body: &Value) -> (StatusCode, Value, MockServer) {
+    async fn send(wire: Wire, r2: bool, body: &Value) -> (StatusCode, Value, Upstream) {
         let _bypass = LoopbackBypassGuard::new();
         let server = upstream().await;
         let t = tenant();
@@ -2019,7 +2046,7 @@ mod wire_tests {
             .await
             .expect("body");
         let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, v, server)
+        (status, v, Upstream(Some(server)))
     }
 
     /// Every byte that reached the provider, as one string.

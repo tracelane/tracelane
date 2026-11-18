@@ -14,6 +14,7 @@ verifiers. These are the surfaces customers install; they ship publicly (Apache
 | [`verifier-rust`](verifier-rust/) | Reference audit-ledger verifier (Rust). |
 | [`verifier-typescript`](verifier-typescript/) | Reference audit-ledger verifier (TS). |
 | [`verifier-python`](verifier-python/) | Reference audit-ledger verifier (Python). |
+| [`verifier-wasm`](verifier-wasm/) | Static browser page that runs the Rust verifier (WebAssembly) on an action evidence ZIP. Source only, not hosted. |
 
 The three verifiers are **identical by construction** on the v2.1 canonical
 format: `payload` is the verbatim stored canonical string, SHA-256'd

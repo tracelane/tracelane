@@ -9,6 +9,7 @@ use anyhow::Context as _;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 // B-385: the ONE admission pipeline the three dispatch routes run.
+mod action_control;
 mod admin_audit;
 mod admission;
 mod agent_loops;
@@ -30,6 +31,7 @@ mod budgets;
 mod byok;
 mod byok_api;
 mod byok_rotate;
+mod checkpoint_timestamp;
 mod circuit_breaker;
 mod clickhouse_query;
 mod control_plane;
@@ -86,6 +88,7 @@ mod og51_cache_tests;
 mod og_controls_tests;
 mod otel_export;
 mod otel_export_routes;
+mod siem_export;
 // OG-11: the routing document through the real handlers.
 #[cfg(all(test, debug_assertions))]
 mod og11_routing_tests;
@@ -141,6 +144,7 @@ mod usage_breakdown;
 mod auto_rollback;
 mod cache_controls;
 mod cache_routes;
+mod data_controls_routes;
 mod offpath;
 mod online_eval;
 mod online_eval_routes;
@@ -172,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     init_tracing();
+    key_routes::warn_missing_workos_membership_credentials();
 
     // B-383 (a): `gateway byok-rotate [--dry-run]` — re-wrap every BYOK row under
     // the active KEK, then exit. Same env, same pool, no listener.
@@ -222,3 +227,18 @@ fn init_tracing() {
             .init();
     }
 }
+
+mod mcp_policy;
+
+mod approvals;
+mod mcp_store;
+
+mod mcp_proxy;
+mod mcp_transport;
+
+mod mcp_routes;
+
+mod mcp_inspection;
+
+#[cfg(all(test, debug_assertions))]
+mod mcp_security_tests;

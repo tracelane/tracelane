@@ -74,12 +74,17 @@ esac
 # epochs, a key's narrowing; og50_* — exports sealed, isolated, audited). Both ran green
 # on a fresh database (2 passed); 41 + 2 discovered, 66 + 2 executed.
 EXPECTED_PG_TESTS=43
-EXPECTED_PG_EXECUTED=68
+# Protected evidence: seven existing transaction/checkpoint probes plus five
+# hook, restart, ciphertext, foreign-FK and reservation-binding probes.
+EXPECTED_ACTION_PG_TESTS=27
+# Portal issuance adds a policy/audit regression to control_plane::pg_tests.
+EXPECTED_PG_EXECUTED=82
 case "${1:-}" in
   ""|--selftest) ;;
 esac
 
 CONTAINER=tlane-pg-integration-$$
+bash "$(dirname "${BASH_SOURCE[0]}")/reap-orphan-containers.sh" tlane-pg-integration-  # a killed earlier run's containers
 STARTED_CONTAINER=0
 cleanup() { [ "$STARTED_CONTAINER" = 1 ] && docker rm -fv "$CONTAINER" >/dev/null 2>&1; return 0; }
 trap cleanup EXIT
@@ -251,6 +256,20 @@ PY
     exit 1
   fi
   echo "SELFTEST: postgres_tenant_integration discovers $DISCOVERED tests (floor $EXPECTED_PG_TESTS)."
+  ACTION_LIST_LOG="$(mktemp)"
+  if ! cargo test -p gateway --bin gateway action_control:: -- --list --ignored >"$ACTION_LIST_LOG" 2>&1; then
+    echo "SELFTEST CANNOT DETERMINE — action_control test discovery failed before tests could be listed:" >&2
+    grep -E '^error' "$ACTION_LIST_LOG" | head -5 >&2
+    rm -f "$ACTION_LIST_LOG"
+    exit 1
+  fi
+  ACTION_DISCOVERED="$(grep -c ': test$' "$ACTION_LIST_LOG" || true)"
+  rm -f "$ACTION_LIST_LOG"
+  if [ "${ACTION_DISCOVERED:-0}" -lt "$EXPECTED_ACTION_PG_TESTS" ]; then
+    echo "SELFTEST FAILED — action_control discovers $ACTION_DISCOVERED test(s), floor is $EXPECTED_ACTION_PG_TESTS: the protected evidence suite shrank."
+    exit 1
+  fi
+  echo "SELFTEST: action_control discovers $ACTION_DISCOVERED tests (floor $EXPECTED_ACTION_PG_TESTS)."
   echo "SELFTEST: falsifying in an isolated worktree ($WT). The real tree is NOT touched."
   echo "SELFTEST: reverted the cast to the shipped defect (\$9::numeric). Expecting RED from the ONE test that mints a key."
   if ( cd "$WT" && CARGO_TARGET_DIR="$WT_TARGET" TRACELANE_RUNNER_ONLY="create_tenant_and_lookup_by_api_key" bash "$WT/scripts/ci/run-postgres-integration.sh" ) >/dev/null 2>&1; then
@@ -270,6 +289,10 @@ if [ -z "${POSTGRES_TEST_URL:-}" ]; then
     exit 0
   fi
 fi
+
+# Leftover per-test databases from earlier runs on a long-lived local cluster filled a
+# cloud session's disk (runbooks/RCA-pg-test-db-leak.md). Local URLs only; never fails.
+bash "$(dirname "$0")/sweep-test-dbs.sh" || true
 
 # `enum_param_serialization_contract` reaches Postgres through `build_pool()`,
 # i.e. POSTGRES_URL, and needs a MIGRATED database (it asserts on the `plan`
@@ -356,6 +379,13 @@ run_and_count -p gateway --bin gateway retention_sweep::b409_tests -- --ignored 
 # OG-35/OG-36: the audited admin-access write + its refusal, the append-only trigger,
 # tenant-scoped paging of the trail, the CIDR CHECK, and the route end to end.
 run_and_count -p gateway --bin gateway control_plane::pg_tests -- --ignored || RC=1
+# Public share revocation: repeat-owner success, original timestamp preserved,
+# and wrong tenant/trace/id refused by the real store on a migrated database.
+run_and_count -p gateway --bin gateway trace_share::tests::pg_revoke_is_idempotent_and_scoped_to_tenant_trace_and_id -- --ignored || RC=1
+# ACT-09: the export tests verify their ZIP with the real `tracelane-audit` binary
+# from this CARGO_TARGET_DIR; `cargo test -p gateway` does not build it.
+cargo build -p tracelane-audit --bin tracelane-audit || RC=1
+run_and_count -p gateway --bin gateway action_control:: -- --ignored || RC=1
 if [ "$EXECUTED" -lt "$EXPECTED_PG_EXECUTED" ]; then
   echo "postgres integration: FAIL — executed $EXECUTED test(s), floor is $EXPECTED_PG_EXECUTED: the suite shrank or a filter matched nothing (B-494)"
   exit 1

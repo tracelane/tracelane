@@ -225,6 +225,10 @@ impl OverflowMode {
 /// result for every feature plus the plan-level limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedEntitlements {
+    /// None means unresolved MCP policy; security decisions fail closed.
+    pub mcp: Option<Arc<crate::mcp_store::Snapshot>>,
+    /// Explicit tenant opt-in; unavailable/no cache always OFF.
+    pub action_control: bool,
     pub plan_lookup_key: String,
     pub f_pr7_trajectory: bool,
     pub f_pr8_argdrift: bool,
@@ -403,6 +407,7 @@ impl ResolvedEntitlements {
     pub fn effective_window_days(&self) -> i32 {
         self.auto_age_window_days
             .unwrap_or(self.indexed_window_days)
+            .min(self.queryable_days)
     }
 
     /// rev4 M3: whether the six allowances and three windows came from a real
@@ -486,6 +491,8 @@ impl ResolvedEntitlements {
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            mcp: None,
+            action_control: false,
             controls: std::sync::Arc::default(),
             guardrail_policies: Arc::default(),
             failover_enabled: false,
@@ -612,6 +619,8 @@ impl ResolvedEntitlements {
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            mcp: None,
+            action_control: false,
             controls: std::sync::Arc::default(),
             guardrail_policies: Arc::default(),
             failover_enabled: false,
@@ -780,6 +789,15 @@ impl EntitlementCache {
         (self.resolve_and_store(tenant, false).await, true)
     }
 
+    /// Read a previously resolved snapshot without SQL or scheduling a refresh.
+    /// Invalidated or never-resolved tenants have no usable cached decision.
+    pub(crate) fn cached_resolved(&self, tenant: Uuid) -> Option<Arc<ResolvedEntitlements>> {
+        if self.forced.contains(&tenant) {
+            return None;
+        }
+        self.last_known.get(&tenant).map(|r| r.clone())
+    }
+
     /// Whether a real resolver result exists, rather than the outage fallback.
     pub fn has_resolved(&self, tenant: Uuid) -> bool {
         self.last_known.contains_key(&tenant)
@@ -802,6 +820,10 @@ impl EntitlementCache {
             .last_known
             .get(&tenant)
             .map_or_else(ResolvedEntitlements::deny_all, |last| (**last).clone());
+        // Stale grants cannot reopen content hidden by an invalidated retention change.
+        resolved.queryable_days = 0;
+        resolved.mcp = None;
+        resolved.action_control = false;
         resolved.routing = Arc::new(crate::routing::RoutingState::Invalid);
         let mut controls = (*resolved.controls).clone();
         controls.policy = Some(tracelane_shared::key_policy::LayerPolicy::Invalid);
@@ -949,17 +971,33 @@ impl EntitlementCache {
 /// resolver: the deny floor; the metering job: its 3-day window; the sweep: 730
 /// days, never delete early). The inner alias is `pa` too, so `verify_schema`'s
 /// alias scan sees every `plan_allowances` column the rule names.
+/// ONE expression for read and deletion windows. An unknown plan never becomes
+/// permission to delete at a guessed window. PostgreSQL LEAST ignores nullable override.
+macro_rules! retention_window_sql {
+    () => {
+        "CASE WHEN COALESCE(we.queryable_days, pa.queryable_days) IS NULL THEN NULL ELSE (SELECT CASE WHEN floor_days <= 0 OR floor_days > COALESCE(we.queryable_days, pa.queryable_days) THEN NULL ELSE GREATEST(LEAST(COALESCE(we.queryable_days, pa.queryable_days), dc.retention_days), floor_days) END FROM (SELECT COALESCE((SELECT (value->>CASE WHEN COALESCE(we.f_audit_addon, pe.f_audit_addon, false) THEN 'audit_addon_min_days' ELSE 'retention_days_min' END)::int FROM billing_policy WHERE key='data_controls'), COALESCE(we.queryable_days, pa.queryable_days)) AS floor_days) retention_floor) END"
+    };
+}
+pub(crate) use retention_window_sql;
+
 macro_rules! allowance_pin_join {
     ($key:literal) => {
+        crate::entitlement_cache::allowance_pin_join!($key, "now()")
+    };
+    ($key:literal, $clock:literal) => {
         concat!(
             " LEFT JOIN LATERAL (SELECT pa.* FROM plan_allowances pa \
                WHERE pa.plan_lookup_key = ",
             $key,
             " AND (pa.is_current OR (t.plan_version IS NOT NULL \
-                 AND (t.price_protected_until IS NULL OR t.price_protected_until > now()) \
+                 AND (t.price_protected_until IS NULL OR t.price_protected_until > ",
+            $clock,
+            ") \
                  AND pa.plan_version = t.plan_version)) \
                ORDER BY (t.plan_version IS NOT NULL \
-                 AND (t.price_protected_until IS NULL OR t.price_protected_until > now()) \
+                 AND (t.price_protected_until IS NULL OR t.price_protected_until > ",
+            $clock,
+            ") \
                  AND pa.plan_version = t.plan_version) DESC \
                LIMIT 1) pa ON true "
         )
@@ -978,7 +1016,7 @@ pub(crate) use allowance_pin_join;
 /// NULL in a real row) from "no row" (fail closed, [`row_to_resolved`]).
 pub(crate) const SQL: &str = concat!(
     "\
-                SELECT pe.plan_lookup_key, \
+                SELECT pe.plan_lookup_key, t.action_control, \
                   COALESCE(we.f_pr7_trajectory, pe.f_pr7_trajectory) AS f_pr7_trajectory, \
                   COALESCE(we.f_pr8_argdrift, pe.f_pr8_argdrift) AS f_pr8_argdrift, \
                   COALESCE(we.f_pr9_a2a_handoff, pe.f_pr9_a2a_handoff) AS f_pr9_a2a_handoff, \
@@ -1011,7 +1049,9 @@ pub(crate) const SQL: &str = concat!(
                   COALESCE(we.scan_units_included, pa.scan_units_included) AS scan_units_included, \
                   COALESCE(we.eval_runs_included, pa.eval_runs_included) AS eval_runs_included, \
                   COALESCE(we.indexed_window_days, pa.indexed_window_days) AS indexed_window_days, \
-                  COALESCE(we.queryable_days, pa.queryable_days) AS queryable_days, \
+                  ",
+    retention_window_sql!(),
+    " AS queryable_days, \
                   COALESCE(we.ledger_days, pa.ledger_days) AS ledger_days, \
                   (pa.plan_lookup_key IS NOT NULL) AS allowance_row_found, \
                   pa.plan_version AS plan_version, \
@@ -1039,7 +1079,8 @@ pub(crate) const SQL: &str = concat!(
                 FROM tenants t \
                 JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
                 LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id",
-    allowance_pin_join!("pe.plan_lookup_key"),
+    allowance_pin_join!("COALESCE(we.plan_lookup_key, pe.plan_lookup_key)"),
+    " LEFT JOIN workspace_data_controls dc ON dc.tenant_id = t.id ",
     "WHERE t.id = $1 AND t.archived_at IS NULL"
 );
 
@@ -1067,6 +1108,7 @@ pub fn pg_resolver(pool: crate::db::DbPool) -> ResolveFn {
                     attach_content_capture(&client, &tenant, &mut resolved).await;
                     attach_cache_settings(&client, &tenant, &mut resolved).await;
                     attach_workspace_controls(&client, &tenant, &mut resolved).await?;
+                    resolved.mcp = Some(crate::mcp_store::load(&client, &tenant).await?);
                     resolved.guardrail_policies =
                         Arc::new(crate::guardrail::policy_store::load(&client, &tenant).await?);
                     attach_workspace_routing(&client, &tenant, &mut resolved).await?;
@@ -1324,6 +1366,7 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
     };
     let days = |col: &str, floor_v: i32| row.get::<_, Option<i32>>(col).unwrap_or(floor_v);
     ResolvedEntitlements {
+        action_control: row.get("action_control"),
         plan_lookup_key: row.get("plan_lookup_key"),
         f_pr7_trajectory: row.get("f_pr7_trajectory"),
         f_pr8_argdrift: row.get("f_pr8_argdrift"),
@@ -1417,6 +1460,7 @@ fn row_to_resolved(row: &tokio_postgres::Row) -> ResolvedEntitlements {
         auto_age_window_days: row.get("auto_age_window_days"),
         // Filled by `pg_resolver` from `model_aliases` after this row is mapped.
         model_aliases: std::sync::Arc::default(),
+        mcp: None,
         controls: std::sync::Arc::default(),
         guardrail_policies: Arc::default(),
         // Filled by `pg_resolver` from `workspace_failover` after this row is mapped.
@@ -1837,6 +1881,8 @@ mod tests {
             spend_ceiling_micro_usd: None,
             auto_age_window_days: None,
             model_aliases: std::sync::Arc::default(),
+            mcp: None,
+            action_control: false,
             controls: std::sync::Arc::default(),
             guardrail_policies: Arc::default(),
             failover_enabled: false,
@@ -2530,10 +2576,15 @@ pub fn selected_columns() -> Vec<(&'static str, String)> {
         .iter()
         .chain(crate::db::controls::CONTROLS_SCHEMA_COLUMNS)
         .chain(crate::db::cache_settings::CACHE_SCHEMA_COLUMNS)
+        .chain(&[
+            ("workspace_data_controls", "tenant_id"),
+            ("workspace_data_controls", "retention_days"),
+        ])
         .chain(crate::guardrail::policy_store::SCHEMA_COLUMNS)
         .chain(crate::guardrail::hooks_api::SCHEMA_COLUMNS)
         .chain(crate::db::control_audit::CONTROL_AUDIT_SCHEMA_COLUMNS)
         .chain(ROUTING_SCHEMA_COLUMNS)
+        .chain(crate::mcp_store::SCHEMA_COLUMNS)
     {
         if !out.iter().any(|(ot, oc)| ot == t && oc == c) {
             out.push((t, (*c).to_string()));

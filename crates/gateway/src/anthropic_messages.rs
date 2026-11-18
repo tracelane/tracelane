@@ -478,15 +478,13 @@ fn is_streaming(body: &Value) -> bool {
 /// backend). The caller turns that into `502 provider_unavailable` rather than
 /// falling back to an unguarded client — an SSRF guard you can lose under load is
 /// not a guard.
-fn upstream_client() -> anyhow::Result<&'static reqwest::Client> {
+pub(crate) fn upstream_client() -> anyhow::Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    if let Some(c) = CLIENT.get() {
-        return Ok(c);
-    }
-    let built = crate::ssrf_guard::safe_client_builder()
-        .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
-        .build()?;
-    Ok(CLIENT.get_or_init(|| built))
+    crate::ssrf_guard::shared_client(&CLIENT, || {
+        Ok(crate::ssrf_guard::safe_client_builder()
+            .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
+            .build()?)
+    })
 }
 
 /// The client's `anthropic-version` / `anthropic-beta`, passed through untouched.
@@ -910,6 +908,9 @@ fn unroutable_on_messages() -> crate::admission::Malformed {
 }
 
 impl crate::admission::Parsed for MessagesParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<Value> {
+        Some(self.json_body.clone())
+    }
     fn model(&self) -> &str {
         &self.chat_request.model
     }
@@ -935,6 +936,7 @@ impl crate::admission::Route for Messages {
     const NAME: &'static str = "messages";
     const AUDIT_EVENT_TYPE: &'static str = "messages.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Refuses;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     // OG-11 (a native relay: only Anthropic targets of a virtual model, fallthrough within Anthropic).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Messages,
@@ -1210,6 +1212,8 @@ async fn messages_admitted(
         crate::server::config::trace_content(),
         entitlements.as_deref().map(|e| e.content_capture),
         &claims.tenant_id,
+        claims.key_capture,
+        Some(&headers),
     );
     let MessagesParsed {
         raw: body,
@@ -1356,6 +1360,7 @@ async fn messages_admitted(
         let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
+                zdr_required: headers.contains_key("x-tracelane-zdr"),
                 tenant_id,
                 api_key_id: claims.api_key_id(),
                 project_id: claims.governance.as_ref().and_then(|g| g.project_id),
@@ -2597,6 +2602,14 @@ pub(crate) async fn count_tokens_with_claims(
     if let Some(refusal) = scope_refusal(&claims) {
         return refusal;
     }
+    if let Err(d) = crate::zdr::gate(
+        &headers,
+        &state.zdr.load(),
+        "anthropic",
+        crate::zdr::ZdrBinding::Gated,
+    ) {
+        return coded_error(StatusCode::BAD_REQUEST, d.code, &d.message);
+    }
     let tenant_id = &claims.tenant_id;
     tracing::Span::current().record("tenant_id", tenant_id.to_string());
 
@@ -2872,6 +2885,28 @@ fn capture_image_part(block: &Value) -> ContentPart {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     #[tokio::test]
+    async fn og38_companions_refuse_required() {
+        let _bypass = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 5})))
+            .mount(&upstream)
+            .await;
+        let t = tenant();
+        install_byok(&t);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tracelane-zdr", "required".parse().unwrap());
+        let response = count_tokens_with_claims(
+            state_for(&upstream.uri(), in_memory_chain()), headers,
+            Bytes::from(json!({"model":"claude-sonnet-4-6", "messages":[{"role":"user","content":"private"}]}).to_string()),
+            claims_for(&t),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn og30_messages_and_count_tokens_honour_policy_before_upstream() {
         let _bypass = LoopbackBypassGuard::new();
         let upstream = MockServer::start().await;
@@ -3104,6 +3139,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }
@@ -4557,6 +4593,54 @@ async fn og30_redacted_delta_does_not_clear_raw_initial_text() {
         assert_eq!(matches!(result, Release::Blocked(_, _)), blocked);
         if let Release::Bytes(frames) = result {
             assert!(frames.is_empty());
+        }
+    }
+}
+
+/// Lives here, not in `ssrf_guard.rs`: that file is compiled into integration tests via
+/// `#[path]`, where these crate modules do not exist (export clippy, 2026-11-18).
+#[cfg(test)]
+mod b619_shared_client_tests {
+    /// B-619: an upstream client is shared within one test but never across tests (each test
+    /// runs on its own thread), so no test can be handed a connection whose driver died with
+    /// another test's runtime. Asserted on the real call sites.
+    #[test]
+    fn b619_upstream_clients_are_per_test_never_shared_across_tests() {
+        type Site = fn() -> usize;
+        let sites: [(&str, Site); 4] = [
+            ("anthropic_messages", || {
+                std::ptr::from_ref(crate::anthropic_messages::upstream_client().unwrap()) as usize
+            }),
+            ("openai_responses", || {
+                std::ptr::from_ref(crate::openai_responses::upstream_client().unwrap()) as usize
+            }),
+            ("passthrough", || {
+                std::ptr::from_ref(
+                    crate::passthrough::upstream_client(
+                        crate::providers::translation_policy::passthrough_policy().unwrap(),
+                    )
+                    .unwrap(),
+                ) as usize
+            }),
+            ("media_common", || {
+                std::ptr::from_ref(
+                    crate::media_common::upstream_client(crate::media_common::ClientKind::Files)
+                        .unwrap(),
+                ) as usize
+            }),
+        ];
+        for (name, site) in sites {
+            let here = site();
+            assert_eq!(
+                here,
+                site(),
+                "{name}: one client per test (pooling within a test)"
+            );
+            let other = std::thread::spawn(site).join().unwrap();
+            assert_ne!(
+                here, other,
+                "{name}: a client must not cross into another test"
+            );
         }
     }
 }

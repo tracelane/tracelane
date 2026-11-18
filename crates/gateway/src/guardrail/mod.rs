@@ -72,3 +72,6 @@ pub mod hooks_api;
 #[cfg(test)]
 pub mod adapter_tests;
 pub mod adapters;
+
+#[cfg(test)]
+mod labelled_eval;

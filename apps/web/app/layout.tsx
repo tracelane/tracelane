@@ -110,7 +110,7 @@ export const metadata: Metadata = {
 		template: "%s — Tracelane",
 	},
 	description:
-		"The flight recorder for AI agents. Full-fidelity traces, a tamper-evident audit ledger you can verify offline, and inline heuristic guardrails.",
+		"Agents act. People decide. Rules and human approval for AI agent actions, full-fidelity traces, inline heuristic guardrails, and a tamper-evident audit ledger you can verify offline.",
 	// Brand assets (public/brand) — the ADR-074 geometric T monogram, monochrome.
 	// The Chisel bracket-recorder mark it replaced is dead; do not resurrect it.
 	// One polarity only (dark mark on light), pinned PERMANENTLY by founder decision:
@@ -120,7 +120,7 @@ export const metadata: Metadata = {
 		icon: [
 			{ url: "/brand/favicon-32.png", type: "image/png", sizes: "32x32" },
 			{ url: "/brand/favicon-16.png", type: "image/png", sizes: "16x16" },
-			{ url: "/brand/tracelane-mark.svg", type: "image/svg+xml" },
+			{ url: "/favicon.svg", type: "image/svg+xml" },
 		],
 		// B-252 CLOSED: this pointed at /brand/logo-icon-light.png, which 4088da73 deleted
 		// — a 404 apple-touch icon in production from that commit until 2026-08-15. Every

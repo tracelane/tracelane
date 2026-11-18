@@ -28,7 +28,7 @@ export default function manifest(): MetadataRoute.Manifest {
 		name: "Tracelane",
 		short_name: "Tracelane",
 		description:
-			"The flight recorder for AI agents. Full-fidelity traces, a tamper-evident audit ledger you can verify offline, and inline heuristic guardrails.",
+			"Agents act. People decide. Rules and human approval for AI agent actions, full-fidelity traces, inline heuristic guardrails, and a tamper-evident audit ledger you can verify offline.",
 		start_url: "/",
 		display: "standalone",
 		// design-constraint-ok: a web-app manifest is JSON read by the OS installer, not CSS — it cannot reference a custom property, so the value must be a literal. Hand-synced to --canvas (light); it was #f4f6fa and survived two palette swaps because nothing enforced the sync until this marker existed.
@@ -56,6 +56,12 @@ export default function manifest(): MetadataRoute.Manifest {
 				sizes: "512x512",
 				type: "image/png",
 				purpose: "any",
+			},
+			{
+				src: "/brand/pwa-maskable-512.png",
+				sizes: "512x512",
+				type: "image/png",
+				purpose: "maskable",
 			},
 		],
 	};

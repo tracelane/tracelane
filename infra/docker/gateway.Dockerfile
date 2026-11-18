@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release -p gateway && \
     cp /build/target/release/gateway /gateway
 
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:57e5704e70a85b90191182eb6110d1c817df0d8e96035cb041195c5a351f0861 AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:2c362104c7f7adc37e6bdc87451450ff3834871a6268d930815cbe561493f947 AS runtime
 LABEL org.opencontainers.image.title="Tracelane Gateway" \
       org.opencontainers.image.description="The flight recorder for AI agents — Rust gateway" \
       org.opencontainers.image.licenses="Apache-2.0" \

@@ -7,6 +7,10 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+	AnchorKeyCard,
+	type AnchorKeyState,
+} from "@/components/settings/AnchorKeyCard";
 import { CopyButton } from "@/components/trace-viewer/CopyButton";
 import { db } from "@/db";
 import { tenantAuditKeys, tenants } from "@/db/schema";
@@ -32,20 +36,45 @@ function fingerprint(b64: string): string {
 
 export default async function AuditKeyPage() {
 	const session = await requireSession();
-	const [tenantRow] = await db
-		.select({ id: tenants.id })
-		.from(tenants)
-		.where(eq(tenants.workosOrgId, session.tenantId))
-		.limit(1);
-
 	let ed = "";
-	if (tenantRow?.id) {
-		const [row] = await db
-			.select({ ed: tenantAuditKeys.publicKeyB64 })
-			.from(tenantAuditKeys)
-			.where(eq(tenantAuditKeys.tenantId, tenantRow.id))
+	let keysUnavailable = false;
+	let anchor: AnchorKeyState = { status: "error" };
+	try {
+		const [tenantRow] = await db
+			.select({ id: tenants.id })
+			.from(tenants)
+			.where(eq(tenants.workosOrgId, session.tenantId))
 			.limit(1);
-		ed = row?.ed ?? "";
+		if (!tenantRow?.id) {
+			keysUnavailable = true;
+		} else {
+			const [row] = await db
+				.select({
+					ed: tenantAuditKeys.publicKeyB64,
+					anchor: tenantAuditKeys.anchorPubkeySpkiB64,
+				})
+				.from(tenantAuditKeys)
+				.where(eq(tenantAuditKeys.tenantId, tenantRow.id))
+				.limit(1);
+			ed = row?.ed ?? "";
+			if (!row || row.anchor === null) {
+				anchor = { status: "absent" };
+			} else if (
+				row.anchor &&
+				Buffer.from(row.anchor, "base64").toString("base64") === row.anchor
+			) {
+				// Hash the decoded DER; Node's permissive base64 decoder must not
+				// turn corrupt stored text into a plausible fingerprint.
+				anchor = {
+					status: "present",
+					spkiB64: row.anchor,
+					fingerprint: fingerprint(row.anchor),
+				};
+			}
+		}
+	} catch {
+		// A failed read cannot establish absence. Never expose database details.
+		keysUnavailable = true;
 	}
 
 	return (
@@ -60,7 +89,16 @@ export default async function AuditKeyPage() {
 				</p>
 			</div>
 
-			{ed ? (
+			{keysUnavailable ? (
+				<Card className="p-5">
+					<p className="text-sm font-medium text-ink">
+						Cannot determine signing key
+					</p>
+					<p className="mt-1 text-sm text-ink-2">
+						The workspace key read is unavailable. Reload to try again.
+					</p>
+				</Card>
+			) : ed ? (
 				<Card provenance className="space-y-3 p-5">
 					<div>
 						<div className="flex items-center justify-between gap-2">
@@ -72,7 +110,7 @@ export default async function AuditKeyPage() {
 						<code className="mt-1 block break-all font-mono text-xs text-ink">
 							{ed}
 						</code>
-						<div className="mt-1 font-mono text-2xs text-ink-2">
+						<div className="mt-1 break-all font-mono text-2xs text-ink-2">
 							SHA-256 fingerprint: {fingerprint(ed)}
 						</div>
 					</div>
@@ -131,6 +169,8 @@ export default async function AuditKeyPage() {
 				</Card>
 			)}
 
+			<AnchorKeyCard state={anchor} />
+
 			{/* How-to — written from the ADR-066 entitlement split, not marketing:
 			    self-verify is default-granted on EVERY plan; only the Article-12
 			    export is entitlement-gated (f_audit_addon — seeded TRUE on Enterprise
@@ -182,7 +222,8 @@ export default async function AuditKeyPage() {
 							</span>{" "}
 							The same bytes drive the open-source CLI. Run{" "}
 							<code className="rounded bg-surface-2 px-1 py-0.5 font-mono text-xs text-ink">
-								tlane verify ./audit.ndjson --tenant-pubkey &lt;key above&gt;
+								tlane verify ./audit.ndjson --tenant-pubkey &lt;Ed25519 signing
+								key&gt;
 							</code>{" "}
 							(add <code className="font-mono text-ink">--offline</code> to skip
 							the Rekor network check). It reproduces the same verdict

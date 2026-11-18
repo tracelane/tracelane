@@ -6,7 +6,7 @@
  * link fails 502. Negative cases first per testing.md.
  */
 
-import type { NextRequest } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/auth", () => ({
@@ -43,6 +43,14 @@ vi.mock("@/lib/entitlements", () => ({
 	resolveEntitlements: vi.fn(async () => ({ f_sso: h.fSso })),
 }));
 
+vi.mock("@/lib/control-change", () => ({
+	recordControlChange: vi.fn(async () => ({ ok: true })),
+	recordControlChangeFailed: vi.fn(async () => {}),
+}));
+import {
+	recordControlChange,
+	recordControlChangeFailed,
+} from "@/lib/control-change";
 import { POST } from "./route";
 
 function req(body: unknown): NextRequest {
@@ -100,6 +108,7 @@ function stub(opts: {
 describe("POST /api/settings/workspace/portal", () => {
 	beforeEach(() => {
 		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+		vi.mocked(recordControlChange).mockResolvedValue({ ok: true });
 		// Default the EXISTING tests to an entitled tenant so they keep asserting
 		// what they were written to assert (role, intent, WorkOS failures).
 		h.tenantRow = { id: "t-1", plan: "enterprise" };
@@ -209,5 +218,116 @@ describe("POST /api/settings/workspace/portal", () => {
 		};
 		expect(body.organization).toBe("org_SESSION"); // never org_ATTACKER
 		expect(body.intent).toBe("domain_verification");
+	});
+});
+
+describe("portal admin policy boundary", () => {
+	beforeEach(() => {
+		vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_do_not_use");
+		h.tenantRow = { id: "t-1", plan: "enterprise" };
+		h.fSso = true;
+		vi.mocked(recordControlChange).mockResolvedValue({ ok: true });
+	});
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
+	for (const intent of ["sso", "dsync", "domain_verification", "audit_logs"]) {
+		it.each([
+			[403, "admin_ip_not_allowed"],
+			[403, "sso_required"],
+			[503, "control_audit_unavailable"],
+		] as const)(
+			`refuses ${intent} before link issuance: %s %s`,
+			async (status, error) => {
+				const fetch = stub({ link: "https://portal.workos.com/secret" });
+				vi.mocked(recordControlChange).mockResolvedValue({
+					ok: false,
+					response: NextResponse.json({ error }, { status }),
+				});
+				const request = req({
+					intent,
+					organization: "org_ATTACKER",
+					ip: "203.0.113.1",
+				});
+				request.headers.set("x-forwarded-for", "203.0.113.1");
+				const response = await POST(request);
+				expect(response.status).toBe(status);
+				expect(await response.json()).toEqual({ error });
+				expect(
+					fetch.mock.calls.some((c) =>
+						String(c[0]).includes("/portal/generate_link"),
+					),
+				).toBe(false);
+			},
+		);
+		it(`audits ${intent} before issuing a session-scoped link`, async () => {
+			const fetch = stub({ link: "https://portal.workos.com/secret" });
+			expect(
+				(await POST(req({ intent, organization: "org_ATTACKER" }))).status,
+			).toBe(200);
+			expect(recordControlChange).toHaveBeenCalledExactlyOnceWith(
+				"workspace.portal.generate",
+				"org_SESSION",
+				undefined,
+				{ intent },
+			);
+			const index = fetch.mock.calls.findIndex((c) =>
+				String(c[0]).includes("/portal/generate_link"),
+			);
+			expect(
+				vi.mocked(recordControlChange).mock.invocationCallOrder[0],
+			).toBeLessThan(fetch.mock.invocationCallOrder[index] ?? -1);
+		});
+	}
+	it("does not audit or mint for an unprivileged user", async () => {
+		stub({ callerRole: "member" });
+		expect((await POST(req({ intent: "audit_logs" }))).status).toBe(403);
+		expect(recordControlChange).not.toHaveBeenCalled();
+	});
+	it("does not audit or mint paid intent for an unentitled user", async () => {
+		h.fSso = false;
+		stub({});
+		expect((await POST(req({ intent: "sso" }))).status).toBe(403);
+		expect(recordControlChange).not.toHaveBeenCalled();
+	});
+	it("records network failure without exposing the exception", async () => {
+		const fetch = stub({});
+		fetch.mockImplementation(async (...args: unknown[]) => {
+			if (String(args[0]).includes("organization_memberships"))
+				return {
+					ok: true,
+					json: async () => ({
+						data: [
+							{
+								id: "m",
+								user_id: "user_ME",
+								organization_id: "org_SESSION",
+								role: { slug: "admin" },
+							},
+						],
+					}),
+				} as Response;
+			throw new Error("private provider error");
+		});
+		const response = await POST(req({ intent: "sso" }));
+		expect(response.status).toBe(502);
+		expect(await response.text()).not.toContain("private provider error");
+		expect(recordControlChangeFailed).toHaveBeenCalledWith(
+			"workspace.portal.generate",
+			"org_SESSION",
+			undefined,
+			{ intent: "sso" },
+		);
+	});
+	it("records downstream failure without a portal link", async () => {
+		stub({ portalOk: false });
+		expect((await POST(req({ intent: "sso" }))).status).toBe(502);
+		expect(recordControlChangeFailed).toHaveBeenCalledWith(
+			"workspace.portal.generate",
+			"org_SESSION",
+			undefined,
+			{ intent: "sso" },
+		);
 	});
 });

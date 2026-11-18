@@ -18,7 +18,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildDpdpPhase2Pack } from "../src/commands/export.js";
+import {
+	buildDpdpPhase2Pack,
+	registerExportCommand,
+} from "../src/commands/export.js";
 import { buildInitConfig, registerInitCommand } from "../src/commands/init.js";
 import { fetchTrace, renderTrace } from "../src/commands/trace.js";
 
@@ -214,5 +217,69 @@ describe("tlane init — writes atomically (no check-then-write race)", () => {
 		const written = JSON.parse(readFileSync(target, "utf-8"));
 		expect(written.serviceName).toBe("agent-y");
 		expect(written.stale).toBeUndefined();
+	});
+});
+
+describe("guardrail retirement in generated evidence", () => {
+	let dir: string;
+	beforeEach(async () => {
+		dir = mkdtempSync(join(tmpdir(), "guardrail-pack-"));
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const program = new Command();
+		program.exitOverride();
+		registerExportCommand(program);
+		await program.parseAsync([
+			"node",
+			"tlane",
+			"export",
+			"--pack",
+			"eu-ai-act-art12",
+			"--output-dir",
+			dir,
+			"--no-zip",
+		]);
+	});
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+		vi.restoreAllMocks();
+	});
+
+	it("omits retired scorers from model and guardrail output", () => {
+		const registry = readFileSync(
+			join(dir, "art12-03-model-registry.json"),
+			"utf8",
+		);
+		const evidence = readFileSync(
+			join(dir, "art12-05-guardrail-evidence.md"),
+			"utf8",
+		);
+		for (const retired of [
+			"trajectory-guard",
+			"slm-judge",
+			"TrajectoryGuard",
+			"SlmJudge",
+			"trajectory_guard.rs",
+			"slm_judge.rs",
+		]) {
+			expect(registry + evidence).not.toContain(retired);
+		}
+		expect(evidence).toContain("mcp_hash_watcher.rs");
+		expect(evidence).toContain("tool_schema_validator.rs");
+	});
+
+	it("labels generated inventories without asserting tenant enablement", () => {
+		const registry = JSON.parse(
+			readFileSync(join(dir, "art12-03-model-registry.json"), "utf8"),
+		);
+		const evidence = readFileSync(
+			join(dir, "art12-05-guardrail-evidence.md"),
+			"utf8",
+		);
+		expect(registry.basis).toContain("Static example provider inventory");
+		expect(evidence).toContain("Static source inventory");
+		expect(evidence).toContain("does not attest tenant enablement");
+		expect(evidence).not.toContain(
+			"All predictors run inline on every request",
+		);
 	});
 });

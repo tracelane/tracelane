@@ -9,7 +9,7 @@ import { NextResponse } from "next/server";
  * lock cannot be acquired. WorkOS remains an external transaction boundary.
  */
 export async function withOwnerMutation(
-	orgId: string,
+	orgId: string | readonly string[],
 	mutate: () => Promise<NextResponse>,
 ): Promise<NextResponse> {
 	let pool: Pool | undefined;
@@ -18,9 +18,16 @@ export async function withOwnerMutation(
 		if (!connectionString) throw new Error("database not configured");
 		pool = new Pool({ connectionString });
 		return await drizzle(pool).transaction(async (tx) => {
-			await tx.execute(
-				sql`SELECT pg_advisory_xact_lock(hashtextextended(${`tracelane:owners:${orgId}`}, 0))`,
-			);
+			// Every caller uses the same order and key namespace, so global account
+			// deletion serializes with individual workspace membership mutations.
+			const orgs = [
+				...new Set(typeof orgId === "string" ? [orgId] : orgId),
+			].sort();
+			for (const org of orgs) {
+				await tx.execute(
+					sql`SELECT pg_advisory_xact_lock(hashtextextended(${`tracelane:owners:${org}`}, 0))`,
+				);
+			}
 			return mutate();
 		});
 	} catch {

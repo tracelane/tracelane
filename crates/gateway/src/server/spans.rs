@@ -325,7 +325,7 @@ const MESSAGE_BYTES_MULTIPLE: usize = 8;
 /// `[REDACTED:<category>]` markers), then cap. This runs on every plan and every route,
 /// independent of the R2 rail: R2 rewrites what is SENT, this bounds what is KEPT.
 /// Only reached when the workspace or the operator opted into capture.
-fn store_safe(s: &mut String, cap: usize) {
+pub(crate) fn store_safe(s: &mut String, cap: usize) {
     *s = tracelane_policy::pii::redact(s);
     truncate_utf8(s, cap);
 }
@@ -1154,6 +1154,12 @@ impl RequestConfig {
         attrs.tracelane_request_non_text_parts = self.non_text_parts;
         attrs.tracelane_misconfig_flags = self.misconfig_flags;
         attrs.tracelane_zdr_required = self.zdr_required;
+        if self.zdr_required == Some(true) {
+            attrs.extra.insert(
+                "tracelane_zdr_capture_suppressed".to_owned(),
+                serde_json::json!(true),
+            );
+        }
         attrs.tracelane_zdr_eligible_providers = self.zdr_eligible_providers;
         if let Some(b) = self.bridge {
             attrs
@@ -2101,7 +2107,7 @@ mod tests {
             ..Default::default()
         };
         // No operator block AND no control plane: the decision the OSS self-host makes.
-        let capture = crate::server::config::capture_decision(None, None, &tenant);
+        let capture = crate::server::config::capture_decision(None, None, &tenant, None, None);
         assert!(
             CapturedInput::build(capture, &req).is_none(),
             "with no trace_content block installed, capture MUST be off — an              absent config is the unprivileged state (.claude/rules/tenancy.md)"
@@ -3073,7 +3079,7 @@ mod tests {
             Some("get_weather".to_owned()),
             r#"{"city":"Bangalore"}"#.to_owned(),
         )];
-        let capture = crate::server::config::capture_decision(None, None, &tenant);
+        let capture = crate::server::config::capture_decision(None, None, &tenant, None, None);
         assert!(
             CapturedOutput::build(capture, "", &calls).is_none(),
             "with no trace_content block installed, capture MUST be off — \
@@ -3095,6 +3101,8 @@ mod tests {
                 output: false,
             }),
             &tenant,
+            None,
+            None,
         );
         assert!(
             CapturedOutput::build(input_only, "some text", &calls).is_none(),

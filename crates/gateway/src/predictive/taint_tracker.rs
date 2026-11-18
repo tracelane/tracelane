@@ -4,8 +4,8 @@
 //! the web + high-capability model. If all three co-occur in a single agent
 //! run, the risk of prompt injection leading to RCE is significantly elevated.
 //!
-//! The tracker maintains a per-tenant taint state across spans in the same
-//! trace. When taint reaches the LETHAL threshold it emits
+//! The tracker scores supplied fields within one request, without retained
+//! cross-span state. When taint reaches the LETHAL threshold it emits
 //! `Decision::Warn { aft_id: "AFT-TAINT-LETHAL-001" }`.
 //!
 //! Taint sources (add 1 point each):

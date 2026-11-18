@@ -291,6 +291,46 @@ pub fn safe_client_builder() -> reqwest::ClientBuilder {
         .tcp_keepalive(std::time::Duration::from_secs(60))
 }
 
+/// The process-wide upstream client held in `slot`, built once by `build`, so every request
+/// shares one keep-alive pool.
+///
+/// **B-619 (unit tests only):** one client per `(slot, test thread)` instead. A pooled
+/// connection's driver task is spawned on the runtime of the test that opened it and dies with
+/// that runtime; a client shared across tests handed a later test a dead connection, and it
+/// answered `502 provider_unavailable` at random. libtest runs each test on its own thread.
+///
+/// # Errors
+/// Fail-CLOSED: whatever `build` returns; never an unguarded client.
+pub(crate) fn shared_client(
+    slot: &'static std::sync::OnceLock<reqwest::Client>,
+    build: impl FnOnce() -> anyhow::Result<reqwest::Client>,
+) -> anyhow::Result<&'static reqwest::Client> {
+    #[cfg(test)]
+    {
+        thread_local! {
+            static PER_TEST: std::cell::RefCell<
+                std::collections::HashMap<usize, &'static reqwest::Client>,
+            > = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let id = std::ptr::from_ref(slot) as usize;
+        if let Some(c) = PER_TEST.with(|m| m.borrow().get(&id).copied()) {
+            return Ok(c);
+        }
+        // Leaked per test thread: a test binary's lifetime, a handful of clients per test.
+        let c: &'static reqwest::Client = Box::leak(Box::new(build()?));
+        PER_TEST.with(|m| m.borrow_mut().insert(id, c));
+        Ok(c)
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(c) = slot.get() {
+            return Ok(c);
+        }
+        let built = build()?;
+        Ok(slot.get_or_init(|| built))
+    }
+}
+
 /// Returns `true` if `ip` falls in any blocked address range.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {

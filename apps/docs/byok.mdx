@@ -114,6 +114,64 @@ AWS KMS, Vault Transit, GCP KMS,
 and Azure Key Vault. The dashboard fingerprint registry does not call these
 endpoints.
 
+### Cloud principal enrollment
+
+For AWS KMS, the role trust policy must require `sts:ExternalId` equal to
+`tracelane-<workspace-tenant-uuid>`. The gateway supplies the authenticated
+workspace's UUID; a request cannot choose a different external ID.
+
+For GCP KMS and Azure Key Vault, **arrange enrollment with the gateway operator
+before configuring the API**. The operator must independently verify your
+workspace's ownership of the cloud delegation and exact key reference. A
+successful wrap/unwrap through the gateway is an access test, not ownership
+verification. Customer API requests cannot create this enrollment.
+
+On self-hosted gateways, the operator sets `TRACELANE_KMS_PRINCIPAL_BINDINGS` to
+a JSON array. Each entry names a workspace tenant UUID (not an organisation ID),
+the exact backend configuration, and the exact key reference:
+
+```json
+[
+  {
+    "tenant_id": "11111111-1111-4111-8111-111111111111",
+    "configuration": {
+      "backend": "gcp_kms",
+      "params": { "service_account": "kms@customer-project.iam.gserviceaccount.com" }
+    },
+    "key_ref": "projects/customer-project/locations/global/keyRings/customer/cryptoKeys/providers"
+  },
+  {
+    "tenant_id": "22222222-2222-4222-8222-222222222222",
+    "configuration": {
+      "backend": "azure_key_vault",
+      "params": { "directory_id": "33333333-3333-4333-8333-333333333333" }
+    },
+    "key_ref": "https://customer.vault.azure.net/keys/providers/version"
+  }
+]
+```
+
+These are placeholder identifiers. The registry grants no cloud permissions by
+itself: GCP still needs service-account impersonation and KMS access; Azure still
+needs the deployment application's access to the specified directory and key.
+A GCP service account or Azure directory may be enrolled for only one workspace;
+multiple keys for that workspace may be enrolled during rotation. Exact matching
+means a different key reference needs enrollment. Azure references include the key
+version; GCP references identify the CryptoKey, so rotating its primary version
+does not change the enrollment. See [GCP key rotation](https://docs.cloud.google.com/kms/docs/rotate-key).
+
+Missing, malformed, or conflicting enrollment refuses GCP/Azure use, including
+existing configurations. Set the registry before upgrading the gateway. Restart
+the gateway after changing it to replace the process environment and clear cached
+provider keys. For rewrap, enroll both old and new references first, perform the
+rewrap, then remove the old reference and restart. No database migration is needed
+for enrollment. Keep the fail-closed configuration if verification fails.
+
+Cloud key disablement can take up to the configured DEK cache lifetime to affect
+new requests; `GET /v1/security/kms` reports `revocation_bound_secs`. Requests that
+already hold a provider key can finish. This setup protects provider-key envelopes,
+not trace payloads.
+
 ## Rotate & revoke dashboard fingerprints
 
 Registering, listing, rotating, and removing CMK **fingerprints** is available

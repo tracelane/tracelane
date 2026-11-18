@@ -315,6 +315,12 @@ impl Default for CachePolicy {
     }
 }
 impl CachePolicy {
+    /// A caller-requested privacy bypass is visible even when capture defaults off.
+    pub fn suspend_for_zdr(mut self) -> Self {
+        self.bypass = true;
+        self.quiet = false;
+        self
+    }
     pub fn suspend(mut self) -> Self {
         self.bypass = true;
         self

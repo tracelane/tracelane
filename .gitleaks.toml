@@ -29,6 +29,12 @@ description = "Google Authentication Key (AQ. format, 2026) — no upstream rule
 regex = '''AQ\.[A-Za-z0-9_\-]{20,}'''
 keywords = ["aq."]
 
+[[rules]]
+id = "tracelane-stripe-live-key"
+description = "Stripe live secret key"
+regex = '''sk_live_[A-Za-z0-9]{16,}'''
+keywords = ["sk_live_"]
+
 [allowlist]
 description = "Redaction/PII-detection source patterns + gitignored artifacts"
 paths = [
@@ -45,6 +51,8 @@ paths = [
 # conformance vectors, the vector generator, and the three reference verifiers —
 # not a secret. The `generic-api-key` rule false-flags its base64 as high-entropy.
 regexes = [
+  # Synthetic RFC 3161 fixture: SHA-256 identifier of a PUBLIC Ed25519 key.
+  '''^fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889$''',
   '''t8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=''',
 
   # FALSE POSITIVES: clearly-marked TEST FIXTURES that are credential-SHAPED by
@@ -69,4 +77,9 @@ regexes = [
   # NOTE: these regexes match gitleaks' extracted SECRET, not the matched line —
   # so this is the identifier itself, not `keyId = tenantPubkeyB64`.
   '''^tenantPubkeyB64$''',
+
+  # FALSE POSITIVE: the public site's curl example uses the literal placeholder
+  # `YOUR_TRACELANE_KEY` (apps/site/src/pages/index.astro); `curl-auth-header`
+  # fires on the `Authorization: Bearer` shape. Pinned to the exact placeholder.
+  '''^YOUR_TRACELANE_KEY$''',
 ]

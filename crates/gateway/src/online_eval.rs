@@ -1360,7 +1360,9 @@ mod capture_policy {
     #[test]
     fn capture_decision_is_fail_closed_without_a_block() {
         let t = tenant();
-        assert!(!crate::server::config::capture_decision(None, None, &t).judge_may_read());
+        assert!(
+            !crate::server::config::capture_decision(None, None, &t, None, None).judge_may_read()
+        );
         // GWY-53: the judge needs BOTH halves — an input-only opt-in must not let it
         // read the answer it would grade.
         let input_only = crate::server::config::capture_decision(
@@ -1370,6 +1372,8 @@ mod capture_policy {
                 output: false,
             }),
             &t,
+            None,
+            None,
         );
         assert!(!input_only.judge_may_read());
     }

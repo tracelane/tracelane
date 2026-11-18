@@ -15,8 +15,10 @@ import { Button } from "@tracelanedev/ui";
  * server-gated; the confirms are the launch compensating control for no re-auth.
  */
 
+import { SignOutButton } from "@/components/SignOutButton";
 import { EmailChangeForm } from "@/components/settings/EmailChangeForm";
 import { apiFetchRaw } from "@/lib/api-fetch";
+import { signOutNow } from "@/lib/sign-out";
 import { useMutation } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -70,6 +72,8 @@ export function ProfileManager({
 	canDeleteOrg: boolean;
 }) {
 	const router = useRouter();
+	const [accountDeleted, setAccountDeleted] = useState(false);
+	const [logoutFailed, setLogoutFailed] = useState(false);
 	const [name, setName] = useState(initialName);
 	const [confirmEmail, setConfirmEmail] = useState("");
 	const [confirmOrg, setConfirmOrg] = useState("");
@@ -77,7 +81,14 @@ export function ProfileManager({
 	const save = useMutation({ mutationFn: saveName });
 	const delAccount = useMutation({
 		mutationFn: deleteAccount,
-		onSuccess: () => router.push("/sign-out"),
+		onSuccess: async () => {
+			setAccountDeleted(true);
+			try {
+				await signOutNow();
+			} catch {
+				setLogoutFailed(true);
+			}
+		},
 	});
 	const delOrg = useMutation({
 		mutationFn: deleteOrg,
@@ -158,13 +169,24 @@ export function ProfileManager({
 						type="button"
 						disabled={
 							confirmEmail.trim().toLowerCase() !== email.toLowerCase() ||
-							delAccount.isPending
+							delAccount.isPending ||
+							accountDeleted
 						}
 						onClick={() => delAccount.mutate(confirmEmail.trim())}
 						className="rounded-control border border-danger/60 px-3 py-1.5 text-xs font-medium text-danger-ink hover:bg-danger-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 					>
-						{delAccount.isPending ? "Deleting…" : "Delete my account"}
+						{accountDeleted
+							? "Signing out…"
+							: delAccount.isPending
+								? "Deleting…"
+								: "Delete my account"}
 					</Button>
+					{logoutFailed && (
+						<div role="alert">
+							<p>Could not sign out — try again</p>
+							<SignOutButton />
+						</div>
+					)}
 					{delAccount.error && (
 						<p className="text-xs text-danger-ink">
 							{(delAccount.error as Error).message}

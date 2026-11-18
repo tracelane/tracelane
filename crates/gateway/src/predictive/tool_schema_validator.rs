@@ -19,7 +19,7 @@
 //! over `serde_json::Value`, which covers the common hallucination shapes
 //! without pulling a full JSON-Schema engine onto the hot path. Nested-object
 //! schemas are intentionally not recursed — top-level checks are deterministic
-//! and bounded; full conformance is the post-call SLM judge's job.
+//! and bounded; full conformance is outside this validator's supported subset.
 //!
 //! Decision: observe-first `Warn { aft_id: "AFT-TOOL-SCHEMA-001" }`. The
 //! gateway is a proxy — a schema violation is a strong signal but blocking a

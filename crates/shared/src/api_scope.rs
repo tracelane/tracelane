@@ -33,8 +33,7 @@
 //! **Fails CLOSED, in every direction except the one compatibility case:**
 //! unknown scope string → denied · unreadable column → denied · empty set →
 //! impossible by constraint, and denied here too if one ever appears · `NULL` →
-//! full surface, which is the documented legacy behaviour and the only open
-//! direction.
+//! the legacy surface, excluding explicitly granted passthrough and MCP access.
 
 use std::collections::BTreeSet;
 
@@ -68,13 +67,15 @@ pub enum Scope {
     /// `OG-08` — raw provider passthrough (`/v1/passthrough/{provider}/…`). The body is
     /// opaque to the gateway, so NO guardrail and no per-model budget sees it.
     ///
-    /// **The ONE scope a legacy `NULL`-scope key does NOT get** — see
-    /// [`KeyScope::allows`]. That is the single deliberate exception to the
+    /// **Like MCP, legacy `NULL`-scope keys do not receive this scope** — see
+    /// [`KeyScope::allows`]. This is an explicit exception to the
     /// "legacy keys keep the full surface" compatibility direction: a capability
     /// that bypasses guardrails must be granted by name, per key, and never be
     /// inherited by a key minted before the capability existed. `admin` does not
     /// imply it either (nothing implies anything).
     Passthrough,
+    /// Explicit opt-in to registered MCP servers; never inherited by legacy keys.
+    Mcp,
 }
 
 impl Scope {
@@ -88,6 +89,7 @@ impl Scope {
             "ingest" => Some(Self::Ingest),
             "admin" => Some(Self::Admin),
             "passthrough" => Some(Self::Passthrough),
+            "mcp" => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -100,6 +102,7 @@ impl Scope {
             Self::Ingest => "ingest",
             Self::Admin => "admin",
             Self::Passthrough => "passthrough",
+            Self::Mcp => "mcp",
         }
     }
 
@@ -110,13 +113,14 @@ impl Scope {
     /// resolves to, use [`Scope::default_mint_set`] — the two are deliberately
     /// different and conflating them is the defect below.
     #[must_use]
-    pub fn all() -> [Scope; 5] {
+    pub fn all() -> [Scope; 6] {
         [
             Scope::Chat,
             Scope::Read,
             Scope::Ingest,
             Scope::Admin,
             Scope::Passthrough,
+            Scope::Mcp,
         ]
     }
 
@@ -203,7 +207,7 @@ impl KeyScope {
             // future scope added to the enum forces a decision here.
             Self::LegacyFullSurface => match needed {
                 Scope::Chat | Scope::Read | Scope::Ingest | Scope::Admin => true,
-                Scope::Passthrough => false,
+                Scope::Passthrough | Scope::Mcp => false,
             },
             Self::Scoped(s) => s.contains(&needed),
         }
@@ -262,8 +266,8 @@ mod tests {
             // `passthrough` itself is the one deliberate exception.
             assert_eq!(
                 k.allows(s),
-                s != Scope::Passthrough,
-                "legacy key must retain {s:?} (and only `passthrough` is withheld)"
+                !matches!(s, Scope::Passthrough | Scope::Mcp),
+                "legacy key must retain {s:?} (passthrough and MCP are withheld)"
             );
         }
         assert_eq!(k.slugs(), None);
@@ -313,7 +317,7 @@ mod tests {
                 "{existing:?} must not gain `ingest` by the variant being added"
             );
         }
-        // The ONE open direction, unchanged: a legacy key allows everything.
+        // Legacy keys retain the original scopes, excluding explicit opt-ins.
         assert!(KeyScope::from_column(None).allows(Scope::Ingest));
     }
 
@@ -395,5 +399,27 @@ mod tests {
         assert_eq!(k.slugs(), Some(vec!["passthrough"]));
         assert_eq!(Scope::from_slug(" PassThrough "), Some(Scope::Passthrough));
         assert!(!Scope::default_mint_set().contains(&Scope::Passthrough));
+    }
+}
+
+#[cfg(test)]
+mod mcp_scope_tests {
+    use super::*;
+    #[test]
+    fn mcp_explicit_scope_is_recognized() {
+        let scope = Scope::from_slug("mcp");
+        assert!(scope.is_some(), "MCP needs its own explicit scope");
+        assert_eq!(scope.unwrap().as_slug(), "mcp");
+    }
+}
+
+#[cfg(test)]
+mod mcp_grant_tests {
+    use super::*;
+    #[test]
+    fn mcp_legacy_key_has_no_scope() {
+        assert!(!KeyScope::from_column(None).allows(Scope::Mcp));
+        assert!(!KeyScope::from_column(Some(&["admin".into()])).allows(Scope::Mcp));
+        assert!(KeyScope::from_column(Some(&["mcp".into()])).allows(Scope::Mcp));
     }
 }

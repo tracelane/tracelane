@@ -255,12 +255,81 @@ fn is_jwks_test_bypass_enabled() -> bool {
     false
 }
 
-async fn fetch_from_workos() -> Result<JwksCache> {
-    let client_id = std::env::var("WORKOS_CLIENT_ID")
-        .context("WORKOS_CLIENT_ID env var required for JWT validation")?;
+/// Key ids the control plane currently signs with, for refusing tenant key sets that
+/// alias them. `None` when no control plane is configured (`WORKOS_CLIENT_ID` unset).
+///
+/// # Errors
+/// Fail-CLOSED for callers: a configured control plane whose JWKS cannot be fetched is `Err`.
+pub(crate) async fn control_plane_kids() -> Result<Option<std::collections::HashSet<String>>> {
+    if std::env::var("WORKOS_CLIENT_ID").is_err() {
+        return Ok(None);
+    }
+    Ok(Some(get_cached().await?.keys.keys().cloned().collect()))
+}
 
-    let base_url = std::env::var("WORKOS_JWKS_URL")
-        .unwrap_or_else(|_| format!("https://api.workos.com/sso/jwks/{client_id}"));
+/// Whether `kid` is a key the control plane signs with, refreshing on a miss (with the
+/// existing cooldown) so a just-rotated WorkOS key is seen. `false` when no control plane is
+/// configured (`WORKOS_CLIENT_ID` unset: release builds refuse every control-plane JWT then).
+///
+/// # Errors
+/// Fail-CLOSED for callers: a configured control plane whose JWKS cannot be fetched is `Err`.
+pub(crate) async fn is_control_plane_kid(kid: &str) -> Result<bool> {
+    if std::env::var("WORKOS_CLIENT_ID").is_err() {
+        return Ok(false);
+    }
+    Ok(get_cached_with_refresh_on_miss(kid)
+        .await?
+        .lookup(kid)
+        .is_some())
+}
+
+/// Test seam: install a fresh control-plane key cache holding `kids` (dummy key material).
+/// The returned guard empties the cache on drop, so the dummy keys never leak into a later
+/// test that authenticates through the real (mocked) control-plane JWKS.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn seed_control_plane_kids_for_tests(kids: &[&str]) -> SeededControlKids {
+    let keys = kids
+        .iter()
+        .map(|k| {
+            (
+                (*k).to_owned(),
+                DecodingKey::from_secret(b"unit-test-not-a-key"),
+            )
+        })
+        .collect();
+    cache().store(Arc::new(Some(Arc::new(JwksCache {
+        keys,
+        fetched_at: Instant::now(),
+    }))));
+    SeededControlKids
+}
+#[cfg(test)]
+pub(crate) struct SeededControlKids;
+#[cfg(test)]
+impl Drop for SeededControlKids {
+    fn drop(&mut self) {
+        cache().store(Arc::new(None));
+    }
+}
+
+/// The control plane's own JWKS URL: `WORKOS_JWKS_URL`, else WorkOS's per-client default.
+/// `None` when neither is configured. One derivation, shared with the principal-issuer refusal
+/// (`action_control::principal::validate_issuer`), so the two can never disagree.
+pub(crate) fn control_plane_jwks_url() -> Option<String> {
+    std::env::var("WORKOS_JWKS_URL").ok().or_else(|| {
+        std::env::var("WORKOS_CLIENT_ID")
+            .ok()
+            .map(|client_id| format!("https://api.workos.com/sso/jwks/{client_id}"))
+    })
+}
+
+async fn fetch_from_workos() -> Result<JwksCache> {
+    // Unchanged contract: the client id is required even when WORKOS_JWKS_URL overrides the URL.
+    std::env::var("WORKOS_CLIENT_ID")
+        .context("WORKOS_CLIENT_ID env var required for JWT validation")?;
+    let base_url =
+        control_plane_jwks_url().context("WORKOS_CLIENT_ID env var required for JWT validation")?;
 
     // R3 H4: validate the URL through SSRF + host allowlist
     // BEFORE the HTTP call, so a misconfigured / DNS-poisoned host

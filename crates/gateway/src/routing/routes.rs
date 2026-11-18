@@ -521,6 +521,28 @@ async fn simulate(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn og62_viewer_get_and_put_are_forbidden() {
+        let mut claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::JwtBearer);
+        claims.role = Some(crate::auth::Role::Viewer);
+        let _guard = crate::media_common::test_support::as_claims(claims);
+        let state =
+            crate::handler_harness::test_state(crate::providers::ProviderRegistry::new().unwrap());
+        let headers = crate::handler_harness::authed();
+        assert_eq!(
+            get_routing(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_routing(State(state), headers, Ok(Json(PutBody { doc: json!({}) })))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
     #[test]
     fn if_match_reads_quoted_and_bare_versions_and_refuses_garbage() {
         let mut h = HeaderMap::new();

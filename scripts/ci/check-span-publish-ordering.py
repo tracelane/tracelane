@@ -282,7 +282,16 @@ def check(lines: list[str], admission: list[str]) -> list[str]:
     # 3) Dispatch: the DispatchGuard brackets the provider await (B-375 b), and
     #    since B-385 it is ARMED by the admission pipeline the moment the ledger
     #    row exists.
+    # 2026-10-30: `run` became a wrapper that delegates to `run_steps`, where the
+    # publish and the arm now live; reading only `run` turned this check red on a
+    # correct tree. Splice `run_steps` into `run` at its call site, so an arm or a
+    # publish in EITHER body is read in execution order.
     run_body = fn_body(admission, "run")
+    steps_body = fn_body(admission, "run_steps")
+    if run_body is not None and steps_body is not None:
+        call = next((k for k, ln in enumerate(run_body) if "run_steps" in ln), None)
+        if call is not None:
+            run_body = run_body[:call] + steps_body + run_body[call + 1 :]
     if run_body is None:
         errors.append("could not find `fn run` in admission.rs — the pipeline is gone")
     else:
@@ -573,6 +582,41 @@ async fn run<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, R
 }
 """
 
+# The 2026-10-30 shape: `run` delegates to `run_steps`. Good when the arm follows the
+# publish inside `run_steps`; refused when the WRAPPER arms before delegating.
+_GOOD_ADMISSION_DELEGATES = """\
+async fn run<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, Refusal> {
+    let trace_id = resolve_trace();
+    let result = run_steps::<R>(state, body, trace_id).await;
+    result
+}
+
+async fn run_steps<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, Refusal> {
+    let parsed = R::parse(body)?;
+    if let Err(err) = state.audit_chain.publish(audit_event).await {
+        return Err(Refusal::AuditUnavailable);
+    }
+    let dispatch_guard = DispatchGuard::arm(state, tenant_id, trace_id);
+    Ok(Admitted { parsed, dispatch_guard })
+}
+"""
+
+_ADMISSION_WRAPPER_ARMS_FIRST = """\
+async fn run<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, Refusal> {
+    let early = DispatchGuard::arm(state, tenant_id, trace_id);
+    let result = run_steps::<R>(state, body, trace_id).await;
+    result
+}
+
+async fn run_steps<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, Refusal> {
+    let parsed = R::parse(body)?;
+    if let Err(err) = state.audit_chain.publish(audit_event).await {
+        return Err(Refusal::AuditUnavailable);
+    }
+    Ok(Admitted { parsed })
+}
+"""
+
 _ADMISSION_NEVER_ARMS = """\
 async fn run<R: Route>(state: &AppState, body: R::Body) -> Result<Admitted<R>, Refusal> {
     let parsed = R::parse(body)?;
@@ -673,6 +717,18 @@ SELFTEST_CASES: list[tuple[str, str, str, str | None]] = [
         "admission_that_arms_before_the_publish_is_refused",
         _GOOD_BUFFERED + _GOOD_STREAMING + _GOOD_HANDLER,
         _ADMISSION_ARMS_BEFORE_PUBLISH,
+        "is BEFORE the ledger publish",
+    ),
+    (
+        "admission_delegating_to_run_steps_passes",
+        _GOOD_BUFFERED + _GOOD_STREAMING + _GOOD_HANDLER,
+        _GOOD_ADMISSION_DELEGATES,
+        None,
+    ),
+    (
+        "admission_wrapper_that_arms_before_run_steps_is_refused",
+        _GOOD_BUFFERED + _GOOD_STREAMING + _GOOD_HANDLER,
+        _ADMISSION_WRAPPER_ARMS_FIRST,
         "is BEFORE the ledger publish",
     ),
     (

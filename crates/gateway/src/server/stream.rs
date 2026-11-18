@@ -111,6 +111,9 @@ struct StreamFinalizer {
     // ── accumulated by the loop ──────────────────────────────────────────
     input_tokens: u32,
     output_tokens: u32,
+    saw_usage: bool,
+    /// Count provider text without retaining it, independent of capture/redaction.
+    output_bytes_for_estimate: usize,
     /// Only the Done event sets these; a pre-Done cut leaves them None.
     cache_read: Option<u32>,
     cache_creation: Option<u32>,
@@ -217,6 +220,16 @@ impl StreamFinalizer {
         // gateway post-processing → overhead.
         let provider_complete_ts = chrono::Utc::now();
 
+        // Price the same estimated usage that the span and budget recorders see.
+        // Count received bytes before yielding, so cancellation and capture-off
+        // requests do not lose their estimate. Explicit provider usage wins.
+        let estimated = !self.saw_usage
+            && (self.input_bytes_for_estimate > 0 || self.output_bytes_for_estimate > 0);
+        if estimated {
+            self.input_tokens = estimate_tokens(self.input_bytes_for_estimate).unwrap_or(0);
+            self.output_tokens = estimate_tokens(self.output_bytes_for_estimate).unwrap_or(0);
+        }
+
         let mut span = build_gateway_span(
             &self.tenant_id,
             self.trace_id,
@@ -289,35 +302,11 @@ impl StreamFinalizer {
         {
             out.apply(&mut span.attributes);
         }
-        // BILL-01 / OBS-51 step 3a: a stream that closed with NO upstream
-        // usage event at all (Gemini never emits one) gets a DETERMINISTIC
-        // estimate rather than reporting 0 tokens for a real conversation.
-        // Runs AFTER the stream closed (this is `run`, reached only once the
-        // loop has ended or the generator has dropped), never on the yield
-        // path: `estimate_tokens` is O(1) (integer division on lengths
-        // already computed), so there is nothing here for `spawn_blocking`
-        // to protect a hot byte from — the constraint the brief states
-        // ("never on the yield path") is satisfied by `run`'s own position,
-        // not by an extra thread hop for arithmetic this cheap.
-        if self.input_tokens == 0 && self.output_tokens == 0 {
-            let output_len = span
-                .attributes
-                .gen_ai_output_messages
-                .as_ref()
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .map_or(0, str::len);
-            if self.input_bytes_for_estimate > 0 || output_len > 0 {
-                span.attributes.gen_ai_usage_input_tokens =
-                    estimate_tokens(self.input_bytes_for_estimate);
-                span.attributes.gen_ai_usage_output_tokens = estimate_tokens(output_len);
-                span.attributes.extra.insert(
-                    "tracelane_usage_estimated".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-            }
+        if estimated {
+            span.attributes.extra.insert(
+                "tracelane_usage_estimated".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
         // BILL-01 meter 1: stamp + meter the FINAL span shape.
         super::spans::stamp_and_meter_span_bytes(&mut span, self.meters.clone());
@@ -335,14 +324,16 @@ impl StreamFinalizer {
         // test whether or not NATS is wired.
         #[cfg(test)]
         crate::otlp_emit::test_sink::record(&span);
+        // GWY-43: the key's monthly total, read off the SPAN so the number that
+        // enforces the budget and the number the dashboard renders are one. Before the
+        // NATS check (2026-10-29): spend enforcement is a control, not capture — a
+        // no-capture gateway must still trip its hard budgets.
+        record_key_spend(self.api_key_id.as_deref(), &span);
         let Some(nats_client) = self.nats.as_ref() else {
             // NATS disabled — never drop the span silently.
             crate::otlp_emit::note_span_dropped_no_nats();
             return;
         };
-        // GWY-43: the key's monthly total, read off the SPAN so the number that
-        // enforces the budget and the number the dashboard renders are one.
-        record_key_spend(self.api_key_id.as_deref(), &span);
 
         // ── EVL-28: the online-eval judge, STREAMING path ───────────────────
         // A cancelled stream is a truncated answer; grading it would score the
@@ -504,6 +495,8 @@ pub(super) fn provider_stream_to_sse(
         let mut fin = StreamFinalizer {
             input_tokens: 0,
             output_tokens: 0,
+            saw_usage: false,
+            output_bytes_for_estimate: 0,
             cache_read: None,
             cache_creation: None,
             stream_error: None,
@@ -632,6 +625,8 @@ pub(super) fn provider_stream_to_sse(
                         fin.stream_error = Some("upstream_timeout");
                         timeout.record_attempt(&mut fin.dispatch_attempts);
                         yield Ok(Event::default().data(serde_json::json!({"error": timeout.error_json()}).to_string()));
+                    } else {
+                        yield Ok(Event::default().data(serde_json::json!({"error": {"code": "provider_stream_error", "message": "Upstream stream interrupted"}}).to_string()));
                     }
                     crate::otlp_emit::emit_operation_exception(
                         &fin.tenant_id,
@@ -645,6 +640,8 @@ pub(super) fn provider_stream_to_sse(
                 }
                 Some(Ok(event)) => match event {
                     ProviderEvent::StreamChunk { delta } => {
+                        fin.output_bytes_for_estimate =
+                            fin.output_bytes_for_estimate.saturating_add(delta.len());
                         // Enforce-before-yield: feed the seam, emit only the safe
                         // (redacted + re-inserted) text it releases. A block
                         // terminates the stream WITHOUT emitting the held-back
@@ -756,6 +753,7 @@ pub(super) fn provider_stream_to_sse(
                         cost_usd: cost,
                         reasoning,
                     } => {
+                        fin.saw_usage = true;
                         merge_usage_tokens(&mut fin.input_tokens, &mut fin.output_tokens, it, ot);
                         if cost.is_some() {
                             fin.cost_usd = cost;
@@ -802,6 +800,7 @@ pub(super) fn provider_stream_to_sse(
                         // its tool calls as fields, not stream deltas.
                         fin.tool_calls.absorb_response_calls(&response);
                         if let Some(usage) = response.usage {
+                            fin.saw_usage = true;
                             merge_usage_tokens(
                                 &mut fin.input_tokens,
                                 &mut fin.output_tokens,
@@ -1099,6 +1098,155 @@ pub(crate) mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn no_usage_stream_charges_estimated_spend() {
+        for capture in [
+            super::super::config::ContentCapture::OFF,
+            super::super::config::ContentCapture {
+                output: true,
+                max_field_bytes: 16,
+                ..super::super::config::ContentCapture::OFF
+            },
+        ] {
+            let trace = Uuid::new_v4();
+            let tenant = Uuid::new_v4();
+            let key = Uuid::new_v4().to_string();
+            let mut ctx = test_ctx("claude-sonnet-4-6", None, tenant.as_u128(), trace.as_u128());
+            ctx.capture = capture;
+            ctx.input_bytes_for_estimate = 80;
+            let text = "a harmless answer ".repeat(64);
+            let response = Sse::new(provider_stream_to_sse(mock_stream(vec![chunk(&text)]), ctx))
+                .into_response();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let spans = crate::otlp_emit::test_sink::for_trace(trace);
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+            assert_eq!(span.attributes.gen_ai_usage_input_tokens, Some(20));
+            assert_eq!(
+                span.attributes.gen_ai_usage_output_tokens,
+                estimate_tokens(text.len())
+            );
+            assert!(
+                span.attributes
+                    .gen_ai_usage_cost
+                    .is_some_and(|cost| cost > 0.0)
+            );
+            assert_eq!(
+                span.attributes.extra.get("tracelane_usage_estimated"),
+                Some(&serde_json::json!(true))
+            );
+            if !capture.output {
+                assert!(span.attributes.gen_ai_output_messages.is_none());
+            }
+            // The same recorded cost feeds both the workspace and key budgets.
+            record_key_spend(Some(&key), span);
+            for subject in [
+                crate::spend::Subject::Workspace(tenant),
+                crate::spend::Subject::Key(Uuid::parse_str(&key).unwrap()),
+            ] {
+                assert!(matches!(
+                    crate::spend::tracker().check(subject, Some(0.000001)),
+                    crate::spend::BudgetDecision::Exceeded { .. }
+                ));
+            }
+        }
+    }
+
+    /// 2026-10-29 SRE review: with no NATS client (`TRACELANE_ALLOW_NO_CAPTURE=1`) the
+    /// finalizer returned BEFORE `record_key_spend`, so a streamed request never reached the
+    /// key / workspace spend trackers, `budgets::record_span` or `limits::reconcile_span` —
+    /// hard budgets could not trip. The test above masked it by calling `record_key_spend`
+    /// by hand. RED before the fix: the key's tracked spend stayed 0.
+    #[tokio::test]
+    async fn stream_records_key_spend_without_nats() {
+        let trace = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let mut ctx = test_ctx("claude-sonnet-4-6", None, tenant.as_u128(), trace.as_u128());
+        assert!(ctx.nats.is_none(), "the harness runs without NATS");
+        ctx.api_key_id = Some(key.to_string());
+        let response = Sse::new(provider_stream_to_sse(
+            mock_stream(vec![chunk("hello"), done_event(400)]),
+            ctx,
+        ))
+        .into_response();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        let cost = spans[0].attributes.gen_ai_usage_cost.unwrap_or(0.0);
+        assert!(cost > 0.0, "a priced model yields a cost");
+        for subject in [
+            crate::spend::Subject::Key(key),
+            crate::spend::Subject::Workspace(tenant),
+        ] {
+            assert!(
+                crate::spend::tracker().current_usd(subject) > 0.0,
+                "{subject:?}: the streamed cost must reach the spend tracker with no NATS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_stream_usage_is_not_estimated() {
+        for output in [0, 7] {
+            let trace = Uuid::new_v4();
+            let mut ctx = test_ctx("claude-sonnet-4-6", None, 0xE2E, trace.as_u128());
+            ctx.input_bytes_for_estimate = 80;
+            let events = vec![
+                chunk("a harmless answer"),
+                ProviderEvent::UsageUpdate {
+                    input_tokens: output,
+                    output_tokens: output,
+                    cache_read: None,
+                    cache_creation: None,
+                    cost_usd: Some(0.25),
+                    reasoning: None,
+                },
+            ];
+            let response =
+                Sse::new(provider_stream_to_sse(mock_stream(events), ctx)).into_response();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let spans = crate::otlp_emit::test_sink::for_trace(trace);
+            assert!(
+                !spans[0]
+                    .attributes
+                    .extra
+                    .contains_key("tracelane_usage_estimated")
+            );
+            assert_eq!(spans[0].attributes.gen_ai_usage_output_tokens, Some(output));
+            assert_eq!(spans[0].attributes.gen_ai_usage_cost, Some(0.25));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_usage_cancelled_stream_prices_received_text_without_capture() {
+        let _lock = DROP_COUNTER_TEST_LOCK.lock().await;
+        let trace = Uuid::new_v4();
+        let text = "a harmless answer ".repeat(64);
+        let ctx = test_ctx("claude-sonnet-4-6", None, 0xE2E, trace.as_u128());
+        let mut sse = Box::pin(provider_stream_to_sse(mock_stream(vec![chunk(&text)]), ctx));
+        assert!(sse.next().await.is_some());
+        drop(sse);
+        let spans = crate::otlp_emit::test_sink::for_trace(trace);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].attributes.gen_ai_usage_output_tokens,
+            estimate_tokens(text.len())
+        );
+        assert!(
+            spans[0]
+                .attributes
+                .gen_ai_usage_cost
+                .is_some_and(|cost| cost > 0.0)
+        );
+        assert!(spans[0].attributes.gen_ai_output_messages.is_none());
+    }
+
     /// `stamp_and_meter_span_bytes` records through `tokio::spawn`; give those
     /// tasks the runtime (current-thread under `#[tokio::test]`) until the sink
     /// has seen `want` records or the yield budget is spent — a bounded poll,
@@ -1339,6 +1487,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn mid_stream_sever_terminates_cleanly() {
         let wire = run_sse_stream(mock_stream_severing(vec![chunk("partial answer ")])).await;
+        assert!(
+            wire.contains("\"error\""),
+            "a severed stream must tell the client: {wire}"
+        );
         assert!(
             wire.contains("[DONE]"),
             "a severed stream must still close the SSE cleanly; got: {wire}"

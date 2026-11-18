@@ -22,6 +22,7 @@ use crate::server::AppState;
 
 fn governed(doc: Value) -> Claims {
     Claims {
+        key_capture: None,
         governance: tracelane_shared::key_policy::Governance::from_columns(
             None,
             None,

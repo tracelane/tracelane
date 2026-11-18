@@ -85,6 +85,7 @@ impl RequestEvaluation {
 /// one struct (rather than a long argument list) so the hot-path call site
 /// reads clearly and stays stable as more signals are threaded in.
 pub struct RequestInputs<'r> {
+    pub zdr_required: bool,
     /// Resolved internal tenant UUID (never an org_id).
     pub tenant_id: &'r TenantId,
     /// API-key id / subject (ADR-042) — never the secret.
@@ -372,6 +373,7 @@ impl GuardrailEngine {
         record: impl FnOnce(&SideOutcome) -> bool,
     ) -> RequestEvaluation {
         let RequestInputs {
+            zdr_required,
             tenant_id,
             api_key_id,
             project_id,
@@ -424,7 +426,9 @@ impl GuardrailEngine {
         let mut hook_redactions = Vec::new();
         let mut hook_events = Vec::new();
         if !outcome.is_block() {
-            if ctx.policy.unavailable {
+            if zdr_required && ctx.policy.has_hooks() {
+                super::hooks::block(&mut outcome, "HOOK_RETENTION_UNVERIFIED");
+            } else if ctx.policy.unavailable {
                 super::hooks::block(&mut outcome, "HOOK_POLICY_UNAVAILABLE");
             } else if request.stream.unwrap_or(false)
                 && ctx.policy.hooks.iter().any(|h| h.config.post)
@@ -512,6 +516,7 @@ impl GuardrailEngine {
     /// entitlement gate: a rail the tenant's plan does not grant does not run here either).
     pub async fn scan_request(&self, inputs: RequestInputs<'_>) -> SideOutcome {
         let RequestInputs {
+            zdr_required: _,
             tenant_id,
             api_key_id,
             project_id,
@@ -893,6 +898,7 @@ mod tests {
         let req = tainted_exfil_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:e2e"),
                 project_id: None,
@@ -945,6 +951,7 @@ mod tests {
         let req = benign_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: None,
                 project_id: None,
@@ -986,6 +993,7 @@ mod tests {
         let req = tainted_exfil_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: None,
                 project_id: None,
@@ -1048,6 +1056,7 @@ mod tests {
         let tenant = TenantId::from_jwt_claim(Uuid::from_u128(0x3E2E));
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r3"),
                 project_id: None,
@@ -1122,6 +1131,7 @@ mod tests {
         let tenant = TenantId::from_jwt_claim(Uuid::from_u128(0x2E2));
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r2"),
                 project_id: None,
@@ -1196,6 +1206,7 @@ mod tests {
         let tenant = TenantId::from_jwt_claim(Uuid::from_u128(0x2DEAD));
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: None,
                 project_id: None,
@@ -1257,6 +1268,7 @@ mod tests {
         let req = tainted_exfil_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: None,
                 project_id: None,
@@ -1326,6 +1338,7 @@ mod tests {
         let tenant = TenantId::from_jwt_claim(Uuid::new_v4());
         engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:gwy23"),
                 project_id: None,
@@ -1559,6 +1572,7 @@ mod tests {
         let req = tainted_exfil_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:ch"),
                 project_id: None,
@@ -1697,6 +1711,7 @@ mod tests {
         let req = benign_request();
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r1"),
                 project_id: None,
@@ -1723,7 +1738,7 @@ mod tests {
             vec![Box::new(R2SecretsPii::new())],
             chain,
             Some(ch.clone()),
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             enforcing_registry(),
         );
         let correlation = Ulid::new();
@@ -1753,6 +1768,7 @@ mod tests {
         };
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r2"),
                 project_id: None,
@@ -1813,6 +1829,7 @@ mod tests {
         };
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r3"),
                 project_id: None,
@@ -1840,7 +1857,7 @@ mod tests {
             vec![Box::new(R5Format::new())],
             chain,
             Some(ch.clone()),
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             enforcing_registry(),
         );
         let correlation = Ulid::new();
@@ -1879,7 +1896,7 @@ mod tests {
             vec![Box::new(R6SysPromptLeak::new())],
             chain,
             Some(ch.clone()),
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             enforcing_registry(),
         );
         let correlation = Ulid::new();
@@ -1922,7 +1939,7 @@ mod tests {
             vec![Box::new(R7TopicCompetitor::with_config(cfg))],
             chain,
             Some(ch.clone()),
-            None,
+            Some(crate::entitlement_cache::ResolvedEntitlements::paid_rails_cache()),
             enforcing_registry(),
         );
         let correlation = Ulid::new();
@@ -1952,6 +1969,7 @@ mod tests {
         };
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r7"),
                 project_id: None,
@@ -2008,6 +2026,7 @@ mod tests {
         };
         let eval = engine
             .evaluate_request(RequestInputs {
+                zdr_required: false,
                 tenant_id: &tenant,
                 api_key_id: Some("apikey:r8"),
                 project_id: None,
@@ -2047,6 +2066,7 @@ mod tests {
         let run_once = || async {
             engine
                 .evaluate_request(RequestInputs {
+                    zdr_required: false,
                     tenant_id: &tenant,
                     api_key_id: Some("apikey:bench"),
                     project_id: None,

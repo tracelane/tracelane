@@ -37,6 +37,7 @@
  * is never wider than the rail and never clipped.
  */
 
+import { SignOutButton } from "@/components/SignOutButton";
 import { useDismiss } from "@/lib/use-dismiss";
 import { cn } from "@tracelanedev/ui";
 import Link from "next/link";
@@ -203,14 +204,13 @@ export function AccountMenu({ collapsed = false }: { collapsed?: boolean }) {
 							{!collapsed && <span>{label}</span>}
 						</a>
 					))}
-					<a
-						href="/sign-out"
+					<SignOutButton
 						title={collapsed ? "Sign out" : undefined}
 						className={cn(RAIL_ITEM, RAIL_ITEM_IDLE)}
 					>
 						<span className={RAIL_ICON} />
 						{!collapsed && <span>Sign out</span>}
-					</a>
+					</SignOutButton>
 				</div>
 			</details>
 		</>

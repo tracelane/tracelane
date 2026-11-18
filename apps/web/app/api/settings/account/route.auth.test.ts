@@ -40,7 +40,7 @@ const del = () =>
 
 beforeEach(() => {
 	h.session = { user: { id: "user_new", email: "me@example.test" } };
-	h.db = makeDbMock([]);
+	h.db = makeDbMock([[], [], []]);
 	vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_do_not_use");
 	vi.stubGlobal(
 		"fetch",
@@ -58,7 +58,7 @@ it("authenticated identity without an org can erase itself before onboarding", a
 	expect(result.status).toBe(200);
 	expect(await result.json()).toEqual({ deleted: true, orgDeleted: false });
 	expect(h.db?.db.execute).toHaveBeenCalledTimes(1);
-	expect(h.db?.db.select).not.toHaveBeenCalled();
+	expect(h.db?.db.select).toHaveBeenCalledTimes(2);
 	expect(withOwnerMutation).not.toHaveBeenCalled();
 	expect(fetch).toHaveBeenCalledTimes(2);
 	expect(fetch).toHaveBeenCalledWith(
@@ -75,7 +75,7 @@ it("unauthenticated deletion is refused before any database or WorkOS call", asy
 	expect(fetch).not.toHaveBeenCalled();
 });
 
-it("unscoped existing last owner still cannot abandon other members", async () => {
+it("unscoped existing owner must select an organization before deletion", async () => {
 	vi.stubGlobal(
 		"fetch",
 		vi.fn(async (url: string) => ({
@@ -87,6 +87,7 @@ it("unscoped existing last owner still cannot abandon other members", async () =
 								user_id: "user_new",
 								organization_id: "org_existing",
 								role: { slug: "owner" },
+								status: "active",
 							},
 						]
 					: [
@@ -94,11 +95,13 @@ it("unscoped existing last owner still cannot abandon other members", async () =
 								user_id: "user_new",
 								organization_id: "org_existing",
 								role: { slug: "owner" },
+								status: "active",
 							},
 							{
 								user_id: "other",
 								organization_id: "org_existing",
 								role: { slug: "member" },
+								status: "active",
 							},
 						],
 			}),
@@ -106,7 +109,8 @@ it("unscoped existing last owner still cannot abandon other members", async () =
 	);
 	const result = await del();
 	expect(result.status).toBe(409);
-	expect((await result.json()).error).toBe("last_owner_protected");
+	expect((await result.json()).error).toBe("organization_selection_required");
+	expect(withOwnerMutation).not.toHaveBeenCalled();
 	expect(h.db?.db.execute).not.toHaveBeenCalled();
 });
 
@@ -121,3 +125,23 @@ it.each([null, {}])(
 		expect(h.db?.db.execute).not.toHaveBeenCalled();
 	},
 );
+
+it("orgless identity with historical keys cannot erase without confirmed revocation", async () => {
+	h.db = makeDbMock([[{ id: "orphan-key" }]]);
+	const result = await del();
+	expect(result.status).toBe(409);
+	expect(await result.json()).toMatchObject({
+		error: "organization_selection_required",
+	});
+	expect(h.db.db.execute).not.toHaveBeenCalled();
+});
+
+it("orgless deletion refuses success if a mint committed before the erasure marker", async () => {
+	h.db = makeDbMock([[], [], [{ id: "late-key" }]]);
+	const result = await del();
+	expect(result.status).toBe(503);
+	expect(await result.json()).toMatchObject({
+		error: "key_revocation_unconfirmed",
+	});
+	expect(fetch).toHaveBeenCalledTimes(1);
+});

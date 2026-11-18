@@ -340,25 +340,30 @@ async fn main() -> anyhow::Result<()> {
         supervisor::supervise("disk_guard_refresher", shutdown.clone(), || {
             shutdown::until_shutdown(shutdown.clone(), disk_for_refresh.clone().run_refresher())
         }),
-        supervisor::supervise("nats_consumer", shutdown.clone(), || {
-            // Cloned HERE, per attempt — a restarted consumer must hand the
-            // (unsupervised, still-running) ClickHouse writer a live sender,
-            // never the one a prior, now-dead attempt already dropped.
-            let span_tx = nats_tx.clone();
-            nats_consumer::run(
-                cfg.nats_url.clone(),
-                span_tx,
-                single_tenant.clone(),
-                cfg.batch_size,
-                shutdown.clone(),
-                clickhouse_writer::ch_client(
-                    &cfg.clickhouse_url,
-                    &cfg.clickhouse_user,
-                    &cfg.clickhouse_password,
-                    &cfg.clickhouse_db,
-                ),
-            )
-        }),
+        async {
+            // Own the last sender in this arm, so shutdown closes the writer's
+            // channel before try_join! waits for its final drain.
+            let nats_tx = nats_tx;
+            supervisor::supervise("nats_consumer", shutdown.clone(), || {
+                // Cloned HERE, per attempt — a restarted consumer must hand the
+                // (unsupervised, still-running) ClickHouse writer a live sender.
+                let span_tx = nats_tx.clone();
+                nats_consumer::run(
+                    cfg.nats_url.clone(),
+                    span_tx,
+                    single_tenant.clone(),
+                    cfg.batch_size,
+                    shutdown.clone(),
+                    clickhouse_writer::ch_client(
+                        &cfg.clickhouse_url,
+                        &cfg.clickhouse_user,
+                        &cfg.clickhouse_password,
+                        &cfg.clickhouse_db,
+                    ),
+                )
+            })
+            .await
+        },
         clickhouse_writer::run(
             cfg.clickhouse_url.clone(),
             cfg.clickhouse_user.clone(),
@@ -408,5 +413,44 @@ fn init_tracing() {
                     .with_writer(RedactingMakeWriter::new(std::io::stdout)),
             )
             .init();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sigterm_closes_span_channel_and_exits() {
+        let (trigger, shutdown) = shutdown::manual();
+        let (span_tx, mut span_rx) = tokio::sync::mpsc::channel::<span_envelope::SpanEnvelope>(1);
+        let nats_tx = span_tx.clone();
+        drop(span_tx);
+        let consumer = async {
+            let nats_tx = nats_tx;
+            supervisor::supervise("nats_consumer", shutdown.clone(), || {
+                let held = nats_tx.clone();
+                shutdown::until_shutdown(shutdown.clone(), async move {
+                    let _held = held;
+                    std::future::pending::<anyhow::Result<()>>().await
+                })
+            })
+            .await
+        };
+        trigger.send(true).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::try_join!(consumer, async {
+                assert!(
+                    span_rx.recv().await.is_none(),
+                    "writer needs the closed channel to drain"
+                );
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "shutdown must release the supervised sender before waiting for the writer"
+        );
     }
 }

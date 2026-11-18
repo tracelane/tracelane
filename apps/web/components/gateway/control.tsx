@@ -68,6 +68,7 @@ export async function requestJson<T>(
 	verb: Verb,
 	url: string,
 	body?: unknown,
+	headers?: Record<string, string>,
 ): Promise<T> {
 	let res: Response;
 	try {
@@ -76,7 +77,7 @@ export async function requestJson<T>(
 			...(body === undefined
 				? {}
 				: {
-						headers: { "content-type": "application/json" },
+						headers: { "content-type": "application/json", ...headers },
 						body: JSON.stringify(body),
 					}),
 		});
@@ -105,8 +106,9 @@ export function controlRequest<T>(
 	verb: Verb,
 	path: string,
 	body?: unknown,
+	headers?: Record<string, string>,
 ): Promise<T> {
-	return requestJson<T>(verb, `${CONTROL_BASE}/${path}`, body);
+	return requestJson<T>(verb, `${CONTROL_BASE}/${path}`, body, headers);
 }
 
 export function useControlQuery<T>(

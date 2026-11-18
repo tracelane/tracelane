@@ -258,8 +258,19 @@ def selftest() -> int:
                     'Self::Admin => "admin",\n            Self::Bogus => "bogus",',
                     1,
                 )
-                s = re.sub(r"(fn all\(\)\s*->\s*\[Scope;\s*)\d+", r"\g<1>99", s)
-                s = s.replace("Scope::Admin]", "Scope::Admin, Scope::Bogus]", 1)
+                s, count = re.subn(
+                    r"(fn all\(\)\s*->\s*\[Scope;\s*)(\d+)(\]\s*\{\s*\[)",
+                    lambda m: m[1] + str(int(m[2]) + 1) + m[3] + "Scope::Bogus,",
+                    s,
+                    count=1,
+                )
+                assert count == 1, "rust_add must mutate the canonical scope list"
+                if "bogus" not in canonical(s) or canonical(s) != from_slug_arms(s):
+                    print(
+                        "SELFTEST BROKEN — rust_add did not add a consistent canonical scope",
+                        file=sys.stderr,
+                    )
+                    return 1
                 rust.write_text(s)
             elif kind == "ui_add":
                 s = ui.read_text()

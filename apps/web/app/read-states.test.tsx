@@ -1,3 +1,4 @@
+import { tenants } from "@/db/schema";
 import { Children, type ReactNode, isValidElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, expect, it, vi } from "vitest";
@@ -18,16 +19,18 @@ vi.mock("@/lib/auth", () => ({
 vi.mock("@/db", () => ({
 	db: {
 		select: () => ({
-			from: () => ({
+			from: (table: unknown) => ({
 				where: () => ({
-					limit: async () => [
-						{
-							id: "tenant",
-							plan: "free",
-							pubkey: "",
-							createdAt: new Date("2026-09-20T00:00:00Z"),
-						},
-					],
+					limit: async () =>
+						table === tenants
+							? [
+									{
+										id: "tenant",
+										plan: "free",
+										createdAt: new Date("2026-09-20T00:00:00Z"),
+									},
+								]
+							: [],
 				}),
 			}),
 		}),

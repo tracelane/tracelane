@@ -64,3 +64,8 @@ spec/**             linguist-documentation
 *.bat       text eol=crlf
 *.cmd       text eol=crlf
 *.ps1       text eol=crlf
+
+# RFC 3161 fixtures and signatures are exact binary wire bytes.
+packages/verifier-rust/tests/fixtures/timestamp/*.der binary
+packages/verifier-rust/tests/fixtures/timestamp/*.tsr binary
+packages/verifier-rust/tests/fixtures/timestamp/*.sig binary

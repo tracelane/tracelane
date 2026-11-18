@@ -502,6 +502,59 @@
           }
         }
       }
+    },
+    "POST /v1/keys/invalidate-cache": {
+      "summary": "Discard cached authentication grants for this workspace or the current user.",
+      "description": "Call after the database revocation commits. Requires a recognized human JWT; API keys, self-host master credentials and mTLS are refused. With own_keys=true, discard only keys minted by the authenticated user across workspaces; otherwise discard this workspace’s grants. Tenant and user identity come only from verified claims. The acknowledgement covers the serving gateway process only. Other processes and unacknowledged raw SQL revokes remain bounded by the configured authentication cache lease. This operation does not revoke database rows or cancel requests already authenticated.",
+      "tags": [
+        "keys"
+      ],
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "own_keys": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "responses": {
+        "200": {
+          "description": "This process has evicted the selected authentication grants.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "invalidated": {
+                "const": true
+              }
+            },
+            "required": [
+              "invalidated"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "401": {
+          "description": "Authorization is absent or invalid."
+        },
+        "403": {
+          "description": "Human session required, or control-plane admission refused.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "422": {
+          "description": "The JSON body accepts only the optional own_keys boolean."
+        },
+        "503": {
+          "description": "Cache eviction could not be confirmed."
+        }
+      },
+      "x-error-codes": [
+        "human_session_required",
+        "key_revocation_unconfirmed"
+      ]
     }
   }
 }

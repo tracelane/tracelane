@@ -7,6 +7,7 @@ import type { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
+	rateLimit: vi.fn(),
 	auth: {
 		user: { id: "user_ME", email: "me@acme.co", emailVerified: true },
 		organizationId: null as string | null,
@@ -16,6 +17,10 @@ const h = vi.hoisted(() => ({
 	member: false,
 }));
 
+vi.mock("@/lib/rate-limit", async (original) => ({
+	...(await original<typeof import("@/lib/rate-limit")>()),
+	rateLimit: h.rateLimit,
+}));
 vi.mock("@workos-inc/authkit-nextjs", () => ({
 	withAuth: vi.fn(async () => h.auth),
 	switchToOrganization: vi.fn(async () => {}),
@@ -33,6 +38,7 @@ vi.mock("next/server", async (orig) => ({
 	},
 }));
 
+import { resetSignupAlertStateForTests } from "@/lib/signup-alert";
 import { resetWelcomeEmailStateForTests } from "@/lib/welcome-email";
 import { POST } from "./route";
 
@@ -42,8 +48,17 @@ const req = (body: unknown): NextRequest =>
 		headers: new Headers(),
 	}) as unknown as NextRequest;
 
+const resendKey = (c: unknown[]) =>
+	String(c[0]).startsWith("https://api.resend.com")
+		? ((c[1] as { headers?: Record<string, string> } | undefined)?.headers?.[
+				"idempotency-key"
+			] ?? "")
+		: null;
+// The welcome email only; the operator signup alert (PLT-53) is a second Resend call.
 const isResend = (c: unknown[]) =>
-	String(c[0]).startsWith("https://api.resend.com");
+	resendKey(c)?.startsWith("welcome-") ?? false;
+const isSignupAlert = (c: unknown[]) =>
+	resendKey(c)?.startsWith("signup-alert-") ?? false;
 
 /** WorkOS + Resend stub. `resend` picks what Resend does. */
 function stub(resend: "ok" | 400 | 500 | "throw" = "ok") {
@@ -84,8 +99,10 @@ function stub(resend: "ok" | 400 | 500 | "throw" = "ok") {
 
 let n = 0;
 beforeEach(() => {
+	h.rateLimit.mockReset().mockResolvedValue(true);
 	n += 1; // fresh user id per test: the route rate-limits org creation per user
 	resetWelcomeEmailStateForTests();
+	resetSignupAlertStateForTests();
 	h.pending = [];
 	h.member = false;
 	h.auth = {
@@ -172,6 +189,70 @@ describe("welcome email — trigger", () => {
 	});
 });
 
+describe("signup alert (PLT-53) — trigger", () => {
+	const alerts = (spy: ReturnType<typeof stub>) =>
+		spy.mock.calls.filter(isSignupAlert).map((c) => {
+			const body = JSON.parse((c[1] as { body: string }).body) as {
+				to: string[];
+				text: string;
+			};
+			return body;
+		});
+
+	it("fresh provisioning sends ONE alert to the operator, not to the signer-up", async () => {
+		const spy = stub();
+		const res = await POST(req({ name: "Acme" }));
+		await Promise.all(h.pending);
+		expect(res.status).toBe(201);
+		const sent = alerts(spy);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.to).toEqual(["founder@tracelane.dev"]);
+		expect(sent[0]?.text).toContain("email: me@acme.co");
+		expect(sent[0]?.text).toContain("tenant id: tenant-uuid");
+	});
+
+	it("an UNVERIFIED sign-up still alerts the operator, and says so", async () => {
+		h.auth.user = { ...h.auth.user, emailVerified: false };
+		const spy = stub();
+		await POST(req({ name: "Acme" }));
+		await Promise.all(h.pending);
+		const sent = alerts(spy);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.text).toContain("email verified: no");
+	});
+
+	it("session already in an org: no alert", async () => {
+		h.auth.organizationId = "org_OLD";
+		const spy = stub();
+		await POST(req({}));
+		await Promise.all(h.pending);
+		expect(alerts(spy)).toHaveLength(0);
+	});
+
+	it("retry path (existing membership): no alert", async () => {
+		h.member = true;
+		const spy = stub();
+		await POST(req({}));
+		await Promise.all(h.pending);
+		expect(alerts(spy)).toHaveLength(0);
+	});
+
+	it("sign-up still succeeds when the alert's Resend throws", async () => {
+		stub("throw");
+		const res = await POST(req({ name: "Acme" }));
+		await Promise.all(h.pending);
+		expect(res.status).toBe(201);
+	});
+
+	it("NOT TWICE: sign-up, then a repeat POST by the now-member, alerts once in total", async () => {
+		const spy = stub();
+		await POST(req({ name: "Acme" }));
+		await POST(req({ name: "Acme" }));
+		await Promise.all(h.pending);
+		expect(alerts(spy)).toHaveLength(1);
+	});
+});
+
 describe("welcome email — sign-up survives a failing Resend", () => {
 	for (const mode of [400, 500, "throw"] as const) {
 		it(`Resend ${mode}: still 201 created:true`, async () => {
@@ -183,4 +264,36 @@ describe("welcome email — sign-up survives a failing Resend", () => {
 			expect(spy.mock.calls.filter(isResend)).toHaveLength(1);
 		});
 	}
+});
+
+describe("durable limiter responses", () => {
+	async function refused(failed: boolean) {
+		if (failed)
+			h.rateLimit.mockRejectedValueOnce(new Error("private DB detail"));
+		else h.rateLimit.mockResolvedValueOnce(false);
+		const fetcher = stub();
+		const response = await POST(req({ name: "fixture" }));
+		expect(response.status).toBe(failed ? 503 : 429);
+		expect(await response.json()).toEqual(
+			failed
+				? { error: "rate_limit_unavailable" }
+				: {
+						error: "rate_limited",
+						message: "too many workspaces created recently — try again later",
+					},
+		);
+		expect(h.rateLimit).toHaveBeenCalledWith(
+			`org-create:${h.auth.user.id}`,
+			5,
+			3_600_000,
+		);
+		expect(
+			fetcher.mock.calls.every(
+				(c) => !c[1] || (c[1] as { method?: string }).method === undefined,
+			),
+		).toBe(true);
+		expect(h.pending).toHaveLength(0);
+	}
+	it("org_create_limit_durable", () => refused(false));
+	it("org_create_store_down_503", () => refused(true));
 });

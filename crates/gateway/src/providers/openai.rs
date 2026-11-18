@@ -211,11 +211,12 @@ fn build_openai_stream(
         let mut byte_stream = response.bytes_stream();
         // Bytes, not text: a chunk boundary can fall inside a character.
         let mut lines = super::sse_lines::LineBuffer::default();
+        let mut saw_finish_reason = false;
 
         use futures::StreamExt as _;
         while let Some(chunk) = byte_stream.next().await {
             let chunk: Bytes = chunk.map_err(reqwest::Error::without_url).context("error reading response chunk")?;
-            lines.push(&chunk);
+            lines.push(&chunk)?;
 
             while let Some(line) = lines.next_line() {
                 let line = line.context("non-UTF8 SSE line")?;
@@ -227,13 +228,19 @@ fn build_openai_stream(
                     if data == "[DONE]" {
                         return;
                     }
-                    if let Ok(events) = parse_openai_sse(data) {
-                        for event in events {
-                            yield event;
-                        }
+                    let frame: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
+                    let events = parse_openai_sse_value(&frame)?;
+                    saw_finish_reason |= frame["choices"].as_array().is_some_and(|choices| {
+                        choices.iter().any(|choice| !choice["finish_reason"].is_null())
+                    });
+                    for event in events {
+                        yield event;
                     }
                 }
             }
+        }
+        if !saw_finish_reason {
+            Err(anyhow::anyhow!("OpenAI stream ended before [DONE]"))?;
         }
     }
 }
@@ -263,13 +270,17 @@ fn build_openai_stream(
 /// (a compat host that bundles the reason onto the last content chunk loses it)
 /// is neither fixed nor worsened here. Widening that is a behaviour change to
 /// existing streams and does not belong in an observability block.
+#[cfg(test)]
 fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
+    parse_openai_sse_value(&v)
+}
 
+fn parse_openai_sse_value(v: &Value) -> Result<Vec<ProviderEvent>> {
     // RI-05 / B-444: the provider's identity claims ride every OpenAI-compatible
     // chunk (`id`, `model`, `system_fingerprint`). Emitted FIRST on any frame that
     // carries at least one of them; consumers keep the first and ignore the rest.
-    let mut events: Vec<ProviderEvent> = response_meta(&v).into_iter().collect();
+    let mut events: Vec<ProviderEvent> = response_meta(v).into_iter().collect();
 
     // Usage chunk (stream_options.include_usage = true). Pushed LAST, after whatever
     // else this frame carries — F3 (2026-10-03): Mistral bundles the whole tool call,
@@ -327,7 +338,12 @@ fn parse_openai_sse(data: &str) -> Result<Vec<ProviderEvent>> {
     let delta = &v["choices"][0]["delta"];
 
     // Text delta
-    if let Some(text) = delta["content"].as_str()
+    let content = &delta["content"];
+    anyhow::ensure!(
+        content.is_null() || content.is_string(),
+        "invalid SSE content type"
+    );
+    if let Some(text) = content.as_str()
         && !text.is_empty()
     {
         events.push(ProviderEvent::StreamChunk {
@@ -1455,5 +1471,50 @@ mod embeddings_tests {
             })
             .collect();
         assert_eq!(text, "price €5");
+    }
+
+    #[tokio::test]
+    async fn malformed_content_frame_fails_stream() {
+        use futures::StreamExt as _;
+        let resp = crate::providers::sse_lines::response_from_chunks(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        let events: Vec<_> = build_openai_stream(resp).collect().await;
+        assert!(events.iter().any(Result::is_err));
+    }
+
+    #[test]
+    fn non_string_content_frame_is_an_error() {
+        let frame = r#"{"choices":[{"delta":{"content":{"text":"lost"}}}]}"#;
+        assert!(parse_openai_sse(frame).is_err());
+    }
+
+    #[tokio::test]
+    async fn openai_eof_before_done_is_error() {
+        use futures::StreamExt as _;
+        let resp = crate::providers::sse_lines::response_from_chunks(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ]);
+        let events: Vec<_> = build_openai_stream(resp).collect().await;
+        assert!(events.iter().any(Result::is_err));
+    }
+
+    #[tokio::test]
+    async fn eof_after_finish_reason_without_done_is_complete() {
+        use futures::StreamExt as _;
+        let resp = crate::providers::sse_lines::response_from_chunks(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"},\"finish_reason\":null}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ]);
+        let events: Vec<_> = build_openai_stream(resp).collect().await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "finished stream must not error: {events:?}"
+        );
+        assert!(events.into_iter().flatten().any(|event| matches!(
+            event,
+            ProviderEvent::StreamChunk { delta } if delta == "complete"
+        )));
     }
 }

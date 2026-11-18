@@ -1706,17 +1706,18 @@ impl PromptEvalEngine {
             self.tier_for(tenant_id).await,
         )
         .sql_with_settings();
-        let mut rows = self
-            .ch
-            .query(&sql)
-            .bind(tenant_id.to_string())
-            .bind(hours)
-            .bind(model.unwrap_or(""))
-            .bind(model.unwrap_or(""))
-            .bind(limit)
-            .fetch_all::<Row>()
-            .await
-            .context("reading case inputs from spans")?;
+        let mut rows =
+            crate::retention_sweep::read_client(&self.ch, self.entitlements.as_deref(), tenant_id)
+                .await
+                .query(&sql)
+                .bind(tenant_id.to_string())
+                .bind(hours)
+                .bind(model.unwrap_or(""))
+                .bind(model.unwrap_or(""))
+                .bind(limit)
+                .fetch_all::<Row>()
+                .await
+                .context("reading case inputs from spans")?;
 
         // BILL-01 / ADR-076 §2.3 — `JSONExtractRaw` returns
         // `{"$ref":"blake3:<hex>"}` verbatim when ingest deduplicated a large
@@ -1743,21 +1744,25 @@ impl PromptEvalEngine {
             // A failed read used to `unwrap_or(0)` and tell them "this workspace
             // records no prompt content" — sending them to enable a setting that is
             // already on. A read we could not make is an error, not a zero.
-            let recorded: u64 = self
-                .ch
-                .query(
-                    &self
-                        .capped(
-                            "SELECT count() FROM spans \
+            let recorded: u64 = crate::retention_sweep::read_client(
+                &self.ch,
+                self.entitlements.as_deref(),
+                tenant_id,
+            )
+            .await
+            .query(
+                &self
+                    .capped(
+                        "SELECT count() FROM spans \
                      WHERE tenant_id = ? AND JSONHas(attributes, 'gen_ai_input_messages')",
-                            tenant_id,
-                        )
-                        .await,
-                )
-                .bind(tenant_id.to_string())
-                .fetch_one()
-                .await
-                .context("could not count content-bearing spans for this workspace")?;
+                        tenant_id,
+                    )
+                    .await,
+            )
+            .bind(tenant_id.to_string())
+            .fetch_one()
+            .await
+            .context("could not count content-bearing spans for this workspace")?;
             if recorded == 0 {
                 bail!(
                     "this workspace records no prompt content, so no trace can be replayed as a \

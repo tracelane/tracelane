@@ -1,0 +1,304 @@
+{
+  "module": "crates/gateway/src/data_controls_routes.rs",
+  "operations": {
+    "GET /v1/data-controls": {
+      "summary": "Read data controls.",
+      "tags": [
+        "data-controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "Current effective data controls.",
+          "schema": {
+            "$ref": "#/components/schemas/DataControlsView"
+          }
+        },
+        "503": {
+          "description": "Retention configuration or control plane unavailable.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "PUT /v1/data-controls/retention": {
+      "summary": "Update workspace retention.",
+      "tags": [
+        "data-controls"
+      ],
+      "responses": {
+        "200": {
+          "description": "Current effective data controls.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "retention": {
+                "type": "object",
+                "properties": {
+                  "days": {
+                    "anyOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "effective_days": {
+                    "type": "integer"
+                  },
+                  "plan_days": {
+                    "type": "integer"
+                  },
+                  "min_days": {
+                    "type": "integer"
+                  },
+                  "max_days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "days",
+                  "effective_days",
+                  "plan_days",
+                  "min_days",
+                  "max_days"
+                ],
+                "additionalProperties": false
+              },
+              "capture": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "boolean"
+                  },
+                  "output": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "input",
+                  "output"
+                ],
+                "additionalProperties": false
+              },
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "type": "string"
+                    },
+                    "capture": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "input": {
+                              "type": "boolean"
+                            },
+                            "output": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "prefix",
+                    "capture"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "key_overrides_count": {
+                "type": "integer"
+              },
+              "sweep": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "dryrun",
+                      "enforce"
+                    ]
+                  },
+                  "enforced": {
+                    "type": "boolean"
+                  },
+                  "next_sweep_at": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "mode",
+                  "enforced",
+                  "next_sweep_at"
+                ],
+                "additionalProperties": false
+              },
+              "routes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "route": {
+                      "type": "string"
+                    },
+                    "binding": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "route",
+                    "binding"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "can_edit": {
+                "type": "boolean"
+              },
+              "changed": {
+                "type": "boolean"
+              },
+              "rows_past_window": {
+                "type": "object",
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "required": [
+              "retention",
+              "capture",
+              "keys",
+              "key_overrides_count",
+              "sweep",
+              "routes",
+              "can_edit",
+              "changed",
+              "rows_past_window"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "503": {
+          "description": "Retention configuration or control plane unavailable.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "400": {
+          "description": "Invalid fields, retention below floor or above plan, or missing reduction confirmation.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "requestBody": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirm": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "days"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Null days restores plan inheritance. Effective retention is bounded by plan and policy. Reductions require the exact confirmation text: delete data older than N days. Row estimates may be null when unavailable; a change does not imply that a deletion sweep ran."
+    }
+  }
+}

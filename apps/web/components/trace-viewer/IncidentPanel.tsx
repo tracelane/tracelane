@@ -180,6 +180,7 @@ export function IncidentPanel({ traceId }: { traceId: string }) {
 				</div>
 			) : packet ? (
 				<>
+					<h3 className="text-sm font-medium text-ink">What happened</h3>
 					<div className="flex flex-wrap gap-2">
 						{packet.trigger.length === 0 ? (
 							<p className="text-sm text-ink-2">no failing signal recorded</p>
@@ -249,7 +250,14 @@ export function IncidentPanel({ traceId }: { traceId: string }) {
 						) : null}
 					</div>
 					<div>
-						<h3 className="text-sm font-medium text-ink">Explanations</h3>
+						<h3 className="text-sm font-medium text-ink">
+							Explanations: evidence and uncertainty
+						</h3>
+						{packet.explanations.items.length > 0 && (
+							<p className="mt-1 text-xs text-ink-2">
+								Captured differences are observations, not proof of causation.
+							</p>
+						)}
 						{packet.explanations.note ? (
 							<p className="mt-2 text-sm text-ink-2">
 								{packet.explanations.note}
@@ -299,7 +307,7 @@ export function IncidentPanel({ traceId }: { traceId: string }) {
 					{packet.limits.export_permission === "allowed" ? (
 						<div className="space-y-2 border-t border-line pt-4">
 							<h3 className="text-sm font-medium text-ink">
-								Regression fixture
+								Next action: regression fixture
 							</h3>
 							<p className="text-xs text-ink-2">
 								Recorded: inspect captured input. Mocked: replay with recorded

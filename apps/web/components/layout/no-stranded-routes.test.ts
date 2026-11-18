@@ -32,6 +32,8 @@ const SCAN_DIRS = [APP, join(__dirname, "..", "..", "components")];
 /** Routes with no inbound link, each with the reason it is allowed to have none. */
 const DELIBERATE: Record<string, string> = {
 	"/legal/[doc]": "linked from marketing/external, not from app chrome",
+	"/actions":
+		"nav entry is a separate chrome change (nav-model sweep); reached by URL until then",
 	"/": "root redirect — the entry point itself, nothing links to it internally",
 	// OBS-48: a public, unauthenticated share link — reached only via a token an
 	// owner mints and pastes elsewhere (Slack, a GitHub issue), never from this

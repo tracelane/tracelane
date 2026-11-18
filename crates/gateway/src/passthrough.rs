@@ -322,6 +322,7 @@ impl Route for Passthrough {
     const NAME: &'static str = "passthrough";
     const AUDIT_EVENT_TYPE: &'static str = "passthrough.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Unsupported;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Opaque;
     // OG-11 (provider objects are account-scoped: the `default` key only).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Passthrough,
@@ -570,16 +571,16 @@ fn upstream_url(base: &str, path: &str, query: Option<&str>) -> anyhow::Result<r
 /// One process-wide client: redirects off, TLS via rustls, and NO total timeout — a long
 /// download must not be cut at 300 s. The time-to-response-head bound is a `tokio::time::timeout`
 /// at the call site (→ 504); `read_timeout` bounds each read once the body is streaming.
-fn upstream_client(policy: &PassthroughPolicy) -> anyhow::Result<&'static reqwest::Client> {
+pub(crate) fn upstream_client(
+    policy: &PassthroughPolicy,
+) -> anyhow::Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    if let Some(c) = CLIENT.get() {
-        return Ok(c);
-    }
-    let built = crate::ssrf_guard::safe_client_builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(policy.upstream_timeout_secs))
-        .build()?;
-    Ok(CLIENT.get_or_init(|| built))
+    crate::ssrf_guard::shared_client(&CLIENT, || {
+        Ok(crate::ssrf_guard::safe_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(policy.upstream_timeout_secs))
+            .build()?)
+    })
 }
 
 // ── The handler ──────────────────────────────────────────────────────────────
@@ -1257,6 +1258,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

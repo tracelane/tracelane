@@ -580,13 +580,18 @@ impl AlertChecker {
     /// Bind (tenant, window) and fetch a single f64. Logs + returns None on error.
     async fn ch_scalar(&self, sql: &str, rule: &AlertRule) -> Option<f64> {
         let window = rule.window_minutes.max(1) as u32;
-        match self
-            .ch
-            .query(&crate::clickhouse_query::ceiling(sql))
-            .bind(rule.tenant_id.to_string())
-            .bind(window)
-            .fetch_one::<f64>()
-            .await
+        let tenant = tracelane_shared::TenantId::from_jwt_claim(rule.tenant_id);
+        match crate::retention_sweep::read_client(
+            &self.ch,
+            crate::entitlement_cache::global().map(std::sync::Arc::as_ref),
+            &tenant,
+        )
+        .await
+        .query(&crate::clickhouse_query::ceiling(sql))
+        .bind(rule.tenant_id.to_string())
+        .bind(window)
+        .fetch_one::<f64>()
+        .await
         {
             Ok(v) => Some(v),
             Err(err) => {

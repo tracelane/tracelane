@@ -162,12 +162,11 @@ const ROW_COLUMNS: &str = "tenant_id, seq, event_time, event_type, actor, payloa
 
 /// Write a batch of chain rows INSIDE the caller's transaction — the one that holds the
 /// `FOR UPDATE` head lock and advances it. One multi-row `INSERT … SELECT unnest(…)`.
-/// `ON CONFLICT DO NOTHING` on `(tenant_id, seq)`: a seq is minted exactly once under the
-/// row lock, so a conflict can only mean the boot reconcile already adopted this row from
-/// the ClickHouse copy — identical bytes, so nothing is lost by keeping the first.
-pub async fn insert_rows_tx(tx: &Transaction<'_>, rows: &[AuditLogRow]) -> Result<()> {
+/// `ON CONFLICT DO NOTHING` keeps pooled adoption idempotent. Returns the inserted
+/// row count so append callers can refuse conflicts before advancing the head.
+pub async fn insert_rows_tx(tx: &Transaction<'_>, rows: &[AuditLogRow]) -> Result<u64> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut tenant_ids: Vec<uuid::Uuid> = Vec::with_capacity(rows.len());
     let mut seqs: Vec<i64> = Vec::with_capacity(rows.len());
@@ -208,12 +207,11 @@ pub async fn insert_rows_tx(tx: &Transaction<'_>, rows: &[AuditLogRow]) -> Resul
         ],
     )
     .await
-    .context("audit_log_rows insert")?;
-    Ok(())
+    .context("audit_log_rows insert")
 }
 
 /// Same insert, on a pooled client outside any transaction — the reconcile's "adopt
-/// these rows from the ClickHouse copy" path. Idempotent for the same reason as above.
+/// these rows from the ClickHouse copy" path. Conflicts are intentionally ignored.
 pub async fn insert_rows(pool: &Pool, rows: &[AuditLogRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());

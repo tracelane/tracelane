@@ -27,6 +27,7 @@ import {
 } from "vitest";
 
 const h = vi.hoisted(() => ({
+	orgId: "org_01XYZ" as string | undefined,
 	db: null as PgliteDatabase<typeof import("@/db/schema")> | null,
 }));
 
@@ -45,10 +46,14 @@ vi.mock("@/db", () => ({
 vi.mock("@workos-inc/authkit-nextjs", () => ({
 	withAuth: async () => ({
 		user: { id: "user_01ABC", email: "ada@example.test" },
-		organizationId: "org_01XYZ",
+		organizationId: h.orgId,
 	}),
 }));
 vi.mock("@/lib/auth", () => ({
+	requireGatewayToken: async () => ({
+		token: "test-human-jwt",
+		tenantId: "org_01XYZ",
+	}),
 	requireSession: async () => ({
 		tenantId: "org_01XYZ",
 		userId: "user_01ABC",
@@ -57,11 +62,34 @@ vi.mock("@/lib/auth", () => ({
 	invalidateOrgArchivedCache: vi.fn(),
 }));
 vi.mock("@/lib/workos-org", () => ({
+	listUserMemberships: async () =>
+		h.orgId
+			? [
+					{
+						user_id: "user_01ABC",
+						organization_id: h.orgId,
+						role: { slug: "member" },
+						status: "active",
+					},
+				]
+			: [],
 	listMemberships: async () => [
-		{ user_id: "user_01ABC", role: { slug: "member" } },
-		{ user_id: "user_other", role: { slug: "owner" } },
+		{
+			user_id: "user_01ABC",
+			organization_id: "org_01XYZ",
+			role: { slug: "member" },
+			status: "active",
+		},
+		{
+			user_id: "user_other",
+			organization_id: "org_01XYZ",
+			role: { slug: "owner" },
+			status: "active",
+		},
 	],
 	isPrivilegedRole: (role: string) => role === "owner",
+	countsAsOwner: (m: { role: { slug: string }; status?: string }) =>
+		m.role.slug === "owner" && m.status === "active",
 }));
 vi.mock("@/app/api/settings/team/owner-lock", () => ({
 	withOwnerMutation: async (_org: string, work: () => Promise<unknown>) =>
@@ -71,6 +99,7 @@ import { DELETE } from "@/app/api/settings/account/route";
 import type { NextRequest } from "next/server";
 
 import { MAX_EMAIL, MAX_NAME, recordSignIn } from "./signups";
+import { migrationSqlForTestDb } from "./test-migration-sql";
 
 let pg: PGlite;
 
@@ -97,7 +126,9 @@ beforeAll(async () => {
 		.filter((n) => !journaled.has(n.replace(/\.sql$/, "")))
 		.filter((n) => !n.startsWith("0010_"))
 		.sort()) {
-		await pg.exec(readFileSync(path.join(folder, f), "utf-8"));
+		await pg.exec(
+			migrationSqlForTestDb(readFileSync(path.join(folder, f), "utf-8")),
+		);
 	}
 }, 180_000);
 
@@ -106,6 +137,8 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+	h.orgId = "org_01XYZ";
+	await db().delete(schema.apiKeys);
 	await db().execute(sql`DELETE FROM account_deletions`);
 	await db().execute(sql`DELETE FROM signups`);
 	await db().execute(sql`DELETE FROM users`);
@@ -325,7 +358,7 @@ it("deletion erases PII and a delayed callback cannot recreate it", async () => 
 	vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_do_not_use");
 	vi.stubGlobal(
 		"fetch",
-		vi.fn(async () => ({ ok: true })),
+		vi.fn(async () => Response.json({ invalidated: true })),
 	);
 	try {
 		await recordSignIn(signIn());
@@ -380,3 +413,66 @@ it("local erasure rolls back PII and marker together on a mirror failure", async
 		);
 	}
 });
+
+// Execute the route's SQL predicates against real rows, including rotation grace.
+it.each([
+	{ state: "revoked", revokedAt: "2000-01-01T00:00:00Z", status: 200 },
+	{ state: "live", revokedAt: null, status: 409 },
+	{
+		state: "scheduled revocation",
+		revokedAt: "2999-01-01T00:00:00Z",
+		status: 409,
+	},
+])(
+	"orgless account with $state key returns $status",
+	async ({ revokedAt, status }) => {
+		h.orgId = undefined;
+		await seedMirror();
+		await recordSignIn(signIn());
+		await db()
+			.insert(schema.apiKeys)
+			.values({
+				tenantId: "11111111-2222-3333-4444-555555555555",
+				keyHash: "test-orgless-hash",
+				keyPrefix: "test00",
+				name: "historical key",
+				mintedBy: "user_01ABC",
+				revokedAt: revokedAt ? new Date(revokedAt) : null,
+			});
+		vi.stubEnv("WORKOS_API_KEY", "sk_test_workos_do_not_use");
+		const remote = vi.fn(async () => Response.json({}));
+		vi.stubGlobal("fetch", remote);
+		try {
+			const result = await DELETE({
+				json: async () => ({ confirmEmail: "ada@example.test" }),
+			} as NextRequest);
+			expect(result.status).toBe(status);
+			if (status === 200) {
+				expect(await result.json()).toEqual({
+					deleted: true,
+					orgDeleted: false,
+				});
+				expect(await rows()).toHaveLength(0);
+				expect(await db().select().from(schema.accountDeletions)).toEqual([
+					{ workosUserId: "user_01ABC" },
+				]);
+				expect(remote).toHaveBeenCalledWith(
+					"https://api.workos.com/user_management/users/user_01ABC",
+					expect.objectContaining({ method: "DELETE" }),
+				);
+			} else {
+				expect(await result.json()).toEqual({
+					error: "organization_selection_required",
+				});
+				expect(await rows()).toHaveLength(1);
+				expect(await db().select().from(schema.accountDeletions)).toHaveLength(
+					0,
+				);
+				expect(remote).not.toHaveBeenCalled();
+			}
+		} finally {
+			vi.unstubAllGlobals();
+			vi.unstubAllEnvs();
+		}
+	},
+);

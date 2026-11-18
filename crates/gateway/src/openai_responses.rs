@@ -1240,6 +1240,9 @@ fn view_of(json_body: &Value, chat_request: &ChatRequest) -> Value {
 }
 
 impl crate::admission::Parsed for ResponsesParsed {
+    fn approval_body(&self, _key: &[u8; 32]) -> Option<Value> {
+        Some(self.json_body.clone())
+    }
     fn model(&self) -> &str {
         &self.chat_request.model
     }
@@ -1274,6 +1277,7 @@ impl crate::admission::Route for Responses {
     const NAME: &'static str = "responses";
     const AUDIT_EVENT_TYPE: &'static str = "responses.request";
     const CACHE: crate::admission::CacheScope = crate::admission::CacheScope::Refuses;
+    const ZDR: crate::zdr::ZdrBinding = crate::zdr::ZdrBinding::Gated;
     // OG-11 (any provider — each target is re-parsed for ITS mode, native or translated).
     const ROUTING: crate::routing::RoutingScope = crate::routing::RoutingScope {
         wire: crate::routing::Wire::Responses,
@@ -1846,6 +1850,8 @@ async fn responses_admitted(
         crate::server::config::trace_content(),
         entitlements.as_deref().map(|e| e.content_capture),
         &claims.tenant_id,
+        claims.key_capture,
+        Some(&headers),
     );
     let ResponsesParsed {
         raw: body,
@@ -1956,6 +1962,7 @@ async fn responses_admitted(
         let mut gr = state
             .guardrail
             .evaluate_request(crate::guardrail::RequestInputs {
+                zdr_required: headers.contains_key("x-tracelane-zdr"),
                 tenant_id,
                 api_key_id: claims.api_key_id(),
                 project_id: claims.governance.as_ref().and_then(|g| g.project_id),
@@ -2788,15 +2795,13 @@ pub(crate) fn truncate_utf8(s: &str, max: usize) -> String {
 ///
 /// # Errors
 /// Fail-CLOSED: `Err` only if no client can be built; never an unguarded one.
-fn upstream_client() -> anyhow::Result<&'static reqwest::Client> {
+pub(crate) fn upstream_client() -> anyhow::Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    if let Some(c) = CLIENT.get() {
-        return Ok(c);
-    }
-    let built = crate::ssrf_guard::safe_client_builder()
-        .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
-        .build()?;
-    Ok(CLIENT.get_or_init(|| built))
+    crate::ssrf_guard::shared_client(&CLIENT, || {
+        Ok(crate::ssrf_guard::safe_client_builder()
+            .timeout(std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS))
+            .build()?)
+    })
 }
 
 /// Request headers that are NEVER forwarded upstream: hop-by-hop, our own
@@ -4824,6 +4829,28 @@ async fn companion_with_claims(
     if let Some(response) = crate::routing::deadlines::invalid_document(entitlements.as_deref()) {
         return response;
     }
+    // 2026-10-29 SRE review: a companion that carries model input (`input_tokens`) forwards
+    // the caller's prompt with the tenant's key — the pause, the blocks and the workspace /
+    // key model-provider rules apply before anything leaves, exactly as Anthropic
+    // `count_tokens` and Gemini `countTokens` (rev6). The id-only companions (retrieve /
+    // delete / cancel / input_items) send no prompt and stay management calls, as OG-25
+    // keeps Gemini's model list / get — and cancel stays available to stop a background
+    // response while paused.
+    if let Some(model) = call
+        .r2_json
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(Value::as_str)
+        && let Some(r) = crate::controls::companion_refusal(
+            &claims,
+            entitlements.as_deref().map(|e| &*e.controls),
+            model,
+            call.provider_id,
+        )
+    {
+        let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::FORBIDDEN);
+        return coded(status, r.code, &r.message);
+    }
     let deadlines = crate::routing::deadlines::Budget::for_request(
         entitlements.as_deref(),
         call.provider_id,
@@ -5293,6 +5320,14 @@ pub(crate) async fn input_tokens_with_claims(
             &[],
         );
     };
+    if let Err(d) = crate::zdr::gate(
+        &headers,
+        &state.zdr.load(),
+        provider_id,
+        crate::zdr::ZdrBinding::Gated,
+    ) {
+        return coded(StatusCode::BAD_REQUEST, d.code, &d.message);
+    }
     // M-2 (final re-review 2026-10-03): this forwards the WHOLE prompt, so R2 runs over it —
     // inside the companion tail, AFTER scope and the rate limit (LAST review Low 1).
     companion_with_claims(
@@ -5548,6 +5583,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

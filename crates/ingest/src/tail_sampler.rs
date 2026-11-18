@@ -47,11 +47,11 @@ pub enum SamplingPolicy {
 pub struct TailSampler {
     /// Keep probability in `0..=100` for traces with no error/intervention.
     sample_rate_pct: u8,
-    /// Trace ids force-kept (error or intervention seen), each stamped with the
+    /// Tenant and trace ids force-kept (error or intervention seen), each stamped with the
     /// last time it was touched. The stamp drives [`TailSampler::prune`] so the
     /// map stays bounded in a long-running streaming writer that never sees an
     /// explicit trace-close.
-    forced_keep: DashMap<Uuid, Instant>,
+    forced_keep: DashMap<(Uuid, Uuid), Instant>,
 }
 
 impl TailSampler {
@@ -87,11 +87,15 @@ impl TailSampler {
         if force_keep {
             // Stamp (or refresh) the trace's last-seen time so an active trace
             // is never pruned mid-flight; a quiet trace ages out via prune().
-            self.forced_keep.insert(span.trace_id, Instant::now());
+            self.forced_keep
+                .insert((*span.tenant_id.as_uuid(), span.trace_id), Instant::now());
             return SampleDecision::Keep;
         }
         // An earlier span in this trace may already have forced keep.
-        if self.forced_keep.contains_key(&span.trace_id) {
+        if self
+            .forced_keep
+            .contains_key(&(*span.tenant_id.as_uuid(), span.trace_id))
+        {
             return SampleDecision::Keep;
         }
         if self.keep_by_rate(span.trace_id) {
@@ -107,8 +111,8 @@ impl TailSampler {
     /// max-age eviction instead of an explicit per-trace forget. Used only by
     /// tests, hence gated (B-390, 2026-09-12).
     #[cfg(test)]
-    pub fn forget(&self, trace_id: Uuid) {
-        self.forced_keep.remove(&trace_id);
+    pub fn forget(&self, tenant_id: Uuid, trace_id: Uuid) {
+        self.forced_keep.remove(&(tenant_id, trace_id));
     }
 
     /// Evict every sticky verdict last touched more than `max_age` before `now`.
@@ -215,6 +219,23 @@ mod tests {
     }
 
     #[test]
+    fn force_keep_is_isolated_by_tenant() {
+        let sampler = TailSampler::with_rate(0);
+        let trace = Uuid::from_u128(0xabc);
+        let a = span(trace, SpanStatusCode::Error);
+        let mut b = span(trace, SpanStatusCode::Ok);
+        b.tenant_id = TenantId::from_jwt_claim(Uuid::from_u128(2));
+        assert_eq!(
+            sampler.evaluate(&a, SamplingPolicy::Tail),
+            SampleDecision::Keep
+        );
+        assert_eq!(
+            sampler.evaluate(&b, SamplingPolicy::Tail),
+            SampleDecision::Drop
+        );
+    }
+
+    #[test]
     fn zero_rate_drops_clean_traces_full_rate_keeps_all() {
         let drop_all = TailSampler::with_rate(0);
         let keep_all = TailSampler::with_rate(100);
@@ -248,9 +269,9 @@ mod tests {
         let s = TailSampler::with_rate(0);
         let t = Uuid::from_u128(0x55);
         s.evaluate(&span(t, SpanStatusCode::Error), SamplingPolicy::Tail);
-        assert!(s.forced_keep.contains_key(&t));
-        s.forget(t);
-        assert!(!s.forced_keep.contains_key(&t));
+        assert!(s.forced_keep.contains_key(&(Uuid::from_u128(1), t)));
+        s.forget(Uuid::from_u128(1), t);
+        assert!(!s.forced_keep.contains_key(&(Uuid::from_u128(1), t)));
     }
 
     #[test]
@@ -259,19 +280,19 @@ mod tests {
         let t = Uuid::from_u128(0x99);
         let t0 = Instant::now();
         s.evaluate(&span(t, SpanStatusCode::Error), SamplingPolicy::Tail); // stamped at ~t0
-        assert!(s.forced_keep.contains_key(&t));
+        assert!(s.forced_keep.contains_key(&(Uuid::from_u128(1), t)));
 
         // As of t0 + 1min with a 10min window, the entry is still fresh.
         s.prune_at(t0 + Duration::from_secs(60), Duration::from_secs(600));
         assert!(
-            s.forced_keep.contains_key(&t),
+            s.forced_keep.contains_key(&(Uuid::from_u128(1), t)),
             "a fresh sticky entry must survive prune"
         );
 
         // As of t0 + 11min with a 10min window, it has aged out.
         s.prune_at(t0 + Duration::from_secs(660), Duration::from_secs(600));
         assert!(
-            !s.forced_keep.contains_key(&t),
+            !s.forced_keep.contains_key(&(Uuid::from_u128(1), t)),
             "a stale sticky entry must be pruned"
         );
     }
@@ -294,6 +315,6 @@ mod tests {
             "full keeps the same clean span"
         );
         // Full does not touch the sticky map (it needs no per-trace memory).
-        assert!(!s.forced_keep.contains_key(&t));
+        assert!(!s.forced_keep.contains_key(&(Uuid::from_u128(1), t)));
     }
 }

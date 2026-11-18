@@ -106,6 +106,24 @@ const _: () = assert!(ROUTE_STATS.len() == ROUTE_SLOTS);
 static INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static LOAD_SHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+const MCP_METHODS: [&str; 5] = [
+    "tools/call",
+    "resources/read",
+    "prompts/get",
+    "tools/list",
+    "other",
+];
+const MCP_OUTCOMES: [&str; 3] = ["ok", "error", "refused"];
+static MCP_CALLS: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
+
+pub(crate) fn note_mcp_call(method: &str, outcome: &str) {
+    let method_slot = MCP_METHODS
+        .iter()
+        .position(|m| *m == method)
+        .unwrap_or(MCP_METHODS.len() - 1);
+    let outcome_slot = MCP_OUTCOMES.iter().position(|o| *o == outcome).unwrap_or(1);
+    MCP_CALLS[method_slot][outcome_slot].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Which slot a matched route template maps to.
 #[must_use]
@@ -181,6 +199,17 @@ fn route_label(slot: usize) -> &'static str {
 pub fn render() -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(16 * 1024);
+
+    out.push_str("# HELP tracelane_mcp_calls_total Proxied MCP calls by bounded method and outcome.\n# TYPE tracelane_mcp_calls_total counter\n");
+    for (method_slot, method) in MCP_METHODS.iter().enumerate() {
+        for (outcome_slot, outcome) in MCP_OUTCOMES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "tracelane_mcp_calls_total{{method=\"{method}\",outcome=\"{outcome}\"}} {}",
+                MCP_CALLS[method_slot][outcome_slot].load(Ordering::Relaxed)
+            );
+        }
+    }
 
     out.push_str("# HELP tracelane_gateway_http_requests_total Requests finished, by matched route template and status class.\n# TYPE tracelane_gateway_http_requests_total counter\n");
     for (slot, stats) in ROUTE_STATS.iter().enumerate() {
@@ -456,18 +485,24 @@ fn resolve_addr() -> SocketAddr {
     }
 }
 
-/// Serve `/metrics` until the process exits. **Never returns `Err`** — an
+fn operator_router() -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(crate::server::health_detail_handler))
+}
+
+/// Serve `/metrics` and operator `/health` until the process exits. **Never returns `Err`** — an
 /// observability listener must not take the proxy down with it.
 pub async fn run() {
     let addr = resolve_addr();
     if !addr.ip().is_loopback() {
         tracing::warn!(
             %addr,
-            "gateway /metrics is bound to a NON-LOOPBACK address — it is unauthenticated \
+            "gateway /metrics and operator /health are bound to a NON-LOOPBACK address — it is unauthenticated \
              and carries process-wide counters; make sure only your scraper can reach it"
         );
     }
-    let app = Router::new().route("/metrics", get(metrics_handler));
+    let app = operator_router();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -481,7 +516,7 @@ pub async fn run() {
             unreachable!()
         }
     };
-    tracing::info!(%addr, "gateway metrics listening (/metrics, Prometheus text format)");
+    tracing::info!(%addr, "gateway operator listener ready (/metrics and /health)");
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!(error = %e, "gateway metrics server stopped — /metrics is now UNAVAILABLE");
     }
@@ -491,6 +526,44 @@ pub async fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operator_health_keeps_detail_and_metrics() {
+        use tower::ServiceExt;
+        for path in ["/health", "/metrics"] {
+            let response = operator_router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header("Forwarded", "for=192.0.2.1")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if path == "/health" {
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                for key in [
+                    "spans_stream",
+                    "audit_backlog",
+                    "byok_ring",
+                    "prompt_guard_configured",
+                    "degraded",
+                ] {
+                    assert!(body.get(key).is_some(), "missing operator field {key}");
+                }
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&bytes)
+                        .contains("tracelane_gateway_http_requests_total")
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_series_is_present_with_zeros_before_any_traffic() {

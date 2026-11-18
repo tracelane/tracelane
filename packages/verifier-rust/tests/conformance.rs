@@ -4,7 +4,7 @@
 //! same `(hash_chain_valid, rekor_anchors_seen, error count)` tuple for each
 //! vector. Vector content is shared; logic must converge.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracelane_audit_verifier::{VerifyOptions, verify_ledger};
 
 fn vector(name: &str) -> PathBuf {
@@ -13,14 +13,13 @@ fn vector(name: &str) -> PathBuf {
     let pkg = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     pkg.parent()
         .and_then(|p| p.parent())
-        .map(|root| root.join("evals").join("audit-ledger").join(name))
+        .map(|root| vector_in(&root.join("evals").join("audit-ledger"), name))
         .expect("workspace root resolution")
 }
 
 #[test]
 fn good_vector_passes_chain_check() {
     let path = vector("good.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     assert!(
         report.hash_chain_valid,
@@ -35,7 +34,6 @@ fn eval_verdict_vector_passes_chain_check() {
     // Wedge item 3: the promotion-record event. Middle row's `eval_run_id` is
     // JSON null (manual override) — proves null canonicalizes identically here.
     let path = vector("eval-verdict.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     assert!(
         report.hash_chain_valid,
@@ -48,7 +46,6 @@ fn eval_verdict_vector_passes_chain_check() {
 #[test]
 fn tampered_vector_fails_chain_check() {
     let path = vector("tampered.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     assert!(!report.hash_chain_valid, "tampered.ndjson MUST fail");
     assert!(
@@ -60,7 +57,6 @@ fn tampered_vector_fails_chain_check() {
 #[test]
 fn no_anchor_vector_chain_still_valid() {
     let path = vector("no-anchor.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     // Hash chain is independent of Rekor anchors — must still pass.
     assert!(
@@ -76,7 +72,6 @@ fn v2_1_boundary_number_vector_passes() {
     // JS-unsafe number class (1.0, >2^53, 1e2, 0.50). Hashed byte-for-byte, so
     // it verifies identically across all three verifiers.
     let path = vector("boundary-numbers.v2_1.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     assert!(
         report.hash_chain_valid,
@@ -93,7 +88,6 @@ fn legacy_v2_object_vector_still_verifies_in_rust() {
     // green here — was a JS-specific divergence (the TS suite fails on
     // the identical vector). Documents WHY Path 2 (verbatim) was needed.
     let path = vector("boundary-numbers.v2-legacy.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let report = verify_ledger(&path, &VerifyOptions::offline()).expect("io ok");
     assert!(
         report.hash_chain_valid,
@@ -148,7 +142,6 @@ fn trusted_pubkey() -> [u8; 32] {
 #[test]
 fn anchored_v1_verifies_fully_with_trusted_key() {
     let path = vector("anchored.v1.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let opts = VerifyOptions::offline()
         .with_format(tracelane_audit_verifier::FormatVersion::V2_1)
         .with_tenant_pubkey(trusted_pubkey());
@@ -168,7 +161,6 @@ fn anchored_v1_verifies_fully_with_trusted_key() {
 fn forged_anchor_rejected_at_trusted_key_gate() {
     // A genuinely-log-included Rekor entry, but signed under an ATTACKER key.
     let path = vector("forged-anchor.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     let opts = VerifyOptions::offline()
         .with_format(tracelane_audit_verifier::FormatVersion::V2_1)
         .with_tenant_pubkey(trusted_pubkey());
@@ -189,7 +181,6 @@ fn forged_anchor_rejected_at_trusted_key_gate() {
 #[test]
 fn chain_only_mode_asserts_no_anchor() {
     let path = vector("anchored.v1.ndjson");
-    assert!(path.exists(), "conformance vector missing: {path:?}");
     // No tenant_pubkey → chain-only; never green on anchors.
     let opts = VerifyOptions::offline().with_format(tracelane_audit_verifier::FormatVersion::V2_1);
     let report = verify_ledger(&path, &opts).expect("io ok");
@@ -205,10 +196,6 @@ fn chain_only_mode_asserts_no_anchor() {
 #[test]
 fn forged_anchor_without_trusted_key_reports_unverified() {
     let path = vector("forged-anchor.ndjson");
-    if !path.exists() {
-        eprintln!("skipping: vector not found at {}", path.display());
-        return;
-    }
     // No tenant_pubkey — exactly what every doc showed a regulator running.
     let report = verify_ledger(&path, &VerifyOptions::default()).expect("verify");
     assert!(
@@ -374,4 +361,80 @@ fn aud29_i_platform_key_list_supports_rotation() {
     );
     assert!(kinds(&r).is_empty(), "{:?}", r.errors);
     assert_eq!(r.platform_signed_batches, 1);
+}
+
+fn vector_in(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    std::fs::read(&path)
+        .unwrap_or_else(|err| panic!("mandatory conformance fixture {}: {err}", path.display()));
+    path
+}
+
+// Fixed inventory: directory discovery must not silently shrink coverage.
+const MANDATORY_FIXTURES: &[&str] = &[
+    "anchor-vectors.meta.json",
+    "anchored.v1.ndjson",
+    "boundary-numbers.v2-legacy.ndjson",
+    "boundary-numbers.v2_1.ndjson",
+    "eval-verdict.ndjson",
+    "forged-anchor.ndjson",
+    "good.ndjson",
+    "no-anchor.ndjson",
+    "platform-key-vectors.meta.json",
+    "platform-only.ndjson",
+    "platform-shadow.ndjson",
+    "platform-then-workspace.ndjson",
+    "tampered.ndjson",
+    "workspace-then-platform.ndjson",
+];
+
+#[test]
+fn mandatory_fixture_inventory() {
+    assert_eq!(MANDATORY_FIXTURES.len(), 14);
+    for name in MANDATORY_FIXTURES {
+        assert!(
+            !std::fs::read(vector(name))
+                .expect("mandatory fixture")
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn mandatory_missing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        std::panic::catch_unwind(|| vector_in(&root.path().join("absent"), "tampered.ndjson"))
+            .is_err(),
+        "missing mandatory directory must fail before verification"
+    );
+}
+
+#[test]
+fn mandatory_missing_file() {
+    for name in MANDATORY_FIXTURES {
+        let root = tempfile::tempdir().unwrap();
+        for other in MANDATORY_FIXTURES {
+            if other != name {
+                std::fs::copy(vector(other), root.path().join(other)).unwrap();
+            }
+        }
+        assert!(
+            std::panic::catch_unwind(|| vector_in(root.path(), name)).is_err(),
+            "missing mandatory fixture must fail: {name}"
+        );
+    }
+}
+
+#[test]
+fn mandatory_unreadable_file() {
+    for name in MANDATORY_FIXTURES {
+        let root = tempfile::tempdir().unwrap();
+        // A directory is unreadable as a file even for a privileged test runner.
+        std::fs::create_dir(root.path().join(name)).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| vector_in(root.path(), name)).is_err(),
+            "unreadable mandatory fixture must fail: {name}"
+        );
+    }
 }

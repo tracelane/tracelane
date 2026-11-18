@@ -1,4 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import {
+	copyFileSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 /**
@@ -18,17 +25,15 @@ function b64(s: string): Uint8Array {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const vectorsDir = join(__dirname, "..", "..", "..", "evals", "audit-ledger");
 
-function vector(name: string): string {
-	return join(vectorsDir, name);
+function vector(name: string, root = vectorsDir): string {
+	const path = join(root, name);
+	readFileSync(path); // Missing/unreadable mandatory evidence must fail before verification.
+	return path;
 }
 
 describe("audit-verifier conformance", () => {
 	it("good vector passes chain check", async () => {
 		const path = vector("good.ndjson");
-		if (!existsSync(path)) {
-			console.warn(`skipping: vector not found at ${path}`);
-			return;
-		}
 		const report = await verifyLedger(path, { offline: true });
 		expect(report.hash_chain_valid).toBe(true);
 		expect(report.rows_seen).toBe(100);
@@ -36,7 +41,6 @@ describe("audit-verifier conformance", () => {
 
 	it("tampered vector fails chain check", async () => {
 		const path = vector("tampered.ndjson");
-		if (!existsSync(path)) return;
 		const report = await verifyLedger(path, { offline: true });
 		expect(report.hash_chain_valid).toBe(false);
 		expect(report.errors.length).toBeGreaterThan(0);
@@ -44,7 +48,6 @@ describe("audit-verifier conformance", () => {
 
 	it("no-anchor vector chain still valid", async () => {
 		const path = vector("no-anchor.ndjson");
-		if (!existsSync(path)) return;
 		const report = await verifyLedger(path, { offline: true });
 		expect(report.hash_chain_valid).toBe(true);
 		expect(report.rekor_anchors_seen).toBe(0);
@@ -55,7 +58,6 @@ describe("audit-verifier conformance", () => {
 	// byte-for-byte, so it passes identically — the parity bug cannot exist.
 	it("v2.1 boundary-number vector passes (verbatim string)", async () => {
 		const path = vector("boundary-numbers.v2_1.ndjson");
-		if (!existsSync(path)) return;
 		const report = await verifyLedger(path, { offline: true });
 		expect(report.hash_chain_valid).toBe(true);
 		expect(report.rows_seen).toBe(2);
@@ -67,7 +69,6 @@ describe("audit-verifier conformance", () => {
 	// (verbatim string) was chosen; the vector above passes where this cannot.
 	it("legacy-v2 object vector reproduces the lossy JS re-derive", async () => {
 		const path = vector("boundary-numbers.v2-legacy.ndjson");
-		if (!existsSync(path)) return;
 		const report = await verifyLedger(path, { offline: true });
 		expect(report.hash_chain_valid).toBe(false);
 		expect(report.errors.some((e) => e.kind === "row_hash_mismatch")).toBe(
@@ -80,7 +81,6 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 	const metaPath = vector("anchor-vectors.meta.json");
 
 	it("anchored.v1 verifies FULLY with the trusted tenant key", async () => {
-		if (!existsSync(vector("anchored.v1.ndjson"))) return;
 		const meta = JSON.parse(readFileSync(metaPath, "utf8"));
 		const trusted = b64(meta.trusted_tenant_ed25519_pubkey_b64);
 		const text = readFileSync(vector("anchored.v1.ndjson"), "utf8");
@@ -98,7 +98,6 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 
 	it("forged-anchor is REJECTED at the trusted-key gate (C1/C2)", async () => {
 		// A genuinely-log-included Rekor entry, but signed under an ATTACKER key.
-		if (!existsSync(vector("forged-anchor.ndjson"))) return;
 		const meta = JSON.parse(readFileSync(metaPath, "utf8"));
 		const trusted = b64(meta.trusted_tenant_ed25519_pubkey_b64);
 		const text = readFileSync(vector("forged-anchor.ndjson"), "utf8");
@@ -113,7 +112,6 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 	});
 
 	it("chain-only mode (no trusted key) asserts NO anchor — never green", async () => {
-		if (!existsSync(vector("anchored.v1.ndjson"))) return;
 		const text = readFileSync(vector("anchored.v1.ndjson"), "utf8");
 		const r = await verifyLedgerText(text, { formatVersion: "v2.1" });
 		expect(r.hash_chain_valid).toBe(true);
@@ -127,10 +125,6 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 	// many anchors it skipped so every caller can fail closed.
 	it("forged anchor WITHOUT a trusted key reports anchors_unverified, never a silent green", async () => {
 		const path = vector("forged-anchor.ndjson");
-		if (!existsSync(path)) {
-			console.warn(`skipping: vector not found at ${path}`);
-			return;
-		}
 		const report = await verifyLedger(path); // no tenantPubkey — the doc'd usage
 		expect(report.anchors_unverified).toBeGreaterThan(0);
 		expect(report.rekor_anchors_resolved).toBe(0);
@@ -139,10 +133,6 @@ describe("ADR-062 anchor verification (offline, real Rekor v2)", () => {
 
 	it("supplying the trusted key clears anchors_unverified on a good ledger", async () => {
 		const path = vector("anchored.v1.ndjson");
-		if (!existsSync(path)) {
-			console.warn(`skipping: vector not found at ${path}`);
-			return;
-		}
 		const report = await verifyLedger(path, {
 			tenantPubkey: b64("+n4+cpxk9SZH8BK/WUifFHDGLGRn2ceyKMHd1R7S7Pw="),
 		});
@@ -254,4 +244,63 @@ describe("AUD-29 platform-key trust root", () => {
 		expect(kinds(r)).toEqual(["untrusted_tenant_key"]);
 		expect(r.signatures_valid).toBe(false);
 	});
+});
+
+// Fixed inventory: directory discovery must not silently shrink coverage.
+const mandatoryFixtures = [
+	"anchor-vectors.meta.json",
+	"anchored.v1.ndjson",
+	"boundary-numbers.v2-legacy.ndjson",
+	"boundary-numbers.v2_1.ndjson",
+	"eval-verdict.ndjson",
+	"forged-anchor.ndjson",
+	"good.ndjson",
+	"no-anchor.ndjson",
+	"platform-key-vectors.meta.json",
+	"platform-only.ndjson",
+	"platform-shadow.ndjson",
+	"platform-then-workspace.ndjson",
+	"tampered.ndjson",
+	"workspace-then-platform.ndjson",
+];
+
+it("mandatory fixture inventory", () => {
+	expect(mandatoryFixtures).toHaveLength(14);
+	for (const name of mandatoryFixtures) {
+		expect(readFileSync(vector(name)).length).toBeGreaterThan(0);
+	}
+});
+
+it("mandatory missing directory", () => {
+	const root = mkdtempSync(join(tmpdir(), "verifier-fixtures-"));
+	try {
+		expect(() => vector("tampered.ndjson", join(root, "absent"))).toThrow(
+			"tampered.ndjson",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it.each(mandatoryFixtures)("mandatory missing file %s", (name) => {
+	const root = mkdtempSync(join(tmpdir(), "verifier-fixtures-"));
+	try {
+		for (const other of mandatoryFixtures) {
+			if (other !== name) copyFileSync(vector(other), join(root, other));
+		}
+		expect(() => vector(name, root)).toThrow(name);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it.each(mandatoryFixtures)("mandatory unreadable file %s", (name) => {
+	const root = mkdtempSync(join(tmpdir(), "verifier-fixtures-"));
+	try {
+		// A directory cannot be read as a file, regardless of permission bypass.
+		mkdirSync(join(root, name));
+		expect(() => vector(name, root)).toThrow();
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });

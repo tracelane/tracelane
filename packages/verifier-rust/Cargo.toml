@@ -1,6 +1,6 @@
 [package]
 name = "tracelane-audit-verifier"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -8,9 +8,14 @@ description = "Reference verifier for Tracelane tamper-evident audit ledgers"
 repository = "https://github.com/tracelane/tracelane"
 
 [dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["serde"] }
+crc32fast = "1"
+ring = "0.17"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 ed25519-dalek = "3"
 hex = "0.4"
 # ECDSA-P256 (RustCrypto) for the ADR-062 Rekor v2 anchor entry signature
@@ -19,6 +24,13 @@ hex = "0.4"
 # verify_prehash; the online Rekor fetch (ureq) is gone (v2 = offline bundle).
 p256 = "0.13"
 
+# CMS/DER are parsers only; signatures remain verified by ring.
+cms = { version = "=0.2.3", default-features = false, features = ["std"] }
+der = { version = "0.7", features = ["derive", "std", "oid"] }
+x509-cert = { version = "0.2", features = ["std", "pem"] }
+
 [dev-dependencies]
+# Independent COSE implementation for the checkpoint.cose interop proof (tests/cose_interop.rs).
+coset = "0.3"
 tempfile = "3"
 serde_json = "1"

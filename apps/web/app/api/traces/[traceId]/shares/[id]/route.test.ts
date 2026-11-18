@@ -56,7 +56,7 @@ describe("DELETE /api/traces/[traceId]/shares/[id]", () => {
 		);
 	});
 
-	it("keeps 404 distinguishable — not yours or already gone", async () => {
+	it("keeps 404 distinguishable — no such link in this workspace", async () => {
 		gatewayDelete.mockRejectedValueOnce(
 			new FakeGatewayError(404, "no such share", { error: "not_found" }),
 		);

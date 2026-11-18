@@ -3,7 +3,7 @@
  *
  * Thin proxy: the gateway sets `revoked_at` (soft; the row and its view_count
  * survive — see `db/migrations/0036_trace_shares.sql`) and answers 204. A 404
- * here means "not yours or already gone" and is preserved rather than
+ * here means this workspace has no such link on this trace, and is preserved rather than
  * flattened, the same shape as the tool-pins unpin proxy.
  */
 

@@ -125,6 +125,7 @@ pub struct Claims {
     /// admin-plane control) and for a key with no project and no policy — today's
     /// behaviour. The `source_ips` half is enforced at authentication
     /// (`api_key::validate`), the rest at `admission`'s `Step::Policy`.
+    pub key_capture: Option<crate::db::data_controls::KeyCapture>,
     pub governance: Option<std::sync::Arc<tracelane_shared::key_policy::Governance>>,
 }
 
@@ -436,6 +437,7 @@ fn validate_self_host(token: &str, sh: &SelfHostAuth) -> Result<Claims> {
         // BILL-01 A3: no per-key budget on this credential either; `Monthly`
         // is inert here (see the field doc) rather than meaningful.
         budget_reset: crate::spend::BudgetReset::Monthly,
+        key_capture: None,
         governance: None,
     })
 }
@@ -693,6 +695,8 @@ impl AuthPath {
 /// Exactly as [`validate_authorization`]: fail-CLOSED, 401 on a bad credential,
 /// 503 when the store behind it is unreachable.
 pub async fn validate_authorization_traced(authorization: &str) -> Result<(Claims, AuthPath)> {
+    #[cfg(test)]
+    test_claims::note_authentication();
     // Test-only: a scoped credential for route-level scope tests (B-207). Compiled out of
     // every non-test build; thread-local, so a test sets it for its own task only.
     #[cfg(test)]
@@ -793,6 +797,7 @@ async fn validate_jwt(token: &str) -> Result<(Claims, AuthPath)> {
             rate_limit_rpm: None,
             // BILL-01 A3: a JWT carries no per-key budget cadence either.
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         },
         path,
@@ -1035,6 +1040,14 @@ pub(crate) mod test_claims {
 
     thread_local! {
         static OVERRIDE: RefCell<Option<Claims>> = const { RefCell::new(None) };
+        static AUTHENTICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn note_authentication() {
+        AUTHENTICATIONS.with(|n| n.set(n.get() + 1));
+    }
+    pub(crate) fn authentications() -> usize {
+        AUTHENTICATIONS.with(|n| n.get())
     }
 
     pub(crate) fn get() -> Option<Claims> {
@@ -1045,6 +1058,7 @@ pub(crate) mod test_claims {
     pub(crate) struct Guard;
     impl Guard {
         pub(crate) fn set(claims: Claims) -> Self {
+            AUTHENTICATIONS.with(|n| n.set(0));
             OVERRIDE.with(|o| *o.borrow_mut() = Some(claims));
             Self
         }
@@ -1074,6 +1088,7 @@ pub(crate) fn dev_stub_claims(auth_method: AuthMethod) -> Claims {
         budget_usd_monthly: None,
         rate_limit_rpm: None,
         budget_reset: crate::spend::BudgetReset::Monthly,
+        key_capture: None,
         governance: None,
     }
 }
@@ -1439,6 +1454,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }
@@ -1525,6 +1541,7 @@ mod tests {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
+                key_capture: None,
                 governance: None,
             };
             assert_eq!(claims.role, None, "{raw:?} must not resolve to a role");
@@ -1554,6 +1571,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         };
         assert_eq!(admin.role, Some(Role::Owner));

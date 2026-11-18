@@ -10,7 +10,7 @@ import { type DbMock, makeDbMock } from "@/lib/__testutils__/db-mock";
 import type { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const h = vi.hoisted(() => ({ db: null as DbMock | null }));
+const h = vi.hoisted(() => ({ db: null as DbMock | null, ack: true }));
 
 const ctl = vi.hoisted(() => ({
 	record: vi.fn(
@@ -34,10 +34,17 @@ vi.mock("@/lib/control-change", () => ({
 }));
 
 beforeEach(() => {
+	h.ack = true;
 	ctl.record.mockReset();
 	ctl.record.mockResolvedValue({ ok: true });
 	ctl.failed.mockReset();
 });
+
+// Lock behavior is covered against real Postgres in archive-race.live.test.ts.
+vi.mock("../team/owner-lock", () => ({
+	withOwnerMutation: async (_org: string, work: () => Promise<unknown>) =>
+		work(),
+}));
 
 vi.mock("@/db", () => ({
 	get db() {
@@ -47,6 +54,10 @@ vi.mock("@/db", () => ({
 }));
 
 vi.mock("@/lib/auth", () => ({
+	requireGatewayToken: vi.fn(async () => ({
+		token: "test-human-jwt",
+		tenantId: "org_SESSION",
+	})),
 	requireSession: vi.fn(async () => ({
 		tenantId: "org_SESSION",
 		userId: "user_ME",
@@ -57,7 +68,7 @@ vi.mock("@/lib/auth", () => ({
 	invalidateOrgArchivedCache: vi.fn(),
 }));
 
-import { PATCH } from "./route";
+import { DELETE, PATCH } from "./route";
 
 function req(body: unknown): NextRequest {
 	return {
@@ -78,6 +89,8 @@ function stub(opts: {
 	const { callerRole = "admin", membersOk = true, renameOk = true } = opts;
 	const spy = vi.fn(async (...args: unknown[]) => {
 		const url = args[0] as string;
+		if (url.endsWith("/v1/keys/invalidate-cache"))
+			return Response.json({ invalidated: h.ack });
 		if (url.includes("organization_memberships")) {
 			if (!membersOk) return { ok: false, status: 500 } as unknown as Response;
 			return {
@@ -106,6 +119,7 @@ function stub(opts: {
 
 describe("PATCH /api/settings/workspace — org rename", () => {
 	beforeEach(() => {
+		h.ack = true;
 		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
 		h.db = makeDbMock([[{ name: "Old Co" }], []]); // name read, then update
 	});
@@ -170,6 +184,7 @@ describe("PATCH /api/settings/workspace — org rename", () => {
 
 describe("PATCH /api/settings/workspace — control-change recording", () => {
 	beforeEach(() => {
+		h.ack = true;
 		process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
 		h.db = makeDbMock([[{ name: "Old Co" }], []]);
 	});
@@ -200,4 +215,47 @@ describe("PATCH /api/settings/workspace — control-change recording", () => {
 		);
 		expect(ctl.failed).toHaveBeenCalledTimes(1);
 	});
+});
+
+it("unconfirmed_workspace_revocation_does_not_archive", async () => {
+	h.ack = false;
+	process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+	h.db = makeDbMock([[{ id: "tenant-uuid", name: "Acme" }], [], []]);
+	stub({});
+	const res = await DELETE(req({ confirmName: "Acme" }));
+	expect(res.status).toBe(503);
+	expect(h.db.setCalls.some(([v]) => "archivedAt" in (v as object))).toBe(
+		false,
+	);
+});
+
+it("workspace_sql_revoke_failure_does_not_archive", async () => {
+	process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+	h.db = makeDbMock([
+		[{ id: "tenant-uuid", name: "Acme" }],
+		new Error("revoke failed"),
+	]);
+	stub({});
+	const res = await DELETE(req({ confirmName: "Acme" }));
+	expect(res.status).toBe(503);
+	expect(await res.json()).toMatchObject({
+		error: "key_revocation_unconfirmed",
+	});
+	expect(h.db.setCalls.some(([v]) => "archivedAt" in (v as object))).toBe(
+		false,
+	);
+});
+it("workspace_archives_only_after_gateway_acknowledgement", async () => {
+	process.env.WORKOS_API_KEY = "sk_test_workos_do_not_use";
+	h.db = makeDbMock([[{ id: "tenant-uuid", name: "Acme" }], [], []]);
+	const spy = stub({});
+	const res = await DELETE(req({ confirmName: "Acme" }));
+	expect(res.status).toBe(200);
+	expect(h.db.setCalls[0]?.[0]).toHaveProperty("revokedAt");
+	expect(h.db.setCalls[1]?.[0]).toHaveProperty("archivedAt");
+	expect(
+		spy.mock.calls.some((c) =>
+			String(c[0]).endsWith("/v1/keys/invalidate-cache"),
+		),
+	).toBe(true);
 });

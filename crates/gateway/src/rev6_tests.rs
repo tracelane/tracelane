@@ -232,6 +232,66 @@ async fn rev6_gemini_count_tokens_runs_pause_blocks_and_key_policy() {
     assert!(v.to_string().contains("policy_model_denied"), "{v}");
 }
 
+async fn openai_input_tokens(
+    state: crate::server::AppState,
+    claims: crate::auth::Claims,
+) -> (u16, Value) {
+    let body = Bytes::from(json!({"model": "gpt-4o", "input": "hi"}).to_string());
+    let r = crate::openai_responses::input_tokens_with_claims(state, authed(), body, claims).await;
+    let s = r.status().as_u16();
+    (s, body_json(r).await)
+}
+
+/// 2026-10-29 SRE review: OpenAI `POST /v1/responses/input_tokens` forwards the whole prompt
+/// with the tenant's key exactly like the two companions above, so the pause, the blocks,
+/// the workspace policy and the key policy refuse it BEFORE the key is touched. RED before
+/// the fix: `companion_with_claims` ran scope + rate limit + R2 only, so a paused workspace's
+/// prompt still reached OpenAI.
+#[tokio::test]
+async fn openai_input_tokens_runs_pause_blocks_and_key_policy() {
+    let t = fresh_tenant();
+    let (s, v) = openai_input_tokens(state_with(paused()), session(&t)).await;
+    assert_eq!(s, 423, "{v}");
+    assert!(v.to_string().contains("workspace_paused"), "{v}");
+
+    let blocked = WorkspaceControls::from_row(None, None, vec!["gpt-4o*".into()], vec![], vec![]);
+    let (s, v) = openai_input_tokens(state_with(blocked), session(&t)).await;
+    assert_eq!(s, 403, "{v}");
+    assert!(v.to_string().contains("model_blocked"), "{v}");
+
+    let blocked = WorkspaceControls::from_row(None, None, vec![], vec!["openai".into()], vec![]);
+    let (s, v) = openai_input_tokens(state_with(blocked), session(&t)).await;
+    assert_eq!(s, 403, "{v}");
+    assert!(v.to_string().contains("provider_blocked"), "{v}");
+
+    let k = key_claims(
+        &t,
+        uuid::Uuid::new_v4(),
+        None,
+        None,
+        Some(json!({"models": {"deny": ["gpt-4o*"]}})),
+    );
+    let (s, v) = openai_input_tokens(state_with(WorkspaceControls::default()), k).await;
+    assert_eq!(s, 403, "{v}");
+    assert!(v.to_string().contains("policy_model_denied"), "{v}");
+
+    // Must-accept direction: with nothing set the gate does not refuse — the call proceeds
+    // to the key lookup (no key is stored here, so it ends in a key error, never a control
+    // refusal).
+    let (_, v) = openai_input_tokens(state_with(WorkspaceControls::default()), session(&t)).await;
+    for code in [
+        "workspace_paused",
+        "model_blocked",
+        "provider_blocked",
+        "policy_model_denied",
+    ] {
+        assert!(
+            !v.to_string().contains(code),
+            "{code} with no control set: {v}"
+        );
+    }
+}
+
 /// rev6: the must-ACCEPT direction, asked of the gate itself (so no test can reach a
 /// provider): nothing set, or rules that do not touch this model, admit the companion.
 #[test]

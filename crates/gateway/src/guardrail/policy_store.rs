@@ -2,6 +2,7 @@
 use super::policy::Policies;
 use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracelane_shared::TenantId;
 use uuid::Uuid;
 
@@ -13,6 +14,19 @@ pub const SCHEMA_COLUMNS: &[(&str, &str)] = &[
     ("guardrail_policies", "updated_at"),
     ("guardrail_policies", "updated_by"),
 ];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    Updated,
+    NotFound,
+    Conflict,
+}
+
+/// Strong ETag for the scoped stored document. `None` is the absent policy.
+pub fn etag(policy: Option<&Value>) -> String {
+    let bytes = policy.map_or_else(|| "null".to_owned(), Value::to_string);
+    format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
+}
 
 /// Called only during the entitlement snapshot refresh. Fail-CLOSED to the cache's
 /// last-known snapshot when any query fails.
@@ -80,8 +94,9 @@ pub async fn write(
     scope: &str,
     id: Uuid,
     value: &Value,
+    expected_etag: &str,
     actor: &crate::db::control_audit::Actor,
-) -> Result<bool> {
+) -> Result<WriteOutcome> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     // Serialize same-tenant creates too (SELECT FOR UPDATE on a missing policy cannot).
@@ -91,9 +106,12 @@ pub async fn write(
     )
     .await?;
     if !owns(&*tx, tenant.as_uuid(), scope, &id).await? {
-        return Ok(false);
+        return Ok(WriteOutcome::NotFound);
     }
     let before: Option<Value> = tx.query_opt("SELECT policy FROM guardrail_policies WHERE tenant_id = $1 AND scope = $2 AND scope_id = $3", &[tenant.as_uuid(), &scope, &id]).await?.map(|r| r.get(0));
+    if etag(before.as_ref()) != expected_etag {
+        return Ok(WriteOutcome::Conflict);
+    }
     if value.is_null() {
         tx.execute(
             "DELETE FROM guardrail_policies WHERE tenant_id = $1 AND scope = $2 AND scope_id = $3",
@@ -117,7 +135,7 @@ pub async fn write(
     )
     .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(WriteOutcome::Updated)
 }
 
 #[cfg(test)]
@@ -151,29 +169,103 @@ mod pg_tests {
             user_agent: None,
         };
         let before = json!({"rails":{"R8_injection":{"mode":"observe"}}});
-        assert!(
-            write(&pool, &ta, "workspace", a, &before, &actor)
+        assert_eq!(
+            write(&pool, &ta, "workspace", a, &before, &etag(None), &actor)
                 .await
-                .unwrap()
+                .unwrap(),
+            WriteOutcome::Updated
         );
         assert_eq!(
             load(&client, &a).await.unwrap().workspace,
             Some(before.clone())
         );
         assert!(load(&client, &b).await.unwrap().workspace.is_none());
-        assert!(
-            !write(&pool, &tb, "workspace", a, &Value::Null, &actor)
-                .await
-                .unwrap()
+        assert_eq!(
+            write(
+                &pool,
+                &tb,
+                "workspace",
+                a,
+                &Value::Null,
+                &etag(None),
+                &actor
+            )
+            .await
+            .unwrap(),
+            WriteOutcome::NotFound
         );
         let count: i64 = client.query_one("SELECT count(*) FROM admin_audit_log WHERE actor_workspace_id = $1 AND action = 'guardrail.policy.set'", &[&a]).await.unwrap().get(0);
         assert_eq!(count, 1);
         client.batch_execute("ALTER TABLE admin_audit_log ADD CONSTRAINT og30_refuse CHECK (action <> 'guardrail.policy.set') NOT VALID").await.unwrap();
         assert!(
-            write(&pool, &ta, "workspace", a, &Value::Null, &actor)
-                .await
-                .is_err()
+            write(
+                &pool,
+                &ta,
+                "workspace",
+                a,
+                &Value::Null,
+                &etag(Some(&before)),
+                &actor
+            )
+            .await
+            .is_err()
         );
         assert_eq!(load(&client, &a).await.unwrap().workspace, Some(before));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an operator-run migrated Postgres test database"]
+    async fn og62_two_writers_second_gets_conflict_and_first_survives() {
+        let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
+        let client = pool.get().await.unwrap();
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO tenants (id, workos_org_id, name) VALUES ($1, $2, 'policy race test')",
+                &[&id, &format!("org_policy_race_{id}")],
+            )
+            .await
+            .unwrap();
+        let tenant = TenantId::from_jwt_claim(id);
+        let actor = crate::db::control_audit::Actor {
+            sub: "unit-test-admin".into(),
+            role: "admin",
+            auth_method: "workos_session",
+            request_id: Uuid::new_v4().to_string(),
+            ip: None,
+            user_agent: None,
+        };
+        let initial = etag(None);
+        let first = json!({"rails":{"R8_injection":{"mode":"observe"}}});
+        let second = json!({"rails":{"R8_injection":{"mode":"block"}}});
+        assert_eq!(
+            write(&pool, &tenant, "workspace", id, &first, &initial, &actor)
+                .await
+                .unwrap(),
+            WriteOutcome::Updated
+        );
+        assert_eq!(
+            write(&pool, &tenant, "workspace", id, &second, &initial, &actor)
+                .await
+                .unwrap(),
+            WriteOutcome::Conflict
+        );
+        assert_eq!(load(&client, &id).await.unwrap().workspace, Some(first));
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn og62_etag_is_stable_for_equal_content_and_changes_with_policy() {
+        let a = json!({"rails":{"R1_cost":{"enabled":true,"mode":"block"}}});
+        let same = json!({"rails":{"R1_cost":{"mode":"block","enabled":true}}});
+        let changed = json!({"rails":{"R1_cost":{"mode":"observe","enabled":true}}});
+        assert_eq!(etag(Some(&a)), etag(Some(&same)));
+        assert_ne!(etag(Some(&a)), etag(Some(&changed)));
+        assert_ne!(etag(None), etag(Some(&a)));
     }
 }

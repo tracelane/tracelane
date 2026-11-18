@@ -1,0 +1,38 @@
+[package]
+name = "tracelane-verifier-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "Browser (WebAssembly) wrapper around the Tracelane action-bundle verifier"
+repository = "https://github.com/tracelane/tracelane"
+publish = false
+
+# Standalone on purpose: the root workspace resolves gateway features (tokio,
+# reqwest) that must never reach a wasm32 build or this crate's lockfile.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tracelane-audit-verifier = { path = "../verifier-rust" }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Exact pin: the generated JS glue must come from the same wasm-bindgen-cli version.
+wasm-bindgen = "=0.2.120"
+js-sys = "0.3"
+# The verifier's ring pulls getrandom 0.2, which refuses to build for
+# wasm32-unknown-unknown without a declared entropy source. Verification
+# itself draws no randomness.
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

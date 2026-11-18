@@ -350,6 +350,27 @@ impl ResponseGuard {
         if self.blocked || self.post_done {
             return GuardStep::Emit(String::new());
         }
+        if self.buf.accumulated().len().saturating_add(delta.len())
+            > crate::providers::translation_policy::limits().response_guard_max_bytes
+        {
+            let reason_code = "RESPONSE_BUFFER_LIMIT";
+            self.blocked = true;
+            let outcome = super::dispatcher::SideOutcome {
+                side: super::outcome::Side::Response,
+                decision: super::outcome::Decision::Block,
+                records: vec![super::dispatcher::RailRecord {
+                    rail: "response_buffer",
+                    policy_version: "limit@1",
+                    latency_micros: 0,
+                    outcome: super::outcome::RailOutcome::block(reason_code),
+                }],
+                total_latency_micros: 0,
+            };
+            self.engine
+                .record_response(&outcome, &self.inputs, &self.buf, usage)
+                .await;
+            return GuardStep::Block { reason_code };
+        }
         self.buf.push_chunk(delta);
         let snapshot = self.snapshot().await.clone();
         let hold_format =
@@ -715,6 +736,25 @@ mod tests {
             }
         );
         assert!(guard.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn response_guard_bounds_streamed_output() {
+        let engine = engine_with(vec![]);
+        let mut guard = ResponseGuard::new(engine, inputs(None), Vec::new());
+        let delta = "x".repeat(1024);
+        let mut blocked = false;
+        for _ in 0..2048 {
+            if matches!(guard.on_delta(&delta, None).await, GuardStep::Block { .. }) {
+                blocked = true;
+                break;
+            }
+        }
+        assert!(
+            blocked,
+            "streamed response must have a bounded guard buffer"
+        );
+        assert!(guard.buf.accumulated().len() <= 1_048_576);
     }
 
     /// R7 competitor redaction rides the same seam: a competitor mention in the

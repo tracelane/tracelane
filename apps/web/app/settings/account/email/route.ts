@@ -101,19 +101,26 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 	}
 	const session = await requireSession();
 
-	if (
-		!rateLimit(
-			`email-change:${session.userId}`,
-			ATTEMPT_LIMIT,
-			ATTEMPT_WINDOW_MS,
-		)
-	) {
+	try {
+		if (
+			!(await rateLimit(
+				`email-change:${session.userId}`,
+				ATTEMPT_LIMIT,
+				ATTEMPT_WINDOW_MS,
+			))
+		) {
+			return NextResponse.json(
+				{
+					error: "rate_limited",
+					detail: "too many attempts — try again in a few minutes",
+				},
+				{ status: 429 },
+			);
+		}
+	} catch {
 		return NextResponse.json(
-			{
-				error: "rate_limited",
-				detail: "too many attempts — try again in a few minutes",
-			},
-			{ status: 429 },
+			{ error: "rate_limit_unavailable" },
+			{ status: 503 },
 		);
 	}
 

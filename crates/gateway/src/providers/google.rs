@@ -261,7 +261,7 @@ pub(super) fn build_gemini_stream(
             let chunk: Bytes = chunk
                 .map_err(reqwest::Error::without_url)
                 .context("error reading Gemini response chunk")?;
-            lines.push(&chunk);
+            lines.push(&chunk)?;
 
             while let Some(line) = lines.next_line() {
                 let line = line.context("non-UTF8 Gemini SSE line")?;

@@ -940,9 +940,34 @@ pub(crate) fn offer(span: &TracelaneSpan) {
     let Some(exports) = dir.get(span.tenant_id.as_uuid()) else {
         return;
     };
+    // The export is an EXTERNAL write: it gets the same one-way PII redaction the ClickHouse
+    // write applies (`ingest::clickhouse_writer::build_span_row`), once per span.
+    let Some(span) = redacted_for_export(span) else {
+        for e in exports {
+            e.stats.note_dropped(1);
+        }
+        return;
+    };
     for e in exports {
-        e.offer(hub, span);
+        e.offer(hub, &span);
     }
+}
+
+/// The span as it may leave the gateway: name, status message and every attribute string
+/// passed through `tracelane_policy::pii` (security review of #236, finding A — an email in
+/// `user_id` was stored redacted but exported raw).
+///
+/// # Errors
+/// None returned; `None` when the redacted attributes no longer deserialize. Fail-CLOSED: the
+/// caller does not export the span and counts it as dropped (never exports it unredacted).
+fn redacted_for_export(span: &TracelaneSpan) -> Option<TracelaneSpan> {
+    use tracelane_policy::pii;
+    let attributes = serde_json::to_value(&span.attributes).ok()?;
+    let mut out = span.clone();
+    out.attributes = serde_json::from_value(pii::redact_json(&attributes)).ok()?;
+    out.name = pii::redact(&span.name);
+    out.status.message = span.status.message.as_deref().map(pii::redact);
+    Some(out)
 }
 
 /// Ask the background task to rebuild the directory now (after a write).
@@ -987,7 +1012,7 @@ async fn build_directory(
     let mut out: Directory = HashMap::new();
     for row in rows {
         // The directory read already filters on `enabled`; a row that says otherwise is not exported.
-        if !row.enabled {
+        if !row.enabled || row.format != "otlp" {
             continue;
         }
         let ok = match granted.get(&row.tenant_id) {
@@ -1230,6 +1255,7 @@ pub(crate) fn install_for_test(
     crate::otlp_emit::set_span_tap(offer);
     let id = Uuid::new_v4();
     let sealed = crate::db::otel_exports::Sealed {
+        format: "otlp".into(),
         id,
         tenant_id: tenant,
         url: url.to_owned(),
@@ -1662,6 +1688,7 @@ mod tests {
 
     fn sealed_for(tenant: Uuid, url: &str) -> crate::db::otel_exports::Sealed {
         crate::db::otel_exports::Sealed {
+            format: "otlp".into(),
             id: Uuid::new_v4(),
             tenant_id: tenant,
             url: url.to_owned(),
@@ -1922,6 +1949,112 @@ mod tests {
         assert!(exported_text(true, true).await.contains(SECRET_PROMPT));
         // Capture OFF: the span holds no text, so there is none to export whatever the flag says.
         assert!(!exported_text(false, true).await.contains(SECRET_PROMPT));
+    }
+
+    #[tokio::test]
+    async fn no_content_delivery_omits_status_and_event_secrets_at_local_receiver() {
+        timing::fast();
+        let _bypass = LoopbackBypassGuard::new();
+        for include_content in [false, true] {
+            let tenant = Uuid::new_v4();
+            let _claims = tenant_claims(tenant);
+            let rx = receiver(200).await;
+            install_for_test(
+                tenant,
+                &format!("{}/v1/traces", rx.uri()),
+                vec![],
+                include_content,
+                1.0,
+                false,
+            );
+            let mut span = a_span(tenant, SpanStatusCode::Error);
+            span.status.message = Some("PRIVATE_RECEIVER_STATUS_813".into());
+            span.attributes.gen_ai_usage_input_tokens = Some(42);
+            span.attributes.tracelane_events = Some(vec![tracelane_shared::span::SpanEvent {
+                name: "gen_ai.evaluation.result".into(),
+                time_unix_us: 1,
+                attributes: [
+                    (
+                        "exception.stacktrace".into(),
+                        json!("PRIVATE_RECEIVER_STACK_813"),
+                    ),
+                    (
+                        "gen_ai.evaluation.explanation".into(),
+                        json!("PRIVATE_RECEIVER_EXPLANATION_813"),
+                    ),
+                    ("gen_ai.evaluation.score.value".into(), json!(0.9)),
+                ]
+                .into(),
+            }]);
+            offer(&span);
+            until("sentinel export", || async {
+                !requests(&rx).await.is_empty()
+            })
+            .await;
+            let delivered = requests(&rx).await;
+            remove_for_test(tenant);
+            assert_eq!(delivered.len(), 1);
+            let text = String::from_utf8_lossy(&delivered[0].body);
+            for secret in [
+                "PRIVATE_RECEIVER_STATUS_813",
+                "PRIVATE_RECEIVER_STACK_813",
+                "PRIVATE_RECEIVER_EXPLANATION_813",
+            ] {
+                assert_eq!(
+                    text.contains(secret),
+                    include_content,
+                    "{secret}, content={include_content}"
+                );
+            }
+            let decoded = spans_in(&delivered, tenant);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].status.code, SpanStatusCode::Error);
+            assert_eq!(decoded[0].attributes.gen_ai_usage_input_tokens, Some(42));
+        }
+    }
+
+    /// The export is an EXTERNAL write, so it gets the same one-way PII redaction the
+    /// ClickHouse write applies (`ingest::clickhouse_writer::build_span_row`): span name,
+    /// status message and every attribute string. Security review of #236, finding A: an
+    /// email in `user_id` was stored redacted but exported raw.
+    #[tokio::test]
+    async fn export_redacts_pii_like_the_clickhouse_write() {
+        timing::fast();
+        let _bypass = LoopbackBypassGuard::new();
+        for include_content in [false, true] {
+            let tenant = Uuid::new_v4();
+            let _claims = tenant_claims(tenant);
+            let rx = receiver(200).await;
+            install_for_test(
+                tenant,
+                &format!("{}/v1/traces", rx.uri()),
+                vec![],
+                include_content,
+                1.0,
+                false,
+            );
+            let mut span = a_span(tenant, SpanStatusCode::Error);
+            span.name = "lookup for jane.doe.813@example.com".into();
+            span.status.message = Some("failed for jane.doe.813@example.com".into());
+            span.attributes.user_id = Some("jane.doe.813@example.com".into());
+            span.attributes.gen_ai_usage_input_tokens = Some(42);
+            offer(&span);
+            until("pii export", || async { !requests(&rx).await.is_empty() }).await;
+            let delivered = requests(&rx).await;
+            remove_for_test(tenant);
+            assert_eq!(delivered.len(), 1);
+            let text = String::from_utf8_lossy(&delivered[0].body);
+            assert!(
+                !text.contains("jane.doe.813@example.com"),
+                "content={include_content}: the email must not leave the gateway"
+            );
+            assert!(
+                text.contains("[REDACTED:email]"),
+                "content={include_content}: redacted, not dropped"
+            );
+            let decoded = spans_in(&delivered, tenant);
+            assert_eq!(decoded[0].attributes.gen_ai_usage_input_tokens, Some(42));
+        }
     }
 
     // ── Spec §7 row 8: secrets ───────────────────────────────────────────────────────────

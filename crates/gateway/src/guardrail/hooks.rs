@@ -38,8 +38,8 @@ impl Config {
         let value = secret.expose_secret();
         !value.is_empty()
             && value.len() <= cap.secret_bytes
-            && if self.adapter.is_some() {
-                reqwest::header::HeaderValue::from_str(value).is_ok()
+            && if let Some(adapter) = &self.adapter {
+                adapter.credential_ok(value)
             } else {
                 value.len() >= cap.min_secret_bytes
             }
@@ -58,10 +58,14 @@ impl Config {
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && self
-                .adapter
-                .as_ref()
-                .is_none_or(|a| a.valid(&self.endpoint))
+            && self.adapter.as_ref().is_none_or(|a| {
+                a.valid(&self.endpoint)
+                    && (!self.post || super::adapters::supports_post(a))
+                    // GWY-68 review M1: a caller can push input past the analyzer's limit
+                    // or latency; a PII control that then fails open is switched off.
+                    && !(self.fail_mode == FailMode::Open
+                        && matches!(a, super::adapters::Adapter::Presidio { .. }))
+            })
     }
 }
 #[derive(Clone)]
@@ -197,12 +201,32 @@ pub fn acquire(tenant: Uuid) -> Option<Permit> {
     Some(Permit(tenant))
 }
 
+/// Tests with a canned answer never reach Google; every other path mints a real token.
+async fn armor_token(tenant: Uuid, hook: &Hook) -> Result<SecretString, &'static str> {
+    #[cfg(test)]
+    if hook.answer.is_some() {
+        return Ok(SecretString::from("unit-test-access-token"));
+    }
+    super::adapters::model_armor_token(tenant, hook).await
+}
 /// Fail-CLOSED for invalid destinations and malformed replies. Only operational
 /// failures use the explicitly selected fail-open mode. No upstream text is logged.
-async fn exchange(hook: &Hook, phase: Phase, text: &str) -> Result<Reply, &'static str> {
+async fn exchange(
+    tenant: Uuid,
+    hook: &Hook,
+    phase: Phase,
+    text: &str,
+) -> Result<Reply, &'static str> {
     let caps = limits().ok_or("HOOK_CONFIGURATION_INVALID")?;
-    let wire = if hook.config.adapter.is_some() {
-        super::adapters::request(hook, phase, text).ok_or("HOOK_ADAPTER_INPUT_INVALID")?
+    let wire = if let Some(adapter) = &hook.config.adapter {
+        let bearer = match adapter {
+            super::adapters::Adapter::GoogleModelArmor { .. } => {
+                Some(armor_token(tenant, hook).await?)
+            }
+            _ => None,
+        };
+        super::adapters::request_with(hook, phase, text, chrono::Utc::now(), bearer.as_ref())
+            .ok_or("HOOK_ADAPTER_INPUT_INVALID")?
     } else {
         let (body, signature) = signed_body(hook, phase, text);
         let mut headers = reqwest::header::HeaderMap::new();
@@ -218,7 +242,7 @@ async fn exchange(hook: &Hook, phase: Phase, text: &str) -> Result<Reply, &'stat
         }
     };
     let parse = |bytes: &[u8]| match &hook.config.adapter {
-        Some(adapter) => super::adapters::parse_reply(adapter, bytes),
+        Some(adapter) => super::adapters::parse_reply_for(adapter, bytes, text),
         None => parse_reply(bytes),
     };
     #[cfg(test)]
@@ -228,6 +252,9 @@ async fn exchange(hook: &Hook, phase: Phase, text: &str) -> Result<Reply, &'stat
         }
         if answer.transport_error {
             return Err("HOOK_TRANSPORT");
+        }
+        if let Some(reason) = answer.status.and_then(|s| status_reason(hook, s)) {
+            return Err(reason);
         }
         return parse(&answer.bytes).ok_or("HOOK_MALFORMED");
     }
@@ -243,8 +270,8 @@ async fn exchange(hook: &Hook, phase: Phase, text: &str) -> Result<Reply, &'stat
         .send()
         .await
         .map_err(|_| "HOOK_TRANSPORT")?;
-    if !response.status().is_success() {
-        return Err("HOOK_TRANSPORT");
+    if let Some(reason) = status_reason(hook, response.status().as_u16()) {
+        return Err(reason);
     }
     if response
         .content_length()
@@ -261,6 +288,23 @@ async fn exchange(hook: &Hook, phase: Phase, text: &str) -> Result<Reply, &'stat
     }
     parse(&bytes).ok_or("HOOK_MALFORMED")
 }
+/// The reason a non-2xx answer carries, or `None` for success.
+///
+/// A vendor ADAPTER that answers 4xx was reached and refused this input or this key: that
+/// is a verdict about the request, not an outage, so it fails CLOSED (`HOOK_REJECTED`)
+/// whatever the hook's failure mode. Otherwise an attacker could pad a prompt past the
+/// vendor's input limit, or a revoked key could, and turn a fail-open hook into a pass
+/// (security review, GWY-64 M1). 408 and 429 are the vendor's own "try later", so they and
+/// every 5xx stay `HOOK_TRANSPORT`, which follows the failure mode. A customer's own
+/// webhook keeps its documented contract: any non-2xx is `HOOK_TRANSPORT`.
+pub(crate) fn status_reason(hook: &Hook, status: u16) -> Option<&'static str> {
+    match status {
+        200..=299 => None,
+        408 | 429 => Some("HOOK_TRANSPORT"),
+        400..=499 if hook.config.adapter.is_some() => Some("HOOK_REJECTED"),
+        _ => Some("HOOK_TRANSPORT"),
+    }
+}
 pub async fn evaluate(tenant: Uuid, hook: &Hook, phase: Phase, text: &str) -> Evaluation {
     let start = std::time::Instant::now();
     let mut redactions = Vec::new();
@@ -271,7 +315,7 @@ pub async fn evaluate(tenant: Uuid, hook: &Hook, phase: Phase, text: &str) -> Ev
     } else if let Some(_permit) = acquire(tenant) {
         match tokio::time::timeout(
             std::time::Duration::from_millis(hook.config.timeout_ms),
-            exchange(hook, phase, text),
+            exchange(tenant, hook, phase, text),
         )
         .await
         {
@@ -433,6 +477,8 @@ pub struct TestAnswer {
     pub bytes: Vec<u8>,
     pub delay_ms: u64,
     pub transport_error: bool,
+    /// The HTTP status the endpoint answers with (`None` = 200).
+    pub status: Option<u16>,
 }
 
 #[cfg(test)]
@@ -453,6 +499,7 @@ pub fn fixture() -> Hook {
             bytes: br#"{"decision":"deny"}"#.to_vec(),
             delay_ms: 0,
             transport_error: false,
+            status: None,
         }),
     }
 }

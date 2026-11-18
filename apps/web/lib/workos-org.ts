@@ -17,6 +17,9 @@ export interface OrgMembership {
 	user_id: string;
 	organization_id: string;
 	role: { slug: string };
+	/** WorkOS lists `pending` (invited, not accepted) and `inactive` memberships too,
+	 * each with its role. Absent on a malformed row, which then never counts as an owner. */
+	status?: "active" | "inactive" | "pending" | string;
 }
 
 export interface OrgInvitation {
@@ -37,6 +40,15 @@ export interface OrgInvitation {
  * `admin`/`member`, so `owner` only appears if the org defined that role. */
 export function isPrivilegedRole(slug: string): boolean {
 	return slug === "admin" || slug === "owner";
+}
+
+/** Whether a membership counts toward "another owner remains" (last-owner protection).
+ * Only an ACTIVE privileged membership does: a pending invitation or an inactive
+ * membership listed with an owner role cannot manage the workspace, so counting it would
+ * let the real last owner leave, demote themselves, or delete their account and orphan
+ * the workspace (security review of #232, M1). Fail-closed: a missing status never counts. */
+export function countsAsOwner(m: OrgMembership): boolean {
+	return isPrivilegedRole(m.role.slug) && m.status === "active";
 }
 
 /** Follow WorkOS cursor pagination, collecting every `data` row. `null` on any

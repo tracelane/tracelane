@@ -23,9 +23,8 @@
 //! - `TRACELANE_RETENTION_SWEEP` = `off` (DEFAULT) | `dryrun` (log what WOULD be
 //!   deleted, delete NOTHING) | `enforce` (delete). Nothing is deleted until an
 //!   operator explicitly sets `enforce`.
-//! - A tenant whose window can't be resolved falls back to **730d** (the max
-//!   `queryable_days` any tier carries, so an unresolved tenant is never
-//!   deleted early) — `resolve_retentions` COALESCEs to 730.
+//! - A tenant whose plan window cannot be resolved is skipped; deletion never
+//!   guesses a window. Current reference floors also apply to stored overrides.
 //! - A non-positive resolved window SKIPS that tenant (a 0/negative value would
 //!   mean "delete everything" — the fail-safe never mass-deletes on a bad value).
 //! - The sweep only ever deletes rows OLDER than the tenant's window; the table's
@@ -62,6 +61,12 @@ pub(crate) struct SweepRun {
     skipped: u64,
     failed: u64,
     budget_reported: bool,
+    #[cfg(test)]
+    before_tenant: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    before_mutation: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    before_submit: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 impl SweepRun {
     pub(crate) fn new(policy: RetentionSweepPolicy) -> Self {
@@ -76,6 +81,12 @@ impl SweepRun {
             skipped: 0,
             failed: 0,
             budget_reported: false,
+            #[cfg(test)]
+            before_tenant: None,
+            #[cfg(test)]
+            before_mutation: None,
+            #[cfg(test)]
+            before_submit: None,
         }
     }
     fn skip(&mut self) {
@@ -178,6 +189,11 @@ pub(crate) async fn delete_bounded(
             .checked_add(Duration::from_secs(run.policy.delete_wait_secs))
             .unwrap_or(run.deadline),
     );
+    #[cfg(test)]
+    if let Some(barrier) = run.before_submit.take() {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
     match tokio::time::timeout_at(wait_deadline, query.execute()).await {
         Ok(Ok(())) => DeleteOutcome::Done,
         Err(_) => {
@@ -302,7 +318,7 @@ const INITIAL_DELAY: Duration = Duration::from_secs(120);
 /// tomorrow's first. Mirrors `billing::metering_job::secs_until_next_daily`'s
 /// same-day-else-tomorrow shape, generalised to more than one slot per day.
 /// Never zero (`tokio::time::sleep(0)` would fire immediately and busy-loop).
-fn secs_until_next_retention_slot(now: chrono::DateTime<chrono::Utc>) -> u64 {
+pub(crate) fn secs_until_next_retention_slot(now: chrono::DateTime<chrono::Utc>) -> u64 {
     let today = now.date_naive();
     for &hour in &RETENTION_SLOT_HOURS {
         let at = today
@@ -537,6 +553,11 @@ async fn run_sweep_inner(
     }
     let mut total: u64 = 0;
     let mut swept = 0usize;
+    #[cfg(test)]
+    if let Some(barrier) = &run.before_tenant {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
     'tenants: for tr in &tenants {
         let Some(days) = sweep_days(tr.queryable_days) else {
             tracing::warn!(
@@ -551,7 +572,28 @@ async fn run_sweep_inner(
             if run.exhausted(mode) {
                 break 'tenants;
             }
-            match sweep_one(&ch, t, &tr.tenant_id, days, mode, run).await {
+            // Hold the retention fence through the ClickHouse submission.
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            let current = match locked_retention(&tx, &tr.tenant_id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    run.skip();
+                    continue 'tenants;
+                }
+                Err(_) => {
+                    run.failure();
+                    continue 'tenants;
+                }
+            };
+            #[cfg(test)]
+            if t.label == "spans"
+                && let Some(barrier) = run.before_mutation.take()
+            {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            match sweep_one(&ch, t, &tr.tenant_id, days.max(current), mode, run).await {
                 Ok(n) => total += n,
                 // A single tenant/table failure never aborts the run — skip + log.
                 Err(e) => {
@@ -559,6 +601,33 @@ async fn run_sweep_inner(
                     tracing::warn!(error = %e, tenant_id = %tr.tenant_id, table = t.label,
                         "retention sweep: tenant/table failed — skipping");
                 }
+            }
+            tx.commit().await?;
+        }
+        if mode == SweepMode::Enforce && !run.exhausted(mode) {
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            let current = match locked_retention(&tx, &tr.tenant_id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    run.skip();
+                    continue;
+                }
+                Err(_) => {
+                    run.failure();
+                    continue;
+                }
+            };
+            let cleared = clear_approval_previews(&tx, &tr.tenant_id, days.max(current)).await;
+            match cleared {
+                Ok(n) => {
+                    tx.commit().await?;
+                    if n > 0 {
+                        run.statements_left = run.statements_left.saturating_sub(1);
+                        run.mutations += 1;
+                    }
+                }
+                Err(_) => run.failure(),
             }
         }
     }
@@ -872,7 +941,7 @@ async fn sweep_orphans_one(
             tracing::info!(
                 table = label,
                 deleted = n,
-                "retention sweep [enforce]: deleted rows of recorded purges absent from the live tenant list (RI-02 rule 5)"
+                "retention sweep [enforce]: deleted rows of recorded purges absent from the live tenant list"
             );
             Ok(rows_accounted(mode, n))
         }
@@ -901,11 +970,16 @@ async fn sweep_orphans_one(
 const RETENTION_TENANTS_SQL: &str = concat!(
     "\
     SELECT t.id::text, \
-           COALESCE(we.queryable_days, pa.queryable_days, 730)::int \
+           ",
+    crate::entitlement_cache::retention_window_sql!(),
+    "::int \
     FROM tenants t \
-    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id",
+    LEFT JOIN plan_entitlements pe ON pe.plan_lookup_key = t.plan::text || '_v1' \
+    LEFT JOIN workspace_entitlements we ON we.tenant_id = t.id \
+    LEFT JOIN workspace_data_controls dc ON dc.tenant_id = t.id ",
     crate::entitlement_cache::allowance_pin_join!(
-        "COALESCE(we.plan_lookup_key, t.plan::text || '_v1')"
+        "COALESCE(we.plan_lookup_key, t.plan::text || '_v1')",
+        "clock_timestamp()"
     ),
 );
 
@@ -919,9 +993,71 @@ async fn resolve_retentions(pool: &DbPool) -> anyhow::Result<Vec<TenantRetention
         .iter()
         .map(|r| TenantRetention {
             tenant_id: r.get(0),
-            queryable_days: r.get(1),
+            // Keep every live identity for orphan protection. Zero authorizes no
+            // time deletion; filtering this row would turn it into an orphan.
+            queryable_days: r.get::<_, Option<i32>>(1).unwrap_or(0),
         })
         .collect())
+}
+
+#[cfg(test)]
+async fn resolve_retention(pool: &DbPool, tenant: &str) -> anyhow::Result<Option<u64>> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    locked_retention(&tx, tenant).await
+}
+
+pub(crate) async fn retention_lock_key(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &str,
+) -> anyhow::Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT hashtextextended('tracelane.retention:' || $1::text, 0)",
+            &[&tenant],
+        )
+        .await?
+        .get(0))
+}
+
+async fn locked_retention(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &str,
+) -> anyhow::Result<Option<u64>> {
+    let key = retention_lock_key(tx, tenant).await?;
+    tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&key])
+        .await?;
+    if tx
+        .query_opt("SELECT id FROM tenants WHERE id=$1::text::uuid", &[&tenant])
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let row = tx
+        .query_opt(
+            &format!("{RETENTION_TENANTS_SQL} WHERE t.id = $1::text::uuid"),
+            &[&tenant],
+        )
+        .await?;
+    Ok(row
+        .and_then(|r| r.get::<_, Option<i32>>(1))
+        .and_then(sweep_days))
+}
+
+async fn clear_approval_previews(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &str,
+    days: u64,
+) -> anyhow::Result<u64> {
+    let limit = i64::try_from(crate::mcp_policy::settings()?.approvals.sweep_batch)?;
+    let days = i32::try_from(days)?;
+    Ok(tx.execute(
+        "UPDATE approvals SET args_preview=NULL WHERE tenant_id=$1::text::uuid AND id IN \
+         (SELECT id FROM approvals WHERE tenant_id=$1::text::uuid AND args_preview IS NOT NULL \
+          AND created_at < clock_timestamp()-make_interval(days=>$2) ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED)",
+        &[&tenant, &days, &limit],
+    ).await?)
 }
 
 /// B-459: the tombstones `scripts/ops/tenant-purge.sh` writes (migration 0053).
@@ -1238,7 +1374,7 @@ mod tests {
         );
     }
 
-    async fn tombstone_pg_fixture() -> DbPool {
+    pub(super) async fn tombstone_pg_fixture() -> DbPool {
         let config: tokio_postgres::Config = std::env::var("POSTGRES_TEST_URL")
             .expect("throwaway Postgres URL")
             .parse()
@@ -1254,17 +1390,56 @@ mod tests {
             // Session-local tables: no application database is migrated or seeded.
             let pg = pool.get().await.unwrap();
             pg.batch_execute("CREATE TEMP TABLE tenants (id uuid, plan text, plan_version text, price_protected_until timestamptz);
-                CREATE TEMP TABLE workspace_entitlements (tenant_id uuid, queryable_days int, plan_lookup_key text);
-                CREATE TEMP TABLE plan_entitlements (plan_lookup_key text, queryable_days int);
+                CREATE TEMP TABLE workspace_entitlements (tenant_id uuid, queryable_days int, plan_lookup_key text, f_audit_addon boolean);
+                CREATE TEMP TABLE workspace_data_controls (tenant_id uuid, retention_days int);
+                CREATE TEMP TABLE plan_entitlements (plan_lookup_key text, queryable_days int, f_audit_addon boolean);
                 CREATE TEMP TABLE plan_allowances (plan_version text, plan_lookup_key text, queryable_days int, is_current boolean);
                 INSERT INTO plan_allowances VALUES ('v3', 'free_v1', 30, true);
                 CREATE TEMP TABLE purged_tenants (tenant_id uuid, purged_at timestamptz NOT NULL DEFAULT now());
                 CREATE TEMP TABLE billing_policy (key text, value jsonb);
                 INSERT INTO tenants VALUES ('00000000-0000-0000-0000-00000000fa11', 'free', NULL, NULL);
-                INSERT INTO plan_entitlements VALUES ('free_v1', 30);
+                INSERT INTO plan_entitlements VALUES ('free_v1', 30, false);
                 INSERT INTO purged_tenants VALUES ('00000000-0000-0000-0000-00000000fa11', now() - interval '72 hours');").await.unwrap();
         }
         pool
+    }
+
+    #[tokio::test]
+    #[ignore = "throwaway Postgres; POSTGRES_TEST_URL"]
+    async fn og38_retention_floor_follows_audit_activation() {
+        let pool = tombstone_pg_fixture().await;
+        {
+            let pg = pool.get().await.unwrap();
+            pg.batch_execute("UPDATE plan_allowances SET queryable_days=730;
+                INSERT INTO workspace_data_controls SELECT id,7 FROM tenants;
+                INSERT INTO billing_policy VALUES ('data_controls','{\"retention_days_min\":7,\"audit_addon_min_days\":180}');").await.unwrap();
+        }
+        assert_eq!(
+            resolve_retentions(&pool).await.unwrap()[0].queryable_days,
+            7
+        );
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute("UPDATE plan_entitlements SET f_audit_addon=true")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_retentions(&pool).await.unwrap()[0].queryable_days,
+            180
+        );
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(
+                "UPDATE billing_policy SET value=jsonb_set(value,'{audit_addon_min_days}','200')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_retentions(&pool).await.unwrap()[0].queryable_days,
+            200
+        );
     }
 
     #[tokio::test]
@@ -2252,3 +2427,163 @@ mod b409_tests {
         assert_eq!(days(fresh), v4_builder().queryable, "unpinned tenant");
     }
 }
+
+/// Bounded estimate; unavailable counts remain null, never a fabricated zero.
+pub(crate) async fn estimate(
+    state: &crate::server::AppState,
+    tenant: &tracelane_shared::TenantId,
+    days: i32,
+    cap: u64,
+) -> serde_json::Value {
+    #[derive(serde::Deserialize, clickhouse::Row)]
+    struct Count {
+        n: u64,
+    }
+    let mut counts = serde_json::Map::new();
+    let client = state
+        .quota_ch_url
+        .clone()
+        .map(crate::clickhouse_query::ch_client);
+    let tier = crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), tenant).await;
+    for table in SWEEP_TABLES {
+        let value = match &client {
+            None => None,
+            Some(client) => {
+                // The limit is inside the aggregate so both the output and scan are bounded.
+                let source = table
+                    .count_sql
+                    .replacen("SELECT count() AS n", "SELECT 1", 1);
+                let sql = crate::clickhouse_query::TenantQuery::new(
+                    format!("SELECT count() AS n FROM ({source} LIMIT {cap})"),
+                    tier,
+                )
+                .sql_with_settings();
+                client
+                    .query(&sql)
+                    .bind(tenant.to_string())
+                    .bind(days)
+                    .fetch_one::<Count>()
+                    .await
+                    .ok()
+                    .map(|r| r.n)
+            }
+        };
+        counts.insert(table.label.to_owned(), serde_json::json!(value));
+    }
+    serde_json::Value::Object(counts)
+}
+
+/// Reuse the sweep's exact table/time predicates for pre-sweep visibility.
+/// Only telemetry tables participate; datasets and the ledger remain untouched.
+pub(crate) fn read_filters(days: i32) -> String {
+    let mut entries: Vec<String> = SWEEP_TABLES
+        .iter()
+        .map(|t| {
+            if days <= 0 {
+                return format!("'tracelane.{}': '0'", t.label);
+            }
+            let condition = t
+                .count_sql
+                .split_once("WHERE tenant_id = ? AND ")
+                .map(|(_, p)| {
+                    p.replace(" < ", " >= ")
+                        .replace('?', &days.max(0).to_string())
+                })
+                .unwrap_or_else(|| "0".to_owned());
+            format!("'tracelane.{}': '{}'", t.label, condition)
+        })
+        .collect();
+    // spend_hourly has its own TTL but must obey the same pre-sweep read window.
+    let spend_window = if days <= 0 {
+        "0".to_owned()
+    } else {
+        format!("bucket_hour >= now() - INTERVAL {} DAY", days.max(0))
+    };
+    entries.push(format!("'tracelane.spend_hourly': '{spend_window}'"));
+    format!("{{{}}}", entries.join(","))
+}
+pub(crate) async fn read_client(
+    client: &clickhouse::Client,
+    cache: Option<&crate::entitlement_cache::EntitlementCache>,
+    tenant: &tracelane_shared::TenantId,
+) -> clickhouse::Client {
+    let days = match cache {
+        Some(cache) => cache.resolved(*tenant.as_uuid()).await.queryable_days,
+        None => crate::entitlement_cache::ResolvedEntitlements::deny_all().queryable_days,
+    };
+    client
+        .clone()
+        .with_option("additional_table_filters", read_filters(days))
+}
+
+#[cfg(test)]
+mod read_window_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "disposable ClickHouse on localhost:18139; CLICKHOUSE_RETENTION_TEST_URL; serial"]
+    async fn og38_retention_read_filters_hide_old_content() {
+        let url = retention_test_fixture::disposable_url();
+        let ch = retention_test_fixture::reset(&url).await;
+        ch.query("CREATE TABLE tracelane.spans (tenant_id String,start_time DateTime,text String) ENGINE=Memory").execute().await.unwrap();
+        let a = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(38));
+        let b = tracelane_shared::TenantId::from_jwt_claim(uuid::Uuid::from_u128(39));
+        ch.query("INSERT INTO tracelane.spans VALUES (?,now()-toIntervalDay(40),'private-old'),(?,now(),'visible-new'),(?,now()-toIntervalDay(40),'other-tenant-old')")
+            .bind(a.to_string()).bind(a.to_string()).bind(b.to_string()).execute().await.unwrap();
+        let resolve: crate::entitlement_cache::ResolveFn = std::sync::Arc::new(|id| {
+            Box::pin(async move {
+                Ok(crate::entitlement_cache::ResolvedEntitlements {
+                    queryable_days: if id == uuid::Uuid::from_u128(38) {
+                        7
+                    } else {
+                        730
+                    },
+                    ..crate::entitlement_cache::ResolvedEntitlements::deny_all()
+                })
+            })
+        });
+        let cache = crate::entitlement_cache::EntitlementCache::new(resolve);
+        let sql = "SELECT text FROM tracelane.spans WHERE tenant_id = ? ORDER BY text";
+        let visible = read_client(&ch, Some(&cache), &a)
+            .await
+            .query(sql)
+            .bind(a.to_string())
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(visible, vec!["visible-new"]);
+        let sibling = read_client(&ch, Some(&cache), &b)
+            .await
+            .query(sql)
+            .bind(b.to_string())
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(sibling, vec!["other-tenant-old"]);
+        let physical = ch
+            .query("SELECT count() FROM tracelane.spans WHERE tenant_id = ?")
+            .bind(a.to_string())
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(
+            physical, 2,
+            "read boundary applies before physical deletion"
+        );
+        ch.query("DROP TABLE tracelane.spans")
+            .execute()
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "retention_sweep_fix_tests.rs"]
+mod fix_tests;
+
+#[cfg(test)]
+#[path = "retention_preview_fix_tests.rs"]
+mod preview_fix_tests;
+
+#[cfg(test)]
+#[path = "retention_test_fixture.rs"]
+mod retention_test_fixture;

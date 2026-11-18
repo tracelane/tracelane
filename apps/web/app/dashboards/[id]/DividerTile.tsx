@@ -109,7 +109,7 @@ export function DividerTile({ dashboardId, tileId, label, canEdit }: Props) {
 					className="shrink-0 whitespace-nowrap rounded px-1 text-xs font-medium uppercase tracking-wide text-ink-2 transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-focus-ring disabled:cursor-not-allowed disabled:opacity-50"
 				>
 					{value || (
-						<span className="italic normal-case text-ink-3 opacity-0 transition-opacity group-hover/divider:opacity-100 group-focus-within/divider:opacity-100">
+						<span className="normal-case text-ink-3 opacity-0 transition-opacity group-hover/divider:opacity-100 group-focus-within/divider:opacity-100">
 							+ Add label
 						</span>
 					)}

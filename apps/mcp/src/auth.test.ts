@@ -145,7 +145,7 @@ describe("bootstrapStdioTenant (stdio API-key auth — L3 sweep)", () => {
 	});
 
 	it("FAIL CLOSED: a set-but-rejected key throws (never falls back to env)", async () => {
-		vi.stubEnv("TRACELANE_API_KEY", "tlane_rejected_key_98765432109876");
+		vi.stubEnv("TRACELANE_API_KEY", "tlane_rejected_key_98765432109876"); // gitleaks:allow — a fake key the test expects to be rejected
 		vi.stubEnv("TRACELANE_TENANT_ID", "must-not-be-used");
 		vi.stubEnv("TRACELANE_GATEWAY_URL", "https://gateway.tracelane.dev");
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(

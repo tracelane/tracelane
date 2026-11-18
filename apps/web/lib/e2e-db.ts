@@ -27,6 +27,7 @@ const plansV3 = plansV3Json as unknown as PlansV3;
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
+import { migrationSqlForTestDb } from "./test-migration-sql";
 
 type E2EDatabase = ReturnType<typeof drizzle<typeof schema>>;
 
@@ -72,7 +73,10 @@ export async function setupE2EDb(): Promise<E2EDatabase | null> {
 		.filter((f) => !journaled.has(f.replace(/\.sql$/, "")))
 		.sort();
 	for (const file of nonJournaled) {
-		await pg.exec(readFileSync(path.join(folder, file), "utf-8"));
+		// CONCURRENTLY cannot run inside exec's implicit transaction: see test-migration-sql.ts.
+		await pg.exec(
+			migrationSqlForTestDb(readFileSync(path.join(folder, file), "utf-8")),
+		);
 	}
 
 	// Seed plan_entitlements (mirror of db/seed.mjs / the pglite guard test) +
@@ -163,6 +167,28 @@ export async function setupE2EDb(): Promise<E2EDatabase | null> {
 			'insert into "workspace_entitlements" ("tenant_id", "plan_lookup_key", "f_audit_addon") values ($1, $2, true)',
 			[E2E_INTERNAL_TENANT_ID, "team_v1"],
 		);
+	}
+
+	// Site screenshots (`SITE_SHOTS=1`, scripts/proofs/site-shots.mjs): the spend-by-key view reads key
+	// NAMES from Postgres (app/gateway/key-labels.ts), so the demo keys the fixture gateway reports
+	// costs for need real rows here. Demo data only; never reached by a prod build.
+	if (process.env.SITE_SHOTS === "1") {
+		for (const [suffix, name] of [
+			["10", "refund-agent"],
+			["11", "order-agent"],
+			["12", "account-agent"],
+			["13", "contact-agent"],
+		]) {
+			await pg.query(
+				'insert into "api_keys" ("id", "tenant_id", "name", "key_prefix") values ($1, $2, $3, $4)',
+				[
+					`ddc00000-0000-4000-8000-0000000000${suffix}`,
+					E2E_INTERNAL_TENANT_ID,
+					name,
+					`tlane_demo${suffix}`,
+				],
+			);
+		}
 	}
 
 	holder[GLOBAL_KEY] = db;

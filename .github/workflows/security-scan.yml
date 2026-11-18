@@ -54,7 +54,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
 
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -90,6 +90,8 @@ jobs:
           # The finding is still printed in full and still reaches a human; what is
           # removed is the urgency to remediate without reading the diff.
           cargo audit || echo "::warning::cargo audit reported findings — read them, and read any suggested \`cargo update\` BEFORE running it (TRAPS §43)"
+          # The browser verifier is its own Cargo workspace with its own lockfile (AUD-33).
+          cargo audit --file packages/verifier-wasm/Cargo.lock || echo "::warning::cargo audit (verifier-wasm) reported findings — read them before any cargo update (TRAPS §43)"
 
       - name: pnpm audit (Node deps)
         run: pnpm audit --audit-level=high
@@ -190,7 +192,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
 
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -225,7 +227,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable 2024-12
 
       - name: Cache Rust deps
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # cache-bin false (2026-10-03): the self-hosted runner shares $HOME with the dev box, and
           # the post-job "Cleaning cargo/bin" deleted ~/.cargo/bin/rustup (every cargo broke).
@@ -238,4 +240,7 @@ jobs:
         # `--all-features` so the deny gate covers feature-gated deps too
         # (wasmtime, ort, etc.). Exits non-zero on any violation. Uses the
         # default `deny.toml` (no --config) so it matches the local verify-all gate.
-        run: cargo deny --all-features check
+        run: |
+          cargo deny --all-features check
+          # The browser verifier's own workspace/lockfile, against the same policy (AUD-33).
+          cargo deny --manifest-path packages/verifier-wasm/Cargo.toml --all-features check --config deny.toml

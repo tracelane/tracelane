@@ -14,6 +14,7 @@
  * bypass the auth middleware.
  */
 
+import { refuseCrossOriginMutation } from "@/lib/csrf";
 import { e2eAuthEnabled } from "@/lib/e2e-auth";
 import { legacyCookieCleanup } from "@/lib/legacy-cookie-cleanup";
 import { authkitMiddleware } from "@workos-inc/authkit-nextjs";
@@ -29,6 +30,14 @@ export default async function middleware(
 	request: NextRequest,
 	event: NextFetchEvent,
 ) {
+	// Before auth and before the E2E bypass: a cross-origin state change is refused whoever
+	// is signed in (lib/csrf.ts — the session cookie rides same-site requests).
+	if (refuseCrossOriginMutation(request)) {
+		return NextResponse.json(
+			{ error: "cross_origin_refused" },
+			{ status: 403 },
+		);
+	}
 	if (e2eAuthEnabled()) return NextResponse.next();
 	const response = await authkit(request, event);
 	// Expire a legacy `Domain=.tracelane.dev` session cookie left from before the

@@ -5,12 +5,10 @@ import { Button } from "@tracelanedev/ui";
 import { TBody, TD, TH, THead, TR, Table } from "@tracelanedev/ui";
 
 /**
- * ByokKeyManager — self-service CMK/BYOK key management UI.
+ * ByokKeyManager — public-key fingerprint registry UI.
  *
- * Allows tenants to register, rotate, and revoke their Customer-Managed
- * Keys (CMK) for envelope encryption of provider API keys and trace payloads.
- * Keys are stored server-side as envelope-encrypted entries; only the
- * public key fingerprint is shown in the UI (the raw key never transits here).
+ * Records public-key fingerprints and replacement/revocation status. It does
+ * not configure the gateway customer KMS or re-encrypt provider keys.
  *
  * Pain-points: PP-G5 (BYOK provider keys), PP-P15 (enterprise CMK self-service).
  */
@@ -82,7 +80,7 @@ async function rotateKey(id: string, publicKeyPem: string): Promise<CmkEntry> {
 // enforcement ships in a later release). "active" would overstate that.
 const STATUS_LABEL: Record<KeyStatus, string> = {
 	active: "Registered",
-	rotating: "Rotating",
+	rotating: "Replacement recorded",
 	revoked: "Revoked",
 };
 
@@ -118,7 +116,7 @@ function KeyRow({
 							onClick={() => onRotate(entry.id)}
 							className="text-xs px-2 py-1 rounded border border-line hover:bg-surface-2 transition-colors"
 						>
-							Rotate
+							Replace fingerprint
 						</Button>
 						{/* DEAD CLASSES, FIXED 2026-08-22. This carried `border-destructive`
 						    and `hover:bg-destructive/10`. `--color-destructive` was one of the
@@ -312,7 +310,9 @@ export function ByokKeyManager() {
 
 			{!isLoading && !isError && keys.length === 0 && (
 				<div className="rounded-card border border-dashed border-line p-8 text-center text-sm text-ink-2">
-					No CMK keys registered. Add a key to enable BYOK encryption.
+					No CMK fingerprints registered. Add a public key to record its
+					fingerprint. Gateway encryption requires separate customer KMS
+					configuration.
 				</div>
 			)}
 
@@ -355,7 +355,7 @@ export function ByokKeyManager() {
 			{/* Rotate key modal */}
 			{rotateId !== null && (
 				<Modal
-					title="Rotate CMK Key"
+					title="Register replacement fingerprint"
 					onClose={() => {
 						setRotateId(null);
 						setRotatePem("");
@@ -363,9 +363,9 @@ export function ByokKeyManager() {
 					width="lg"
 				>
 					<p className="text-xs text-ink-2">
-						Provide the new public key. The old key will remain active during
-						re-encryption (status: rotating) and be revoked automatically once
-						complete.
+						Register a replacement public key fingerprint. The old record is
+						marked as replaced. This does not rotate gateway encryption keys or
+						automatically revoke the old record.
 					</p>
 					<textarea
 						value={rotatePem}
@@ -395,7 +395,7 @@ export function ByokKeyManager() {
 							disabled={!rotatePem.trim()}
 							className="px-4 py-2 rounded text-sm bg-action text-action-on hover:bg-action/90 disabled:opacity-50 transition-colors"
 						>
-							Rotate Key
+							Register replacement
 						</Button>
 					</div>
 				</Modal>

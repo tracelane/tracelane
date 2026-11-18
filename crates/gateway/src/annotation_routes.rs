@@ -2173,10 +2173,15 @@ async fn fetch_candidates(
         after_ms.is_some(),
         crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), tenant).await,
     );
-    let mut q = crate::clickhouse_query::ch_client(url)
-        .query(&sql)
-        .bind(tenant.to_string())
-        .bind(filter.window_hours);
+    let mut q = crate::retention_sweep::read_client(
+        &crate::clickhouse_query::ch_client(url),
+        state.entitlements.as_deref(),
+        tenant,
+    )
+    .await
+    .query(&sql)
+    .bind(tenant.to_string())
+    .bind(filter.window_hours);
     if let QueueSource::OnlineEvalScore { max_score, rubric } = &filter.source {
         q = q.bind(*max_score);
         if let Some(r) = rubric {
@@ -3018,6 +3023,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }

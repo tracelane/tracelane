@@ -32,6 +32,7 @@
 
 import { CopyButton } from "@/components/trace-viewer/CopyButton";
 import { apiFetchRaw } from "@/lib/api-fetch";
+import { formatDateTimeUtc } from "@/lib/format-date";
 import {
 	announcePopoverOpen,
 	onOtherPopoverOpen,
@@ -108,6 +109,25 @@ export function shareErrorMessage(
 	return "Couldn't complete that action. Nothing was recorded.";
 }
 
+/** Everything a public link exposes. One string, so the dialog and the note cannot drift.
+ * Keep it in step with the gateway's share filter. */
+export const SHARE_LINK_SCOPE =
+	"It shows trace metadata, including the workspace name; trace, span and agent IDs; span, agent, workflow, prompt, model, provider, client and tool names; status codes, finish reasons, guardrail verdicts and failure signatures; timing, usage and cost; numeric and boolean attributes; and ledger position and anchor status. Spans added later also appear.";
+
+/** Copy the just-issued public URL, UTC expiry and the shared view's scope.
+ * Warn about forwarding and distinguish one trace from a complete audit ledger. */
+export function buildReviewNote(url: string, expiresAt: string): string {
+	return [
+		"Tracelane trace review (read-only)",
+		`Link: ${url}`,
+		`Expires: ${formatDateTimeUtc(expiresAt)}`,
+		"Anyone with this link can open it without signing in. Forward it only to people who should see it.",
+		SHARE_LINK_SCOPE,
+		"Prompts, responses and tool bodies are not included.",
+		"This is one trace, not proof of a complete audit ledger.",
+	].join("\n");
+}
+
 /** Days from now until `iso`, floored — never negative. */
 function daysUntil(iso: string, nowMs = Date.now()): number {
 	const ms = new Date(iso).getTime() - nowMs;
@@ -153,6 +173,15 @@ export function ShareLinkRow({
 					<span className="text-ink-2">
 						Created {new Date(link.created_at).toLocaleDateString()}
 					</span>
+				)}
+				{mintedUrl && (
+					<div className="mt-2 flex flex-wrap items-center gap-2">
+						<span className="text-2xs text-ink-2">Reviewer note</span>
+						<CopyButton
+							value={buildReviewNote(mintedUrl, link.expires_at)}
+							label="Copy review note"
+						/>
+					</div>
 				)}
 				<div className="text-2xs text-ink-3">
 					{link.view_count} view{link.view_count === 1 ? "" : "s"} · expires in{" "}
@@ -256,7 +285,15 @@ export function ShareDialog({
 				`/api/traces/${encodeURIComponent(traceId)}/shares/${encodeURIComponent(id)}`,
 				{ method: "DELETE" },
 			);
-			if (!res.ok && res.status !== 404) {
+			if (res.status === 404) {
+				// Repeat revokes by the owner return 204, so a 404 means this workspace
+				// has no such link on this trace. It may still be live: keep the row.
+				setMintError(
+					"This link was not revoked: this workspace has no such link on this trace. If you switched workspace, switch back and try again.",
+				);
+				return;
+			}
+			if (!res.ok) {
 				setMintError(await parseError(res));
 				return;
 			}
@@ -301,6 +338,11 @@ export function ShareDialog({
 					<p className="text-2xs text-ink-3">
 						Prompts, responses and tool bodies are never included.
 					</p>
+					<p className="text-2xs text-ink-3">
+						Anyone with this link can open it without signing in, until it
+						expires or is revoked. {SHARE_LINK_SCOPE} A shared trace is not an
+						independently verified audit.
+					</p>
 					<Button
 						type="button"
 						variant="primary"
@@ -325,7 +367,9 @@ export function ShareDialog({
 						) : links === null ? (
 							<p className="text-sm text-ink-3">Loading…</p>
 						) : links.length === 0 ? (
-							<p className="text-sm text-ink-3">No links yet</p>
+							<p className="text-sm text-ink-3">
+								No active links in your current workspace
+							</p>
 						) : (
 							links.map((l) => (
 								<ShareLinkRow

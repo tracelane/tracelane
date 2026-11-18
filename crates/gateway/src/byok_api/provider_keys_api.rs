@@ -272,7 +272,12 @@ async fn list(headers: HeaderMap, State(state): State<AppState>) -> impl IntoRes
     };
     let rejections = match state.quota_ch_url.as_deref() {
         Some(url) => crate::provider_key_validate::rejections(
-            &crate::clickhouse_query::ch_client(url),
+            &crate::retention_sweep::read_client(
+                &crate::clickhouse_query::ch_client(url),
+                state.entitlements.as_deref(),
+                &tenant,
+            )
+            .await,
             &tenant,
             &rows,
             crate::clickhouse_query::tier_for_tenant(state.entitlements.as_ref(), &tenant).await,

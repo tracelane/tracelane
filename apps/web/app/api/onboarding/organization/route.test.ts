@@ -18,6 +18,9 @@ const h = vi.hoisted(() => ({
 	},
 }));
 
+// Counter durability and outage paths have their own integration/route tests.
+vi.mock("@/lib/rate-limit", () => ({ rateLimit: vi.fn(async () => true) }));
+
 vi.mock("@workos-inc/authkit-nextjs", () => ({
 	withAuth: vi.fn(async () => h.auth),
 	switchToOrganization: vi.fn(async () => {}),
@@ -141,6 +144,51 @@ describe("POST /api/onboarding/organization — creator provisioned as admin", (
 				(c[0] as string).endsWith("/organizations") && methodOf(c) === "POST",
 		);
 		expect(createdOrg).toBe(false);
+	});
+
+	it("membership_lookup_failure_does_not_create_org", async () => {
+		const spy = vi.fn(
+			async (..._args: unknown[]) => ({ ok: false, status: 503 }) as Response,
+		);
+		vi.stubGlobal("fetch", spy);
+		const res = await POST(req({ name: "Unexpected" }));
+		expect(res.status).toBe(502);
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(
+			spy.mock.calls.some(
+				(call) =>
+					(call[0] as string).endsWith("/organizations") &&
+					methodOf(call) === "POST",
+			),
+		).toBe(false);
+	});
+
+	it("malformed_membership_lookup_does_not_create_org", async () => {
+		const spy = vi.fn(
+			async () =>
+				({
+					ok: true,
+					json: async () => ({}),
+				}) as Response,
+		);
+		vi.stubGlobal("fetch", spy);
+		const res = await POST(req({ name: "Unexpected" }));
+		expect(res.status).toBe(502);
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it("membership_without_org_id_does_not_create_org", async () => {
+		const spy = vi.fn(
+			async () =>
+				({
+					ok: true,
+					json: async () => ({ data: [{}] }),
+				}) as Response,
+		);
+		vi.stubGlobal("fetch", spy);
+		const res = await POST(req({ name: "Unexpected" }));
+		expect(res.status).toBe(502);
+		expect(spy).toHaveBeenCalledTimes(1);
 	});
 
 	it("REJECT: WorkOS membership creation fails → 502", async () => {

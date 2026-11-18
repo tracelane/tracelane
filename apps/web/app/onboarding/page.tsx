@@ -21,6 +21,7 @@ import { Button } from "@tracelanedev/ui";
  * than dropping it silently. Markers are cleared on completion.
  */
 
+import { ConnectionPathPicker } from "@/components/onboarding/ConnectionPathPicker";
 import { VerifyByTrace } from "@/components/onboarding/VerifyByTrace";
 import { apiFetchRaw } from "@/lib/api-fetch";
 import {
@@ -542,6 +543,8 @@ tlane init --endpoint ${GATEWAY_URL}`;
 					</div>
 				</div>
 			)}
+
+			<ConnectionPathPicker />
 
 			<VerifyByTrace />
 

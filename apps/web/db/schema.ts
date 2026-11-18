@@ -18,6 +18,7 @@ import {
 	customType,
 	date,
 	doublePrecision,
+	foreignKey,
 	index,
 	inet,
 	integer,
@@ -60,6 +61,8 @@ export const planEnum = pgEnum("plan", [
 
 /** BILL-02: the annual pair's last-seen state, written by the webhook only. */
 export type AnnualPairHalfJson = {
+	/** Event clock for this half; independent of the other subscription. */
+	modified_at?: string | null;
 	id: string;
 	plan: string;
 	status: string;
@@ -92,6 +95,7 @@ export type AnnualPairJson = {
 export const tenants = pgTable(
 	"tenants",
 	{
+		actionControl: boolean("action_control").notNull().default(false),
 		id: uuid("id").defaultRandom().primaryKey(),
 		workosOrgId: text("workos_org_id").notNull(),
 		// Legacy Stripe column kept for back-compat during the Phase-2
@@ -717,6 +721,23 @@ export const otelExports = pgTable(
 		tenantId: uuid("tenant_id")
 			.notNull()
 			.references(() => tenants.id, { onDelete: "cascade" }),
+		format: text("format").notNull().default("otlp"),
+		actionCursor: bigint("action_cursor", { mode: "number" })
+			.notNull()
+			.default(-1),
+		spanCursorMs: bigint("span_cursor_ms", { mode: "number" })
+			.notNull()
+			.default(0),
+		spanCursorTrace: text("span_cursor_trace").notNull().default(""),
+		spanCursorId: text("span_cursor_id").notNull().default(""),
+		deliveryAttempts: integer("delivery_attempts").notNull().default(0),
+		retryAt: timestamp("retry_at", { withTimezone: true })
+			.notNull()
+			.default(sql`'epoch'::timestamptz`),
+		leaseUntil: timestamp("lease_until", { withTimezone: true })
+			.notNull()
+			.default(sql`'epoch'::timestamptz`),
+		leaseToken: uuid("lease_token"),
 		name: text("name").notNull(),
 		url: text("url").notNull(),
 		headersEnc: text("headers_enc"),
@@ -742,6 +763,14 @@ export const otelExports = pgTable(
 	(t) => [
 		index("otel_exports_tenant_idx").on(t.tenantId),
 		index("otel_exports_enabled_idx").on(t.tenantId).where(sql`${t.enabled}`),
+		check(
+			"otel_exports_format_check",
+			sql`${t.format} IN ('otlp','splunk','sentinel','ocsf')`,
+		),
+		check(
+			"otel_exports_delivery_attempts_check",
+			sql`${t.deliveryAttempts} >= 0`,
+		),
 		check(
 			"otel_exports_name_len_chk",
 			sql`char_length(${t.name}) BETWEEN 1 AND 128`,
@@ -930,6 +959,7 @@ export const apiKeys = pgTable(
 		// ── OG-51 (migration 0075): this key's own cache NARROWING (NULL = none) ──
 		// {"mode":"off"?,"namespace_by"?}; a key can only narrow, never widen. Read by the
 		// gateway's entitlement refresh, written only by PATCH /v1/keys/{id}.
+		capture: jsonb("capture").$type<{ input?: boolean; output?: boolean }>(),
 		cache: jsonb("cache"),
 	},
 	(t) => [
@@ -999,6 +1029,23 @@ export const webhookEvents = pgTable(
 );
 
 export type WebhookEvent = typeof webhookEvents.$inferSelect;
+
+// ── Applied-migration ledger (migration 0092) ─────────────────────────────────
+// Written only by scripts/deploy/migrate.sh (deploy.yml `migrate` job): one row per
+// apps/web/db/migrations file applied to Neon, with the file's sha256. The app never
+// reads or writes it; it is declared here so Drizzle stays the single schema source.
+
+export const opsAppliedMigrations = pgTable(
+	"ops_applied_migrations",
+	{
+		name: text("name").primaryKey(),
+		sha256: text("sha256").notNull(),
+		appliedAt: timestamp("applied_at", { withTimezone: true })
+			.defaultNow()
+			.notNull(),
+	},
+	(t) => [check("ops_applied_migrations_sha256_check", sql`${t.sha256} ~ '^[0-9a-f]{64}$'`)],
+);
 
 // ── Admin audit log ───────────────────────────────────────────────────────────
 // Durable trail of mutating admin actions (ADR-031). Written via raw SQL in
@@ -1338,7 +1385,12 @@ export const auditLogRows = pgTable(
 		signature: text("signature").notNull().default(""),
 		signingPubkey: text("signing_pubkey").notNull().default(""),
 	},
-	(t) => [primaryKey({ columns: [t.tenantId, t.seq] })],
+	(t) => [primaryKey({ columns: [t.tenantId, t.seq] }),
+        index("audit_protected_event_id").on(t.tenantId, sql`((${t.payload}::jsonb)->>'event_id')`).where(sql`${t.eventType} IN ('decision_made','denied_runtime')`),
+        index("audit_policy_activations").on(t.tenantId, t.seq).where(sql`${t.eventType} = 'policy_activated'`),
+        index("audit_action_id").on(t.tenantId, sql`((${t.payload}::jsonb)->>'action_id')`, t.seq).where(sql`${t.eventType} IN ('action_proposed','decision_made','approval_requested','approval_granted','approval_denied','approval_attempt_rejected','approval_consumed','approval_expired','approval_invalidated','legacy_forward_attempted','execution_started','execution_succeeded','execution_failed','execution_unknown','denied_runtime','policy_activated')`),
+        index("audit_action_heads").on(t.tenantId, t.seq.desc()).where(sql`${t.eventType} IN ('action_proposed','denied_runtime')`),
+    ],
 );
 
 export type AuditLogRow = typeof auditLogRows.$inferSelect;
@@ -2251,5 +2303,453 @@ export const tenantDataKeys = pgTable(
 		uniqueIndex("tenant_data_keys_active_tenant_idx")
 			.on(t.tenantId)
 			.where(sql`${t.retiredAt} IS NULL`),
+	],
+);
+
+// Workspace retention can only shorten the plan window; values are validated by the gateway.
+export const workspaceDataControls = pgTable("workspace_data_controls", {
+	tenantId: uuid("tenant_id")
+		.primaryKey()
+		.references(() => tenants.id, { onDelete: "cascade" }),
+	retentionDays: integer("retention_days"),
+	updatedBy: text("updated_by").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+});
+
+export const mcpServers = pgTable(
+	"mcp_servers",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		slug: text("slug").notNull(),
+		name: text("name").notNull(),
+		url: text("url").notNull(),
+		transport: text("transport").notNull(),
+		authMode: text("auth_mode").notNull(),
+		credentialKind: text("credential_kind").notNull().default("bearer"),
+		credentialHeader: text("credential_header"),
+		credentialCt: text("credential_ct"),
+		credentialLast4: text("credential_last4"),
+		enabled: boolean("enabled").notNull().default(true),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		archivedAt: timestamp("archived_at", { withTimezone: true }),
+	},
+	(t) => [
+		check("mcp_servers_slug_check", sql`${t.slug} ~ '^[a-z0-9-]{1,48}$'`),
+		check(
+			"mcp_servers_transport_check",
+			sql`${t.transport} IN ('streamable_http','legacy_sse')`,
+		),
+		check(
+			"mcp_servers_auth_mode_check",
+			sql`${t.authMode} IN ('none','gateway_held','passthrough')`,
+		),
+		check(
+			"mcp_servers_credential_kind_check",
+			sql`${t.credentialKind} IN ('bearer','header')`,
+		),
+		check(
+			"mcp_servers_check",
+			sql`(${t.authMode}='gateway_held') = (${t.credentialCt} IS NOT NULL)`,
+		),
+		check(
+			"mcp_servers_check1",
+			sql`${t.credentialKind} != 'header' OR ${t.credentialHeader} IS NOT NULL`,
+		),
+		uniqueIndex("mcp_servers_tenant_id_id_key").on(t.tenantId, t.id),
+		uniqueIndex("mcp_servers_slug")
+			.on(t.tenantId, t.slug)
+			.where(sql`${t.archivedAt} IS NULL`),
+	],
+);
+
+export const mcpPolicy = pgTable(
+	"mcp_policy",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		rulesMode: text("rules_mode").notNull().default("observe"),
+		pinsMode: text("pins_mode").notNull().default("observe"),
+		injectionMode: text("injection_mode").notNull().default("observe"),
+		defaultAction: text("default_action").notNull().default("allow"),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedBy: text("updated_by").notNull(),
+	},
+	(t) => [
+		check(
+			"mcp_policy_rules_mode_check",
+			sql`${t.rulesMode} IN ('observe','enforce')`,
+		),
+		check(
+			"mcp_policy_pins_mode_check",
+			sql`${t.pinsMode} IN ('observe','enforce')`,
+		),
+		check(
+			"mcp_policy_injection_mode_check",
+			sql`${t.injectionMode} IN ('observe','enforce')`,
+		),
+		check(
+			"mcp_policy_default_action_check",
+			sql`${t.defaultAction} IN ('allow','deny')`,
+		),
+	],
+);
+
+export const mcpToolRules = pgTable(
+	"mcp_tool_rules",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		serverId: uuid("server_id"),
+		keyId: uuid("key_id"),
+		toolGlob: text("tool_glob").notNull(),
+		action: text("action").notNull(),
+		reason: text("reason").notNull().default(""),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		createdBy: text("created_by").notNull(),
+	},
+	(t) => [
+		foreignKey({
+			columns: [t.tenantId, t.serverId],
+			foreignColumns: [mcpServers.tenantId, mcpServers.id],
+		}),
+		check(
+			"mcp_tool_rules_action_check",
+			sql`${t.action} IN ('allow','deny','require_approval')`,
+		),
+		index("mcp_tool_rules_tenant").on(t.tenantId),
+	],
+);
+
+export const mcpToolDefs = pgTable(
+	"mcp_tool_defs",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		serverId: uuid("server_id").notNull(),
+		toolName: text("tool_name").notNull(),
+		defHash: text("def_hash").notNull(),
+		status: text("status").notNull().default("observed"),
+		firstSeen: timestamp("first_seen", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		lastSeen: timestamp("last_seen", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		seenCount: bigint("seen_count", { mode: "number" }).notNull().default(1),
+		approvedBy: text("approved_by"),
+		approvedAt: timestamp("approved_at", { withTimezone: true }),
+	},
+	(t) => [
+		foreignKey({
+			columns: [t.tenantId, t.serverId],
+			foreignColumns: [mcpServers.tenantId, mcpServers.id],
+		}),
+		check(
+			"mcp_tool_defs_status_check",
+			sql`${t.status} IN ('observed','approved')`,
+		),
+		primaryKey({ columns: [t.tenantId, t.serverId, t.toolName, t.defHash] }),
+		uniqueIndex("mcp_tool_defs_approved")
+			.on(t.tenantId, t.serverId, t.toolName)
+			.where(sql`${t.status}='approved'`),
+	],
+);
+
+export const approvalSettings = pgTable(
+	"approval_settings",
+	{
+		tenantId: uuid("tenant_id")
+			.primaryKey()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		requireSecondApprover: boolean("require_second_approver")
+			.notNull()
+			.default(false),
+		defaultTtlSecs: integer("default_ttl_secs").notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedBy: text("updated_by").notNull(),
+	},
+	(t) => [
+		check(
+			"approval_settings_default_ttl_secs_check",
+			sql`${t.defaultTtlSecs} > 0`,
+		),
+	],
+);
+
+export const approvalRules = pgTable(
+	"approval_rules",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		modelGlob: text("model_glob").notNull(),
+		keyId: uuid("key_id"),
+		ttlSecs: integer("ttl_secs"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		createdBy: text("created_by").notNull(),
+	},
+	(t) => [
+		check("approval_rules_ttl_secs_check", sql`${t.ttlSecs} > 0`),
+		index("approval_rules_tenant").on(t.tenantId),
+	],
+);
+
+export const approvals = pgTable(
+	"approvals",
+	{
+		id: uuid("id").primaryKey().defaultRandom(),
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		subjectKind: text("subject_kind").notNull(),
+		serverId: uuid("server_id"),
+		subject: text("subject").notNull(),
+		keyId: uuid("key_id"),
+		projectId: uuid("project_id"),
+		requesterSub: text("requester_sub").notNull(),
+		requesterCreator: text("requester_creator"),
+		argsFp: text("args_fp").notNull(),
+		argsBytes: bigint("args_bytes", { mode: "number" }).notNull(),
+		argsPreview: text("args_preview"),
+		// Nullable bindings identify legacy approvals; C1-4 owns protected lifecycle.
+		actionId: uuid("action_id"),
+		decisionId: uuid("decision_id"),
+		requestDigest: text("request_digest"),
+		policyId: uuid("policy_id"),
+		policyVersion: integer("policy_version"),
+		policyHash: text("policy_hash"),
+		toolRef: uuid("tool_ref"),
+		contractVersion: integer("contract_version"),
+		proposerKeyId: uuid("proposer_key_id"),
+		policyPublisherSub: text("policy_publisher_sub"),
+		qualifiedHumanSub: text("qualified_human_sub"),
+		requestedLedgerSeq: bigint("requested_ledger_seq", { mode: "bigint" }),
+		decidedLedgerSeq: bigint("decided_ledger_seq", { mode: "bigint" }),
+		consumedLedgerSeq: bigint("consumed_ledger_seq", { mode: "bigint" }),
+		ruleId: uuid("rule_id"),
+		status: text("status").notNull().default("pending"),
+		decidedBy: text("decided_by"),
+		decidedAt: timestamp("decided_at", { withTimezone: true }),
+		decisionNote: text("decision_note"),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+		grantExpiresAt: timestamp("grant_expires_at", { withTimezone: true }),
+		consumedAt: timestamp("consumed_at", { withTimezone: true }),
+		traceId: uuid("trace_id"),
+	},
+	(t) => [
+		foreignKey({ columns: [t.tenantId, t.policyId, t.policyVersion], foreignColumns: [actionPolicies.tenantId, actionPolicies.policyId, actionPolicies.version] }),
+		foreignKey({ columns: [t.tenantId, t.toolRef, t.contractVersion], foreignColumns: [actionToolContracts.tenantId, actionToolContracts.toolRef, actionToolContracts.version] }),
+		foreignKey({ columns: [t.tenantId, t.requestedLedgerSeq], foreignColumns: [auditLogRows.tenantId, auditLogRows.seq] }),
+		foreignKey({ columns: [t.tenantId, t.decidedLedgerSeq], foreignColumns: [auditLogRows.tenantId, auditLogRows.seq] }),
+		foreignKey({ columns: [t.tenantId, t.consumedLedgerSeq], foreignColumns: [auditLogRows.tenantId, auditLogRows.seq] }),
+		check("approvals_request_digest_check", sql`${t.requestDigest} ~ '^[0-9a-f]{64}$'`),
+		check("approvals_policy_hash_check", sql`${t.policyHash} ~ '^[0-9a-f]{64}$'`),
+		foreignKey({
+			columns: [t.tenantId, t.serverId],
+			foreignColumns: [mcpServers.tenantId, mcpServers.id],
+		}),
+		uniqueIndex("approvals_active_request").on(
+			t.tenantId,
+			t.requesterSub,
+			t.argsFp,
+		).where(sql`${t.status} IN ('pending','approved')`),
+		check(
+			"approvals_subject_kind_check",
+			sql`${t.subjectKind} IN ('tool','model')`,
+		),
+		check(
+			"approvals_status_check",
+			sql`${t.status} IN ('pending','approved','denied','expired','consumed','invalidated')`,
+		),
+		index("approvals_queue").on(t.tenantId, t.status, t.createdAt.desc(), t.id),
+        uniqueIndex("approvals_tenant_action_id").on(t.tenantId, t.actionId).where(sql`${t.actionId} IS NOT NULL`),
+        index("approvals_protected_request").on(t.tenantId, t.requesterSub, t.requestDigest, t.policyHash, t.createdAt.desc()).where(sql`${t.actionId} IS NOT NULL`),
+        foreignKey({name: "approvals_proposer_fk", columns:[t.tenantId,t.proposerKeyId], foreignColumns:[apiKeys.tenantId,apiKeys.id]}),
+        check("approvals_protected_binding", sql`${t.actionId} IS NULL OR (${t.decisionId} IS NOT NULL AND ${t.requestDigest} IS NOT NULL AND ${t.policyId} IS NOT NULL AND ${t.policyVersion} IS NOT NULL AND ${t.policyHash} IS NOT NULL AND ${t.toolRef} IS NOT NULL AND ${t.contractVersion} IS NOT NULL AND ${t.proposerKeyId} IS NOT NULL AND ${t.requesterCreator} IS NOT NULL AND ${t.requesterCreator}<>'' AND ${t.policyPublisherSub} IS NOT NULL AND ${t.policyPublisherSub}<>'')`),
+        check("approvals_protected_state", sql`${t.actionId} IS NULL OR ((${t.status} NOT IN ('approved','denied','consumed') OR (${t.decidedLedgerSeq} IS NOT NULL AND ${t.qualifiedHumanSub} IS NOT NULL AND ${t.qualifiedHumanSub}<>${t.requesterCreator} AND ${t.qualifiedHumanSub}<>${t.policyPublisherSub})) AND (${t.status}<>'consumed' OR ${t.consumedLedgerSeq} IS NOT NULL))`),
+	],
+);
+
+// Additive protected-action projections; the existing audit ledger remains canonical.
+export const actionExecutions = pgTable(
+	"action_executions",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id),
+		executionId: uuid("execution_id").notNull(),
+		actionId: uuid("action_id").notNull(),
+		agentKeyId: uuid("agent_key_id").notNull(),
+		decisionId: uuid("decision_id").notNull(),
+		policyId: uuid("policy_id").notNull(),
+		policyVersion: integer("policy_version").notNull(),
+		policyHash: text("policy_hash").notNull(),
+		idempotencyKey: uuid("idempotency_key").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		ledgerSeq: bigint("ledger_seq", { mode: "bigint" }).notNull(),
+		state: text("state").notNull(),
+		receiptDigest: text("receipt_digest"),
+		receiptJcs: text("receipt_jcs"),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.executionId] }),
+		uniqueIndex("action_executions_action").on(t.tenantId, t.actionId),
+		uniqueIndex("action_executions_idempotency").on(t.tenantId, t.idempotencyKey),
+		foreignKey({
+			columns: [t.tenantId, t.ledgerSeq],
+			foreignColumns: [auditLogRows.tenantId, auditLogRows.seq],
+		}),
+		check(
+			"action_executions_state_check",
+			sql`${t.state} IN ('in_flight','succeeded','failed','unknown')`,
+		),
+		check("action_executions_policy_version_check", sql`${t.policyVersion} > 0`),
+		check(
+			"action_executions_policy_hash_check",
+			sql`${t.policyHash} ~ '^[0-9a-f]{64}$'`,
+		),
+		check(
+			"action_executions_digest_check",
+			sql`${t.requestDigest} ~ '^[0-9a-f]{64}$'`,
+		),
+	],
+);
+export const actionTokenizationSecrets = pgTable("action_tokenization_secrets", {
+	tenantId: uuid("tenant_id")
+		.primaryKey()
+		.references(() => tenants.id),
+	encryptedSecret: text("encrypted_secret").notNull(),
+});
+// ACT-17: the key a tool server countersigns protected receipts with (gateway-written).
+export const actionToolReceiptKeys = pgTable(
+	"action_tool_receipt_keys",
+	{
+		tenantId: uuid("tenant_id").notNull(),
+		serverId: uuid("server_id").notNull(),
+		receiptKeyId: text("receipt_key_id").notNull(),
+		publicKey: bytea("public_key").notNull(),
+		registeredAt: timestamp("registered_at", { withTimezone: true }).notNull().defaultNow(),
+	},
+	(t) => [primaryKey({ columns: [t.tenantId, t.serverId] })],
+);
+// Retained with the ledger, including after tenant deletion. Exact signed JCS TEXT.
+export const auditHeadCheckpoints = pgTable(
+	"audit_head_checkpoints",
+	{
+		tenantId: uuid("tenant_id").notNull(),
+		checkpointId: uuid("checkpoint_id").notNull(),
+		checkpointOrder: bigserial("checkpoint_order", { mode: "bigint" }).notNull(),
+		statement: text("statement").notNull(),
+		signature: bytea("signature").notNull(),
+		timestampResponse: bytea("timestamp_response"),
+		timestampAttemptedAt: timestamp("timestamp_attempted_at", { withTimezone: true }),
+	},
+	(t) => [
+		primaryKey({ columns: [t.tenantId, t.checkpointId] }),
+		index("audit_head_checkpoints_order").on(t.tenantId, t.checkpointOrder),
+	],
+);
+
+export const actionToolContracts = pgTable("action_tool_contracts", {
+	tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+	toolRef: uuid("tool_ref").notNull(),
+	version: integer("version").notNull(),
+	serverId: uuid("server_id").notNull(),
+	toolName: text("tool_name").notNull(),
+	protected: boolean("protected").notNull(),
+	bodyJcs: text("body_jcs").notNull(),
+	contractHash: text("contract_hash").notNull(),
+}, (t) => [
+	primaryKey({ columns: [t.tenantId, t.toolRef, t.version] }),
+	uniqueIndex("action_tool_contracts_binding").on(t.tenantId, t.serverId, t.toolName, t.version),
+	foreignKey({ columns: [t.tenantId, t.serverId], foreignColumns: [mcpServers.tenantId, mcpServers.id] }),
+	check("action_tool_contracts_version_check", sql`${t.version} > 0`),
+	check("action_tool_contracts_hash_check", sql`${t.contractHash} ~ '^[0-9a-f]{64}$'`),
+]);
+export const actionPolicies = pgTable("action_policies", {
+	tenantId: uuid("tenant_id").notNull().references(() => tenants.id),
+	policyId: uuid("policy_id").notNull(),
+	version: integer("version").notNull(),
+	toolRef: uuid("tool_ref").notNull(),
+	contractVersion: integer("contract_version").notNull(),
+	bodyJcs: text("body_jcs").notNull(),
+	policyHash: text("policy_hash").notNull(),
+	publisherSub: text("publisher_sub").notNull(),
+}, (t) => [
+	primaryKey({ columns: [t.tenantId, t.policyId, t.version] }),
+	uniqueIndex("action_policies_tool_version").on(t.tenantId, t.toolRef, t.version),
+	uniqueIndex("action_policies_tool_policy_version").on(t.tenantId, t.toolRef, t.policyId, t.version),
+	foreignKey({ columns: [t.tenantId, t.toolRef, t.contractVersion], foreignColumns: [actionToolContracts.tenantId, actionToolContracts.toolRef, actionToolContracts.version] }),
+	check("action_policies_version_check", sql`${t.version} > 0`),
+	check("action_policies_hash_check", sql`${t.policyHash} ~ '^[0-9a-f]{64}$'`),
+]);
+export const actionPolicyActive = pgTable("action_policy_active", {
+	tenantId: uuid("tenant_id").notNull(),
+	toolRef: uuid("tool_ref").notNull(),
+	policyId: uuid("policy_id").notNull(),
+	version: integer("version").notNull(),
+}, (t) => [
+	primaryKey({ columns: [t.tenantId, t.toolRef] }),
+	foreignKey({ columns: [t.tenantId, t.toolRef, t.policyId, t.version], foreignColumns: [actionPolicies.tenantId, actionPolicies.toolRef, actionPolicies.policyId, actionPolicies.version] }),
+]);
+
+// Global abuse counters: the namespace is part of the hashed key. No raw IP/user ID.
+export const webRateLimits = pgTable(
+	"web_rate_limits",
+	{
+		keyHash: bytea("key_hash").notNull(),
+		windowStart: timestamp("window_start", { withTimezone: true }).notNull(),
+		count: integer("count").notNull(),
+	},
+	(t) => [
+		primaryKey({ columns: [t.keyHash, t.windowStart] }),
+		index("web_rate_limits_window_start_idx").on(t.windowStart),
+	],
+);
+
+// Tenant-registered issuers for verified on-behalf-of principal tokens.
+export const tenantPrincipalIssuers = pgTable(
+	"tenant_principal_issuers",
+	{
+		tenantId: uuid("tenant_id")
+			.notNull()
+			.references(() => tenants.id, { onDelete: "cascade" }),
+		id: uuid("id").primaryKey(),
+		issuer: text("issuer").notNull(),
+		jwksUrl: text("jwks_url").notNull(),
+		audience: text("audience").notNull(),
+		allowedAlgs: text("allowed_algs").array().notNull(),
+		createdBySub: text("created_by_sub").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+	},
+	(t) => [
+		index("tenant_principal_issuers_tenant_idx").on(t.tenantId),
+		uniqueIndex("tenant_principal_issuers_tenant_issuer").on(t.tenantId, t.issuer),
 	],
 );

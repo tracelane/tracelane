@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 
 export const metadata: Metadata = { title: "Sign-in didn't complete" };
 
@@ -18,12 +17,12 @@ export default function SignInErrorPage() {
 					Something interrupted the sign-in. Nothing is wrong with your
 					workspace — please try again.
 				</p>
-				<Link
+				<a
 					href="/sign-in"
 					className="inline-block rounded-control bg-action px-4 py-2 text-sm font-medium text-action-on transition-colors hover:bg-action/90"
 				>
 					Sign in again
-				</Link>
+				</a>
 			</div>
 		</div>
 	);

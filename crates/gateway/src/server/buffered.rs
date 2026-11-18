@@ -740,8 +740,10 @@ pub(super) async fn buffer_provider_stream(
     // OBS-53: the response-side confidence summary, buffered path.
     logprobs_acc.apply(&mut span.attributes);
 
+    // Spend enforcement is a control, not capture: record it with or without NATS
+    // (2026-10-29 — the streaming finalizer had the same gap).
+    record_key_spend(api_key_id, &span);
     if state.nats.is_some() {
-        record_key_spend(api_key_id, &span);
         // ── EVL-28: the online-eval judge, BUFFERED path ────────────────────
         // Unchanged position: BEFORE the guardrail seam, on the pre-redaction
         // `text` — the judge samples what the model actually produced, the

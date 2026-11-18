@@ -348,6 +348,23 @@ pub enum Degradation {
     /// `dropped` / `failed` counters and `status` on `GET /v1/exports/otel` say which.
     /// `crates/gateway/src/otel_export.rs`.
     OtelExportDropped = 42,
+    /// Paused-refusal evidence was NOT written for a protected `tools/call` refused by a
+    /// paused workspace: the write failed or timed out, the per-epoch cap was reached, or the
+    /// request digest could not be computed. The refusal itself (423) still stood; only the
+    /// signed `denied_runtime` row is missing. `crates/gateway/src/action_control/execution.rs`.
+    ActionEvidenceDeferred = 43,
+    /// `AUD-32` (2026-11-13): a scheduled liveness checkpoint (heartbeat) for one tenant was
+    /// not minted: the audit key, the database or the signer failed. The ledger is untouched;
+    /// the verifier will report the missing interval as a gap. Other tenants still get theirs.
+    /// `crates/gateway/src/action_control/heartbeat.rs`.
+    ActionHeartbeatFailed = 44,
+    /// Best-effort independent checkpoint timestamp acquisition failed.
+    CheckpointTimestampFailed = 45,
+    /// Bounded asynchronous SIEM delivery or source acquisition failed.
+    SiemExportFailed = 46,
+    /// ACT-17: a tool server's success was refused because its countersignature was missing,
+    /// malformed or did not verify; the call is recorded Unknown, never Succeeded.
+    CountersignatureRejected = 47,
 }
 
 impl Degradation {
@@ -400,6 +417,11 @@ impl Degradation {
             Self::BudgetSpendUnknown => "budget_spend_unknown",
             Self::SpendAlertDeliveryFailed => "spend_alert_delivery_failed",
             Self::OtelExportDropped => "otel_export_dropped",
+            Self::ActionEvidenceDeferred => "action_evidence_deferred",
+            Self::ActionHeartbeatFailed => "action_heartbeat_failed",
+            Self::CheckpointTimestampFailed => "checkpoint_timestamp_failed",
+            Self::SiemExportFailed => "siem_export_failed",
+            Self::CountersignatureRejected => "countersignature_rejected",
         }
     }
 
@@ -508,9 +530,10 @@ impl Degradation {
                  absent from the invoice. Check POLAR_ACCESS_TOKEN and Polar reachability."
             }
             Self::UsageWarningEmailUnconfigured => {
-                "a usage-warning email (75%/90% of an included allowance) could not be \
-                 sent — RESEND_API_KEY is unset. Customers crossing a threshold are not \
-                 being notified; the in-app usage page still shows it."
+                "a gateway email (a usage warning at 75%/90% of an allowance, or a spend \
+                 alert) could not be sent — RESEND_API_KEY is unset on the gateway. \
+                 Customers crossing a threshold are not being emailed (the in-app usage \
+                 page still shows it)."
             }
             Self::MeteringGaugeGapBackfilled => {
                 "the daily metering job found a day without its own marker row inside \
@@ -619,6 +642,27 @@ impl Degradation {
                  GET /v1/exports/otel shows each export's dropped / failed counters and status \
                  — usually the customer's collector is down, slow or refusing the credential."
             }
+            Self::CheckpointTimestampFailed => {
+                "independent checkpoint timestamp acquisition failed; inspect TSA configuration, pinned certificates, network and Postgres. Untimestamped exports remain available."
+            }
+            Self::SiemExportFailed => {
+                "SIEM delivery failed; inspect destination status, source connectivity and credentials. Bounded retries pause exhausted destinations; explicit operator retry retains the source cursor."
+            }
+            Self::CountersignatureRejected => {
+                "a tool server's success was recorded Unknown because its receipt countersignature \
+                 was missing or did not verify under the registered key; check the tool server's \
+                 signing key and that it signs the attestation it received."
+            }
+            Self::ActionHeartbeatFailed => {
+                "a scheduled action-ledger heartbeat checkpoint could not be minted for a tenant \
+                 (audit key, Postgres or signer failure); exports still work, but the gap will \
+                 show in verification. Check Postgres reachability and the BYOK master key."
+            }
+            Self::ActionEvidenceDeferred => {
+                "a protected tool call was refused because the workspace is paused, but its signed \
+                 refusal row was not written (write failed or timed out, per-epoch cap reached, or \
+                 arguments malformed). The refusal itself stood; check Postgres and the ledger head."
+            }
             Self::SpendAlertDeliveryFailed => {
                 "a spend alert could not be delivered to a customer's email, Slack or webhook \
                  channel and is being retried; GET /v1/controls/alert-events shows the error. \
@@ -690,13 +734,18 @@ impl Degradation {
             Self::BudgetSpendUnknown,
             Self::SpendAlertDeliveryFailed,
             Self::OtelExportDropped,
+            Self::ActionEvidenceDeferred,
+            Self::ActionHeartbeatFailed,
+            Self::CheckpointTimestampFailed,
+            Self::SiemExportFailed,
+            Self::CountersignatureRejected,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 43;
+pub const COUNT: usize = 48;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -747,6 +796,11 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

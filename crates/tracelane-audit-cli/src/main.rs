@@ -27,21 +27,26 @@
 //!
 //! ## V1 deferrals (ADR-034)
 //!
-//! `--format pdf` is queued for V1.1; the text + json formats cover
-//! the regulator-runnable invariant for V1 launch (2026-06-16) +
-//! Article 12 enforcement date (2026-08-02).
+//! `--format pdf` is not available; the text + json formats carry the full
+//! report. On dates: the pages read on 2026-11-13 (artificialintelligenceact.eu)
+//! give 2 December 2027 as the date the EU AI Act's high-risk obligations,
+//! Article 12 record-keeping among them, apply to Annex III systems. Check the
+//! Official Journal. This tool does not decide whether a system is high-risk
+//! and makes no statement of conformity.
 
-use std::io::{BufWriter, Write as _};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use tracelane_audit_verifier::{FormatVersion, VerifyOptions, VerifyReport, verify_ledger};
+use tracelane_audit_verifier::{
+    FormatVersion, VerifyOptions, VerifyReport, verify_ledger, verify_ledger_reader,
+};
 use uuid::Uuid;
+
+mod evidence_pack;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -65,7 +70,77 @@ struct Cli {
 enum Command {
     /// Verify an audit range. PASS prints a summary + exits 0;
     /// FAIL prints field-level diffs + exits 1.
-    Verify(VerifyArgs),
+    Verify(Box<VerifyArgs>),
+    /// Offline: check that one ledger row is in a signed tree checkpoint
+    /// (RFC 6962 inclusion proof against a C2SP checkpoint note).
+    VerifyInclusion(InclusionArgs),
+    /// Offline: check that a later signed tree checkpoint extends an earlier one
+    /// (RFC 6962 consistency proof). No witness cosignature is checked.
+    VerifyConsistency(ConsistencyArgs),
+    /// Verify an action bundle offline, then write a control-mapping pack
+    /// (CSV, OSCAL JSON, HTML). A bundle that fails verification gets no pack.
+    /// The pack is a mapping, not an assessment.
+    EvidencePack(EvidencePackArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct TreeArgs {
+    /// Independently pinned Ed25519 public-key FILE (hex or base64), as for `verify --pubkey`.
+    #[arg(long, value_name = "PATH")]
+    pubkey: PathBuf,
+    /// Workspace UUID the checkpoint must be for.
+    #[arg(long, value_name = "UUID")]
+    workspace: Uuid,
+    /// Proof FILE: one hex SHA-256 hash per line.
+    #[arg(long, value_name = "PATH", required_unless_present = "ledger")]
+    proof: Option<PathBuf>,
+    /// Build the proof from this `ledger.ndjson` instead and print it. Its hash
+    /// chain is NOT checked here; run `verify` on the bundle for that.
+    #[arg(long, value_name = "PATH", conflicts_with = "proof")]
+    ledger: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct InclusionArgs {
+    /// The `tree-checkpoint.note` member of an action bundle.
+    #[arg(long, value_name = "PATH")]
+    checkpoint: PathBuf,
+    /// Zero-based ledger sequence number of the row.
+    #[arg(long)]
+    index: u64,
+    /// The row's `row_hash` (hex). Required with --proof; checked against --ledger.
+    #[arg(long, value_name = "HEX", required_unless_present = "ledger")]
+    row_hash: Option<String>,
+    #[command(flatten)]
+    tree: TreeArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConsistencyArgs {
+    /// The earlier checkpoint note.
+    #[arg(long, value_name = "PATH")]
+    old: PathBuf,
+    /// The later checkpoint note.
+    #[arg(long, value_name = "PATH")]
+    new: PathBuf,
+    #[command(flatten)]
+    tree: TreeArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct EvidencePackArgs {
+    /// Action bundle ZIP to verify.
+    #[arg(long, value_name = "PATH")]
+    file: PathBuf,
+    /// Independently pinned Ed25519 public-key FILE (base64 or hex). Required.
+    #[arg(long, value_name = "PATH")]
+    pubkey: Option<PathBuf>,
+    /// Independently obtained TSA leaf certificate, DER or PEM. Repeatable.
+    #[arg(long, value_name = "PATH")]
+    tsa_cert: Vec<PathBuf>,
+    /// New or empty directory to write the pack into.
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
 }
 
 #[derive(Debug, clap::Args)]
@@ -104,6 +179,19 @@ struct VerifyArgs {
     /// --workspace / --from / --to are ignored.
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
+
+    /// Independently pinned Ed25519 public-key FILE for an offline action ZIP.
+    #[arg(long, value_name = "PATH")]
+    pubkey: Option<PathBuf>,
+
+    /// Independently obtained TSA leaf certificate, DER or PEM. Repeat for rotation.
+    #[arg(long, value_name = "PATH")]
+    tsa_cert: Vec<PathBuf>,
+
+    /// Report every interval longer than this many seconds between consecutive signed
+    /// checkpoints of an action ZIP as a gap. Set it to your heartbeat cadence plus slack.
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=3_153_600_000))]
+    max_gap: Option<u64>,
 
     /// Public Sigstore Rekor v2 transparency-log base URL. Only used to
     /// display the queryable anchor location; anchor verification is
@@ -144,8 +232,7 @@ struct VerifyArgs {
 
     /// Skip anchor (inclusion-proof) verification entirely. Useful for
     /// air-gapped verification of the chain + Merkle structure only —
-    /// does NOT satisfy Article 12 transparency-log conformance on its
-    /// own.
+    /// with this flag no transparency-log anchor is checked.
     #[arg(long)]
     offline: bool,
 
@@ -261,24 +348,299 @@ impl Verdict {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Verify(args) => match run_verify(args) {
+        Command::Verify(args) => {
+            if let Some(code) = run_action_bundle(&args) {
+                return code;
+            }
+            match run_verify(*args) {
+                Ok(report) => Verdict::of(&report).exit_code(),
+                Err(e) => {
+                    eprintln!("tracelane-audit: error: {e:#}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Command::EvidencePack(args) => run_evidence_pack(&args),
+        Command::VerifyInclusion(args) => tree_exit(verify_inclusion(&args)),
+        Command::VerifyConsistency(args) => tree_exit(verify_consistency(&args)),
+    }
+}
+
+use tracelane_audit_verifier::action::tree;
+/// Exit code plus cause: 5 = the note does not verify under the pin, 4 = anything else.
+type TreeFailure = (u8, anyhow::Error);
+fn tree_exit(result: Result<String, TreeFailure>) -> ExitCode {
+    match result {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err((code, e)) => {
+            eprintln!("FAIL ({code}): {e:#}");
+            ExitCode::from(code)
+        }
+    }
+}
+fn hash32(text: &str) -> Result<tree::Hash> {
+    hex::decode(text.trim())
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+        .context("expected a 32-byte hex hash")
+}
+impl TreeArgs {
+    /// Errors fail CLOSED; trust comes only from the external --pubkey file.
+    fn checkpoint(&self, path: &Path) -> Result<tree::Checkpoint, TreeFailure> {
+        let pin = std::fs::read_to_string(&self.pubkey)
+            .context("read external --pubkey")
+            .and_then(|s| decode_pubkey32(&s))
+            .map_err(|e| (5, e))?;
+        let note = std::fs::read(path)
+            .with_context(|| format!("read {}", path.display()))
+            .map_err(|e| (4, e))?;
+        tree::open_checkpoint(&note, &tree::origin(self.workspace), &pin).map_err(|e| (5, e))
+    }
+    /// The first `size` leaves of --ledger, when one was given.
+    fn leaves(&self, size: u64) -> Result<Option<Vec<tree::Hash>>> {
+        let Some(path) = &self.ledger else {
+            return Ok(None);
+        };
+        let mut leaves = tree::ledger_leaves(&std::fs::read(path).context("read --ledger")?)?;
+        if (leaves.len() as u64) < size {
+            bail!("--ledger has fewer rows than the checkpoint tree size {size}");
+        }
+        leaves.truncate(usize::try_from(size)?);
+        Ok(Some(leaves))
+    }
+    fn proof_file(&self) -> Result<Vec<tree::Hash>> {
+        let path = self
+            .proof
+            .as_ref()
+            .context("--proof or --ledger required")?;
+        std::fs::read_to_string(path)
+            .context("read --proof")?
+            .lines()
+            .map(hash32)
+            .collect()
+    }
+}
+fn proof_text(proof: &[tree::Hash]) -> String {
+    proof
+        .iter()
+        .map(|h| format!("\n{}", hex::encode(h)))
+        .collect()
+}
+fn verify_inclusion(args: &InclusionArgs) -> Result<String, TreeFailure> {
+    let cp = args.tree.checkpoint(&args.checkpoint)?;
+    (|| {
+        let given = args.row_hash.as_deref().map(hash32).transpose()?;
+        let (leaf, proof) = match args.tree.leaves(cp.size)? {
+            Some(leaves) => {
+                let index = usize::try_from(args.index)?;
+                let leaf = *leaves.get(index).context("--index outside the tree")?;
+                (leaf, tree::inclusion_proof(&leaves, index)?)
+            }
+            None => (
+                tree::leaf_hash(&given.context("--row-hash required with --proof")?),
+                args.tree.proof_file()?,
+            ),
+        };
+        if given.is_some_and(|row| tree::leaf_hash(&row) != leaf) {
+            bail!("--row-hash is not the row at --index in --ledger");
+        }
+        tree::verify_inclusion(&leaf, args.index, cp.size, &proof, &cp.root)?;
+        Ok(format!(
+            "PASS — row {} is included in the signed tree of size {} (root {}); proof:{}",
+            args.index,
+            cp.size,
+            hex::encode(cp.root),
+            proof_text(&proof)
+        ))
+    })()
+    .map_err(|e| (4, e))
+}
+fn verify_consistency(args: &ConsistencyArgs) -> Result<String, TreeFailure> {
+    let old = args.tree.checkpoint(&args.old)?;
+    let new = args.tree.checkpoint(&args.new)?;
+    (|| {
+        let proof = match args.tree.leaves(new.size)? {
+            Some(leaves) => tree::consistency_proof(&leaves, usize::try_from(old.size)?)?,
+            None => args.tree.proof_file()?,
+        };
+        tree::verify_consistency(old.size, new.size, &old.root, &new.root, &proof)?;
+        Ok(format!(
+            "PASS — signed tree of size {} extends the signed tree of size {}; proof:{}",
+            new.size,
+            old.size,
+            proof_text(&proof)
+        ))
+    })()
+    .map_err(|e| (4, e))
+}
+
+/// Fail-CLOSED: the same offline verify as `verify`, and nothing is written
+/// unless it passes and the shipped control map validates.
+fn run_evidence_pack(args: &EvidencePackArgs) -> ExitCode {
+    let report = match std::fs::File::open(&args.file)
+        .map_err(|e| (2, format!("tracelane-audit: error: {e}")))
+        .and_then(|file| verify_action_zip(file, args.pubkey.as_deref(), &args.tsa_cert, None))
+    {
+        Ok(report) => report,
+        Err((code, message)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
+    };
+    let written = evidence_pack::shipped_map()
+        .and_then(|map| evidence_pack::render(&map, &report))
+        .and_then(|pack| evidence_pack::write(&args.out, &pack));
+    if let Err(e) = written {
+        eprintln!("tracelane-audit: error: {e:#}");
+        return ExitCode::from(2);
+    }
+    println!("{report}");
+    println!(
+        "evidence pack written to {} ({}); a mapping only, not an assessment",
+        args.out.display(),
+        evidence_pack::FILES.join(", ")
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_action_bundle(args: &VerifyArgs) -> Option<ExitCode> {
+    if (args.pubkey.is_some() || !args.tsa_cert.is_empty() || args.max_gap.is_some())
+        && args.file.is_none()
+    {
+        eprintln!(
+            "--pubkey, --tsa-cert and --max-gap require --file; action bundles verify offline"
+        );
+        return Some(ExitCode::from(2));
+    }
+    let path = args.file.as_ref()?;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return None, // Preserve the legacy I/O diagnostic path.
+    };
+    // Exactly four magic bytes, without seeking or reopening a FIFO/stdin.
+    let mut prefix = Vec::with_capacity(4);
+    if let Err(e) = Read::by_ref(&mut file).take(4).read_to_end(&mut prefix) {
+        eprintln!("tracelane-audit: error: {e}");
+        return Some(ExitCode::from(2));
+    }
+    let is_zip = prefix == b"PK\x03\x04"
+        || prefix == b"PK\x05\x06"
+        || prefix == b"PK\x07\x08"
+        || path.extension().is_some_and(|e| e == "zip");
+    if !is_zip {
+        if args.pubkey.is_some() || !args.tsa_cert.is_empty() || args.max_gap.is_some() {
+            eprintln!("--pubkey, --tsa-cert and --max-gap require an action ZIP");
+            return Some(ExitCode::from(4));
+        }
+        // Replay the sniffed bytes into the unchanged legacy verifier.
+        let reader = BufReader::new(Cursor::new(prefix).chain(file));
+        return Some(match run_verify_source(args, Some(Box::new(reader))) {
             Ok(report) => Verdict::of(&report).exit_code(),
             Err(e) => {
                 eprintln!("tracelane-audit: error: {e:#}");
                 ExitCode::from(2)
             }
-        },
+        });
     }
+    if file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() > MAX_BUNDLE_BYTES)
+    {
+        eprintln!("FAIL (4): action bundle exceeds {MAX_BUNDLE_BYTES} byte limit");
+        return Some(ExitCode::from(4));
+    }
+    let reader = Cursor::new(prefix).chain(file);
+    Some(
+        match verify_action_zip(reader, args.pubkey.as_deref(), &args.tsa_cert, args.max_gap) {
+            Ok(report) => {
+                match args.format {
+                    OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return Some(ExitCode::from(2));
+                        }
+                    },
+                    OutputFormat::Text => println!("{report}"),
+                };
+                ExitCode::SUCCESS
+            }
+            Err((code, message)) => {
+                eprintln!("{message}");
+                ExitCode::from(code)
+            }
+        },
+    )
+}
+
+/// The one offline action-bundle verify, shared by `verify` and `evidence-pack`.
+///
+/// # Errors
+/// Fails CLOSED with the exit code and the stderr line: 4 format, 5 trust, 6 semantics.
+fn verify_action_zip(
+    reader: impl Read,
+    pubkey: Option<&Path>,
+    tsa_cert: &[PathBuf],
+    max_gap_secs: Option<u64>,
+) -> std::result::Result<tracelane_audit_verifier::action::bundle::Report, (u8, String)> {
+    let raw = read_bundle(reader).map_err(|e| (4, format!("FAIL (4): {e}")))?;
+    let pin = pubkey
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .context("read external --pubkey")
+                .and_then(|s| decode_pubkey32(&s))
+        })
+        .transpose()
+        .map_err(|e| (5, format!("TRUST FAIL: {e}")))?;
+    let tsa_pins = tsa_cert
+        .iter()
+        .map(std::fs::read)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| (5, format!("TRUST FAIL: cannot read --tsa-cert: {e}")))?;
+    if !tsa_pins
+        .iter()
+        .all(|p| tracelane_audit_verifier::action::timestamp::validate_pin(p).is_ok())
+    {
+        return Err((
+            5,
+            "TRUST FAIL: --tsa-cert is not a PEM or DER X.509 certificate".into(),
+        ));
+    }
+    tracelane_audit_verifier::action::bundle::verify_with_options(
+        &raw,
+        pin,
+        &tsa_pins,
+        max_gap_secs.map(std::time::Duration::from_secs),
+    )
+    .map_err(|e| (e.code, format!("FAIL ({}): {}", e.code, e.detail)))
+}
+
+// Local resource bound for untrusted ZIP input, independent of plan entitlements.
+use tracelane_audit_verifier::action::archive::MAX_BUNDLE_BYTES;
+fn read_bundle(reader: impl Read) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    reader.take(MAX_BUNDLE_BYTES + 1).read_to_end(&mut raw)?;
+    anyhow::ensure!(
+        raw.len() as u64 <= MAX_BUNDLE_BYTES,
+        "action bundle exceeds {MAX_BUNDLE_BYTES} byte limit"
+    );
+    Ok(raw)
 }
 
 fn run_verify(args: VerifyArgs) -> Result<VerifyReport> {
+    run_verify_source(&args, None)
+}
+fn run_verify_source(args: &VerifyArgs, source: Option<Box<dyn BufRead>>) -> Result<VerifyReport> {
     // ── Source the NDJSON (file or HTTP fetch) ────────────────────────
     let ledger_path: PathBuf = match args.file.clone() {
         Some(path) => {
             eprintln!("tracelane-audit: verifying local file {}", path.display());
             path
         }
-        None => fetch_audit_range(&args).context("fetch /v1/audit/export")?,
+        None => fetch_audit_range(args).context("fetch /v1/audit/export")?,
     };
 
     // ── Build VerifyOptions ───────────────────────────────────────────
@@ -319,7 +681,11 @@ fn run_verify(args: VerifyArgs) -> Result<VerifyReport> {
     }
 
     // ── Verify ────────────────────────────────────────────────────────
-    let report = verify_ledger(&ledger_path, &opts).context("verify_ledger")?;
+    let report = match source {
+        Some(reader) => verify_ledger_reader(reader, &ledger_path.display().to_string(), &opts),
+        None => verify_ledger(&ledger_path, &opts),
+    }
+    .context("verify_ledger")?;
 
     // ── Render ────────────────────────────────────────────────────────
     match args.format {
@@ -573,6 +939,9 @@ mod tests {
             read_key: None,
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
+            pubkey: None,
+            tsa_cert: Vec::new(),
+            max_gap: None,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -608,6 +977,7 @@ mod tests {
                 rows_seen: 2,
                 hash_chain_valid: true,
                 signatures_valid: true,
+                batch_signatures_verified: 1,
                 rekor_anchors_seen: 1,
                 rekor_anchors_resolved: 1,
                 anchors_included: 1,
@@ -686,6 +1056,9 @@ mod tests {
             read_key: None,
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
+            pubkey: None,
+            tsa_cert: Vec::new(),
+            max_gap: None,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -742,6 +1115,9 @@ mod tests {
             read_key: None,
             file: Some(tmp.path().to_path_buf()),
             rekor_url: "http://localhost:0".into(),
+            pubkey: None,
+            tsa_cert: Vec::new(),
+            max_gap: None,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -769,6 +1145,9 @@ mod tests {
             read_key: None,
             file: Some(PathBuf::from("/dev/null")),
             rekor_url: "http://localhost:0".into(),
+            pubkey: None,
+            tsa_cert: Vec::new(),
+            max_gap: None,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -824,5 +1203,198 @@ mod tests {
             urlencode("00000000-0000-0000-0000-00000000000a"),
             "00000000-0000-0000-0000-00000000000a"
         );
+    }
+    #[test]
+    fn tsa_pin_requires_local_file() {
+        let Command::Verify(args) =
+            Cli::try_parse_from(["tracelane-audit", "verify", "--tsa-cert", "synthetic.der"])
+                .unwrap()
+                .command
+        else {
+            panic!("verify subcommand expected");
+        };
+        assert_eq!(run_action_bundle(&args), Some(ExitCode::from(2)));
+    }
+    #[test]
+    fn tsa_pin_requires_action_zip() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"{}").unwrap();
+        let Command::Verify(args) = Cli::try_parse_from([
+            "tracelane-audit",
+            "verify",
+            "--tsa-cert",
+            "synthetic.der",
+            "--file",
+            temp.path().to_str().unwrap(),
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("verify subcommand expected");
+        };
+        assert_eq!(run_action_bundle(&args), Some(ExitCode::from(4)));
+    }
+    // AUD-06: a 5-row ledger and two signed checkpoints (sizes 3 and 5), files only.
+    fn tree_fixture(dir: &Path) -> String {
+        let workspace = Uuid::from_u128(6);
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[6; 32]).unwrap();
+        let pin: [u8; 32] = ring::signature::KeyPair::public_key(&key)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let ledger: String = (0u8..5)
+            .map(|i| {
+                let hash = hex::encode([i; 32]);
+                format!("{{\"seq\":{i},\"row_hash\":\"{hash}\"}}\n")
+            })
+            .collect();
+        let leaves = tree::ledger_leaves(ledger.as_bytes()).unwrap();
+        let origin = tree::origin(workspace);
+        for (name, size) in [("old.note", 3), ("new.note", 5)] {
+            let body = tree::checkpoint_body(&origin, size as u64, &tree::root(&leaves[..size]));
+            let signature = key.sign(body.as_bytes());
+            let note = tree::signed_note(&body, &origin, &pin, signature.as_ref());
+            std::fs::write(dir.join(name), note).unwrap();
+        }
+        std::fs::write(dir.join("ledger.ndjson"), ledger).unwrap();
+        std::fs::write(dir.join("pin.txt"), hex::encode(pin)).unwrap();
+        std::fs::write(dir.join("other.txt"), hex::encode([9u8; 32])).unwrap();
+        workspace.to_string()
+    }
+    /// Run a tree subcommand; `@name` arguments resolve inside `dir`.
+    fn tree_run(dir: &Path, args: &[&str]) -> Result<String, TreeFailure> {
+        let args = args.iter().map(|a| match a.strip_prefix('@') {
+            Some(file) => dir.join(file).to_str().unwrap().to_owned(),
+            None => (*a).to_owned(),
+        });
+        match Cli::try_parse_from(std::iter::once("tracelane-audit".to_owned()).chain(args))
+            .unwrap()
+            .command
+        {
+            Command::VerifyInclusion(args) => verify_inclusion(&args),
+            Command::VerifyConsistency(args) => verify_consistency(&args),
+            Command::Verify(_) | Command::EvidencePack(_) => {
+                unreachable!("tree fixture runs tree subcommands only")
+            }
+        }
+    }
+    const INCLUSION: [&str; 5] = [
+        "verify-inclusion",
+        "--checkpoint",
+        "@new.note",
+        "--ledger",
+        "@ledger.ndjson",
+    ];
+    const CONSISTENCY: [&str; 5] = [
+        "verify-consistency",
+        "--old",
+        "@old.note",
+        "--new",
+        "@new.note",
+    ];
+    #[test]
+    fn tree_proofs_verify_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tree_fixture(dir.path());
+        let trust = ["--pubkey", "@pin.txt", "--workspace", ws.as_str()];
+        let run = |args: &[&str]| tree_run(dir.path(), &[args, &trust[..]].concat());
+        let out = run(&[&INCLUSION[..], &["--index", "3"]].concat()).unwrap();
+        assert!(
+            out.starts_with("PASS — row 3 is included in the signed tree of size 5"),
+            "{out}"
+        );
+        // The printed proof, saved to a file, verifies without the ledger.
+        let proof: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(proof.len(), 3, "{out}");
+        std::fs::write(dir.path().join("proof.txt"), proof.join("\n")).unwrap();
+        let row = hex::encode([3u8; 32]);
+        run(&[
+            &INCLUSION[..3],
+            &["--index", "3", "--row-hash", &row, "--proof", "@proof.txt"],
+        ]
+        .concat())
+        .unwrap();
+        // A longer ledger still proves a row against the earlier, smaller checkpoint.
+        run(&[
+            "verify-inclusion",
+            "--checkpoint",
+            "@old.note",
+            "--index",
+            "2",
+            "--ledger",
+            "@ledger.ndjson",
+        ])
+        .unwrap();
+        let out = run(&[&CONSISTENCY[..], &["--ledger", "@ledger.ndjson"]].concat()).unwrap();
+        assert!(
+            out.starts_with("PASS — signed tree of size 5 extends the signed tree of size 3"),
+            "{out}"
+        );
+        let proof: Vec<&str> = out.lines().skip(1).collect();
+        std::fs::write(dir.path().join("consistency.txt"), proof.join("\n")).unwrap();
+        run(&[&CONSISTENCY[..], &["--proof", "@consistency.txt"]].concat()).unwrap();
+    }
+    #[test]
+    fn tree_proofs_refuse_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tree_fixture(dir.path());
+        let code = |args: &[&str], pin: &str, ws: &str| {
+            let trust = ["--pubkey", pin, "--workspace", ws];
+            tree_run(dir.path(), &[args, &trust[..]].concat())
+                .unwrap_err()
+                .0
+        };
+        // A row hash that is not the row at that index.
+        let absent = hex::encode([7u8; 32]);
+        let wrong_row = [&INCLUSION[..], &["--index", "3", "--row-hash", &absent]].concat();
+        assert_eq!(code(&wrong_row, "@pin.txt", &ws), 4);
+        // An index outside the signed tree, even though the ledger file is longer.
+        let outside = [
+            "verify-inclusion",
+            "--checkpoint",
+            "@old.note",
+            "--ledger",
+            "@ledger.ndjson",
+            "--index",
+            "4",
+        ];
+        assert_eq!(code(&outside, "@pin.txt", &ws), 4);
+        // Another key, and another workspace, are trust failures.
+        let at3 = [&INCLUSION[..], &["--index", "3"]].concat();
+        assert_eq!(code(&at3, "@other.txt", &ws), 5);
+        assert_eq!(code(&at3, "@pin.txt", &Uuid::from_u128(7).to_string()), 5);
+        // A valid proof for row 2 does not verify for row 3.
+        let ledger = std::fs::read(dir.path().join("ledger.ndjson")).unwrap();
+        let proof = tree::inclusion_proof(&tree::ledger_leaves(&ledger).unwrap(), 2).unwrap();
+        std::fs::write(
+            dir.path().join("proof.txt"),
+            proof_text(&proof).trim_start(),
+        )
+        .unwrap();
+        let row = hex::encode([3u8; 32]);
+        let stale = [
+            &INCLUSION[..3],
+            &["--index", "3", "--row-hash", &row, "--proof", "@proof.txt"],
+        ]
+        .concat();
+        assert_eq!(code(&stale, "@pin.txt", &ws), 4);
+        // Swapped checkpoints: the "new" tree is smaller than the "old" one.
+        let swapped = [
+            "verify-consistency",
+            "--old",
+            "@new.note",
+            "--new",
+            "@old.note",
+            "--ledger",
+            "@ledger.ndjson",
+        ];
+        assert_eq!(code(&swapped, "@pin.txt", &ws), 4);
+        // A rewritten early row: the ledger no longer reproduces the signed roots.
+        let text = String::from_utf8(ledger).unwrap();
+        let rewritten = text.replacen("0101", "0f0f", 1);
+        assert_ne!(rewritten, text);
+        std::fs::write(dir.path().join("ledger.ndjson"), rewritten).unwrap();
+        let args = [&CONSISTENCY[..], &["--ledger", "@ledger.ndjson"]].concat();
+        assert_eq!(code(&args, "@pin.txt", &ws), 4);
     }
 }

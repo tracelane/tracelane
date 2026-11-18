@@ -39,7 +39,7 @@ const program = new Command();
 
 program
 	.name("tlane")
-	.description("Tracelane CLI — the flight recorder for AI agents")
+	.description("Tracelane CLI — rules and human approval for AI agent actions")
 	.version(version);
 
 registerInitCommand(program);

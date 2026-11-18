@@ -23,11 +23,37 @@ type Verb = "GET" | "PUT" | "POST" | "PATCH" | "DELETE";
  * Every gateway route the dashboard's generic control proxy may reach, as
  * `[verb, path pattern]`. `*` is exactly one path segment. A route that is not here is
  * refused 404 BEFORE a token is minted — the proxy is a typed relay, not a tunnel.
- * The OG-11/12/30 slot routes (routing, guardrail policy) are listed read-only so a slot
- * page can show what the route answers; the OG-51 cache and OG-50 OTel export routes carry
- * their writes too, because those pages are real editors.
+ * Routing, guardrail policy, cache and OTel export have editors. Only their exact
+ * write paths are listed here.
  */
 export const CONTROL_PROXY_ROUTES: readonly (readonly [Verb, string])[] = [
+	["GET", "mcp-servers"],
+	["POST", "mcp-servers"],
+	["GET", "mcp-servers/*"],
+	["PATCH", "mcp-servers/*"],
+	["DELETE", "mcp-servers/*"],
+	["POST", "mcp-servers/*/test"],
+	["GET", "mcp-policy"],
+	["PUT", "mcp-policy"],
+	["GET", "mcp-policy/preview"],
+	["GET", "mcp-tool-rules"],
+	["POST", "mcp-tool-rules"],
+	["DELETE", "mcp-tool-rules/*"],
+	["GET", "mcp-tools"],
+	["POST", "mcp-tools/approve"],
+	["DELETE", "mcp-tools/*/*"],
+	["GET", "approvals"],
+	["GET", "approvals/*"],
+	["POST", "approvals/*/approve"],
+	["POST", "approvals/*/deny"],
+	["GET", "approvals/settings"],
+	["PUT", "approvals/settings"],
+	["GET", "approval-rules"],
+	["POST", "approval-rules"],
+	["DELETE", "approval-rules/*"],
+	["GET", "data-controls"],
+	["PUT", "data-controls/retention"],
+	["PATCH", "keys/*"],
 	["GET", "controls"],
 	["PUT", "controls/policy"],
 	["POST", "controls/pause"],
@@ -50,6 +76,7 @@ export const CONTROL_PROXY_ROUTES: readonly (readonly [Verb, string])[] = [
 	["GET", "audit/control-changes"],
 	// Slot reads (OG-11/12 routing, OG-51 cache, OG-50 OTel export).
 	["GET", "routing"],
+	["PUT", "routing"],
 	["GET", "cache"],
 	["PUT", "cache/settings"],
 	["POST", "cache/invalidate"],
@@ -59,6 +86,12 @@ export const CONTROL_PROXY_ROUTES: readonly (readonly [Verb, string])[] = [
 	["DELETE", "exports/otel/*"],
 	["POST", "exports/otel/*/test"],
 	["GET", "guardrails/policy"],
+	["PUT", "guardrails/policy"],
+	// Guardrail integrations: a key or signing secret rides once in the PUT body and is
+	// never returned by the gateway.
+	["GET", "guardrails/hooks"],
+	["PUT", "guardrails/hooks/*"],
+	["DELETE", "guardrails/hooks/*"],
 ];
 
 /**
@@ -84,14 +117,21 @@ export function isProxiedControlRoute(verb: string, path: string): boolean {
 
 /** Feature-detected slots: shown in the Gateway tab strip only when the route answers. */
 export const GATEWAY_SLOTS = [
-	{ id: "routing", label: "Routing", probe: "routing", spec: "OG-11 / OG-12" },
-	{ id: "cache", label: "Cache", probe: "cache", spec: "OG-51" },
-	{ id: "otel", label: "OTel export", probe: "exports/otel", spec: "OG-50" },
+	{ id: "mcp", label: "MCP tools", probe: "mcp-policy" },
+	{ id: "approvals", label: "Approvals", probe: "approvals" },
+	{ id: "data-controls", label: "Data controls", probe: "data-controls" },
+	{ id: "routing", label: "Routing", probe: "routing" },
+	{ id: "cache", label: "Cache", probe: "cache" },
+	{ id: "otel", label: "OTel export", probe: "exports/otel" },
 	{
 		id: "guardrails",
 		label: "Guardrail policy",
 		probe: "guardrails/policy",
-		spec: "OG-30",
+	},
+	{
+		id: "guardrail-integrations",
+		label: "Guardrail integrations",
+		probe: "guardrails/hooks",
 	},
 ] as const;
 export type GatewaySlot = (typeof GATEWAY_SLOTS)[number];
@@ -169,6 +209,14 @@ export function describeRefusal(
 				"This workspace requires an SSO sign-in for admin actions. Sign in through your identity provider and retry.",
 		};
 	}
+	if (status === 403 && code === "separation_required") {
+		return {
+			kind: "forbidden",
+			code,
+			message:
+				"You created this agent key or published this policy, so you can't approve it.",
+		};
+	}
 	if (status === 403) {
 		const need = str(body?.required_role);
 		return {
@@ -198,6 +246,31 @@ export function describeRefusal(
 				(secs === null
 					? "Too many admin changes in a short time. Wait a moment and retry."
 					: `Too many admin changes in a short time. Retry in ${secs}s.`),
+		};
+	}
+	if (status === 409 && code === "approval_expired") {
+		return { kind: "conflict", code, message: "This request expired." };
+	}
+	if (status === 409 && code === "descriptor_expired") {
+		return {
+			kind: "conflict",
+			code,
+			message:
+				"This request's details are past retention, so it can no longer be approved.",
+		};
+	}
+	if (status === 409 && code === "descriptor_mismatch") {
+		return {
+			kind: "conflict",
+			code,
+			message: "This request changed. Review it again.",
+		};
+	}
+	if (status === 400 && code === "descriptor_unsupported") {
+		return {
+			kind: "invalid",
+			code,
+			message: "This request can't be decided from this view.",
 		};
 	}
 	if (status === 409) {

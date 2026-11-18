@@ -36,6 +36,7 @@ fn who(auth_method: AuthMethod, role: Option<Role>) -> Claims {
         budget_usd_monthly: None,
         rate_limit_rpm: None,
         budget_reset: crate::spend::BudgetReset::Monthly,
+        key_capture: None,
         governance: None,
     }
 }

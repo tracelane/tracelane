@@ -1,0 +1,346 @@
+{
+  "module": "crates/gateway/src/mcp_routes.rs",
+  "operations": {
+    "GET /v1/action-authority": {
+      "module": "crates/gateway/src/mcp_routes.rs",
+      "summary": "Whether action control is on for the workspace and which protected tools hold authority, optionally as of a past instant.",
+      "tags": [
+        "action-control"
+      ],
+      "parameters": [
+        {
+          "name": "as_of",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The authority register for the workspace.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "as_of_invalid (not RFC 3339), as_of_in_future, or as_of_too_recent (newer than the register's minimum age, a setting).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "register_unavailable: the entitlement or control-plane read failed; never reported as \"off\".",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "as_of_invalid",
+        "as_of_in_future",
+        "as_of_too_recent",
+        "register_unavailable"
+      ],
+      "x-error-modules": [
+        "crates/gateway/src/action_control/authority.rs"
+      ]
+    },
+    "GET /v1/action-policies": {
+      "module": "crates/gateway/src/action_control/policy_api.rs",
+      "summary": "The active policy (tool, contract and policy versions and hashes, publisher) for every protected tool in the workspace.",
+      "tags": [
+        "action-control"
+      ],
+      "responses": {
+        "200": {
+          "description": "`policies`: one entry per protected tool with an active policy.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "evidence_unavailable"
+      ]
+    },
+    "GET /v1/action-policies/{tool_ref}": {
+      "module": "crates/gateway/src/action_control/policy_api.rs",
+      "summary": "One protected tool's active policy with its contract and policy bodies, and its version history.",
+      "tags": [
+        "action-control"
+      ],
+      "parameters": [
+        {
+          "name": "tool_ref",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The active policy and its versions, newest first.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "policy_not_found (also for a tool_ref that is not a UUID).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "policy_not_found",
+        "evidence_unavailable"
+      ]
+    },
+    "POST /v1/action-policies": {
+      "module": "crates/gateway/src/action_control/policy_api.rs",
+      "summary": "Publish a new version of a protected tool's policy (human session only; versions must increase).",
+      "tags": [
+        "action-control"
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "201": {
+          "description": "The activated policy version.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_policy_request.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "403": {
+          "description": "forbidden: not a human session, or the caller cannot edit policies.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "mcp_server_not_found.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "409": {
+          "description": "action_control_disabled, policy_conflict or policy_version_must_increase.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "422": {
+          "description": "policy_invalid or contract_invalid.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable; any unlisted failure also fails closed as 503.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_policy_request",
+        "forbidden",
+        "mcp_server_not_found",
+        "action_control_disabled",
+        "policy_conflict",
+        "policy_version_must_increase",
+        "policy_invalid",
+        "contract_invalid",
+        "evidence_unavailable"
+      ]
+    },
+    "GET /v1/actions": {
+      "module": "crates/gateway/src/action_control/timeline.rs",
+      "summary": "Protected actions, newest first: every proposal plus runtime denials that have no proposal.",
+      "tags": [
+        "action-control"
+      ],
+      "parameters": [
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          },
+          "description": "Page size; clamped to the configured maximum list page size."
+        },
+        {
+          "name": "before",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "A page of action heads.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_request (limit or before is not a non-negative integer).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "409": {
+          "description": "action_control_disabled.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_request",
+        "action_control_disabled",
+        "evidence_unavailable"
+      ]
+    },
+    "GET /v1/actions/{action_id}": {
+      "module": "crates/gateway/src/action_control/timeline.rs",
+      "summary": "One protected action's timeline from the canonical ledger rows, with its approval descriptor.",
+      "tags": [
+        "action-control"
+      ],
+      "parameters": [
+        {
+          "name": "action_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The action's events and status.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "action_not_found (also for an action_id that is not a UUID).",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "409": {
+          "description": "action_control_disabled.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "action_not_found",
+        "action_control_disabled",
+        "evidence_unavailable"
+      ]
+    },
+    "PUT /v1/mcp-servers/{id}/receipt-key": {
+      "module": "crates/gateway/src/action_control/receipt_keys.rs",
+      "summary": "Register or rotate the Ed25519 key a tool server countersigns protected receipts with. The key is recorded in the action ledger.",
+      "tags": [
+        "action-control"
+      ],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "requestBody": {
+        "type": "object"
+      },
+      "responses": {
+        "200": {
+          "description": "`server_id` and the `receipt_key_id` (SHA-256 of the key) now in force.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "400": {
+          "description": "invalid_receipt_key: the body is not exactly `{\"public_key\": <64 lowercase hex characters>}`, or the key is the gateway's own attestation key.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "404": {
+          "description": "mcp_server_not_found.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "409": {
+          "description": "action_control_disabled.",
+          "schema": {
+            "type": "object"
+          }
+        },
+        "503": {
+          "description": "evidence_unavailable; any unlisted failure also fails closed as 503.",
+          "schema": {
+            "type": "object"
+          }
+        }
+      },
+      "x-error-codes": [
+        "invalid_receipt_key",
+        "mcp_server_not_found",
+        "action_control_disabled",
+        "evidence_unavailable"
+      ]
+    }
+  }
+}

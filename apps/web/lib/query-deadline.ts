@@ -46,16 +46,55 @@ interface CacheEntry {
 	servedAt: number;
 }
 
-/**
- * Last-known-good cache. Process-local and intentionally unbounded-by-time
- * but bounded by the number of distinct dashboard query shapes (small). A
- * stale entry is strictly better than a spinner under FT-07.
- */
+/** Process-local fallback cache policy for dashboard and trace streams. */
+export const DEADLINE_CACHE_LIMITS = {
+	maxEntries: 128,
+	maxAgeMs: 5 * 60_000,
+} as const;
+
+/** Last-known-good results, oldest insertion first. */
 const lastKnownGood = new Map<string, CacheEntry>();
+
+function cachedRows(key: string, now: number): CacheEntry | undefined {
+	const entry = lastKnownGood.get(key);
+	if (entry && now - entry.servedAt > DEADLINE_CACHE_LIMITS.maxAgeMs) {
+		lastKnownGood.delete(key);
+		return undefined;
+	}
+	return entry;
+}
+
+function saveRows(key: string, rows: unknown[], servedAt: number): void {
+	for (const [candidate, entry] of lastKnownGood) {
+		if (servedAt - entry.servedAt > DEADLINE_CACHE_LIMITS.maxAgeMs) {
+			lastKnownGood.delete(candidate);
+		}
+	}
+	lastKnownGood.delete(key);
+	while (lastKnownGood.size >= DEADLINE_CACHE_LIMITS.maxEntries) {
+		const oldest = lastKnownGood.keys().next().value;
+		if (oldest === undefined) break;
+		lastKnownGood.delete(oldest);
+	}
+	lastKnownGood.set(key, { rows, servedAt });
+}
 
 /** Test-only: clear the staleness cache between cases. */
 export function __resetDeadlineCacheForTests(): void {
 	lastKnownGood.clear();
+}
+
+export function __deadlineCacheStatsForTests(): {
+	entries: number;
+	rows: number;
+} {
+	return {
+		entries: lastKnownGood.size,
+		rows: [...lastKnownGood.values()].reduce(
+			(sum, entry) => sum + entry.rows.length,
+			0,
+		),
+	};
 }
 
 /**
@@ -78,7 +117,7 @@ export async function queryWithDeadline<Row>(
 	// The live query: refresh the cache on success. We keep a handle so the
 	// timeout branch can let it complete in the background.
 	const live = runQuery().then((rows) => {
-		lastKnownGood.set(opts.cacheKey, { rows, servedAt: now() });
+		saveRows(opts.cacheKey, rows, now());
 		return rows;
 	});
 
@@ -96,7 +135,7 @@ export async function queryWithDeadline<Row>(
 	// Deadline fired. Serve last-known-good; keep the query alive to warm the
 	// cache (swallow its error — the next request surfaces failures).
 	void live.catch(() => undefined);
-	const cached = lastKnownGood.get(opts.cacheKey);
+	const cached = cachedRows(opts.cacheKey, now());
 	return {
 		rows: (cached?.rows as Row[] | undefined) ?? [],
 		stale: true,
@@ -127,7 +166,7 @@ export function streamQueryWithDeadline<Row>(
 ): ReadableStream<Uint8Array> {
 	const now = opts.now ?? Date.now;
 	const encoder = new TextEncoder();
-	const cached = lastKnownGood.get(opts.cacheKey);
+	const cached = cachedRows(opts.cacheKey, now());
 
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
@@ -144,7 +183,7 @@ export function streamQueryWithDeadline<Row>(
 
 			runQuery()
 				.then((rows) => {
-					lastKnownGood.set(opts.cacheKey, { rows, servedAt: now() });
+					saveRows(opts.cacheKey, rows, now());
 					controller.enqueue(
 						encoder.encode(
 							sseFrame("full", { rows, stale: false, servedAt: now() }),

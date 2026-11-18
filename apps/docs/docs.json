@@ -67,6 +67,7 @@
               "diagnostics",
               "benchmarks",
               "predictive-guardrails",
+              "guardrail-policy",
               "providers",
               "audit-ledger",
               "byok",

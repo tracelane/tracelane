@@ -502,6 +502,7 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: Some(1),
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         };
         let _g = crate::auth::test_claims::Guard::set(claims);

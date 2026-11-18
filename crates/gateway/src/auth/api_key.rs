@@ -51,6 +51,7 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                     budget_usd_monthly,
                     rate_limit_rpm,
                     budget_reset,
+                    key_capture,
                     governance,
                     path,
                 } = auth;
@@ -96,6 +97,7 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                     // BILL-01 A3: same SELECT, same zero-extra-round-trip shape.
                     budget_reset,
                     // OG-20 / OG-23: same SELECT again.
+                    key_capture,
                     governance,
                 };
                 return Ok((claims, super::AuthPath::ApiKey(path)));
@@ -147,6 +149,7 @@ pub async fn validate(api_key: &str) -> Result<(Claims, super::AuthPath)> {
                 budget_usd_monthly: None,
                 rate_limit_rpm: None,
                 budget_reset: crate::spend::BudgetReset::Monthly,
+                key_capture: None,
                 governance: None,
             };
             return Ok((claims, super::AuthPath::Static));

@@ -21,7 +21,12 @@ import {
 	recordControlChange,
 	recordControlChangeFailed,
 } from "@/lib/control-change";
-import { isPrivilegedRole, listMemberships } from "@/lib/workos-org";
+import { prepareKeyRevocation } from "@/lib/gateway";
+import {
+	countsAsOwner,
+	isPrivilegedRole,
+	listMemberships,
+} from "@/lib/workos-org";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -90,9 +95,7 @@ export async function DELETE(
 		// ponytail: the concurrent route race is superseded by withOwnerMutation
 		// (2026-09-22). Remaining boundary: WorkOS writes outside these routes and
 		// ambiguous external failures cannot be rolled back by the Postgres lock.
-		const privilegedCount = members.filter((m) =>
-			isPrivilegedRole(m.role.slug),
-		).length;
+		const privilegedCount = members.filter((m) => countsAsOwner(m)).length;
 		if (isPrivilegedRole(target.role.slug) && privilegedCount <= 1) {
 			return NextResponse.json(
 				{
@@ -114,43 +117,51 @@ export async function DELETE(
 		);
 		if (!rec.ok) return rec.response;
 
-		const del = await fetch(
-			`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
-			{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
-		);
-		if (!del.ok) {
-			await recordControlChangeFailed("member.remove", membershipId, before);
-			return NextResponse.json(
-				{ error: "WorkOS removal failed" },
-				{ status: 502 },
-			);
-		}
-
-		// Revoke the removed member's `tlane_` keys (§3) so their next gateway
-		// request 401s. Best-effort: the membership + its sessions are already gone
-		// via WorkOS, so a revoke failure must not fail the removal (log + move on).
-		// Only keys minted by THIS user (minted_by = their WorkOS user id) are
-		// touched; pre-0011 keys with a NULL minter are unattributable and untouched.
+		// Keep the first sweep retryable, then sweep again after WorkOS deletion:
+		// keys minted while the external removal was pending must not survive it.
 		try {
+			const confirm = await prepareKeyRevocation(session.tenantId);
 			const [t] = await db
 				.select({ id: tenants.id })
 				.from(tenants)
 				.where(eq(tenants.workosOrgId, session.tenantId))
 				.limit(1);
-			if (t) {
-				await db
-					.update(apiKeys)
-					.set({ revokedAt: new Date() })
-					.where(
-						and(
-							eq(apiKeys.tenantId, t.id),
-							eq(apiKeys.mintedBy, target.user_id),
-							or(isNull(apiKeys.revokedAt), gt(apiKeys.revokedAt, sql`now()`)),
-						),
-					);
+			const revokeAndConfirm = async () => {
+				if (t)
+					await db
+						.update(apiKeys)
+						.set({ revokedAt: sql`now()` })
+						.where(
+							and(
+								eq(apiKeys.tenantId, t.id),
+								eq(apiKeys.mintedBy, target.user_id),
+								or(
+									isNull(apiKeys.revokedAt),
+									gt(apiKeys.revokedAt, sql`now()`),
+								),
+							),
+						);
+				await confirm();
+			};
+			await revokeAndConfirm();
+			const del = await fetch(
+				`${WORKOS}/user_management/organization_memberships/${encodeURIComponent(membershipId)}`,
+				{ method: "DELETE", headers: { Authorization: `Bearer ${key}` } },
+			);
+			if (!del.ok) {
+				await recordControlChangeFailed("member.remove", membershipId, before);
+				return NextResponse.json(
+					{ error: "WorkOS removal failed" },
+					{ status: 502 },
+				);
 			}
+			await revokeAndConfirm();
 		} catch {
-			console.error("[team/remove] api-key revoke failed for removed member");
+			await recordControlChangeFailed("member.remove", membershipId, before);
+			return NextResponse.json(
+				{ error: "key_revocation_unconfirmed" },
+				{ status: 503 },
+			);
 		}
 
 		return NextResponse.json({ removed: membershipId }, { status: 200 });
@@ -220,9 +231,7 @@ export async function PATCH(
 		// refused. Granting owner (member/viewer → owner) is always allowed.
 		const demotesOwner =
 			isPrivilegedRole(target.role.slug) && body.role !== "owner";
-		const privilegedCount = members.filter((m) =>
-			isPrivilegedRole(m.role.slug),
-		).length;
+		const privilegedCount = members.filter((m) => countsAsOwner(m)).length;
 		if (demotesOwner && privilegedCount <= 1) {
 			return NextResponse.json(
 				{

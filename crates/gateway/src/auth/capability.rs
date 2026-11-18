@@ -59,7 +59,7 @@ pub enum Capability {
     ManageAllKeys,
     /// Grant the `passthrough` scope (OG-08 H1).
     GrantPassthrough,
-    /// Read routing / guardrail policy (model aliases, failover, tool pins).
+    /// Read admin policy surfaces (model aliases, failover, tool pins).
     ViewPolicies,
     /// Change routing / guardrail / capture policy.
     EditPolicies,
@@ -92,6 +92,10 @@ pub enum Capability {
     /// matrix's `api_key` column — `edit_budgets`, `write_prompts` — so granting it is an
     /// admin decision: a key never holds more than its minter's role allows.
     GrantAdminScope,
+    /// Register MCP servers and change tool policy.
+    ManageMcp,
+    /// Decide pending human approvals. Never held by a tenant API key.
+    ApproveToolCalls,
 }
 
 /// One row of the matrix. `const`-constructible so [`MATRIX`] is data, not code.
@@ -167,6 +171,8 @@ pub const MATRIX: &[Row] = &[
     Row::new(Capability::ReadControlAudit,   "read_control_audit",   Y, N, N, N, N, N, Y),
     Row::new(Capability::ManageControls,     "manage_controls",      Y, N, N, N, N, N, Y),
     Row::new(Capability::GrantAdminScope,    "grant_admin_scope",    Y, N, N, N, N, N, Y),
+    Row::new(Capability::ManageMcp,          "manage_mcp",           Y, N, N, N, N, N, Y),
+    Row::new(Capability::ApproveToolCalls,   "approve_tool_calls",   Y, N, N, N, N, N, Y),
 ];
 
 /// Every row sits at its variant's index — a misplaced or missing row is a
@@ -178,7 +184,7 @@ const _: () = {
         i += 1;
     }
     assert!(
-        MATRIX.len() == Capability::GrantAdminScope as usize + 1,
+        MATRIX.len() == Capability::ApproveToolCalls as usize + 1,
         "MATRIX must have one row per Capability"
     );
 };
@@ -228,6 +234,7 @@ pub const fn scope_grant_capability(scope: tracelane_shared::api_scope::Scope) -
         S::Chat | S::Read | S::Ingest => Capability::MintKeys,
         S::Admin => Capability::GrantAdminScope,
         S::Passthrough => Capability::GrantPassthrough,
+        S::Mcp => Capability::ManageMcp,
     }
 }
 
@@ -342,20 +349,58 @@ use Method::{Delete, Get, Patch, Post, Put};
 /// THE control-route registry. One entry per (method, path); keep each on ONE line
 /// (the route-auth guard reads them).
 ///
-/// Its consumers are the guard (`scripts/ci/check-route-auth.py`, which parses this
-/// table) and the tests below — not the request path, which calls
-/// `require_control` with the capability inline. Hence no runtime reader.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The route-auth guard, tests, and MCP control dispatcher read this table.
+/// Other control handlers pass their listed capability to `require_control`.
 #[rustfmt::skip]
 pub const CONTROL_ROUTES: &[ControlRoute] = &[
+    cr(Get, "/v1/mcp-servers", C::ViewPolicies, None),
+    cr(Get, "/v1/mcp-servers/{id}", C::ViewPolicies, None),
+    cr(Post, "/v1/mcp-servers", C::ManageMcp, Some("mcp_server.create")),
+    cr(Patch, "/v1/mcp-servers/{id}", C::ManageMcp, Some("mcp_server.update")),
+    cr(Delete, "/v1/mcp-servers/{id}", C::ManageMcp, Some("mcp_server.archive")),
+    cr(Post, "/v1/mcp-servers/{id}/test", C::ManageMcp, None),
+    cr(Put, "/v1/mcp-servers/{id}/receipt-key", C::ManageMcp, Some("mcp_server.receipt_key.set")),
+    cr(Get, "/v1/mcp-policy", C::ViewPolicies, None),
+    cr(Put, "/v1/mcp-policy", C::ManageMcp, Some("mcp_policy.update")),
+    cr(Get, "/v1/mcp-policy/preview", C::ViewPolicies, None),
+    cr(Get, "/v1/mcp-tool-rules", C::ViewPolicies, None),
+    cr(Post, "/v1/mcp-tool-rules", C::ManageMcp, Some("mcp_tool_rule.create")),
+    cr(Delete, "/v1/mcp-tool-rules/{id}", C::ManageMcp, Some("mcp_tool_rule.delete")),
+    cr(Get, "/v1/mcp-tools", C::ViewPolicies, None),
+    cr(Get, "/v1/action-authority", C::ViewPolicies, None),
+    cr(Post, "/v1/mcp-tools/approve", C::ManageMcp, Some("mcp_tool.approve")),
+    cr(Delete, "/v1/mcp-tools/{server_id}/{tool_name}", C::ManageMcp, Some("mcp_tool.unpin")),
+    cr(Get, "/v1/approvals", C::ApproveToolCalls, None),
+    cr(Get, "/v1/approvals/{id}", C::ApproveToolCalls, None),
+    cr(Post, "/v1/approvals/{id}/approve", C::ApproveToolCalls, Some("approval.approve")),
+    cr(Post, "/v1/approvals/{id}/deny", C::ApproveToolCalls, Some("approval.deny")),
+    cr(Get, "/v1/actions", C::ApproveToolCalls, None),
+    cr(Get, "/v1/actions/{action_id}", C::ApproveToolCalls, None),
+    cr(Get, "/v1/approvals/settings", C::ManageMcp, None),
+    cr(Put, "/v1/approvals/settings", C::ManageMcp, Some("approval.settings.update")),
+    cr(Post, "/v1/principal-issuers", C::ManageSecurity, Some("principal_issuer.register")),
+    cr(Delete, "/v1/principal-issuers", C::ManageSecurity, Some("principal_issuer.delete")),
+    cr(Get, "/v1/action-policies", C::ViewPolicies, None),
+    cr(Get, "/v1/action-policies/{tool_ref}", C::ViewPolicies, None),
+    cr(Post, "/v1/action-policies", C::EditPolicies, Some("action_policy.activate")),
+    cr(Get, "/v1/approval-rules", C::ViewPolicies, None),
+    cr(Post, "/v1/approval-rules", C::ManageMcp, Some("approval_rule.create")),
+    cr(Delete, "/v1/approval-rules/{id}", C::ManageMcp, Some("approval_rule.delete")),
+
+    cr(Get, "/v1/data-controls", C::ViewSettings, None),
+    cr(Put, "/v1/data-controls/retention", C::EditPolicies, Some("workspace.retention.set")),
     cr(Get, "/v1/security/kms", C::ViewSettings, None),
     cr(Put, "/v1/security/kms", C::ManageSecurity, Some("security.kms.set")),
     cr(Post, "/v1/security/kms/migrate", C::ManageSecurity, Some("security.kms.migrate")),
     cr(Post, "/v1/security/kms/rewrap", C::ManageSecurity, Some("security.kms.rewrap")),
     cr(Delete, "/v1/security/kms", C::ManageSecurity, Some("security.kms.delete")),
+    cr(Get,    "/v1/guardrails/policy",                 C::ViewPolicies,       None),
     cr(Put,    "/v1/guardrails/policy",                 C::EditPolicies,       Some("guardrail.policy.set")),
     cr(Put, "/v1/guardrails/hooks/{id}", C::EditPolicies, Some("guardrail.hook.put")),
     cr(Delete, "/v1/guardrails/hooks/{id}", C::EditPolicies, Some("guardrail.hook.delete")),
+    // Discards derived cache entries only; authority remains in Postgres. The
+    // handler additionally requires human JWT auth (never machine credentials).
+    cr(Post,   "/v1/keys/invalidate-cache",             C::ViewKeys,           None),
     cr(Post,   "/v1/keys",                              C::MintKeys,           Some("api_key.create")),
     cr(Post,   "/v1/keys/{id}/rotate",                  C::ManageAllKeys,      Some("api_key.rotate")),
     cr(Patch,  "/v1/keys/{id}",                         C::MintKeys,           Some("api_key.update")),
@@ -424,6 +469,8 @@ pub const WEB_CONTROL_ACTIONS: &[(&str, Capability)] = &[
     ("member.invite.failed",        C::ManageTeam),
     ("member.invite_revoke",        C::ManageTeam),
     ("member.invite_revoke.failed", C::ManageTeam),
+    ("workspace.portal.generate",        C::ManageSecurity),
+    ("workspace.portal.generate.failed", C::ManageSecurity),
     ("workspace.rename",            C::ManageTeam),
     ("workspace.rename.failed",     C::ManageTeam),
     ("workspace.delete",            C::ManageTeam),
@@ -463,11 +510,12 @@ mod tests {
             budget_usd_monthly: None,
             rate_limit_rpm: None,
             budget_reset: crate::spend::BudgetReset::Monthly,
+            key_capture: None,
             governance: None,
         }
     }
 
-    const ALL: [Capability; 22] = [
+    const ALL: [Capability; 24] = [
         C::ReadTraces,
         C::ViewSpend,
         C::ViewSettings,
@@ -490,6 +538,8 @@ mod tests {
         C::ReadControlAudit,
         C::ManageControls,
         C::GrantAdminScope,
+        C::ManageMcp,
+        C::ApproveToolCalls,
     ];
 
     #[test]
@@ -500,6 +550,13 @@ mod tests {
             assert_eq!(c.row().cap, c);
             assert!(slugs.insert(c.slug()), "duplicate slug {}", c.slug());
         }
+    }
+
+    #[test]
+    fn og62_viewer_cannot_read_or_edit_policy() {
+        let viewer = principal(AuthMethod::JwtBearer, Some(Role::Viewer));
+        assert!(!viewer.can(C::ViewPolicies));
+        assert!(!viewer.can(C::EditPolicies));
     }
 
     #[test]
@@ -539,6 +596,8 @@ mod tests {
                 C::ManageAllKeys,
                 C::GrantPassthrough,
                 C::GrantAdminScope,
+                C::ManageMcp,
+                C::ApproveToolCalls,
                 C::ManageProviderKeys,
                 C::ReadControlAudit,
             ] {
@@ -574,6 +633,8 @@ mod tests {
             C::ManageAllKeys,
             C::GrantPassthrough,
             C::GrantAdminScope,
+            C::ManageMcp,
+            C::ApproveToolCalls,
             C::EditPolicies,
             C::EditProjects,
             C::ManageProviderKeys,
@@ -605,6 +666,9 @@ mod tests {
                     | "/v1/alerts/test"
                     | "/v1/controls/alert-channels/{id}/test"
                     | "/v1/exports/otel/{id}/test"
+                    | "/v1/mcp-servers/{id}/test"
+                    // Cache eviction changes no persisted controls or key grants.
+                    | "/v1/keys/invalidate-cache"
                     // OG-11: a dry run of the dispatch plan — nothing is written.
                     | "/v1/routing/simulate"
             );
@@ -618,31 +682,48 @@ mod tests {
         }
     }
 
-    /// No registered control route is reachable by a viewer or an unrecognised
-    /// slug — the control plane is never the least-privileged column's.
+    /// Viewers can read explicitly published settings, never mutate controls.
+    /// An unrecognised role cannot reach any registered control route.
     #[test]
     fn no_control_route_is_open_to_a_viewer_or_an_unrecognised_slug() {
         let viewer = principal(AuthMethod::JwtBearer, Some(Role::Viewer));
         let unknown = principal(AuthMethod::JwtBearer, None);
         for r in CONTROL_ROUTES {
-            // OG-37 (`specs/OG-37-external-kms-byok.md` §2): the KMS status READ is
-            // `ViewSettings` by design — every writing KMS route is `ManageSecurity`.
-            if r.method == Method::Get && r.path == "/v1/security/kms" {
-                continue;
-            }
-            assert!(
-                !viewer.can(r.cap),
-                "{:?} {} open to viewer",
-                r.method,
-                r.path
-            );
             assert!(
                 !unknown.can(r.cap),
                 "{:?} {} open to unknown slug",
                 r.method,
                 r.path
             );
+            // OG-37: KMS status exposes configuration status, never credentials.
+            let kms_status = r.path == "/v1/security/kms";
+            // OG-38 § Viewer privacy transparency: trace readers need capture/retention settings.
+            let privacy_settings = r.path == "/v1/data-controls";
+            // Recognized humans may discard their tenant's derived auth cache;
+            // this grants no authority to edit or revoke a stored key.
+            let cache_eviction = r.method == Method::Post && r.path == "/v1/keys/invalidate-cache";
+            let viewer_read =
+                (r.method == Method::Get && (kms_status || privacy_settings)) || cache_eviction;
+            assert_eq!(
+                viewer.can(r.cap),
+                viewer_read,
+                "{:?} {} viewer contract",
+                r.method,
+                r.path
+            );
         }
+    }
+
+    #[test]
+    fn portal_link_generation_requires_security_management() {
+        assert_eq!(
+            web_action_capability("workspace.portal.generate"),
+            Some(C::ManageSecurity)
+        );
+        assert_eq!(
+            web_action_capability("workspace.portal.generate.failed"),
+            Some(C::ManageSecurity)
+        );
     }
 
     #[test]

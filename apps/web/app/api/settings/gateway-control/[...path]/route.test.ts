@@ -157,6 +157,46 @@ describe("what the relay refuses before touching the gateway", () => {
 });
 
 describe("forwarding", () => {
+	it("relays the policy ETag from GET", async () => {
+		h.gw.mockResolvedValue(upstream(200, { policy: null }, { etag: '"abc"' }));
+		const res = await GET(
+			req("GET", "guardrails/policy"),
+			ctx("guardrails/policy"),
+		);
+		expect(res.headers.get("etag")).toBe('"abc"');
+	});
+	it("forwards the routing version only on the routing PUT", async () => {
+		h.gw.mockResolvedValue(upstream(200, { doc: {}, version: 8 }));
+		const res = await PUT(
+			req("PUT", "routing", {
+				body: '{"doc":{}}',
+				headers: { ...ours, "if-match": "7" },
+			}),
+			ctx("routing"),
+		);
+		expect(res.status).toBe(200);
+		expect(h.gw).toHaveBeenCalledWith("/v1/routing", {
+			method: "PUT",
+			headers: { "content-type": "application/json", "if-match": "7" },
+			body: '{"doc":{}}',
+		});
+	});
+	it("forwards a guardrail policy PUT with its ETag precondition", async () => {
+		h.gw.mockResolvedValue(upstream(200, { policy: { rails: {} } }));
+		const res = await PUT(
+			req("PUT", "guardrails/policy", {
+				body: '{"rails":{}}',
+				headers: { ...ours, "if-match": "7" },
+			}),
+			ctx("guardrails/policy"),
+		);
+		expect(res.status).toBe(200);
+		expect(h.gw).toHaveBeenCalledWith("/v1/guardrails/policy", {
+			method: "PUT",
+			headers: { "content-type": "application/json", "if-match": "7" },
+			body: '{"rails":{}}',
+		});
+	});
 	it("sends the verb, path and query with the user's body", async () => {
 		h.gw.mockResolvedValue(upstream(200, { items: [] }));
 		await GET(
