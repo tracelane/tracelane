@@ -1,0 +1,68 @@
+---
+classification: PUBLIC
+title: "Exported span attributes"
+description: "OpenTelemetry GenAI and OpenInference names, content controls, and missing values."
+---
+
+Gateway spans retain their existing GenAI attributes; successful model-call spans and
+enabled OTLP exports add OpenInference names.
+An enabled OTLP export uses the recorded values; it does not fetch missing request
+content or infer unrecorded values. Export availability depends on your workspace's
+export entitlement and destination settings.
+
+## Model calls
+
+| OpenInference attribute | Source |
+|---|---|
+| `openinference.span.kind` | Known operation type, such as `LLM`, `EMBEDDING`, `TOOL` or `AGENT`. An agent-name header alone does not make a model call an agent span. |
+| `llm.model_name` | Recorded response model when available; otherwise the requested model. |
+| `llm.request.model_name` | Requested model, also recorded as `gen_ai.request.model`. |
+| `llm.response.model_name` | Provider-reported response model, also recorded as `gen_ai.response.model`; absent when not reported. |
+| `llm.provider` | Recorded provider from `gen_ai.provider.name`. |
+| `llm.system` | Recorded API system from `gen_ai.system`. |
+| `llm.token_count.prompt` | Recorded input tokens, including known cached input tokens. |
+| `llm.token_count.completion` | Recorded output tokens from `gen_ai.usage.output_tokens`. |
+| `llm.token_count.total` | Prompt plus completion, only when both are known. |
+| `llm.token_count.prompt_details.cache_read` | Recorded cached input tokens read. |
+| `llm.token_count.prompt_details.cache_write` | Recorded input tokens written to the prompt cache. |
+| `llm.token_count.completion_details.reasoning` | Recorded reasoning tokens; these are already included in output usage and are not added again. |
+| `llm.invocation_parameters` | JSON text containing only recorded numeric `temperature`, `top_p`, `max_tokens`, and `seed`. Other request fields are not included. |
+
+Embedding spans use `embedding.model_name` rather than the LLM identification
+attributes. Other operation types receive a kind only when it is known. A provider
+name is not guessed from arbitrary metadata.
+
+Missing usage stays absent. A recorded zero remains zero. When a provider's input
+count excludes cached tokens, an inclusive prompt count requires recorded cache-read
+and cache-write components. If either is missing, the OpenInference prompt and total
+attributes are absent; the original GenAI input value remains available. Existing
+writer counts are not an independent guarantee that a provider reported usage.
+
+## Captured content
+
+For gateway-captured messages, an OTLP export with content enabled adds
+`input.value` and `output.value` as JSON text derived, at export time, from the same
+redacted, bounded messages as `gen_ai.input.messages` and `gen_ai.output.messages`,
+with `input.mime_type` and `output.mime_type` set to `application/json`. For MCP tool
+calls they are derived from the captured, redacted arguments and result: valid JSON
+is labeled `application/json`, other text `text/plain`. Tracelane does not store a
+second copy of captured content for these names, and they do not add to the bytes
+you are billed for. SDK-exported content keeps its recorded form, including plain
+text, and only an explicitly recorded supported MIME type is exported.
+
+A span already at the whole-span size limit omits the added metadata attributes; its
+existing GenAI fields are preserved.
+
+Input and output capture are separate opt-ins. An attribute is absent when capture
+is off for that direction or no content was recorded. Legacy captured messages
+retain their existing truncation markers. No MIME attribute is added without its
+corresponding value.
+
+A destination configured without content receives neither content naming form nor
+their MIME attributes. Exported spans also pass through redaction. This setting is
+not anonymization: recorded model names, identifiers and other reviewed metadata
+may still identify an operation.
+
+The attribute names follow the
+[OpenInference LLM span specification](https://github.com/Arize-ai/openinference/blob/9c181be6bf4cd16571a6c340f3713a9e42a6f45d/spec/spans/llm.md).
+No particular destination's UI rendering or delivery outcome is implied.

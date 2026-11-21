@@ -11,6 +11,7 @@ export default defineConfig({
 		"instrumentations/langgraph": "src/instrumentations/langgraph.ts",
 		"instrumentations/openai_agents": "src/instrumentations/openai_agents.ts",
 		"instrumentations/vercel_ai": "src/instrumentations/vercel_ai.ts",
+		"instrumentations/approvals": "src/instrumentations/approvals.ts",
 		"instrumentations/mcp": "src/instrumentations/mcp.ts",
 		"instrumentations/claude_code": "src/instrumentations/claude_code.ts",
 		"instrumentations/cursor": "src/instrumentations/cursor.ts",

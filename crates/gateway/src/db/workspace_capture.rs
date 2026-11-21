@@ -59,7 +59,7 @@ pub enum SetError {
 /// Propagates the statement error. The entitlement refresh treats it as capture OFF
 /// (fail-CLOSED: turning capture off is the privacy-safe direction).
 pub async fn get_with(
-    client: &tokio_postgres::Client,
+    client: &(impl tokio_postgres::GenericClient + Sync),
     tenant: &uuid::Uuid,
 ) -> Result<Option<WorkspaceCapture>> {
     let row = client
@@ -136,6 +136,26 @@ where
     let store = |ctx: &str, e: &dyn std::fmt::Display| SetError::Store(anyhow!("{ctx}: {e}"));
     let mut client = pool.get().await.map_err(|e| store("pool", &e))?;
     let tx = client.transaction().await.map_err(|e| store("begin", &e))?;
+    let outcome = set_in_tx(&tx, tenant_id, new, actor).await?;
+    if outcome.changed {
+        record(outcome.previous).await.map_err(SetError::Ledger)?;
+        tx.commit().await.map_err(|e| store("commit", &e))?;
+    }
+    Ok(outcome)
+}
+
+/// SQL and control audit only; caller must acknowledge the ledger before committing.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn set_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    new: WorkspaceCapture,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> std::result::Result<SetOutcome, SetError> {
+    let store = |ctx: &str, e: &dyn std::fmt::Display| SetError::Store(anyhow!("{ctx}: {e}"));
+    crate::db::controls::lock_config(tx, tenant_id)
+        .await
+        .map_err(SetError::Store)?;
     let tenant = tenant_id.as_uuid();
     let inserted = tx
         .query_opt(
@@ -159,7 +179,14 @@ where
         output: row.get(1),
     };
     if previous == new {
-        // Dropping `tx` rolls back — including a row this call materialised.
+        if inserted {
+            tx.execute(
+                "DELETE FROM workspace_content_capture WHERE tenant_id = $1",
+                &[tenant],
+            )
+            .await
+            .map_err(|e| store("restore absence", &e))?;
+        }
         return Ok(SetOutcome {
             previous,
             current: previous,
@@ -177,7 +204,7 @@ where
         .map_err(|e| store("update", &e))?
         .get(0);
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant_id,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -190,8 +217,6 @@ where
     )
     .await
     .map_err(|e| store("audit", &e))?;
-    record(previous).await.map_err(SetError::Ledger)?;
-    tx.commit().await.map_err(|e| store("commit", &e))?;
     Ok(SetOutcome {
         previous,
         current: new,
@@ -294,7 +319,7 @@ mod tests {
         assert_eq!(stored.setting, ON);
         assert!(stored.updated_at.is_some());
         let mut refreshed = WorkspaceCapture::default();
-        if let Some(w) = get_with(&client, &id).await.expect("refresh read") {
+        if let Some(w) = get_with(&**client, &id).await.expect("refresh read") {
             refreshed = w;
         }
         assert_eq!(refreshed, ON, "the refresh read sees the same row");

@@ -33,7 +33,9 @@ import type { LatencyBreakdown } from "@/lib/latency";
 import type { SessionSummary } from "@/lib/sessions";
 import { type TimeRange, windowParams } from "./time-range";
 
-type Win = Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs">;
+type Win = Pick<TimeRange, "sinceMs" | "untilMs" | "bucketMs"> & {
+	permissionErrors?: "throw";
+};
 
 type GlanceState = "ok" | "unavailable" | "over_cap" | "denied";
 export type WorkspaceGlanceResponse = {
@@ -103,11 +105,18 @@ export function fetchWorkspaceGlance(): Promise<WorkspaceGlanceResponse | null> 
 	);
 }
 
-async function orNull<T>(p: Promise<T>): Promise<T | null> {
+async function orNull<T>(
+	p: Promise<T>,
+	preservePermission = false,
+): Promise<T | null> {
 	try {
 		return await p;
 	} catch (err) {
-		if (err instanceof GatewayError) return null;
+		if (
+			err instanceof GatewayError &&
+			(!preservePermission || err.status !== 403)
+		)
+			return null;
 		throw err;
 	}
 }
@@ -138,7 +147,10 @@ export function fetchSloRows(
 	const q = windowParams(r, { bucket: true });
 	if (opts.provider) q.set("provider", opts.provider);
 	if (opts.model) q.set("model", opts.model);
-	return orNull(gatewayGet<SloRow[]>(url("/v1/slo", q)));
+	return orNull(
+		gatewayGet<SloRow[]>(url("/v1/slo", q)),
+		r.permissionErrors === "throw",
+	);
 }
 
 /**
@@ -158,7 +170,10 @@ export function fetchSloSummary(
 	const q = windowParams(r, { bucket: true });
 	if (opts.provider) q.set("provider", opts.provider);
 	if (opts.model) q.set("model", opts.model);
-	return orNull(gatewayGet<SloSummary>(url("/v1/slo/summary", q)));
+	return orNull(
+		gatewayGet<SloSummary>(url("/v1/slo/summary", q)),
+		r.permissionErrors === "throw",
+	);
 }
 
 /** `GET /v1/slo/models` — one merged row per (provider, model); bucket as above (B-500). */
@@ -187,6 +202,7 @@ export function fetchSloTimeseries(
 export function fetchGatewayStatsFor(r: Win): Promise<GatewayStats | null> {
 	return orNull(
 		gatewayGet<GatewayStats>(url("/v1/gateway/stats", windowParams(r))),
+		r.permissionErrors === "throw",
 	);
 }
 
@@ -210,7 +226,10 @@ export function fetchCostBreakdownFor(
 	q.set("hours", String(hoursOf(r)));
 	q.set("by", by);
 	if (scope) q.set("scope", scope);
-	return orNull(gatewayGet<CostBreakdown>(url("/v1/costs", q)));
+	return orNull(
+		gatewayGet<CostBreakdown>(url("/v1/costs", q)),
+		r.permissionErrors === "throw",
+	);
 }
 
 /** Defined only for streamed generations with a measured first-token time. */
@@ -235,6 +254,7 @@ export function fetchLatencyBreakdownFor(
 	q.set("hours", String(hoursOf(r)));
 	return orNull(
 		gatewayGet<LatencyBreakdown>(url("/v1/query/latency-breakdown", q)),
+		r.permissionErrors === "throw",
 	);
 }
 
@@ -265,7 +285,10 @@ export type ToolAnalytics = {
 export function fetchToolAnalyticsFor(r: Win): Promise<ToolAnalytics | null> {
 	const q = windowParams(r);
 	q.set("hours", String(hoursOf(r)));
-	return orNull(gatewayGet<ToolAnalytics>(url("/v1/query/tool-analytics", q)));
+	return orNull(
+		gatewayGet<ToolAnalytics>(url("/v1/query/tool-analytics", q)),
+		r.permissionErrors === "throw",
+	);
 }
 
 // ── guardrails ────────────────────────────────────────────────────────────────
@@ -274,7 +297,10 @@ export function fetchToolAnalyticsFor(r: Win): Promise<ToolAnalytics | null> {
 export function fetchGuardrailStatsFor(r: Win): Promise<GuardrailStats | null> {
 	const q = windowParams(r);
 	q.set("hours", String(hoursOf(r)));
-	return orNull(gatewayGet<GuardrailStats>(url("/v1/guardrails/stats", q)));
+	return orNull(
+		gatewayGet<GuardrailStats>(url("/v1/guardrails/stats", q)),
+		r.permissionErrors === "throw",
+	);
 }
 
 /** `GET /v1/guardrails/verdicts` — the decision-mix click-through. */
@@ -335,6 +361,7 @@ export function fetchSignaturesFor(
 					? d.total_traces_affected
 					: null,
 		})),
+		r.permissionErrors === "throw",
 	);
 }
 
@@ -381,5 +408,35 @@ export function fetchSessionsFor(
 		gatewayGet<{ sessions: SessionSummary[] }>(url("/v1/sessions", q)).then(
 			(d) => d.sessions,
 		),
+	);
+}
+
+export type ProviderFailureRow = {
+	provider: string;
+	failed: number;
+	rate_limited: number;
+	server_error: number;
+	other: number;
+	unknown: number;
+};
+export type ProviderFailuresData = {
+	totals: ProviderFailureRow & {
+		captured_spans: number;
+		recorded_spans: number;
+		capped_spans: number;
+		provider_count: number;
+	};
+	providers: ProviderFailureRow[];
+	truncated: boolean;
+	record_cap: number;
+};
+/** Recorded failures only; preserve forbidden reads for this panel's access state. */
+export function fetchProviderFailuresFor(
+	r: Win,
+): Promise<ProviderFailuresData | null> {
+	const q = windowParams(r);
+	return orNull(
+		gatewayGet<ProviderFailuresData>(url("/v1/query/provider-failures", q)),
+		true,
 	);
 }

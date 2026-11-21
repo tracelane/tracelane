@@ -59,6 +59,11 @@ pub(super) async fn classify_tx(
         // Validate preserved bytes before Value normalization can erase duplicates.
         arguments(mcp).map_err(|_| anyhow::anyhow!("invalid_protected_request"))?;
         mcp.protected.store(true, Ordering::Release);
+    } else if ac::policy_store::protected_elsewhere_tx(tx, claims, server.id, &server.url, tool)
+        .await?
+    {
+        // Audit H1: the same upstream is protected under another registration.
+        anyhow::bail!("mcp_tool_protected_elsewhere");
     }
     Ok(protected)
 }
@@ -220,6 +225,7 @@ fn refusal(err: anyhow::Error) -> Response {
         "principal_required" => "principal_required",
         "principal_invalid" => "principal_invalid",
         "principal_unverifiable" => "principal_unverifiable",
+        "receipt_key_conflict" => "receipt_key_conflict",
         "mcp_tool_definition_changed" => "mcp_tool_definition_changed",
         "idempotency_mismatch" => "idempotency_mismatch",
         "idempotency_key_required" => "idempotency_key_required",
@@ -248,7 +254,7 @@ fn refusal(err: anyhow::Error) -> Response {
             StatusCode::UNAUTHORIZED
         } else if matches!(
             code,
-            "protected_execution_unavailable" | "principal_unverifiable"
+            "protected_execution_unavailable" | "principal_unverifiable" | "receipt_key_conflict"
         ) {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -766,5 +772,23 @@ mod paused_refusal_tests {
     async fn refusal_keeps_other_codes_and_unknown_errors_503() {
         check("policy_denied", 409, "policy_denied").await;
         check("anything_else", 503, "protected_execution_unavailable").await;
+    }
+}
+
+#[cfg(test)]
+mod receipt_key_refusal_tests {
+    #[tokio::test]
+    async fn b634_http_conflict_code() {
+        let response = super::refusal(anyhow::anyhow!("receipt_key_conflict"));
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"], "receipt_key_conflict");
+        assert_eq!(value["message"], "receipt key conflict");
     }
 }

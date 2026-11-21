@@ -7,6 +7,7 @@ import {
 	workspaceKeyDate,
 } from "./AuditWorkflow";
 
+import { summarizeAudit } from "@/app/audit/answer";
 import {
 	type AuditVerdict,
 	deriveAuditVerdict,
@@ -18,6 +19,7 @@ import { formatDateTimeUtc, parseUtcMs } from "@/lib/format-date";
 import type { VerifyReport } from "@tracelanedev/audit-verifier";
 import { Button, cn } from "@tracelanedev/ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AuditAnswers } from "./AuditAnswers";
 
 export interface LedgerRange {
 	total: number;
@@ -519,6 +521,22 @@ export function AuditLedgerView({
 				: `${fmt(checkedRows)} rows checked · total unknown`
 			: undefined;
 	const outside = rangeValid ? rangeValid.total - rows.length : undefined;
+	const summary = summarizeAudit({
+		verdict: verifying ? { state: "ready" } : verdict,
+		hashChainValid: report ? report.hash_chain_valid : null,
+		platformVerified,
+		unanchoredTail: report?.rows_unanchored_tail ?? 0,
+		// chain_only is genesis-rooted: the hash chain was checked over every loaded row
+		// even though no anchor established trust, so "Unchanged?" must see those rows
+		// (#385 review M1). Every other untrusted state checked nothing it can vouch for.
+		checkedRows: report?.trust_established
+			? checkedRows
+			: verdict.state === "chain_only" && report?.hash_chain_valid
+				? report.rows_seen
+				: 0,
+		totalRows: rangeValid?.total,
+		readError: verifyError ? "failed" : undefined,
+	});
 	const empty = !ndjson.trim() && rangeValid?.total === 0;
 	const noWindowRows = !ndjson.trim() && !empty;
 	const publicBatches = anchoredRecords(anchors);
@@ -697,6 +715,7 @@ export function AuditLedgerView({
 										? "No new verdict is available. Retry the check, or reload the evidence if the problem continues."
 										: copy.detail}
 						</p>
+						{!empty && !noWindowRows && <AuditAnswers summary={summary} />}
 					</div>
 					<details className="mt-3 text-xs text-ink-2">
 						<summary className="cursor-pointer">
@@ -827,24 +846,34 @@ export function AuditLedgerView({
 				</div>
 			</section>
 
-			<AuditWorkflow
-				report={report}
-				rows={rows.length}
-				first={first}
-				last={last}
-				batches={anchors.length}
-				ledgerRange={rangeValid}
-				window={window}
-				empty={empty}
-				readError={verifyError || noWindowRows}
-				platformPubkeyB64={platformPubkeyB64}
-				platformKeySource={platformKeySource}
-				platformFingerprint={platformFingerprint}
-				workspaceFingerprint={workspaceFingerprint}
-				workspaceKeyCreatedAt={workspaceKeyCreatedAt}
-				workspaceKeySinceSeq={workspaceKeySinceSeq}
-				platformCrossCheck={platformCrossCheck}
-			/>
+			<details className="group surface-card" data-audit-steps>
+				<summary className="cursor-pointer select-none px-5 py-4 text-sm font-semibold">
+					How this was checked
+					<span className="ml-2 font-normal text-ink-3">
+						Collect · Link · Sign · Anchor
+					</span>
+				</summary>
+				<div className="px-2 pb-2">
+					<AuditWorkflow
+						report={report}
+						rows={rows.length}
+						first={first}
+						last={last}
+						batches={anchors.length}
+						ledgerRange={rangeValid}
+						window={window}
+						empty={empty}
+						readError={verifyError || noWindowRows}
+						platformPubkeyB64={platformPubkeyB64}
+						platformKeySource={platformKeySource}
+						platformFingerprint={platformFingerprint}
+						workspaceFingerprint={workspaceFingerprint}
+						workspaceKeyCreatedAt={workspaceKeyCreatedAt}
+						workspaceKeySinceSeq={workspaceKeySinceSeq}
+						platformCrossCheck={platformCrossCheck}
+					/>
+				</div>
+			</details>
 			<section className="space-y-3" aria-label="Your evidence">
 				<h2 className="text-base font-semibold">Your evidence</h2>
 				<Button variant="secondary" disabled={!report} onClick={saveReport}>

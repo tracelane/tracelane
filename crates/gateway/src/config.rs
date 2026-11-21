@@ -300,6 +300,8 @@ pub struct FileConfig {
     semantic_cache: Option<SemanticCacheConfig>,
     trace_content: Option<TraceContentConfig>,
     model_policy: Option<ModelPolicyConfig>,
+    /// GWY-80: the `sovereign:` block.
+    sovereign: Option<crate::sovereign::SovereignConfig>,
 }
 
 impl FileConfig {
@@ -409,6 +411,13 @@ pub fn semantic_cache() -> Option<&'static SemanticCacheConfig> {
 #[must_use]
 pub fn trace_content() -> Option<&'static TraceContentConfig> {
     CONFIG.get().and_then(|c| c.trace_content.as_ref())
+}
+
+/// GWY-80: the installed `sovereign:` block, or `None` when absent — which means no
+/// request is classified or confined, and spans carry no `tracelane_routing_*` fields.
+#[must_use]
+pub fn sovereign() -> Option<&'static crate::sovereign::SovereignConfig> {
+    CONFIG.get().and_then(|c| c.sovereign.as_ref())
 }
 
 /// The installed `model_policy:` block (`OBS-52`), or `None` when absent —
@@ -691,6 +700,11 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
     let mut seen_semantic_cache = false;
     let mut seen_trace_content = false;
     let mut seen_model_policy = false;
+    let mut seen_sovereign = false;
+    let mut sovereign_indent: Option<usize> = None;
+    let mut sv_providers: Option<(String, usize)> = None;
+    let mut sv_model: Option<(String, usize)> = None;
+    let mut sv_classes: Option<(String, usize)> = None;
     // Indent at which alias names sit. Fixed by the first alias line, so an
     // inconsistently-indented sibling is an error rather than a silent skip.
     let mut alias_indent: Option<usize> = None;
@@ -764,10 +778,17 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
                     seen_model_policy = true;
                     section = Section::ModelPolicy;
                 }
+                "sovereign:" => {
+                    if seen_sovereign {
+                        bail!("line {lineno}: duplicate `sovereign:` block");
+                    }
+                    seen_sovereign = true;
+                    section = Section::Sovereign;
+                }
                 other => bail!(
                     "line {lineno}: unsupported top-level key `{other}` — this reader \
                      understands only `models:`, `failover:`, `semantic_cache:`, \
-                     `trace_content:` and `model_policy:`"
+                     `trace_content:`, `model_policy:` and `sovereign:`"
                 ),
             }
             continue;
@@ -912,6 +933,34 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
                 }
                 continue;
             }
+            Section::Sovereign => {
+                let sv_at = *sovereign_indent.get_or_insert(indent);
+                if indent != sv_at {
+                    bail!(
+                        "line {lineno}: inconsistent indentation — `sovereign:` keys are \
+                         indented {sv_at} spaces, this line is indented {indent}"
+                    );
+                }
+                let (key, value) = content.split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "line {lineno}: expected `key: value` under `sovereign:`, found `{content}`"
+                    )
+                })?;
+                let value = scalar(value, lineno)?;
+                if value.is_empty() {
+                    bail!("line {lineno}: `{}` has an empty value", key.trim());
+                }
+                match key.trim() {
+                    "providers" => set_once(&mut sv_providers, "providers", value, lineno)?,
+                    "model" => set_once(&mut sv_model, "model", value, lineno)?,
+                    "classes" => set_once(&mut sv_classes, "classes", value, lineno)?,
+                    other => bail!(
+                        "line {lineno}: unsupported key `{other}` under `sovereign:` — only \
+                         `providers`, `model` and `classes` are read"
+                    ),
+                }
+                continue;
+            }
             Section::Models => {}
         }
 
@@ -999,12 +1048,26 @@ pub fn parse(src: &str) -> anyhow::Result<FileConfig> {
         None
     };
 
+    let sovereign = if seen_sovereign {
+        let (Some((providers, _)), Some((model, _))) = (sv_providers, sv_model) else {
+            bail!("`sovereign:` needs both `providers:` and `model:`");
+        };
+        Some(crate::sovereign::SovereignConfig::build(
+            &providers,
+            &model,
+            sv_classes.as_ref().map(|(c, _)| c.as_str()),
+        )?)
+    } else {
+        None
+    };
+
     Ok(FileConfig {
         models,
         failover,
         semantic_cache,
         trace_content,
         model_policy,
+        sovereign,
     })
 }
 
@@ -1018,6 +1081,7 @@ enum Section {
     SemanticCache,
     TraceContent,
     ModelPolicy,
+    Sovereign,
 }
 
 /// Record a `failover:` scalar, refusing a second one.
@@ -1266,7 +1330,7 @@ fn build_trace_content(
             // nothing and the feature silently produces unusable eval cases.
             // Upper bound: `otlp_emit::publish_span` has no payload check, so an
             // oversized span is dropped WHOLE by NATS — losing the trace, not
-            // just the text. 1 MiB is well under the default NATS max_payload.
+            // just the text. A 1 MiB field can exceed the default whole-span wire limit.
             if !(1_024..=1_048_576).contains(&n) {
                 bail!(
                     "line {ln}: `max_field_bytes` must be between 1024 and 1048576, got {n} \
@@ -2437,5 +2501,57 @@ mod key_capture_tests {
         let a = capture(Some(false), Some(false), true);
         let b = capture(None, None, true);
         assert!(!a.input && !a.output && b.input && b.output);
+    }
+}
+
+/// `GWY-80`: the `sovereign:` block through the file parser.
+#[cfg(test)]
+mod sovereign_block_tests {
+    use super::parse;
+
+    #[test]
+    fn a_full_block_parses() {
+        let cfg = parse(
+            "sovereign:\n  providers: ollama\n  model: ollama/llama3.3\n  classes: secret, credit_card\n",
+        )
+        .expect("valid block");
+        let sv = cfg.sovereign.as_ref().expect("block installed");
+        assert!(sv.is_sovereign("ollama"));
+        assert_eq!(sv.model(), "ollama/llama3.3");
+    }
+
+    #[test]
+    fn a_file_without_the_block_has_none() {
+        assert!(parse("models:\n").expect("valid").sovereign.is_none());
+    }
+
+    #[test]
+    fn a_block_missing_providers_or_model_refuses() {
+        assert!(parse("sovereign:\n  model: ollama/x\n").is_err());
+        assert!(parse("sovereign:\n  providers: ollama\n").is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_a_duplicate_key_or_a_duplicate_block_refuses() {
+        assert!(
+            parse("sovereign:\n  providers: ollama\n  model: ollama/x\n  fallback: openai\n")
+                .is_err()
+        );
+        assert!(
+            parse("sovereign:\n  providers: ollama\n  providers: nvidia\n  model: ollama/x\n")
+                .is_err()
+        );
+        assert!(
+            parse("sovereign:\n  providers: ollama\n  model: ollama/x\nsovereign:\n  providers: ollama\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_native_adapter_or_unknown_class_in_the_block_refuses() {
+        assert!(parse("sovereign:\n  providers: anthropic\n  model: claude-x\n").is_err());
+        assert!(
+            parse("sovereign:\n  providers: ollama\n  model: ollama/x\n  classes: iban\n").is_err()
+        );
     }
 }

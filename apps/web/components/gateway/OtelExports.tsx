@@ -364,7 +364,7 @@ export function OtelExports() {
 					<Panel
 						id="otel-exports"
 						title="OTel export"
-						description="Manage export destinations. OTLP delivery is best-effort and uses an in-memory queue. SIEM connectors: In development, not yet available. Delivery details appear per destination."
+						note="Manage export destinations. OTLP delivery is best-effort and uses an in-memory queue. SIEM connectors: In development, not yet available. Delivery details appear per destination."
 					>
 						{!plan.export_enabled ? (
 							<EmptyNote>
@@ -401,7 +401,7 @@ export function OtelExports() {
 					<Panel
 						id="otel-create"
 						title="Add an export"
-						description={
+						note={
 							plan.max_exports !== null
 								? `Your plan allows up to ${plan.max_exports}.`
 								: undefined

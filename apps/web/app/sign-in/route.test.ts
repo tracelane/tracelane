@@ -42,3 +42,27 @@ describe("/sign-in", () => {
 		expect(h.getSignInUrl).toHaveBeenCalledWith(undefined);
 	});
 });
+
+describe("/sign-in?reauth=1 (approver step-up)", () => {
+	it("forces a fresh sign-in with max_age=0 and keeps the return page", async () => {
+		await expect(
+			GET(req("?reauth=1&returnTo=%2Factions%2Fa1")),
+		).rejects.toThrow("NEXT_REDIRECT:https://auth.example/authorize?max_age=0");
+		expect(h.getSignInUrl).toHaveBeenCalledWith({ returnTo: "/actions/a1" });
+	});
+
+	it("only reauth=1 forces; any other value is a plain sign-in", async () => {
+		for (const v of ["0", "true", ""]) {
+			h.redirect.mockClear();
+			await expect(GET(req(`?reauth=${v}`))).rejects.toThrow("NEXT_REDIRECT");
+			expect(h.redirect).toHaveBeenCalledWith("https://auth.example/authorize");
+		}
+	});
+
+	it("still drops an open-redirect returnTo while forcing", async () => {
+		await expect(
+			GET(req("?reauth=1&returnTo=https%3A%2F%2Fevil.example")),
+		).rejects.toThrow("max_age=0");
+		expect(h.getSignInUrl).toHaveBeenCalledWith(undefined);
+	});
+});

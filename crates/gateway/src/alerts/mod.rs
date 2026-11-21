@@ -533,8 +533,29 @@ async fn read_bounded_body(resp: reqwest::Response) -> String {
 /// three distinct [`DeliveryError`] variants — none of them is reported as a
 /// delivery. The checker awaits this with a whole-operation deadline and
 /// retries failed delivery on its next tick; the test route surfaces the error.
-#[tracing::instrument(skip_all, fields(http_status = tracing::field::Empty))]
 pub async fn deliver_alert(webhook_url: &str, text: &str) -> Result<u16, DeliveryError> {
+    deliver_json(webhook_url, &serde_json::json!({ "text": text })).await
+}
+
+/// `GWY-81`: the same delivery as [`deliver_alert`] with Slack Block Kit `blocks` beside the
+/// `text` fallback. Same SSRF validation, pinning and error handling — only the body differs.
+///
+/// # Errors
+/// Same as [`deliver_alert`].
+pub async fn deliver_alert_blocks(
+    webhook_url: &str,
+    text: &str,
+    blocks: serde_json::Value,
+) -> Result<u16, DeliveryError> {
+    deliver_json(
+        webhook_url,
+        &serde_json::json!({ "text": text, "blocks": blocks }),
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, fields(http_status = tracing::field::Empty))]
+async fn deliver_json(webhook_url: &str, body: &serde_json::Value) -> Result<u16, DeliveryError> {
     // The webhook URL is itself a credential (a Slack URL embeds its token), so
     // it is never a tracing field and never part of an error string.
     // B-472 (REV-3): the connection goes to the addresses the guard CHECKED, not to
@@ -565,7 +586,7 @@ pub async fn deliver_alert(webhook_url: &str, text: &str) -> Result<u16, Deliver
     // the credential — strip it before the error becomes a string anyone logs.
     let resp = client
         .post(webhook_url)
-        .json(&serde_json::json!({ "text": text }))
+        .json(body)
         .send()
         .await
         .map_err(|e| DeliveryError::Unreachable(e.without_url().to_string()))?;

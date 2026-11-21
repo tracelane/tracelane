@@ -47,6 +47,10 @@ export const CONTROL_PROXY_ROUTES: readonly (readonly [Verb, string])[] = [
 	["POST", "approvals/*/approve"],
 	["POST", "approvals/*/deny"],
 	["GET", "approvals/settings"],
+	// Protected-tool policies: read the active set; publish a policy file (admin session).
+	["GET", "action-policies"],
+	["GET", "action-policies/*"],
+	["POST", "action-policies"],
 	["PUT", "approvals/settings"],
 	["GET", "approval-rules"],
 	["POST", "approval-rules"],
@@ -119,6 +123,11 @@ export function isProxiedControlRoute(verb: string, path: string): boolean {
 export const GATEWAY_SLOTS = [
 	{ id: "mcp", label: "MCP tools", probe: "mcp-policy" },
 	{ id: "approvals", label: "Approvals", probe: "approvals" },
+	{
+		id: "protected-tools",
+		label: "Protected tools",
+		probe: "action-policies",
+	},
 	{ id: "data-controls", label: "Data controls", probe: "data-controls" },
 	{ id: "routing", label: "Routing", probe: "routing" },
 	{ id: "cache", label: "Cache", probe: "cache" },
@@ -163,6 +172,7 @@ export type RefusalKind =
 	| "forbidden"
 	| "ip_blocked"
 	| "sso_required"
+	| "reauth_required"
 	| "paused"
 	| "rate_limited"
 	| "conflict"
@@ -181,6 +191,14 @@ export interface Refusal {
 
 const str = (v: unknown): string | undefined =>
 	typeof v === "string" && v !== "" ? v : undefined;
+
+/** "a sign-in from the last 15 minutes", or "a recent sign-in" when the window is unknown. */
+function signInWindow(secs: unknown): string {
+	if (typeof secs !== "number" || !Number.isSafeInteger(secs) || secs <= 0)
+		return "a recent sign-in";
+	const [n, unit] = secs % 60 === 0 ? [secs / 60, "minute"] : [secs, "second"];
+	return `a sign-in from the last ${n === 1 ? unit : `${n} ${unit}s`}`;
+}
 
 /**
  * Word a gateway refusal. The gateway's own `message` wins for 400/409/503 (it names the
@@ -207,6 +225,14 @@ export function describeRefusal(
 			code,
 			message:
 				"This workspace requires an SSO sign-in for admin actions. Sign in through your identity provider and retry.",
+		};
+	}
+	if (status === 403 && code === "reauth_required") {
+		// ACT-41: the window comes from the gateway (`max_age_secs`), never from copy here.
+		return {
+			kind: "reauth_required",
+			code,
+			message: `Approving needs ${signInWindow(body?.max_age_secs)}. Sign in again, then approve.`,
 		};
 	}
 	if (status === 403 && code === "separation_required") {

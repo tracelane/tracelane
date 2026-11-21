@@ -281,6 +281,18 @@ pub fn render() -> String {
     );
     counter(
         &mut out,
+        "tracelane_gateway_approval_ledger_refused_total",
+        "Approval transitions refused (503) because their signed-ledger record could not be written.",
+        crate::approvals::ledger::REFUSED.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "tracelane_gateway_approval_ledger_legacy_skipped_total",
+        "Approval transitions left off the ledger because the approval was opened before it was recorded.",
+        crate::approvals::ledger::LEGACY_SKIPPED.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
         "tracelane_gateway_auth_throttled_total",
         "API-key lookups refused with 429 before the store because their source's failed-lookup bucket was empty.",
         crate::preauth_limiter::AUTH_THROTTLED_TOTAL.load(Ordering::Relaxed),
@@ -585,6 +597,8 @@ mod tests {
             "tracelane_gateway_http_inflight ",
             "tracelane_gateway_load_shed_total ",
             "tracelane_gateway_request_timeout_total ",
+            "tracelane_gateway_approval_ledger_refused_total ",
+            "tracelane_gateway_approval_ledger_legacy_skipped_total ",
             "tracelane_gateway_auth_throttled_total ",
             "tracelane_gateway_auth_negative_cache_hits_total ",
             "tracelane_gateway_spans_dropped_total ",

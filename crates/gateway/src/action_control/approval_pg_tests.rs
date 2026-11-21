@@ -750,6 +750,24 @@ impl Fixture {
         approve: bool,
         sid: Option<&str>,
     ) -> (axum::http::StatusCode, Value) {
+        self.http_decide_at(
+            human,
+            id,
+            approve,
+            sid,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+    }
+    /// ACT-41: decide over HTTP with a signed JWT whose `auth_time` is chosen (`None` omits it).
+    pub(super) async fn http_decide_at(
+        &self,
+        human: &crate::auth::Claims,
+        id: Uuid,
+        approve: bool,
+        sid: Option<&str>,
+        auth_time: Option<i64>,
+    ) -> (axum::http::StatusCode, Value) {
         use tower::ServiceExt;
         static SESSION_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _lock = SESSION_ENV.lock().await;
@@ -764,7 +782,7 @@ impl Fixture {
         let _env = SessionEnv::new(&jwks.uri());
         let authorization = format!(
             "Bearer {}",
-            protected::session_tests::signed_jwt(human, sid)
+            protected::session_tests::signed_jwt_at(human, sid, auth_time)
         );
         let positive = format!(
             "Bearer {}",
@@ -1952,7 +1970,7 @@ async fn pg_legacy_require_approval_without_policy_ttl_pends_instead_of_bricking
     );
 }
 
-const NOTICE_KEYS: [&str; 7] = [
+const NOTICE_KEYS: [&str; 9] = [
     "type",
     "approval_id",
     "subject",
@@ -1960,6 +1978,8 @@ const NOTICE_KEYS: [&str; 7] = [
     "protected",
     "expires_at",
     "queue_path",
+    "rule",
+    "server_name",
 ];
 async fn add_channel(f: &Fixture, tenant: &Uuid) {
     f.pool.get().await.unwrap().execute("INSERT INTO spend_alert_channels(id,tenant_id,kind,name,target,secret_enc) VALUES($1,$2,'webhook','synthetic','https://example.invalid/hook','synthetic-sealed')", &[&Uuid::new_v4(), tenant]).await.unwrap();
@@ -2327,3 +2347,157 @@ mod heartbeat_pg_tests;
 mod receipt_pg_tests;
 #[path = "timeline_pg_tests.rs"]
 mod timeline_pg_tests;
+
+// ── ACT-41: approving needs a recent sign-in ─────────────────────────────────────────────
+async fn act41_row(f: &Fixture, id: Uuid) -> Value {
+    f.pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT jsonb_build_object('status',status,'at',extract(epoch from decided_auth_at)::bigint,'method',decided_auth_method) FROM approvals WHERE tenant_id=$1 AND id=$2",
+            &[f.agent.tenant_id.as_uuid(), &id],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+const ACT41_SID: Option<&str> = Some("synthetic-verified-session");
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_stale_sign_in_cannot_approve() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let stale = chrono::Utc::now().timestamp() - 901;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, true, ACT41_SID, Some(stale))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "reauth_required");
+    let row = act41_row(&f, id).await;
+    assert_eq!(
+        row["status"], "pending",
+        "a refused step-up decided the row"
+    );
+    assert!(row["method"].is_null());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_missing_auth_time_cannot_approve() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let (status, body) = f.http_decide_at(&f.human, id, true, ACT41_SID, None).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "reauth_required");
+    assert_eq!(act41_row(&f, id).await["status"], "pending");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_future_auth_time_cannot_approve() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let future = chrono::Utc::now().timestamp() + 3_600;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, true, ACT41_SID, Some(future))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(act41_row(&f, id).await["status"], "pending");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_fresh_sign_in_approves_and_records_it() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let at = chrono::Utc::now().timestamp() - 60;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, true, ACT41_SID, Some(at))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let row = act41_row(&f, id).await;
+    assert_eq!(row["status"], "approved");
+    assert_eq!(row["at"], at, "the signed auth_time, not the decision time");
+    assert_eq!(row["method"], "workos_session");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_stale_sign_in_can_still_deny() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let stale = chrono::Utc::now().timestamp() - 86_400;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, false, ACT41_SID, Some(stale))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let row = act41_row(&f, id).await;
+    assert_eq!(row["status"], "denied");
+    assert!(
+        row["at"].is_null() && row["method"].is_null(),
+        "deny records no step-up"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_unrecordable_auth_rolls_the_approval_back() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    // Force the auth record to miss its row: the decision lands with another decider.
+    f.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION act41_swap_decider() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.status='approved' THEN NEW.decided_by := 'synthetic-someone-else'; END IF; RETURN NEW; END $$; \
+             CREATE TRIGGER act41_swap BEFORE UPDATE ON approvals FOR EACH ROW EXECUTE FUNCTION act41_swap_decider();",
+        )
+        .await
+        .unwrap();
+    let at = chrono::Utc::now().timestamp() - 60;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, true, ACT41_SID, Some(at))
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{body}"
+    );
+    let row = act41_row(&f, id).await;
+    assert_eq!(
+        row["status"], "pending",
+        "decision survived a missing auth record"
+    );
+    assert!(row["at"].is_null() && row["method"].is_null());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres and local JWKS fixture"]
+async fn pg_act41_refusal_names_the_window_and_is_audited() {
+    let f = Fixture::new().await;
+    let id = f.pending().await;
+    let stale = chrono::Utc::now().timestamp() - 901;
+    let (status, body) = f
+        .http_decide_at(&f.human, id, true, ACT41_SID, Some(stale))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["max_age_secs"], 900);
+    let after: Value = f
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT after_json FROM admin_audit_log WHERE actor_workspace_id=$1 AND target_id=$2 AND action='approval.reauth_required'",
+            &[f.agent.tenant_id.as_uuid(), &id.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(after["reason"], "auth_time_outside_window");
+    assert_eq!(after["max_age_secs"], 900);
+}

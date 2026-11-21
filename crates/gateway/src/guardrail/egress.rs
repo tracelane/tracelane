@@ -160,9 +160,12 @@ enum Pos {
 enum Rule {
     /// Ordinary forwarded text: read (and rewritten by a redaction).
     Read,
-    /// Ciphertext, a provider signature, binary media by definition, or a credential handed to
-    /// the caller's own server: neither read nor rewritten.
+    /// Ciphertext, a provider signature, or a credential handed to the caller's own server:
+    /// neither read nor rewritten.
     Opaque,
+    /// Binary media by definition (audio payloads): as [`Rule::Opaque`], but reported to a
+    /// reader that must not treat unread content as clean (GWY-80 sovereign classification).
+    OpaqueMedia,
     /// A base64 payload whose MIME type the holder declares (`mimeType` / `media_type`):
     /// opaque if binary, decoded and read if text.
     Media,
@@ -354,8 +357,8 @@ impl Pos {
         match (self, key) {
             (Self::Item, "encrypted_content") if tag == Tag::Ciphertext => Rule::Opaque,
             (Self::GPart, "thoughtSignature" | "thought_signature") => Rule::Opaque,
-            (Self::Audio, "data") => Rule::Opaque,
-            (Self::Part, "audio") if tag == Tag::InputAudio => Rule::Opaque,
+            (Self::Audio, "data") => Rule::OpaqueMedia,
+            (Self::Part, "audio") if tag == Tag::InputAudio => Rule::OpaqueMedia,
             (Self::InlineData, "data") => Rule::Media,
             (Self::MediaSource, "data") if tag == Tag::Base64 => Rule::Media,
             (Self::ImageUrl, "url")
@@ -729,16 +732,18 @@ pub(crate) enum Leaf<'s> {
     Unscannable,
 }
 
-/// A media payload (`mime` declared, or `None`): binary → skipped; text → decoded and handed
-/// to `f`.
+/// A media payload (`mime` declared, or `None`): binary → skipped (and `skipped` told);
+/// text → decoded and handed to `f`.
 fn media_leaf(
     payload: &str,
     mime: Option<&str>,
     origin: Origin,
     f: &mut dyn FnMut(Leaf<'_>, Origin) -> bool,
+    skipped: &mut dyn FnMut(),
 ) -> bool {
     // MED-2: a binary type is believed only when the bytes carry its signature.
     if mime.is_some_and(|m| is_binary_mime(m) && signature_matches(m, payload)) {
+        skipped();
         return false;
     }
     match decode_text_media(payload, mime) {
@@ -754,17 +759,31 @@ fn media_leaf(
 /// [`Origin`], stopping at the first leaf for which `f` returns `true`. Returns whether it
 /// stopped. Allocation-free except for a decoded text payload.
 pub(crate) fn egress_leaves(body: &Value, f: &mut dyn FnMut(Leaf<'_>, Origin) -> bool) -> bool {
+    egress_leaves_reporting(body, f, &mut || {})
+}
+
+/// [`egress_leaves`], also calling `skipped` once for every binary media payload it does not
+/// read (a believed binary `data:` URI or declared-MIME payload, an audio part, a remote media
+/// URL or non-base64 `data:` URI, a `file_id`). For a reader
+/// that must treat content it could not read as NOT clean (GWY-80 sovereign classification);
+/// the guardrail rails keep [`egress_leaves`], whose behaviour is unchanged.
+pub(crate) fn egress_leaves_reporting(
+    body: &Value,
+    f: &mut dyn FnMut(Leaf<'_>, Origin) -> bool,
+    skipped: &mut dyn FnMut(),
+) -> bool {
     fn walk(
         v: &Value,
         pos: Pos,
         origin: Origin,
         f: &mut dyn FnMut(Leaf<'_>, Origin) -> bool,
+        skipped: &mut dyn FnMut(),
     ) -> bool {
         match v {
             Value::String(s) => f(Leaf::Text(s), origin),
             Value::Array(a) => {
                 let e = pos.elem();
-                a.iter().any(|x| walk(x, e, origin, f))
+                a.iter().any(|x| walk(x, e, origin, f, skipped))
             }
             Value::Object(o) => {
                 let origin = object_origin(pos, origin, o);
@@ -788,19 +807,38 @@ pub(crate) fn egress_leaves(body: &Value, f: &mut dyn FnMut(Leaf<'_>, Origin) ->
                     };
                     match (pos.rule(tag, k), child.as_str()) {
                         (Rule::Opaque, _) => false,
-                        (Rule::Media, Some(s)) => media_leaf(s, mime(), co, f),
+                        (Rule::OpaqueMedia, _) => {
+                            skipped();
+                            false
+                        }
+                        (Rule::Media, Some(s)) => media_leaf(s, mime(), co, f, skipped),
                         (Rule::DataUri, Some(s)) => match base64_data_uri(s) {
-                            Some((m, payload)) => media_leaf(payload, Some(m), co, f),
-                            None => f(Leaf::Text(s), co),
+                            Some((m, payload)) => media_leaf(payload, Some(m), co, f, skipped),
+                            None => {
+                                // A remote URL (the provider FETCHES it) or a non-base64 `data:`
+                                // URI is media this reader cannot read: tell `skipped`.
+                                if !s.is_empty() {
+                                    skipped();
+                                }
+                                f(Leaf::Text(s), co)
+                            }
                         },
-                        _ => walk(child, pos.child(tag, k), co, f),
+                        // A provider-held file (`file_id`) is content nothing here can read.
+                        (_, Some(_))
+                            if k == "file_id"
+                                && matches!(pos, Pos::File | Pos::Part | Pos::Block) =>
+                        {
+                            skipped();
+                            f(Leaf::Text(child.as_str().unwrap_or_default()), co)
+                        }
+                        _ => walk(child, pos.child(tag, k), co, f, skipped),
                     }
                 })
             }
             _ => false,
         }
     }
-    walk(body, Pos::Root, Origin::Direct, f)
+    walk(body, Pos::Root, Origin::Direct, f, skipped)
 }
 
 /// Every text leaf (string values and keys) of a FREE-FORM value — a schema, tool-call
@@ -851,7 +889,7 @@ fn redact_walk(v: &mut Value, pos: Pos, map: &mut Vec<RedactionEntry>, policy: O
             let tag = Tag::of(o);
             for (k, child) in o.iter_mut() {
                 match pos.rule(tag, k) {
-                    Rule::Opaque => {}
+                    Rule::Opaque | Rule::OpaqueMedia => {}
                     Rule::Media if child.is_string() => {}
                     Rule::DataUri if child.as_str().is_some_and(is_base64_data_uri) => {}
                     _ => redact_walk(child, pos.child(tag, k), map, policy),
@@ -1128,7 +1166,7 @@ pub(crate) fn redact_hook_json(
                         return Err(Unredactable);
                     }
                     match pos.rule(tag, key) {
-                        Rule::Opaque => continue,
+                        Rule::Opaque | Rule::OpaqueMedia => continue,
                         Rule::Media => return Err(Unredactable),
                         Rule::DataUri if value.as_str().is_some_and(is_base64_data_uri) => {
                             return Err(Unredactable);

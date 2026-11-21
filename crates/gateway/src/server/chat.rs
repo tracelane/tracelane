@@ -627,6 +627,94 @@ async fn chat_completions_handler_with_labels(
     // OG-25: the workspace block lists, for the post-admission model moves below.
     let ws_controls = entitlements.as_deref().map(|e| Arc::clone(&e.controls));
 
+    // --- GWY-80: SOVEREIGN ROUTING ---
+    //
+    // With a `sovereign:` block installed, classify the request (the R2 detector, over
+    // the request as the caller sent it, before any guardrail rewrites it) and decide
+    // where it may go. A request carrying a configured class is CONFINED: moved to the
+    // sovereign model when it named another, and from here on the routing document,
+    // cross-provider failover, the semantic cache tier and the online-eval judge are off
+    // for it, and every dispatch passes `sovereign_egress` (`dispatch_with_retry`). No
+    // block ⇒ `Decision::Off`: no classification, no change, no span field.
+    let sovereign_decision = match state.sovereign {
+        Some(cfg) => crate::sovereign::decide(
+            Some(cfg),
+            &crate::sovereign::classify_request(&chat_request),
+            &model,
+            crate::providers::ProviderRegistry::provider_id_for_model,
+        ),
+        None => crate::sovereign::Decision::Off,
+    };
+    let sovereign_egress =
+        crate::sovereign::Egress::for_decision(state.sovereign, &sovereign_decision);
+    let sovereign_meta = crate::sovereign::Meta::of(&sovereign_decision);
+    match &sovereign_decision {
+        crate::sovereign::Decision::Refuse { class } => {
+            identity.route.sovereign.clone_from(&sovereign_meta);
+            dispatch_guard.record_route(identity.route.clone());
+            dispatch_guard.abort("sovereign_route_unavailable", None);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "sovereign_route_unavailable",
+                    "data_class": class,
+                    "message": "This request carries regulated data and no model endpoint of \
+                                your own is available to serve it. It was not sent anywhere.",
+                })),
+            )
+                .into_response();
+        }
+        crate::sovereign::Decision::Confine {
+            class,
+            model: target,
+            provider,
+            rerouted,
+        } => {
+            // A re-route is a post-admission model change: the key's policy, the
+            // workspace blocks and the budget pricing judged the CALLER's model, so the
+            // sovereign target must pass the same checks the ZDR re-route and failover
+            // hops do. A denial refuses — it never falls back to the caller's model.
+            if *rerouted
+                && (!policy_allows(&claims, ws_controls.as_deref(), target, provider)
+                    || (caller_budgeted
+                        && matches!(
+                            crate::admission::token_pricing(target),
+                            crate::admission::Pricing::Unpriced { .. }
+                        )))
+            {
+                identity.route.sovereign.clone_from(&sovereign_meta);
+                dispatch_guard.record_route(identity.route.clone());
+                dispatch_guard.abort("sovereign_route_denied", None);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "sovereign_route_denied",
+                        "data_class": class,
+                        "message": "This request carries regulated data, and this key or \
+                                    workspace may not use your own model endpoint. It was \
+                                    not sent anywhere.",
+                    })),
+                )
+                    .into_response();
+            }
+            if *rerouted {
+                chat_request.model.clone_from(target);
+                model.clone_from(target);
+            }
+        }
+        crate::sovereign::Decision::Off | crate::sovereign::Decision::Clear => {}
+    }
+    // A confined request is not routed by the workspace document: its candidates are
+    // the caller's frontier targets.
+    let route_plan = if sovereign_egress.confined() {
+        identity.route = super::RouteMeta::default();
+        None
+    } else {
+        route_plan
+    };
+    identity.route.sovereign = sovereign_meta;
+    dispatch_guard.record_route(identity.route.clone());
+
     // --- Step 2e: ONLINE-EVAL ADMISSION (EVL-28, item 11) ---
     //
     // THE CHEAPEST THING THAT COULD POSSIBLY DECIDE THIS, and it is placed here
@@ -668,8 +756,10 @@ async fn chat_completions_handler_with_labels(
         timer.note_cold();
         identity.cold_start = true;
     }
+    // GWY-80: the judge sends the question to a judge model; a confined request's text
+    // goes nowhere but the sovereign endpoint, so it is never sampled.
     let online_eval_pending = match online_eval_policy {
-        Some(policy) => Some(crate::online_eval::Pending {
+        Some(policy) if !sovereign_egress.confined() => Some(crate::online_eval::Pending {
             entitlements: state.entitlements.clone(),
             policy,
             providers: Arc::clone(&state.providers),
@@ -683,7 +773,7 @@ async fn chat_completions_handler_with_labels(
             // question it answered.
             question: crate::online_eval::flatten_request_text(&body),
         }),
-        None => None,
+        _ => None,
     };
     timer.mark("online_eval_admission");
 
@@ -854,7 +944,9 @@ async fn chat_completions_handler_with_labels(
     let header_on = failover_header.is_some_and(|v| v.eq_ignore_ascii_case("cross-provider"));
     let header_off = failover_header.is_some_and(|v| v.eq_ignore_ascii_case("off"));
     let workspace_failover_on = entitlements.as_deref().is_some_and(|e| e.failover_enabled);
-    let cross_provider_failover = header_on || (workspace_failover_on && !header_off);
+    // GWY-80: a confined request never fails over (its egress allows no other provider).
+    let cross_provider_failover =
+        !sovereign_egress.confined() && (header_on || (workspace_failover_on && !header_off));
     // The workspace's own fallback models (empty = the operator chain).
     let workspace_failover_models: Arc<Vec<String>> = entitlements
         .as_deref()
@@ -1436,7 +1528,8 @@ async fn chat_completions_handler_with_labels(
                 cache.config().embedding_models(),
                 // OG-51: the workspace may switch the semantic (embedding) tier off; the exact
                 // tier is a hash that sends nothing anywhere and is unaffected.
-                request_redacted || !cache_policy.semantic_allowed(),
+                // GWY-80: a confined request's text goes to no embedding provider either.
+                request_redacted || sovereign_egress.confined() || !cache_policy.semantic_allowed(),
                 &claims,
                 ws_controls.as_deref(),
                 zdr_caps.as_deref(),
@@ -1645,6 +1738,7 @@ async fn chat_completions_handler_with_labels(
                 &served_label,
                 &provider_key,
             ),
+            &sovereign_egress,
         )
         .await;
         label_attempts(&mut attempts, served_pooled, &served_label);
@@ -1737,6 +1831,7 @@ async fn chat_completions_handler_with_labels(
                 )
                 .with_breaker(&state.circuit_breaker, upstream, region, &cred)
                 .with_attempt(&attempt_security, provider_id, &model, &label, &key),
+                &sovereign_egress,
             )
             .await;
             label_attempts(&mut attempts, true, &label);
@@ -1965,6 +2060,7 @@ async fn chat_completions_handler_with_labels(
                         &label,
                         &fo_key,
                     ),
+                    &sovereign_egress,
                 )
                 .await;
                 label_attempts(&mut fo_attempts, fo_pool.pooled, &label);

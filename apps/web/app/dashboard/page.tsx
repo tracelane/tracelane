@@ -1,3 +1,4 @@
+import { ProviderFailures } from "@/components/dashboard/ProviderFailures";
 import { ResilienceTiles } from "@/components/gateway/ResilienceTiles";
 import { PageHeader } from "@tracelanedev/ui";
 import { StatusBadge } from "@tracelanedev/ui";
@@ -33,7 +34,6 @@ import { NoApiKeysPanel } from "@/components/dashboard/NoApiKeysPanel";
 import { WorkspaceGlance } from "@/components/dashboard/WorkspaceGlance";
 import { WarmingBanner } from "@/components/empty-states/WarmingBanner";
 import { MetricChart } from "@/components/metrics/MetricChart";
-import { OverheadContext } from "@/components/metrics/OverheadContext";
 import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { db } from "@/db";
 import { apiKeys, tenants } from "@/db/schema";
@@ -41,13 +41,13 @@ import { requireSession } from "@/lib/auth";
 import { PLAN_TO_LOOKUP_KEY, type Plan } from "@/lib/entitlements";
 import { GatewayError } from "@/lib/gateway";
 import {
+	fetchCostBreakdownFor,
 	fetchGatewayStatsFor,
 	fetchGuardrailStatsFor,
 	fetchLatencyBreakdownFor,
 	fetchSignaturesFor,
 	fetchSloRows,
 	fetchSloSummary,
-	fetchSloTimeseries,
 	fetchToolAnalyticsFor,
 	fetchWorkspaceGlance,
 } from "@/lib/metrics/fetch";
@@ -64,8 +64,6 @@ import { hintOf } from "@/lib/metrics/hint";
 import { METRICS } from "@/lib/metrics/registry";
 import {
 	type ChartData,
-	drawableBuckets,
-	sloLatencySeries,
 	sloTrafficSeries,
 	sparkOf,
 } from "@/lib/metrics/series";
@@ -80,14 +78,11 @@ import {
 import {
 	Badge,
 	Card,
-	ConcentricRings,
 	EmptyState,
 	ErrorState,
-	Gauge,
 	MetricIcon,
 	type MetricIconName,
 	ModelDonut,
-	RequestFlow,
 	Skeleton,
 	SparkBars,
 } from "@tracelanedev/ui";
@@ -321,30 +316,35 @@ async function availabilityTarget(): Promise<number> {
 }
 
 async function DashboardData({ range }: { range: TimeRange }) {
-	// EIGHT reads, all for THE SAME window (`range` — one object, one instant), all
-	// through `lib/metrics/fetch.ts`: this page computes no hours, no bucket and no
-	// `since` of its own (DSH-11 §3c, guarded by check-metric-single-source.py).
-	// `null` = the gateway was unreachable for that family; each family degrades
-	// alone and renders `—` plus the warming banner, never a confident zero.
-	const [
-		slo,
-		sloSummary,
-		timePoints,
-		sig,
-		gw,
-		toolAnalytics,
-		latency,
-		guardrails,
-	] = await Promise.all([
-		fetchSloRows(range),
-		fetchSloSummary(range),
-		fetchSloTimeseries(range),
-		fetchSignaturesFor(range),
-		fetchGatewayStatsFor(range),
-		fetchToolAnalyticsFor(range),
-		fetchLatencyBreakdownFor(range),
-		fetchGuardrailStatsFor(range),
-	]);
+	// Only this surface opts in to typed permission errors. Keep answered
+	// families visible when another family is forbidden (e.g. billing roles).
+	const window = { ...range, permissionErrors: "throw" as const };
+	const denied = new Set<string>();
+	const read = async <T,>(
+		family: string,
+		request: Promise<T>,
+	): Promise<T | null> => {
+		try {
+			return await request;
+		} catch (error) {
+			if (error instanceof GatewayError && error.status === 403) {
+				denied.add(family);
+				return null;
+			}
+			throw error;
+		}
+	};
+	const [slo, sloSummary, sig, gw, toolAnalytics, latency, guardrails, costs] =
+		await Promise.all([
+			read("Health", fetchSloRows(window)),
+			read("Health", fetchSloSummary(window)),
+			read("Signatures", fetchSignaturesFor(window)),
+			read("Gateway usage", fetchGatewayStatsFor(window)),
+			read("Tools", fetchToolAnalyticsFor(window)),
+			read("Response cache", fetchLatencyBreakdownFor(window)),
+			read("Guardrails", fetchGuardrailStatsFor(window)),
+			read("Spend", fetchCostBreakdownFor(window, "provider")),
+		]);
 
 	const dash = slo === null; // the SLO family is unreachable → em-dash its tiles
 	const rLabel = range.label; // "last 24 hours" · "2026-09-01 14:00 → 17:00 UTC"
@@ -374,7 +374,6 @@ async function DashboardData({ range }: { range: TimeRange }) {
 
 	// Every series on this page sits on ONE grid — `range`'s buckets.
 	const traffic = sloTrafficSeries(range, rows);
-	const latencyData = sloLatencySeries(range, timePoints ?? []);
 	const trafficChart: ChartData = {
 		...traffic,
 		series: traffic.series.filter(
@@ -383,19 +382,27 @@ async function DashboardData({ range }: { range: TimeRange }) {
 	};
 	const callsSpark = sparkOf(traffic, "requests");
 	const tokensSpark = sparkOf(traffic, "tokens");
-	const canChartLatency = drawableBuckets(latencyData, "p95") >= 1; // founder 2026-09-04: one bucket of real traffic is data, show it
-
-	// Real gateway share of the end-to-end trip (both p95; flagged ≈).
-	const gwTripPct =
-		latency && latency.overhead_samples > 0 && meanP95 > 0
-			? Math.round((latency.overhead_p95_ms / meanP95) * 100)
-			: null;
 
 	const totalInputTokens = rows.reduce((s, r) => s + r.total_input_tokens, 0);
 	const totalOutputTokens = rows.reduce((s, r) => s + r.total_output_tokens, 0);
 
 	// Router signals — null when THAT family is unreachable, never folded to 0.
-	const spend = gw ? gw.total_cost_usd : null;
+	const spend =
+		costs && costs.priced_requests > 0 ? costs.total_cost_usd : null;
+	// Q3 counts only spans with measured overhead and a provider. This is sample
+	// coverage, not a claim about all requests eligible for response caching.
+	const cacheHits = latency?.cache_hit_samples;
+	const cacheMeasured =
+		cacheHits === undefined
+			? null
+			: cacheHits + (latency?.overhead_samples ?? 0);
+	const responseCache =
+		cacheMeasured !== null && cacheMeasured > 0 && cacheHits !== undefined
+			? fmtPercent((cacheHits / cacheMeasured) * 100, {
+					n: cacheMeasured,
+					floor: 100,
+				})
+			: null;
 	const signatures = sig?.signatures ?? [];
 
 	const byModel = new Map<
@@ -438,12 +445,6 @@ async function DashboardData({ range }: { range: TimeRange }) {
 		.slice(0, 5);
 	const maxToolCalls = topTools[0]?.calls ?? 0;
 
-	const costSplit = (gw?.providers ?? [])
-		.filter((p) => p.cost_usd > 0)
-		.sort((a, b) => b.cost_usd - a.cost_usd)
-		.slice(0, 4);
-	const costSplitTotal = costSplit.reduce((sum, p) => sum + p.cost_usd, 0);
-
 	/*
 	 * ── THE OPERATIONAL KPI ROW ───────────────────────────────────────────────
 	 * Five metrics, each formatted by the registry's ONE rule for its kind, each
@@ -465,7 +466,6 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			n = {fmtCount(n)} · below the {fmtCount(floor)}-{what} floor
 		</span>
 	);
-	const availAhead = budget.availabilityPct >= budget.targetPct;
 	const kpis: {
 		tone?: "danger" | "warn";
 		label: string;
@@ -481,7 +481,11 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			hint: hintOf(METRICS.block_rate),
 			sub:
 				guardrails === null ? (
-					<span className="text-ink-3">waiting on the gateway</span>
+					<span className="text-ink-3">
+						{denied.has("Guardrails")
+							? "Access denied"
+							: "waiting on the gateway"}
+					</span>
 				) : blockRate.noSample ? (
 					<span className="text-ink-3">{METRICS.block_rate.zeroCopy}</span>
 				) : blockRate.belowFloor ? (
@@ -493,34 +497,17 @@ async function DashboardData({ range }: { range: TimeRange }) {
 				),
 		},
 		{
-			label: METRICS.availability.label,
-			value: dash || avail.noSample ? "—" : avail.text,
-			href: href("/slo"),
-			hint: hintOf(METRICS.availability),
-			sub: dash ? (
-				<span className="text-ink-3">vs {fmtTarget(budget.target)} target</span>
-			) : avail.noSample ? (
-				<span className="text-ink-3">{METRICS.availability.zeroCopy}</span>
-			) : avail.belowFloor ? (
-				<span className="text-ink-3">
-					n = {fmtCount(totalRequests)} · below the {fmtCount(avail.floor)}
-					-request floor for a {fmtTarget(budget.target)} target
-				</span>
-			) : (
-				<span className={availAhead ? "text-ok-ink" : "text-danger-ink"}>
-					<span aria-hidden="true">{availAhead ? "▲" : "▼"}</span>{" "}
-					{availAhead ? "above" : "below"} {fmtTarget(budget.target)} target
-				</span>
-			),
-		},
-		{
-			label: METRICS.cache_hit_rate.label,
+			label: "Provider prompt cache",
 			value: gw === null || cacheHit.noSample ? "—" : cacheHit.text,
 			href: href("/gateway"),
 			hint: hintOf(METRICS.cache_hit_rate),
 			sub:
 				gw === null ? (
-					<span className="text-ink-3">waiting on the gateway</span>
+					<span className="text-ink-3">
+						{denied.has("Gateway usage")
+							? "Access denied"
+							: "waiting on the gateway"}
+					</span>
 				) : cacheHit.noSample ? (
 					<span className="text-ink-3">{METRICS.cache_hit_rate.zeroCopy}</span>
 				) : cacheHit.belowFloor ? (
@@ -532,21 +519,19 @@ async function DashboardData({ range }: { range: TimeRange }) {
 				),
 		},
 		{
-			label: METRICS.latency_p95.label,
-			value: dash || meanP95 <= 0 ? "—" : fmtDurationMs(meanP95),
-			href: href("/slo"),
-			hint: hintOf(METRICS.latency_p95),
-			sub: dash ? (
-				<span className="text-ink-3">end to end</span>
-			) : usingFallback ? (
+			label: "Response cache",
+			value: responseCache?.text ?? "—",
+			href: href("/gateway"),
+			hint: "Response reuse among provider requests with measured gateway overhead; not all cache-eligible requests.",
+			sub: (
 				<span className="text-ink-3">
-					summary unreachable — no window quantile
-				</span>
-			) : totalRequests > 0 && totalRequests < 100 ? (
-				sampleNote(totalRequests, 100, "request")
-			) : (
-				<span className="text-ink-3">
-					end to end · n = {fmtCount(totalRequests)}
+					{cacheMeasured === null
+						? denied.has("Response cache")
+							? "Access denied"
+							: "Sample coverage unavailable"
+						: cacheMeasured === 0
+							? "No measured requests"
+							: `${fmtCount(cacheHits ?? 0)} hits / ${fmtCount(cacheMeasured)} measured requests${responseCache?.belowFloor ? " · small sample" : ""}`}
 				</span>
 			),
 		},
@@ -609,50 +594,26 @@ async function DashboardData({ range }: { range: TimeRange }) {
 		{
 			icon: "spend",
 			label: METRICS.spend_est.label,
-			// null = unreachable; 0 with nothing priced = no priced traffic (both `—`,
-			// and the sub-line says which). A measured spend over priced rows renders.
-			value: spend === null || spend === 0 ? "—" : fmtUsd(spend),
+			value: spend === null ? "—" : fmtUsd(spend),
 			href: href("/gateway"),
 			hint: hintOf(METRICS.spend_est),
 			sub:
-				gw === null ? (
-					<span>waiting on the gateway</span>
-				) : costSplit.length > 0 && costSplitTotal > 0 ? (
-					<span className="flex items-center gap-2">
-						<span className="flex h-1 flex-1 overflow-hidden rounded-full bg-surface-2">
-							{costSplit.map((prov, i) => (
-								<span
-									key={prov.provider}
-									className="h-full bg-chart-primary"
-									style={{
-										width: `${(prov.cost_usd / costSplitTotal) * 100}%`,
-										opacity: Math.max(0.3, 0.9 - i * 0.2),
-									}}
-									title={`${prov.provider}: ${fmtUsd(prov.cost_usd)}`}
-								/>
-							))}
-						</span>
-						<span className="shrink-0">
-							{costSplit.length === 1
-								? costSplit[0]?.provider
-								: `${costSplit.length} providers`}
-						</span>
-					</span>
-				) : (
-					<span>no priced traffic in this window</span>
-				),
+				costs === null
+					? denied.has("Spend")
+						? "Access denied"
+						: "Pricing coverage unavailable"
+					: costs.total_requests === 0
+						? "No requests in this window"
+						: costs.priced_requests === 0
+							? `${fmtCount(costs.unpriced_requests)} unpriced requests · missing pricing`
+							: costs.unpriced_requests > 0
+								? `Lower bound · ${fmtCount(costs.priced_requests)} priced / ${fmtCount(costs.total_requests)} requests · ${fmtCount(costs.unpriced_requests)} unpriced`
+								: `${fmtCount(costs.priced_requests)} priced requests · ${rLabel}`,
 		},
 	];
 
 	const modelHref = (m: string) =>
 		m && m !== "—" ? href("/traces", { model: m }) : undefined;
-	const flowModels = topModels.slice(0, 4).map((m) => ({
-		id: `${m.provider}::${m.model}`,
-		label: m.model,
-		requests: m.requests,
-		errors: m.errors,
-		href: modelHref(m.model),
-	}));
 
 	const topProviders = (gw?.providers ?? [])
 		.slice()
@@ -696,7 +657,15 @@ async function DashboardData({ range }: { range: TimeRange }) {
 		 * the layout underneath them.
 		 */
 		<div className="space-y-5">
-			<ResilienceTiles initial={gw} query={windowParams(range).toString()} />
+			{denied.size > 0 && (
+				<ErrorState
+					title="Some metrics need additional access"
+					description={`Access denied: ${[...denied].sort().join(", ")}. Ask a workspace administrator for access. Other available metrics are shown below.`}
+				/>
+			)}
+			{!denied.has("Gateway usage") && (
+				<ResilienceTiles initial={gw} query={windowParams(range).toString()} />
+			)}
 			{/* The page header used to sit here. It moved OUT of this component and
 			    above the Suspense boundary in `DashboardPage` — it depends on no
 			    gateway read, so rendering it here made the page title wait for the
@@ -704,7 +673,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 			    the "Loading dashboard…" fallback, and the real `<h1>` did not paint
 			    until the fan-out resolved. The warming banner stays, because it is the
 			    one piece of this header region that IS data-derived (`dash`). */}
-			{dash && <WarmingBanner />}
+			{dash && !denied.has("Health") && <WarmingBanner />}
 
 			<InvestigationFocus
 				windowLabel={rLabel}
@@ -742,7 +711,7 @@ async function DashboardData({ range }: { range: TimeRange }) {
 				aria-label="Operational health"
 				className="surface-card overflow-hidden border border-line"
 			>
-				<div className="-ml-px -mt-px grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
+				<div className="-ml-px -mt-px grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4">
 					{kpis.map((k) => (
 						<Link
 							key={k.label}
@@ -865,290 +834,77 @@ async function DashboardData({ range }: { range: TimeRange }) {
 						) : (
 							<CardEmpty
 								ghost={<GhostFloor />}
-								title="No traffic yet"
+								title={
+									denied.has("Health")
+										? "Access denied"
+										: dash
+											? "Traffic measurements unavailable"
+											: "No traffic yet"
+								}
 								description="Requests will appear here as your agents send traffic through the gateway."
-								action={{
-									href: "/settings/providers",
-									label: "Connect a provider",
-								}}
+								action={
+									dash
+										? undefined
+										: {
+												href: "/settings/providers",
+												label: "Connect a provider",
+											}
+								}
 							/>
 						)}
 					</Card>
 
-					{/* Where the time goes — the honest trip split (real p95 per
-					    component). SECONDARY weight (P0.4): it is a breakdown of the
-					    latency the KPI row already states. */}
-					<Link href="/gateway" className={`${TILE_LINK_CLS} lg:col-span-3`}>
-						<Card quiet className="flex h-full flex-col p-5">
-							<CardHead
-								icon="time"
-								title="Where the time goes"
-								meta="gateway vs upstream"
-							/>
-							{latency && latency.overhead_samples > 0 ? (
-								<div
-									className="flex flex-1 flex-col items-center justify-center"
-									title={
-										gwTripPct !== null
-											? "gateway ≈ N% of the trip is a ratio of two p95s measured over different span populations; percentiles are not additive, so read it as approximate."
-											: undefined
-									}
-								>
-									<ConcentricRings
-										rings={[
-											{
-												value: usingFallback
-													? `~${fmtMs(meanP95)}`
-													: fmtMs(meanP95),
-												label: "end-to-end",
-											},
-											{
-												value: fmtMs(latency.provider_p95_ms),
-												label: "provider",
-											},
-											{
-												value: fmtMs(latency.overhead_p95_ms),
-												label: "gateway",
-											},
-										]}
-										caption={
-											gwTripPct !== null
-												? `p95 · gateway ≈ ${gwTripPct}% of the trip${usingFallback ? " (approx)" : ""}`
-												: "p95 · end-to-end · provider · gateway"
-										}
-									/>
-									{/* Founder 2026-09-04: say the split out loud. The rings imply it; the
-									    reader should not have to subtract. Provider time is the model's and
-									    not ours to change; gateway time is, and its p50 is the honest steady
-									    state — a small n makes the p95 the single cold first request. */}
-									<dl className="mt-3 w-full max-w-[17rem] space-y-1 text-2xs">
-										<div className="flex items-baseline justify-between gap-3">
-											<dt className="text-ink-2">Provider (the model)</dt>
-											<dd className="font-mono tabular-nums text-ink">
-												{fmtMs(latency.provider_p95_ms)}
-												{meanP95 > 0 && (
-													<span className="text-ink-3">
-														{" "}
-														·{" "}
-														{Math.round(
-															(latency.provider_p95_ms / meanP95) * 100,
-														)}
-														%
-													</span>
-												)}
-											</dd>
-										</div>
-										<div className="flex items-baseline justify-between gap-3">
-											<dt className="text-ink-2">Gateway (ours)</dt>
-											<dd className="font-mono tabular-nums text-ink">
-												{fmtMs(latency.overhead_p95_ms)}
-												{gwTripPct !== null && (
-													<span className="text-ink-3"> · {gwTripPct}%</span>
-												)}
-											</dd>
-										</div>
-										<div className="flex items-baseline justify-between gap-3">
-											<dt className="text-ink-3">
-												Gateway, typical request (p50)
-											</dt>
-											<dd className="font-mono tabular-nums text-ink-2">
-												{fmtMs(latency.overhead_p50_ms)}
-											</dd>
-										</div>
-										{latency.overhead_samples < 20 && (
-											<p className="pt-1 text-ink-3">
-												n = {latency.overhead_samples} — at this volume the p95
-												is close to the slowest single request.
-											</p>
-										)}
-									</dl>
-								</div>
-							) : (
-								<CardEmpty
-									title="No latency split yet"
-									description="Gateway versus provider latency appears here as requests flow."
-								/>
-							)}
-						</Card>
-					</Link>
-					{/*
-					 * P0.10 — ERROR BUDGET. The one deliberately dark card, in BOTH
-					 * themes, because a burn signal should read as an instrument panel
-					 * rather than as the ninth white tile.
-					 *
-					 * THE BORDER IS LOAD-BEARING AND IT CANNOT BE `border-line`. In dark,
-					 * `--surface-inverse` IS the canvas colour, so with no border the card
-					 * has no edge whatsoever — a void beside cards that all carry a crisp
-					 * hairline. But `--line` is a LIGHT-SURFACE hairline (#e7e7e5), and on
-					 * a near-black card in light theme that paints a bright ring.
-					 * `border-ink-inverse/15` resolves to ~#2f3032 over the card in BOTH
-					 * themes — one expression, correct twice — and lands within a couple
-					 * of points of the #292B2F the brief specifies for this card.
-					 *
-					 * The `.card-lava-top` ink strip that used to sit on this card is
-					 * GONE with the class: `--action` and `--surface-inverse` are both
-					 * ink, so in light theme it painted a 2px #171717 line on a #151619
-					 * card — invisible by construction, and decorative even where it was
-					 * visible, which P0 does not allow.
-					 */}
-					<div className="flex h-full flex-col rounded-[var(--radius-card)] border border-ink-inverse/15 bg-surface-inverse p-6 lg:col-span-3">
-						<div className="flex items-center justify-between gap-3">
-							<div className="flex items-center gap-2">
-								<MetricIcon name="error-budget" size={20} onInverse />
-								<h2 className="t-card-title text-ink-inverse">
-									Error budget ({range.short})
-								</h2>
-							</div>
-						</div>
-						{/*
-						 * The burn rate is a VALUE AGAINST A THRESHOLD, which is the
-						 * textbook case for a gauge. SCALE: 0–2× across the arc, so the
-						 * 1.0× pace line lands at dead centre and "left of the tick" /
-						 * "right of the tick" is legible without reading a number. Above
-						 * 2× the arc pins full and the NUMERAL keeps counting — the arc
-						 * saturates, the datum does not. The centre display is the real
-						 * `head.burn` value in every case, so a pinned arc can never be
-						 * mistaken for a 2× reading.
-						 *
-						 * Dashed on `avail.noSample` too, not just `dash` (B-511): a
-						 * reachable summary with zero requests is not unreachable, but
-						 * an arc sitting dead centre reading '0.00×' still reads as a
-						 * healthy measurement of nothing.
-						 */}
-						{dash || avail.noSample ? (
-							<div className="mt-4 font-mono text-ramp-28 font-semibold leading-none tabular-nums text-ink-inverse">
-								—
-							</div>
-						) : (
-							<Gauge
-								onInverse
-								className="mt-2"
-								value={
-									Number.isFinite(budget.burnRate)
-										? Math.min(100, (budget.burnRate / 2) * 100)
-										: 100
-								}
-								marker={50}
-								display={head.burn}
-								label="burn rate"
-							/>
-						)}
-						<p className="mt-1 text-center text-2xs text-ink-inverse opacity-60">
-							1.0× = on pace
-						</p>
-						<dl className="mt-auto space-y-2.5 border-t border-ink-inverse/10 pt-4 text-xs">
-							<div className="flex items-center justify-between gap-3">
-								<dt className="text-ink-inverse opacity-60">Availability</dt>
-								<dd className="font-mono tabular-nums text-ink-inverse">
-									{dash || avail.noSample ? "—" : avail.text}
-								</dd>
-							</div>
-							<div className="flex items-center justify-between gap-3">
-								<dt className="text-ink-inverse opacity-60">
-									Target (your plan)
-								</dt>
-								<dd className="font-mono tabular-nums text-ink-inverse">
-									{fmtTarget(budget.target)}
-								</dd>
-							</div>
-							<div className="flex items-center justify-between gap-3">
-								<dt className="text-ink-inverse opacity-60">
-									Budget remaining
-								</dt>
-								<dd className="font-mono tabular-nums text-ink-inverse">
-									{/* Same rule as /slo: below the sample floor the remaining-budget
-										   figure is noise ("5002% over" on 4 requests) — 2026-09-27 audit. */}
-									{dash || avail.noSample || avail.belowFloor
+					<Card quiet className="p-5 lg:col-span-6">
+						<CardHead icon="latency" title="Health summary" meta={rLabel} />
+						<dl className="grid grid-cols-2 gap-4 text-xs">
+							{[
+								["Availability", dash || avail.noSample ? "—" : avail.text],
+								[
+									"p95 latency",
+									dash || !sloSummary || totalRequests === 0
 										? "—"
-										: head.budgetRemaining}
-								</dd>
-							</div>
+										: fmtDurationMs(meanP95),
+								],
+								["Burn rate", dash || avail.noSample ? "—" : head.burn],
+								[
+									"Budget remaining",
+									dash || avail.noSample || avail.belowFloor
+										? "—"
+										: head.budgetRemaining,
+								],
+							].map(([label, value]) => (
+								<div key={label}>
+									<dt className="text-ink-3">{label}</dt>
+									<dd className="mt-1 font-mono text-ink">{value}</dd>
+								</div>
+							))}
 						</dl>
-					</div>
+						<p className="mt-4 text-2xs text-ink-3">
+							{dash
+								? denied.has("Health")
+									? "Access denied"
+									: "Health measurements unavailable"
+								: totalRequests === 0
+									? "No measured requests in this window"
+									: `n = ${fmtCount(totalRequests)} requests${usingFallback ? " · summary unavailable; counts from buckets" : ""}${avail.belowFloor ? " · below the availability sample floor" : ""}`}{" "}
+							· target {fmtTarget(budget.target)}
+						</p>
+						<Link
+							href={href("/slo")}
+							className="mt-3 inline-block text-xs text-ink underline"
+						>
+							View SLO history and latency details →
+						</Link>
+					</Card>
 				</div>
-				<OverheadContext data={latency} />
 			</section>
 
 			{/* ── Section 2 — LATENCY, ROUTING & SAFETY ───────────────────────── */}
-			<section aria-label="Latency, routing and safety" className="space-y-3">
-				<SectionLabel>Latency, routing &amp; safety</SectionLabel>
+			<section aria-label="Guardrail activity" className="space-y-3">
+				<SectionLabel>Guardrail activity</SectionLabel>
 				<div className="grid grid-cols-1 gap-4 lg:grid-cols-12 lg:items-stretch">
-					{/* Latency over time + the full gateway-overhead / provider / TTFT
-					    percentile split — all real. PRIMARY. */}
-					<Card className="flex h-full flex-col p-5 lg:col-span-5">
-						<CardHead
-							icon="latency"
-							title={`Latency over time — ${rLabel}${range.kind === "preset" ? " · UTC" : ""}`}
-							meta="true quantiles per bucket"
-						/>
-						{canChartLatency ? (
-							<MetricChart
-								data={latencyData}
-								label={`p50, p95 and p99 latency per ${bucketLabel(range.bucketMs)} bucket, ${rLabel}`}
-								drillPath="/traces"
-								legend
-							/>
-						) : (
-							<CardEmpty
-								ghost={<GhostFloor />}
-								title={
-									timePoints === null
-										? "Waiting on the gateway"
-										: "No latency data yet"
-								}
-								description="Per-bucket percentiles appear here once a bucket in the window carries traffic."
-								action={{ href: "/gateway", label: "Gateway setup" }}
-							/>
-						)}
-						{latency && latency.overhead_samples > 0 && (
-							<dl className="mt-4 grid grid-cols-[auto_1fr] items-baseline gap-x-4 gap-y-2 border-t border-line pt-4 text-2xs">
-								<dt className="text-ink-3">Gateway</dt>
-								<dd className="text-right font-mono tabular-nums text-ink-2">
-									p50 {fmtMs(latency.overhead_p50_ms)} · p95{" "}
-									{fmtMs(latency.overhead_p95_ms)} · p99{" "}
-									{fmtMs(latency.overhead_p99_ms)}
-								</dd>
-								<dt className="text-ink-3">Provider</dt>
-								<dd className="text-right font-mono tabular-nums text-ink-2">
-									p50 {fmtMs(latency.provider_p50_ms)} · p95{" "}
-									{fmtMs(latency.provider_p95_ms)} · p99{" "}
-									{fmtMs(latency.provider_p99_ms)}
-								</dd>
-								<dt className="text-ink-3">TTFT</dt>
-								<dd className="text-right font-mono tabular-nums text-ink-2">
-									{latency.ttft_samples > 0
-										? `p50 ${fmtMs(latency.ttft_p50_ms)} · p95 ${fmtMs(latency.ttft_p95_ms)} · p99 ${fmtMs(latency.ttft_p99_ms)}`
-										: "—"}
-								</dd>
-							</dl>
-						)}
-					</Card>
-
-					{/* Request flow — gateway → model → honest OK/Error split. PRIMARY. */}
-					<Card className="flex h-full flex-col p-5 lg:col-span-4">
-						<CardHead
-							icon="request-flow"
-							title="Request flow"
-							meta="gateway → model → outcome"
-						/>
-						{flowModels.length > 0 ? (
-							<div className="flex flex-1 items-center">
-								<RequestFlow models={flowModels} />
-							</div>
-						) : (
-							<CardEmpty
-								title="No traffic yet"
-								description="The request path — gateway → model → OK or Error — appears here as your agents call the gateway."
-								action={{
-									href: "/settings/providers",
-									label: "Connect a provider",
-								}}
-							/>
-						)}
-					</Card>
-
 					{/* Guardrail activity — real block/fail-open verdicts. SECONDARY. */}
-					<Card quiet className="flex h-full flex-col p-5 lg:col-span-3">
+					<Card quiet className="flex h-full flex-col p-5 lg:col-span-12">
 						<CardHead
 							icon="guardrail"
 							title="Guardrail activity"
@@ -1158,11 +914,17 @@ async function DashboardData({ range }: { range: TimeRange }) {
 							<CardEmpty
 								title={
 									guardrails === null
-										? "Waiting on the gateway"
+										? denied.has("Guardrails")
+											? "Access denied"
+											: "Waiting on the gateway"
 										: "No guardrail activity yet"
 								}
 								description="Block and allow verdicts appear here as requests pass the inline guardrails."
-								action={{ href: "/guardrails", label: "Configure guardrails" }}
+								action={
+									guardrails === null
+										? undefined
+										: { href: "/guardrails", label: "Configure guardrails" }
+								}
 							/>
 						) : (
 							<div className="flex flex-1 flex-col justify-center">
@@ -1326,12 +1088,22 @@ async function DashboardData({ range }: { range: TimeRange }) {
 						) : (
 							<div className="px-6 pb-6">
 								<CardEmpty
-									title="No traffic yet"
+									title={
+										denied.has("Health")
+											? "Access denied"
+											: dash
+												? "Traffic measurements unavailable"
+												: "No traffic yet"
+									}
 									description="Per-model request volume appears here once your agents call the gateway."
-									action={{
-										href: "/settings/providers",
-										label: "Connect a provider",
-									}}
+									action={
+										dash
+											? undefined
+											: {
+													href: "/settings/providers",
+													label: "Connect a provider",
+												}
+									}
 								/>
 							</div>
 						)}
@@ -1350,14 +1122,20 @@ async function DashboardData({ range }: { range: TimeRange }) {
 							<CardEmpty
 								title={
 									gw === null
-										? "Waiting on the gateway"
+										? denied.has("Gateway usage")
+											? "Access denied"
+											: "Waiting on the gateway"
 										: "No provider traffic yet"
 								}
 								description="Per-provider request volume and error rate appear here."
-								action={{
-									href: "/settings/providers",
-									label: "Connect a provider",
-								}}
+								action={
+									gw === null
+										? undefined
+										: {
+												href: "/settings/providers",
+												label: "Connect a provider",
+											}
+								}
 							/>
 						) : (
 							/* `justify-start`, not `justify-center`. This card is the
@@ -1467,7 +1245,9 @@ async function DashboardData({ range }: { range: TimeRange }) {
 								<CardEmpty
 									title={
 										sig === null
-											? "Waiting on the gateway"
+											? denied.has("Signatures")
+												? "Access denied"
+												: "Waiting on the gateway"
 											: "No failure signatures matched yet"
 									}
 									description="A known agent-failure pattern — a tool-schema violation, definition drift — surfaces here when it is seen in your traces."
@@ -1497,8 +1277,12 @@ async function DashboardData({ range }: { range: TimeRange }) {
 					{toolAnalyticsWarming ? (
 						<div className="px-6 pb-6">
 							<CardEmpty
-								title="Warming up"
-								description="Tool usage data is unavailable while the gateway is warming."
+								title={denied.has("Tools") ? "Access denied" : "Warming up"}
+								description={
+									denied.has("Tools")
+										? "Ask a workspace administrator for access to tool metrics."
+										: "Tool usage data is unavailable while the gateway is warming."
+								}
 							/>
 						</div>
 					) : totalToolCalls === 0 ? (
@@ -1718,6 +1502,17 @@ export default async function DashboardPage({
 				<RangeControl />
 			</div>
 			<WindowNotice range={range} />
+			<Suspense
+				fallback={
+					<div
+						aria-busy="true"
+						aria-label="Loading recorded provider failures"
+						className="h-40 animate-pulse border border-line bg-surface-2"
+					/>
+				}
+			>
+				<ProviderFailures range={range} />
+			</Suspense>
 			<Suspense
 				fallback={
 					<p className="py-10 text-sm text-ink-3">Loading dashboard…</p>

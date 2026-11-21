@@ -52,6 +52,14 @@ pub(super) fn handles(key: &str) -> bool {
 }
 
 pub(super) fn apply(attrs: &[KeyValue], out: &mut SpanAttributes, caps: &OtlpCapturePolicy) {
+    // Canonical GenAI already won in the first pass. An explicit OI request
+    // model wins over the generic response/fallback model in either wire order.
+    if out.gen_ai_request_model.is_none() {
+        out.gen_ai_request_model = attrs
+            .iter()
+            .filter(|kv| kv.key == "llm.request.model_name")
+            .find_map(|kv| kv.value.as_ref().and_then(any_value_string));
+    }
     let mut input = BTreeMap::new();
     let mut output = BTreeMap::new();
     let mut documents = BTreeMap::<usize, RetrievalDocument>::new();

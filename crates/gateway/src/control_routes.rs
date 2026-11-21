@@ -898,7 +898,15 @@ async fn test_channel_handler(
         "window": "monthly", "mode": "soft", "budget_usd": 0.0, "spent_usd": 0.0,
     });
     let mail = crate::spend_alerts::Mail::from_env();
-    match crate::spend_alerts::deliver(&mail, &ch, uuid::Uuid::new_v4(), &payload).await {
+    match crate::spend_alerts::deliver(
+        &mail,
+        &ch,
+        uuid::Uuid::new_v4(),
+        &payload,
+        &crate::server::approval_link_base_from_env(),
+    )
+    .await
+    {
         Ok(()) => no_store(Json(json!({ "delivered": true }))),
         Err(e) => no_store((
             StatusCode::BAD_GATEWAY,

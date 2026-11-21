@@ -24,6 +24,8 @@ use uuid::Uuid;
 #[path = "../src/db/mod.rs"]
 #[allow(dead_code)]
 mod db;
+#[path = "../src/gateway_recording.rs"]
+mod gateway_recording;
 // B-383 (a): the KEK ring and the rotate command, for the real-Postgres re-wrap
 // proof below. `byok_rotate` reaches `crate::byok` and `crate::db`, which is why
 // both are mounted here under those exact names.
@@ -1463,6 +1465,7 @@ async fn b378_batch_advances_the_head_by_k_and_chains() -> Result<()> {
         genesis,
         Some(&ids),
         5,
+        &[None, None, None, None, None],
         move |first_seq, prev, kept| {
             seen2.lock().unwrap().push((first_seq, prev, kept.to_vec()));
             Ok(fake_rows(&t2, first_seq, prev, kept))
@@ -1519,6 +1522,7 @@ async fn b378_batch_advances_the_head_by_k_and_chains() -> Result<()> {
         genesis,
         Some(&ids),
         5,
+        &[None, None, None, None, None],
         move |first_seq, prev, kept| {
             calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(fake_rows(&t3, first_seq, prev, kept))
@@ -1550,6 +1554,7 @@ async fn b378_batch_advances_the_head_by_k_and_chains() -> Result<()> {
         genesis,
         Some(&mixed),
         4,
+        &[None, None, None, None],
         move |first_seq, prev, kept| Ok(fake_rows(&t4, first_seq, prev, kept)),
     )
     .await?
@@ -1588,6 +1593,7 @@ async fn b378_a_short_row_vector_refuses_to_advance_the_head() -> Result<()> {
         [1u8; 32],
         Some(&ids),
         3,
+        &[None, None, None],
         move |first_seq, prev, kept| Ok(fake_rows(&t2, first_seq, prev, &kept[..2])),
     )
     .await
@@ -2753,7 +2759,7 @@ async fn og25_controls_round_trip_and_are_audited() -> Result<()> {
     )
     .await?;
     let client = pool.get().await?;
-    let row = read_with(&client, t.as_uuid()).await?.expect("a row");
+    let row = read_with(&**client, t.as_uuid()).await?.expect("a row");
     assert_eq!(row.blocked_models, vec!["gpt-4o*".to_string()]);
     assert_eq!(row.blocked_end_users, vec!["u1".to_string()]);
     assert!(row.blocked_providers.is_empty());
@@ -3847,3 +3853,6 @@ async fn b605_archive_first_blocks_mint_and_rechecks_committed_archive() -> Resu
     .await??;
     Ok(())
 }
+
+#[path = "postgres_tenant_integration/alert_fairness.rs"]
+mod alert_fairness;

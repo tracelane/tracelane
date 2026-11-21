@@ -45,9 +45,26 @@ const READ_SQL: &str = concat!(
     " LEFT JOIN workspace_data_controls dc ON dc.tenant_id=t.id WHERE t.id=$1 AND t.archived_at IS NULL"
 );
 
+/// The workspace's STORED retention choice (`None` = the plan default), through the same
+/// statement `GET /v1/data-controls` runs. A workspace with no plan row has no readable
+/// retention at all — an error here, as the route answers `retention_unavailable`.
+///
+/// # Errors
+/// A statement failure, or no plan row for the tenant. Fail-CLOSED.
+pub(crate) async fn stored_retention_days(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &uuid::Uuid,
+) -> anyhow::Result<Option<i32>> {
+    let row = client
+        .query_opt(READ_SQL, &[tenant])
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("retention_unavailable: no plan row for the workspace"))?;
+    Ok(row.get::<_, Option<i32>>("retention_days"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RetentionBody {
+pub(crate) struct RetentionBody {
     #[serde(deserialize_with = "required_days")]
     days: Option<i32>,
     confirm: Option<String>,
@@ -156,8 +173,24 @@ async fn save_retention(
 ) -> anyhow::Result<bool> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let key =
-        crate::retention_sweep::retention_lock_key(&tx, &claims.tenant_id.to_string()).await?;
+    let changed = save_retention_in_tx(&tx, claims, control, body, policy).await?;
+    if changed {
+        tx.commit().await?;
+    }
+    Ok(changed)
+}
+
+/// Retain the retention-sweep lock and plan validation inside the caller's transaction.
+#[tracing::instrument(skip_all, fields(tenant_id = %claims.tenant_id))]
+pub(crate) async fn save_retention_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    claims: &Claims,
+    control: &crate::control_plane::ControlActor,
+    body: &RetentionBody,
+    policy: crate::db::data_controls::Policy,
+) -> anyhow::Result<bool> {
+    crate::db::controls::lock_config(tx, &claims.tenant_id).await?;
+    let key = crate::retention_sweep::retention_lock_key(tx, &claims.tenant_id.to_string()).await?;
     let acquired: bool = tx
         .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&key])
         .await?
@@ -195,7 +228,7 @@ async fn save_retention(
     };
     tx.execute("INSERT INTO workspace_data_controls (tenant_id,retention_days,updated_by) VALUES ($1,$2,$3) ON CONFLICT (tenant_id) DO UPDATE SET retention_days=EXCLUDED.retention_days,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()", &[claims.tenant_id.as_uuid(),&body.days,&claims.sub]).await?;
     crate::db::control_audit::record(
-        &tx,
+        tx,
         &claims.tenant_id,
         &control.audit,
         crate::db::control_audit::Change {
@@ -207,7 +240,6 @@ async fn save_retention(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok(true)
 }
 async fn write(

@@ -1093,3 +1093,140 @@ pub(super) mod publish_api {
         );
     }
 }
+
+/// Action-control audit H1 + M1 (2026-11-17), against real Postgres.
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn pg_audit_h1_m1_protection_cannot_be_side_stepped() {
+    let (pool, auth, c, p) = setup().await;
+    let server: Uuid = serde_json::from_str::<Value>(&c).unwrap()["server_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tenant = *auth.tenant_id.as_uuid();
+    let mut client = pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    activate_tx(&tx, &auth, Some(&grants()), &c, &p)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let other = Uuid::new_v4();
+    tx.execute("INSERT INTO mcp_servers(id,tenant_id,slug,name,url,transport,auth_mode) VALUES ($1,$2,'other','Other','https://other.invalid','streamable_http','none')",&[&other,&tenant]).await.unwrap();
+
+    // H1 (B-640, checked at call time): another registration of the SAME upstream (URL
+    // variants included) may not call a tool the protected registration protects — whether it
+    // predates the protection or not. An unrelated upstream is unaffected.
+    for (i, url) in [
+        "https://example.invalid",
+        "HTTPS://EXAMPLE.invalid:443/",
+        "https://user@example.invalid/?x=1#f",
+        "https://example.invalid/sse",
+        "https://example.invalid./mcp",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dup = Uuid::new_v4();
+        tx.execute("INSERT INTO mcp_servers(id,tenant_id,slug,name,url,transport,auth_mode) VALUES ($1,$2,$3,'Dup',$4,'streamable_http','none')",&[&dup,&tenant,&format!("dup{i}"),url]).await.unwrap();
+        assert!(
+            protected_elsewhere_tx(&tx, &auth, dup, url, "pay")
+                .await
+                .unwrap(),
+            "{url}"
+        );
+        // Residual (spec §5): a tool the protected registration does not know is judged
+        // exactly, so an unrelated app on the same host:port is not refused wholesale.
+        assert!(
+            !protected_elsewhere_tx(&tx, &auth, dup, url, "pay_v2")
+                .await
+                .unwrap(),
+            "{url}: an unknown tool is judged by exact name across siblings"
+        );
+    }
+    assert!(
+        !protected_elsewhere_tx(&tx, &auth, server, "https://example.invalid", "pay")
+            .await
+            .unwrap(),
+        "the protected registration itself is classified on the protected path"
+    );
+    assert!(
+        !protected_elsewhere_tx(&tx, &auth, other, "https://other.invalid", "pay")
+            .await
+            .unwrap()
+    );
+    // The protected server may not move or be archived while it protects anything.
+    assert!(
+        server_currently_protected_tx(&tx, &tenant, &server)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !server_currently_protected_tx(&tx, &tenant, &other)
+            .await
+            .unwrap()
+    );
+    // Another tenant's registration of the same URL is never judged by this tenant.
+    let foreign = claims(&TenantId::from_jwt_claim(Uuid::new_v4()));
+    assert!(
+        !protected_elsewhere_tx(
+            &tx,
+            &foreign,
+            Uuid::new_v4(),
+            "https://example.invalid",
+            "pay"
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[test]
+fn b640_upstream_identity_normalises_equivalent_urls() {
+    let id = |u: &str| upstream_identity(u).unwrap();
+    let base = id("https://h.invalid/mcp");
+    for same in [
+        "https://H.INVALID/mcp/",
+        "https://h.invalid:443/mcp",
+        "https://h.invalid/sse",
+        "https://h.invalid./mcp",
+        "https://h.invalid/a/../other",
+        "https://u:p@h.invalid/mcp?x=1#y",
+    ] {
+        assert_eq!(id(same), base, "{same}");
+    }
+    for different in [
+        "https://h.invalid:8443/mcp",
+        "http://h.invalid/mcp",
+        "https://g.invalid/mcp",
+    ] {
+        assert_ne!(id(different), base, "{different}");
+    }
+    assert!(upstream_identity("not a url").is_none());
+}
+
+/// B-640 (third review, L3): a contract can never be activated on an archived registration,
+/// which would protect a server nobody can call while the live duplicate stays unprotected.
+#[tokio::test]
+#[ignore = "needs POSTGRES_TEST_URL"]
+async fn b640_activation_refuses_an_archived_server() {
+    let (pool, auth, c, p) = setup().await;
+    let server: Uuid = serde_json::from_str::<Value>(&c).unwrap()["server_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut client = pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.execute(
+        "UPDATE mcp_servers SET archived_at=now() WHERE tenant_id=$1 AND id=$2",
+        &[auth.tenant_id.as_uuid(), &server],
+    )
+    .await
+    .unwrap();
+    let err = activate_tx(&tx, &auth, Some(&grants()), &c, &p)
+        .await
+        .expect_err("an archived server must not be protected");
+    assert_eq!(err.to_string(), "contract_invalid");
+}

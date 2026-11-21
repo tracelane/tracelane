@@ -3796,6 +3796,17 @@ LIMIT 1 BY trace_id"
 /// [`ClickHouseTraceReader`]; tests use the in-module `MockTraceReader`.
 #[async_trait::async_trait]
 pub trait TraceReader: Send + Sync {
+    /// # Errors
+    /// Fails CLOSED when recorded attempt evidence cannot be read.
+    async fn provider_failures(
+        &self,
+        _tenant: &TenantId,
+        _since: i64,
+        _until: i64,
+    ) -> Result<Vec<crate::provider_failures::FailureRow>> {
+        anyhow::bail!("recorded provider failures unavailable")
+    }
+
     /// Recording cutover from the cached policy; absent is unknown.
     /// # Errors
     /// Infallible; missing/invalid data fails OPEN to an absent caption.
@@ -4317,6 +4328,30 @@ impl TraceReader for ClickHouseTraceReader {
             None => None,
         };
         Ok(ent.as_ref().map_or(self.no_cp_rpm, |e| e.rate_limit_rpm))
+    }
+
+    async fn provider_failures(
+        &self,
+        tenant: &TenantId,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<crate::provider_failures::FailureRow>> {
+        let sql = TenantQuery::new(
+            format!("{WINDOW_WITH}{}", crate::provider_failures::summary_sql()),
+            self.tier_for(tenant).await,
+        )
+        .sql_with_settings();
+        Ok(
+            crate::retention_sweep::read_client(&self.client, self.entitlements.as_deref(), tenant)
+                .await
+                .query(&sql)
+                .bind(since)
+                .bind(until)
+                .bind(tenant.to_string())
+                .bind(GATEWAY_PROVIDER_CAP + 1)
+                .fetch_all()
+                .await?,
+        )
     }
 
     async fn rescue_summary(
@@ -5999,6 +6034,10 @@ pub fn routes(state: TraceReadState, extra_routes: Router) -> Router {
         .route("/v1/guardrails/stats", get(guardrail_stats_handler))
         .route("/v1/guardrails/verdicts", get(guardrail_verdicts_handler))
         .route("/v1/query/signatures", get(signatures_handler))
+        .route(
+            "/v1/query/provider-failures",
+            get(provider_failures_handler),
+        )
         .route("/v1/sessions", get(list_sessions_handler))
         .route(
             "/v1/sessions/{session_id}/traces",
@@ -8019,6 +8058,74 @@ async fn gateway_stats_handler(
         })
         .ok();
     served.stamp(Json(response).into_response())
+}
+
+/// Counts recorded failures only. Authentication supplies the tenant; the same
+/// trace-read rate, retention and query budgets apply as other trace aggregates.
+#[instrument(skip_all, fields(tenant_id = tracing::field::Empty))]
+async fn provider_failures_handler(
+    State(state): State<TraceReadState>,
+    Query(q): Query<GatewayStatsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match authenticate(&headers).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    tracing::Span::current().record("tenant_id", tracing::field::display(&claims.tenant_id));
+    let since = match parse_rfc3339_secs(q.since.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid since timestamp"),
+    };
+    let until = match parse_rfc3339_secs(q.until.as_deref()) {
+        Ok(v) => v,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "invalid until timestamp"),
+    };
+    let served = ServedWindow::resolve(
+        since,
+        until,
+        q.hours
+            .unwrap_or(DEFAULT_GATEWAY_HOURS)
+            .clamp(1, MAX_GATEWAY_HOURS),
+        chrono::Utc::now().timestamp(),
+        MAX_WINDOW_SECS,
+    );
+    if served.since_secs > served.until_secs {
+        return error_response(StatusCode::BAD_REQUEST, "since must not follow until");
+    }
+    let rows = match state
+        .reader
+        .provider_failures(
+            &claims.tenant_id,
+            served.since_secs * 1_000_000,
+            served.until_secs * 1_000_000,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "recorded provider failures read failed");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "recorded provider failures unavailable",
+            );
+        }
+    };
+    let Some(totals) = rows.iter().find(|r| r.overall == 1) else {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "recorded provider failure totals unavailable",
+        );
+    };
+    let providers: Vec<_> = rows.iter().filter(|r| r.overall == 0).collect();
+    served.stamp(
+        Json(serde_json::json!({
+            "totals": totals, "providers": providers,
+            "truncated": totals.provider_count > providers.len() as u64,
+            "record_cap": tracelane_shared::span::MAX_DISPATCH_ATTEMPTS,
+        }))
+        .into_response(),
+    )
 }
 
 /// GET /v1/query/latency-breakdown — the honest latency SPLIT for the authenticated
@@ -11103,6 +11210,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
         seen_trace_filters: Mutex<Vec<TraceListFilters>>,
         chain_status: Option<TraceChainStatus>,
         seen_tenant: Mutex<Vec<String>>,
+        seen_failure_windows: Mutex<Vec<(String, i64, i64)>>,
         /// CX-26: every `CostFilters` the handler passed, so a test can prove the
         /// absolute pair reached the reader rather than a rolling substitute.
         seen_cost_filters: Mutex<Vec<CostFilters>>,
@@ -11144,6 +11252,7 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
                 seen_trace_filters: Mutex::new(Vec::new()),
                 chain_status: None,
                 seen_tenant: Mutex::new(Vec::new()),
+                seen_failure_windows: Mutex::new(Vec::new()),
                 seen_cost_filters: Mutex::new(Vec::new()),
             }
         }
@@ -11151,6 +11260,25 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
 
     #[async_trait::async_trait]
     impl TraceReader for MockTraceReader {
+        async fn provider_failures(
+            &self,
+            tenant: &TenantId,
+            since: i64,
+            until: i64,
+        ) -> Result<Vec<crate::provider_failures::FailureRow>> {
+            self.seen_failure_windows
+                .lock()
+                .unwrap()
+                .push((tenant.to_string(), since, until));
+            anyhow::ensure!(
+                !self.rescue_read_fails,
+                "synthetic unavailable attempt read"
+            );
+            Ok(vec![crate::provider_failures::FailureRow {
+                overall: 1,
+                ..Default::default()
+            }])
+        }
         fn trace_read_policy(&self) -> crate::billing::rating::TraceReadPolicy {
             self.trace_read_policy_override
                 .unwrap_or(crate::billing::rating::Policy::default().trace_reads)
@@ -14108,6 +14236,93 @@ AND NOT JSONExtractBool(attributes, 'tracelane_semantic_cache_hit')"
     }
 
     #[tokio::test]
+    async fn provider_failures_rejects_bad_windows_and_preserves_read_errors() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        for (query, fails, expected) in [
+            ("since=invalid", false, StatusCode::BAD_REQUEST),
+            ("until=invalid", false, StatusCode::BAD_REQUEST),
+            (
+                "since=2026-11-18T02:00:00Z&until=2026-11-18T01:00:00Z",
+                false,
+                StatusCode::BAD_REQUEST,
+            ),
+            ("hours=1", true, StatusCode::BAD_GATEWAY),
+        ] {
+            let reader = Arc::new(MockTraceReader {
+                rescue_read_fails: fails,
+                ..MockTraceReader::new()
+            });
+            let app = routes(
+                TraceReadState {
+                    reader,
+                    rejections: test_rejections(),
+                },
+                Router::new(),
+            );
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/v1/query/provider-failures?{query}"))
+                        .header("authorization", "Bearer test-token")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_failures_route_returns_recorded_counts() {
+        use tower::ServiceExt;
+        let _g = DevAuthGuard::new();
+        for (since, expected_since) in [
+            ("2026-11-18T00:00:00Z", "2026-11-18T00:00:00Z"),
+            ("2026-01-01T00:00:00Z", "2026-10-19T01:00:00Z"),
+        ] {
+            let reader = Arc::new(MockTraceReader::new());
+            let app = routes(
+                TraceReadState {
+                    reader: reader.clone(),
+                    rejections: test_rejections(),
+                },
+                Router::new(),
+            );
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!(
+                            "/v1/query/provider-failures?since={since}&until=2026-11-18T01:00:00Z"
+                        ))
+                        .header("authorization", "Bearer test-token")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected_since = chrono::DateTime::parse_from_rfc3339(expected_since)
+                .unwrap()
+                .timestamp_micros();
+            let expected_until = chrono::DateTime::parse_from_rfc3339("2026-11-18T01:00:00Z")
+                .unwrap()
+                .timestamp_micros();
+            assert_eq!(
+                *reader.seen_failure_windows.lock().unwrap(),
+                vec![(DEV_TENANT.to_owned(), expected_since, expected_until)]
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["totals"]["failed"], 0);
+            assert_eq!(body["providers"], serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
     async fn cf_m3_trace_router_limits_reads_per_tenant() {
         use tower::ServiceExt;
         let claims = crate::auth::dev_stub_claims(crate::auth::AuthMethod::ApiKey);
@@ -15323,6 +15538,135 @@ mod clickhouse_roundtrip {
             .await
             .unwrap();
         assert_eq!(unfiltered.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local CLICKHOUSE_TEST_URL"]
+    async fn provider_failures_real_clickhouse_status_coverage_tenant_and_window_contract() {
+        let _serial = SHARED_DB.lock().await;
+        let c = ch().expect("CLICKHOUSE_TEST_URL required; absence is not a pass");
+        ensure_spans(&c).await;
+        let reader = ClickHouseTraceReader::new(c.clone());
+        let a = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let b = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let empty = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let base = chrono::Utc::now().timestamp() - 60;
+        let mut ledger: Vec<serde_json::Value> = [
+            serde_json::json!(429),
+            serde_json::json!(503),
+            serde_json::json!(400),
+            serde_json::json!(302),
+            serde_json::json!(599),
+            serde_json::json!(499),
+            serde_json::json!(500),
+            serde_json::Value::Null,
+            serde_json::json!(200),
+            serde_json::json!(600),
+            serde_json::json!("429"),
+            serde_json::json!(429.5),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+        ]
+        .into_iter()
+        .map(|status| serde_json::json!({"provider":"attempt-a","outcome":"error","status":status}))
+        .collect();
+        ledger.push(serde_json::json!({"provider":"attempt-a","outcome":"error"}));
+        ledger.push(serde_json::json!({"outcome":"error","status":429}));
+        ledger.push(serde_json::json!({"provider":"attempt-a","outcome":"error","status":504,"reason":"upstream_timeout:read_idle"}));
+        ledger.push(serde_json::json!({"provider":"attempt-a","outcome":"error","status":504,"reason":"provider_unavailable"}));
+        ledger.push(serde_json::json!({"provider":"attempt-a","outcome":"ok"}));
+        ledger.push(serde_json::json!({"provider":"attempt-a","outcome":"skipped","status":429}));
+        let capped = vec![
+            serde_json::json!({"provider":"attempt-a","outcome":"ok"});
+            tracelane_shared::span::MAX_DISPATCH_ATTEMPTS
+        ];
+        let span_id = uuid::Uuid::new_v4().to_string();
+        for (tenant, timestamp, attempts) in [
+            (&a, base, ledger.clone()),
+            (&a, base, vec![]),
+            (&a, base, capped),
+            (&b, base, ledger.clone()),
+            (&a, base - 3600, ledger),
+        ] {
+            c.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, status_code, attributes) VALUES (?, ?, ?, 'gen_ai.chat', toDateTime64(?, 6), toDateTime64(?, 6), 2, ?)")
+                .bind(tenant.to_string()).bind(uuid::Uuid::new_v4().to_string()).bind(&span_id)
+                .bind(timestamp).bind(timestamp + 1)
+                .bind(serde_json::json!({"gen_ai_provider_name":"final-provider", "tracelane_dispatch_attempts":attempts}).to_string())
+                .execute().await.unwrap();
+        }
+        let rows = reader
+            .provider_failures(&a, (base - 1) * 1_000_000, (base + 2) * 1_000_000)
+            .await
+            .unwrap();
+        let totals = rows.iter().find(|r| r.overall == 1).unwrap();
+        assert_eq!(
+            (
+                totals.failed,
+                totals.rate_limited,
+                totals.server_error,
+                totals.other,
+                totals.unknown
+            ),
+            (18, 2, 4, 3, 9)
+        );
+        assert_eq!(
+            (
+                totals.captured_spans,
+                totals.recorded_spans,
+                totals.capped_spans,
+                totals.provider_count
+            ),
+            (3, 2, 1, 2)
+        );
+        let attempt = rows.iter().find(|r| r.provider == "attempt-a").unwrap();
+        assert_eq!((attempt.failed, attempt.unknown), (17, 9));
+        assert!(rows.iter().all(|r| r.provider != "final-provider"));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.overall == 0 && r.provider.is_empty())
+                .count(),
+            1
+        );
+        let rows = reader
+            .provider_failures(&empty, (base - 1) * 1_000_000, (base + 2) * 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].overall, rows[0].failed, rows[0].captured_spans),
+            (1, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local CLICKHOUSE_TEST_URL"]
+    async fn provider_failures_real_clickhouse_row_cap_preserves_global_totals() {
+        let _serial = SHARED_DB.lock().await;
+        let c = ch().expect("CLICKHOUSE_TEST_URL required");
+        ensure_spans(&c).await;
+        let tenant = TenantId::from_self_host_config(uuid::Uuid::new_v4());
+        let base = chrono::Utc::now().timestamp() - 60;
+        for n in 0..=GATEWAY_PROVIDER_CAP {
+            c.query("INSERT INTO tracelane.spans (tenant_id, trace_id, span_id, name, start_time, end_time, status_code, attributes) VALUES (?, ?, ?, 'gen_ai.chat', toDateTime64(?, 6), toDateTime64(?, 6), 2, ?)")
+                .bind(tenant.to_string()).bind(uuid::Uuid::new_v4().to_string()).bind(uuid::Uuid::new_v4().to_string())
+                .bind(base).bind(base + 1)
+                .bind(serde_json::json!({"gen_ai_provider_name":"final", "tracelane_dispatch_attempts":[{"provider":format!("provider-{n:03}"),"outcome":"error","status":429}]}).to_string())
+                .execute().await.unwrap();
+        }
+        let rows = ClickHouseTraceReader::new(c)
+            .provider_failures(&tenant, (base - 1) * 1_000_000, (base + 2) * 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), GATEWAY_PROVIDER_CAP as usize + 1);
+        assert_eq!(
+            (rows[0].overall, rows[0].failed, rows[0].provider_count),
+            (
+                1,
+                u64::from(GATEWAY_PROVIDER_CAP) + 1,
+                u64::from(GATEWAY_PROVIDER_CAP) + 1
+            )
+        );
+        assert_eq!(rows[1].provider, "provider-000");
     }
 
     fn ch() -> Option<clickhouse::Client> {

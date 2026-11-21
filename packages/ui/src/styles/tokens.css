@@ -100,7 +100,7 @@
 	--color-chart-3: var(--chart-3);
 	--color-chart-4: var(--chart-4);
 
-	/* THE RECORDER'S AMBER (DSH-16). The one companion hue to `--action`'s indigo —
+	/* THE RECORDER'S AMBER (DSH-16). The one companion hue to the black-and-white UI (`--action` was indigo until 2026-11-18) —
 	   used for "this is being captured right now", never for a clickable
 	   affordance and never for a state (`--warn` stays the degraded colour, even
 	   though both are amber-family: they mean different things and are tuned to
@@ -314,11 +314,13 @@
 
 	--ink-3: #70717a; /* Darkened from the suggested muted grey to meet AA for small text. */
 
-	--action: #5e6ad2;
-	--action-ink: #4c57c0;
+	/* Founder 2026-11-18: the app matches the site — black and white, colour only in data
+	   and status. Was the Linear indigo (#5e6ad2). --info and the chart tokens keep blue. */
+	--action: #000000;
+	--action-ink: #000000;
 	--action-on: #ffffff;
-	--action-soft: #eef0fb;
-	--action-line: #c4c9ef;
+	--action-soft: #f2f3f5;
+	--action-line: #d4d4d8;
 
 	--ok: #1b7f3b;
 	--ok-ink: #166b32;
@@ -346,10 +348,13 @@
 	--chart-3: #3f8f5c;
 	--chart-4: var(--accent-warm);
 
-	--accent-warm: #ad6800;
-	--accent-warm-ink: #875100;
-	--accent-warm-soft: #fff3df;
-	--accent-warm-line: #e4c18a;
+	/* Signal orange (DSH-17, founder 2026-11-19; sampled from the founder's screenshot of
+	   appliedcompute.com: #EA5429). Dots, marks and icons only: 3.62:1 on white, so text
+	   uses -ink (5.65:1 on white, 5.0:1 on -soft). Asserted by apps/site/tests/site.test.ts. */
+	--accent-warm: #ea5429;
+	--accent-warm-ink: #b5401b;
+	--accent-warm-soft: #fdeee8;
+	--accent-warm-line: #f4b9a3;
 
 	--glow-warm: radial-gradient(
 		circle at 50% 45%,
@@ -362,7 +367,7 @@
 	--seal-soft: #e6f4ea;
 	--seal-line: #c2e0cd;
 
-	--selected: #5e6ad2;
+	--selected: #000000;
 	--selected-on: #ffffff;
 
 	--focus-ring: var(--action);
@@ -419,11 +424,11 @@
 	--ink-2: #b5b6be;
 	--ink-3: #92939d;
 
-	--action: #7c85e0;
-	--action-ink: #a5adf5;
+	--action: #f4f4f5;
+	--action-ink: #ffffff;
 	--action-on: #101113;
-	--action-soft: #262a49;
-	--action-line: #4c548d;
+	--action-soft: #26272b;
+	--action-line: #45464e;
 
 	--ok: #30d158;
 	--ok-ink: #4ade80;
@@ -451,10 +456,11 @@
 	--chart-3: #5cc184;
 	--chart-4: var(--accent-warm);
 
-	--accent-warm: #e9a84c;
-	--accent-warm-ink: #f2bb69;
-	--accent-warm-soft: #332511;
-	--accent-warm-line: #735023;
+	/* Signal orange, dark theme (DSH-17): 6.15:1 / 8.45:1 on the dark canvas. */
+	--accent-warm: #f06a40;
+	--accent-warm-ink: #ff8f6b;
+	--accent-warm-soft: #3a1f16;
+	--accent-warm-line: #7a3523;
 	--glow-warm: radial-gradient(
 		circle at 50% 45%,
 		color-mix(in oklab, var(--accent-warm) 20%, transparent) 0%,
@@ -466,7 +472,7 @@
 	--seal-soft: #0f2a18;
 	--seal-line: #1c4630;
 
-	--selected: #7c85e0;
+	--selected: #f4f4f5;
 	--selected-on: #101113;
 
 	--focus-ring: var(--action);

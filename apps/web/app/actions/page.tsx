@@ -1,3 +1,7 @@
+import {
+	CoveragePanel,
+	loadCoverage,
+} from "@/components/actions/CoveragePanel";
 import { ReadFailure } from "@/components/empty-states/ReadFailure";
 import { type ActionList, evidenceSummary, stateInfo } from "@/lib/actions";
 import { formatDateTimeUtc } from "@/lib/format-date";
@@ -15,9 +19,11 @@ export default async function ActionsPage({
 	const before = raw && /^\d{1,18}$/.test(raw) ? raw : null;
 	const header = (
 		<>
-			<PageHeader title="Actions" description={COVERAGE} />
+			<PageHeader title="Actions" note={COVERAGE} />
 		</>
 	);
+	// Start coverage alongside the actions read, so it never adds a serial round trip.
+	const coveragePromise = loadCoverage();
 	let data: ActionList;
 	try {
 		data = await gatewayGet<ActionList>(
@@ -42,9 +48,11 @@ export default async function ActionsPage({
 			</div>
 		);
 	}
+	const coverage = await coveragePromise;
 	return (
 		<div className="space-y-4 p-6">
 			{header}
+			<CoveragePanel coverage={coverage} />
 			{(data.skipped_malformed ?? 0) > 0 && (
 				<p className="text-sm text-ink-2">
 					{data.skipped_malformed} action record(s) on this page could not be

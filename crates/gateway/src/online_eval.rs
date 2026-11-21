@@ -522,6 +522,7 @@ async fn judge_one(job: &JudgeJob) -> anyhow::Result<()> {
         key.expose_secret(),
         &model,
         &job.tenant_id,
+        &crate::sovereign::Egress::unclassified(crate::server::config::sovereign()),
     )
     .await;
     // BILL-01 meter 6 (eval_runs): ONE unit per judge call that reached a

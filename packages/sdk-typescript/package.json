@@ -1,6 +1,6 @@
 {
 	"name": "@tracelanedev/sdk",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Tracelane TypeScript SDK — auto-instrument AI agent frameworks",
 	"repository": {
 		"type": "git",
@@ -88,6 +88,10 @@
 		"./letta": {
 			"import": { "types": "./dist/instrumentations/letta.d.mts", "default": "./dist/instrumentations/letta.mjs" },
 			"require": { "types": "./dist/instrumentations/letta.d.ts", "default": "./dist/instrumentations/letta.js" }
+		},
+		"./approvals": {
+			"import": { "types": "./dist/instrumentations/approvals.d.mts", "default": "./dist/instrumentations/approvals.mjs" },
+			"require": { "types": "./dist/instrumentations/approvals.d.ts", "default": "./dist/instrumentations/approvals.js" }
 		},
 		"./firecrawl": {
 			"import": { "types": "./dist/instrumentations/firecrawl.d.mts", "default": "./dist/instrumentations/firecrawl.mjs" },

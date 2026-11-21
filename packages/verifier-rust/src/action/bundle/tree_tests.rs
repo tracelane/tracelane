@@ -76,3 +76,86 @@ fn tree_checkpoint_other_tenant() {
     assert_eq!(error.code, 5, "{error}");
     assert!(error.detail.starts_with("tree checkpoint: "), "{error}");
 }
+
+#[test]
+fn tree_requirement_preserves_legacy_entry_points() {
+    let (files, pin) = fixture("{}");
+    let raw = seal(files).unwrap();
+    assert!(verify(&raw, Some(pin)).unwrap().tree_size.is_none());
+    assert!(
+        verify_with_tree_requirement(&raw, Some(pin), &[], None, false)
+            .unwrap()
+            .tree_size
+            .is_none()
+    );
+    let error = verify_with_tree_requirement(&raw, Some(pin), &[], None, true).unwrap_err();
+    assert_eq!(error.code, 4);
+    assert_eq!(error.detail, "required tree checkpoint is absent");
+}
+
+#[test]
+fn tree_requirement_reports_absent_optional_timestamp_and_chain() {
+    let (files, pin) = fixture("{}");
+    let raw = seal(with_tree(files, 7, 1, 0)).unwrap();
+    let missing_chain = verify_with_tree_requirement(
+        &raw,
+        Some(pin),
+        &[],
+        Some(std::time::Duration::from_secs(60)),
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(missing_chain.code, 4);
+    assert!(missing_chain.detail.contains("requires checkpoints.ndjson"));
+    let report = verify_with_tree_requirement(&raw, Some(pin), &[], None, true).unwrap();
+    assert_eq!(report.tree_size, Some(3));
+    assert!(!report.timestamped);
+    assert!(report.checkpoint_chain.is_none());
+}
+
+#[test]
+fn tree_requirement_does_not_replace_external_trust() {
+    let (files, _) = fixture("{}");
+    let raw = seal(with_tree(files, 7, 1, 0)).unwrap();
+    for pin in [None, Some([9; 32])] {
+        assert_eq!(
+            verify_with_tree_requirement(&raw, pin, &[], None, true)
+                .unwrap_err()
+                .code,
+            5
+        );
+    }
+}
+
+#[test]
+fn tree_requirement_accepts_verified_empty_tree_not_unknown() {
+    let (mut files, pin) = fixture("{}");
+    let mut head: serde_json::Value = serde_json::from_slice(&files["checkpoint.json"]).unwrap();
+    head["seq"] = serde_json::Value::Null;
+    head["head_hash"] = serde_json::Value::Null;
+    let head = canonical_json(&head.to_string()).unwrap();
+    files.insert(
+        "checkpoint.sig".into(),
+        key(7).sign(head.as_bytes()).as_ref().to_vec(),
+    );
+    files.insert("checkpoint.json".into(), head.into_bytes());
+    files.insert("ledger.ndjson".into(), Vec::new());
+    let raw = seal(with_tree(files, 7, 1, 0)).unwrap();
+    let report = verify_with_tree_requirement(&raw, Some(pin), &[], None, true).unwrap();
+    assert_eq!(report.tree_size, Some(0));
+    assert_eq!(
+        report.tree_root,
+        Some(hex::encode(crate::action::tree::root(&[])))
+    );
+}
+
+#[test]
+fn tree_requirement_preserves_max_gap_bounds() {
+    let (files, pin) = fixture("{}");
+    let raw = seal(with_tree(files, 7, 1, 0)).unwrap();
+    let error =
+        verify_with_tree_requirement(&raw, Some(pin), &[], Some(std::time::Duration::MAX), true)
+            .unwrap_err();
+    assert_eq!(error.code, 4);
+    assert_eq!(error.detail, "max_gap out of range");
+}

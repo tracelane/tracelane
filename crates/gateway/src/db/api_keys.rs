@@ -3103,6 +3103,26 @@ pub async fn update(
 ) -> Result<UpdateOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let mut invalidations = Vec::new();
+    let result = update_in_tx(&tx, tenant, id, editor, patch, actor, &mut invalidations).await?;
+    if matches!(&result, UpdateOutcome::Updated { changed, .. } if !changed.is_empty()) {
+        crate::db::api_keys::commit_and_invalidate(tx, invalidations).await?;
+    }
+    Ok(result)
+}
+
+/// Write and audit inside the caller's transaction; collect cache effects for fenced commit.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn update_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    id: Uuid,
+    editor: KeyEditor<'_>,
+    patch: &KeyPatch,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    invalidations: &mut Vec<[u8; 32]>,
+) -> Result<UpdateOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let select = format!(
         "SELECT {RECORD_COLUMNS}, lookup_hash, \
                 COALESCE(revoked_at <= clock_timestamp(), false), \
@@ -3134,7 +3154,7 @@ pub async fn update(
     let (eff, changed, before, after) = diff_patch(&current, patch);
     // OG-23: a key may only join a LIVE project of its own tenant, with one of that
     // project's environments. Under the row lock, before anything is written.
-    if let Some(refusal) = assignment_refusal(&tx, tenant, &current, &eff).await? {
+    if let Some(refusal) = assignment_refusal(tx, tenant, &current, &eff).await? {
         return Ok(refusal);
     }
     if changed.is_empty() {
@@ -3217,7 +3237,7 @@ pub async fn update(
     let before = serde_json::Value::Object(before);
     let after = serde_json::Value::Object(after);
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -3230,14 +3250,7 @@ pub async fn update(
     )
     .await
     .context("admin_audit_log api_key.update insert failed")?;
-    // Same reason as `rotate`: a cold lookup that read the OLD row before this
-    // commit must finish populating before the invalidation, or it would put the
-    // old limits back into the cache after we cleared it.
-    let _cache_write = AUTH_CACHE_WRITES.write().await;
-    tx.commit().await.context("api_keys update commit failed")?;
-    if let Some(d) = digest {
-        invalidate(d).await;
-    }
+    invalidations.extend(digest);
     Ok(UpdateOutcome::Updated {
         record: Box::new(record),
         changed,

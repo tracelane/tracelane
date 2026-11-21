@@ -4,7 +4,27 @@
 # the version pinned in Cargo.toml (cargo install --locked wasm-bindgen-cli --version 0.2.120).
 set -euo pipefail
 cd "$(dirname "$0")"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+out="$PWD/web/pkg"
+# Reproducible output. Cargo derives symbol hashes from the ABSOLUTE path of path dependencies, and
+# panic locations embed source paths, so a build in another checkout directory gives different bytes
+# (measured: 65,978 bytes differ). So the sources are copied to one fixed directory and built there,
+# with the cargo home and that directory remapped. publish-site.sh --check relies on this to compare
+# a fresh build with the committed copy on any machine with the same rustc and wasm-bindgen-cli.
+root="${TL_WASM_BUILD_ROOT:-/tmp/tl-verifier-wasm-build}"
+# One build at a time per root: two concurrent builds on one runner would delete each other's tree.
+exec 9>"$root.lock"
+command -v flock >/dev/null && flock 9
+rm -rf "$root" && mkdir -p "$root/packages"
+for d in verifier-rust verifier-wasm; do
+  tar -C .. --exclude=target --exclude=web/pkg -c "$d" | tar -x -m -C "$root/packages"
+done
+cp ../../rust-toolchain.toml "$root/rust-toolchain.toml"
+cd "$root/packages/verifier-wasm"
+# The target directory lives BESIDE the wiped build root, so CI builds are warm (only the two crates
+# copied above rebuild). tar -x -m stamps the copies with the current time: tar would otherwise keep the
+# source mtimes, and cargo could then treat them as unchanged and reuse another checkout's build in a shared target. Output stays byte-identical: it does not depend on the target directory.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root.target}"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$root=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 cargo build --release --locked --target wasm32-unknown-unknown -j"${JOBS:-2}"
 rm -rf web/pkg
 wasm-bindgen --target web --no-typescript --out-dir web/pkg \
@@ -19,3 +39,4 @@ fs.writeFileSync("web/pkg/wasm-bytes.js",
 fs.rmSync("web/pkg/tracelane_verifier_wasm_bg.wasm");
 console.log(`release wasm: ${wasm.length} bytes, sha256 ${hash}`);
 '
+rm -rf "$out" && cp -r web/pkg "$out"

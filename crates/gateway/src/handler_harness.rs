@@ -101,6 +101,7 @@ pub(crate) fn test_state_with_chain(
         rejection_metrics: Arc::new(crate::rejection_metrics::RejectionRegistry::new()),
         hotpath: crate::hotpath::Config::default(),
         failover: None,
+        sovereign: None,
         pg: None,
         paused_evidence: None,
         // BILL-01: no ClickHouse in the test state, so no meter sink either —

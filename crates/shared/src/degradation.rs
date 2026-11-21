@@ -365,6 +365,12 @@ pub enum Degradation {
     /// ACT-17: a tool server's success was refused because its countersignature was missing,
     /// malformed or did not verify; the call is recorded Unknown, never Succeeded.
     CountersignatureRejected = 47,
+    /// A rotated gateway signer conflicts with the registered tool receipt key.
+    ReceiptKeyConflict = 48,
+    /// RI-08: an audit message that can never append (malformed reserved recording member or
+    /// a conflicting recording identity) was terminated so it stops redelivering and stalling
+    /// the tenant's other events. Every count is one audit event that did NOT land.
+    AuditMessageTerminated = 49,
 }
 
 impl Degradation {
@@ -422,6 +428,8 @@ impl Degradation {
             Self::CheckpointTimestampFailed => "checkpoint_timestamp_failed",
             Self::SiemExportFailed => "siem_export_failed",
             Self::CountersignatureRejected => "countersignature_rejected",
+            Self::ReceiptKeyConflict => "receipt_key_conflict",
+            Self::AuditMessageTerminated => "audit_message_terminated",
         }
     }
 
@@ -648,6 +656,15 @@ impl Degradation {
             Self::SiemExportFailed => {
                 "SIEM delivery failed; inspect destination status, source connectivity and credentials. Bounded retries pause exhausted destinations; explicit operator retry retains the source cursor."
             }
+            Self::AuditMessageTerminated => {
+                "an audit message was terminated because it can never append (a malformed \
+                 recording member or a conflicting recording identity). That event is not in the \
+                 ledger; the tenant's other events continued. Inspect the gateway error log for the \
+                 event id and fix the producer."
+            }
+            Self::ReceiptKeyConflict => {
+                "A protected tool call was refused because its receipt key matches the gateway attestation key. Register a distinct tool signing key before retrying."
+            }
             Self::CountersignatureRejected => {
                 "a tool server's success was recorded Unknown because its receipt countersignature \
                  was missing or did not verify under the registered key; check the tool server's \
@@ -739,13 +756,15 @@ impl Degradation {
             Self::CheckpointTimestampFailed,
             Self::SiemExportFailed,
             Self::CountersignatureRejected,
+            Self::ReceiptKeyConflict,
+            Self::AuditMessageTerminated,
         ]
     }
 }
 
 /// Number of variants. A compile error here means a variant was added without extending
 /// [`Degradation::all`] — which would leave the new path uncounted, the exact defect.
-pub const COUNT: usize = 48;
+pub const COUNT: usize = 50;
 
 /// `u64::MAX`, not `0`, so the very first occurrence always warns regardless of the wall
 /// clock. A clock pinned near the Unix epoch would make a `0` sentinel indistinguishable
@@ -796,6 +815,8 @@ impl Slot {
 }
 
 static SLOTS: [Slot; COUNT] = [
+    Slot::new(),
+    Slot::new(),
     Slot::new(),
     Slot::new(),
     Slot::new(),

@@ -255,7 +255,7 @@ export function DataControls() {
 						</Panel>
 						<Panel
 							title="Zero retention routing"
-							description="Send the required zero-retention header to constrain provider dispatch. Constrained requests also suppress captured text and response-cache access."
+							note="Send the required zero-retention header to constrain provider dispatch. Constrained requests also suppress captured text and response-cache access."
 						>
 							<p>
 								<code>x-tracelane-zdr: required</code>

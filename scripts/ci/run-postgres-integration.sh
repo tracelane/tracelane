@@ -78,7 +78,9 @@ EXPECTED_PG_TESTS=43
 # hook, restart, ciphertext, foreign-FK and reservation-binding probes.
 EXPECTED_ACTION_PG_TESTS=27
 # Portal issuance adds a policy/audit regression to control_plane::pg_tests.
-EXPECTED_PG_EXECUTED=82
+# Config export/shared writes add fifteen snapshot, transaction and admission tests.
+# RI-08 adds thirteen recording identity/projection and restore contracts; #382 review adds one.
+EXPECTED_PG_EXECUTED=111
 case "${1:-}" in
   ""|--selftest) ;;
 esac
@@ -379,6 +381,9 @@ run_and_count -p gateway --bin gateway retention_sweep::b409_tests -- --ignored 
 # OG-35/OG-36: the audited admin-access write + its refusal, the append-only trigger,
 # tenant-scoped paging of the trail, the CIDR CHECK, and the route end to end.
 run_and_count -p gateway --bin gateway control_plane::pg_tests -- --ignored || RC=1
+# Configuration export and shared writes: fourteen route/store tests plus read-only refusal.
+run_and_count -p gateway --bin gateway config_routes_pg_tests -- --ignored --test-threads=1 || RC=1
+run_and_count -p gateway --bin gateway config_export_transaction_refuses_writes -- --ignored --test-threads=1 || RC=1
 # Public share revocation: repeat-owner success, original timestamp preserved,
 # and wrong tenant/trace/id refused by the real store on a migrated database.
 run_and_count -p gateway --bin gateway trace_share::tests::pg_revoke_is_idempotent_and_scoped_to_tenant_trace_and_id -- --ignored || RC=1
@@ -386,6 +391,12 @@ run_and_count -p gateway --bin gateway trace_share::tests::pg_revoke_is_idempote
 # from this CARGO_TARGET_DIR; `cargo test -p gateway` does not build it.
 cargo build -p tracelane-audit --bin tracelane-audit || RC=1
 run_and_count -p gateway --bin gateway action_control:: -- --ignored || RC=1
+RI08_BEFORE=$EXECUTED
+run_and_count -p gateway --bin gateway ri08_ -- --ignored --skip ri08_ch_ --test-threads=1 || RC=1
+if [ "$((EXECUTED - RI08_BEFORE))" -lt 13 ]; then
+  echo "postgres integration: FAIL — RI-08 executed fewer than its 13 isolated Postgres contracts"
+  RC=1
+fi
 if [ "$EXECUTED" -lt "$EXPECTED_PG_EXECUTED" ]; then
   echo "postgres integration: FAIL — executed $EXECUTED test(s), floor is $EXPECTED_PG_EXECUTED: the suite shrank or a filter matched nothing (B-494)"
   exit 1

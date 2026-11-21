@@ -146,6 +146,16 @@ pub async fn activate_tx(
     let ph = sha(pb.as_bytes());
     server_lock(tx, claims, c.server_id, true).await?;
     workspace_lock(tx, claims).await?;
+    // B-640 (second review, M2): never protect an archived (or absent) registration.
+    ensure!(
+        tx.query_opt(
+            "SELECT 1 FROM mcp_servers WHERE tenant_id=$1 AND id=$2 AND archived_at IS NULL",
+            &[claims.tenant_id.as_uuid(), &c.server_id],
+        )
+        .await?
+        .is_some(),
+        "contract_invalid"
+    );
     let t = claims.tenant_id.as_uuid();
     // Check BOTH directions of immutable tool identity, across all historical versions.
     let history=tx.query_one("SELECT bool_and(tool_ref=$2 AND server_id=$3 AND tool_name=$4),max(version) FROM action_tool_contracts WHERE tenant_id=$1 AND (tool_ref=$2 OR (server_id=$3 AND tool_name=$4))", &[t,&c.tool_ref,&c.server_id,&c.tool_name]).await.context("evidence_unavailable")?;
@@ -375,6 +385,120 @@ pub async fn decide_tx(
         },
         evidence,
     )))
+}
+
+/// B-640: the identity of an upstream MCP endpoint: lower-case host (trailing `.` trimmed) and
+/// effective port. Scheme, path, query, fragment and userinfo are NOT part of it: one upstream
+/// commonly serves the same tools on `/mcp` (streamable) and `/sse` (legacy), so a path-aware
+/// identity let `/sse` reach a tool protected on `/mcp` (second review, H1). Residual (spec §5):
+/// an IP literal or a second DNS name for the same host is a different identity.
+pub(crate) fn upstream_identity(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let port = url.port_or_known_default()?;
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
+}
+
+/// B-640: does `server` CURRENTLY protect `tool`? A known tool: its latest contract version is
+/// protected. An unknown tool, or `None`: the server has any currently protected tool.
+async fn currently_protects_tx(
+    tx: &Transaction<'_>,
+    tenant: &Uuid,
+    server: &Uuid,
+    tool: Option<&str>,
+) -> Result<bool> {
+    Ok(tx
+        .query_one(
+            "WITH latest AS (SELECT DISTINCT ON (tool_name) tool_name, protected \
+               FROM action_tool_contracts WHERE tenant_id=$1 AND server_id=$2 \
+               ORDER BY tool_name, version DESC) \
+             SELECT CASE WHEN EXISTS(SELECT 1 FROM latest WHERE tool_name=$3) \
+                         THEN EXISTS(SELECT 1 FROM latest WHERE tool_name=$3 AND protected) \
+                         ELSE EXISTS(SELECT 1 FROM latest WHERE protected) END",
+            &[tenant, server, &tool],
+        )
+        .await?
+        .get(0))
+}
+
+/// B-640: the latest contract version of exactly `tool` on `server` is protected. Used across
+/// sibling registrations: an unknown tool there must not expand to "anything protected", or one
+/// protected payments app would refuse every tool of an unrelated app on the same host.
+async fn protects_exact_tool_tx(
+    tx: &Transaction<'_>,
+    tenant: &Uuid,
+    server: &Uuid,
+    tool: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(
+            "SELECT protected FROM action_tool_contracts WHERE tenant_id=$1 AND server_id=$2 \
+             AND tool_name=$3 ORDER BY version DESC LIMIT 1",
+            &[tenant, server, &tool],
+        )
+        .await?
+        .is_some_and(|r| r.get::<_, bool>(0)))
+}
+
+/// B-640 (audit H1): another live registration of the SAME upstream currently protects `tool`,
+/// so calling it through this registration would skip decision, approval and evidence.
+/// Checked at call time, so duplicates that predate the protection are covered. It takes no
+/// lock: a call classified while an activation is still uncommitted sees the old state, the
+/// same window the protected server's own path has between classify and dispatch.
+pub(crate) async fn protected_elsewhere_tx(
+    tx: &Transaction<'_>,
+    claims: &crate::auth::Claims,
+    server: Uuid,
+    url: &str,
+    tool: &str,
+) -> Result<bool> {
+    let tenant = claims.tenant_id.as_uuid();
+    let Some(me) = upstream_identity(url) else {
+        return Ok(true); // fail-CLOSED: identity unknown on a security path
+    };
+    let rows = tx
+        .query(
+            "SELECT id, url FROM mcp_servers WHERE tenant_id=$1 AND id<>$2 AND archived_at IS NULL",
+            &[tenant, &server],
+        )
+        .await?;
+    for row in rows {
+        let (id, other): (Uuid, String) = (row.get(0), row.get(1));
+        if upstream_identity(&other).as_deref() == Some(me.as_str())
+            && protects_exact_tool_tx(tx, tenant, &id, tool).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// B-640 (second review, M2): the advisory lock `activate_tx` takes on a server, exclusive, so a
+/// move or archive cannot interleave with an activation on the same server.
+pub(crate) async fn lock_server_for_write_tx(
+    tx: &Transaction<'_>,
+    tenant: &tracelane_shared::TenantId,
+    server: Uuid,
+) -> Result<()> {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        canonical(&(tenant.to_string(), server))?.as_bytes(),
+    );
+    let lock = i64::from_be_bytes(digest.as_ref()[..8].try_into()?);
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&lock])
+        .await?;
+    Ok(())
+}
+
+/// B-640 (audit H1): a server that currently protects any tool may not change which upstream
+/// it points at, nor be archived, while that protection is active (moving it away would free
+/// the URL for an unprotected registration).
+pub(crate) async fn server_currently_protected_tx(
+    tx: &Transaction<'_>,
+    tenant: &Uuid,
+    server: &Uuid,
+) -> Result<bool> {
+    currently_protects_tx(tx, tenant, server, None).await
 }
 
 /// Monotone count of immutable protected activations. Registered unprotected tools

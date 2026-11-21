@@ -25,6 +25,7 @@ pub mod encode;
 pub mod limits;
 
 mod openinference;
+pub mod openinference_emit;
 
 mod events;
 mod labels;

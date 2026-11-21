@@ -96,6 +96,10 @@ pub enum Capability {
     ManageMcp,
     /// Decide pending human approvals. Never held by a tenant API key.
     ApproveToolCalls,
+    /// Export the workspace's control configuration as a document (OG-61a). Admin and the
+    /// self-host operator only: the document describes every control, so an API key never
+    /// holds it, and no other role does.
+    ManageConfig,
 }
 
 /// One row of the matrix. `const`-constructible so [`MATRIX`] is data, not code.
@@ -173,6 +177,7 @@ pub const MATRIX: &[Row] = &[
     Row::new(Capability::GrantAdminScope,    "grant_admin_scope",    Y, N, N, N, N, N, Y),
     Row::new(Capability::ManageMcp,          "manage_mcp",           Y, N, N, N, N, N, Y),
     Row::new(Capability::ApproveToolCalls,   "approve_tool_calls",   Y, N, N, N, N, N, Y),
+    Row::new(Capability::ManageConfig,       "manage_config",        Y, N, N, N, N, N, Y),
 ];
 
 /// Every row sits at its variant's index — a misplaced or missing row is a
@@ -184,7 +189,7 @@ const _: () = {
         i += 1;
     }
     assert!(
-        MATRIX.len() == Capability::ApproveToolCalls as usize + 1,
+        MATRIX.len() == Capability::ManageConfig as usize + 1,
         "MATRIX must have one row per Capability"
     );
 };
@@ -450,6 +455,7 @@ pub const CONTROL_ROUTES: &[ControlRoute] = &[
     cr(Put,    "/v1/security/admin-access",             C::ManageSecurity,     Some("security.admin_access.set")),
     cr(Get,    "/v1/audit/control-changes",             C::ReadControlAudit,   None),
     cr(Post,   "/v1/audit/control-changes",             C::ManageTeam,         Some("web.control_change")),
+    cr(Get,    "/v1/config/export",                     C::ManageConfig,       None),
 ];
 
 /// A control change performed OUTSIDE the gateway (by the dashboard against WorkOS
@@ -471,6 +477,8 @@ pub const WEB_CONTROL_ACTIONS: &[(&str, Capability)] = &[
     ("member.invite_revoke.failed", C::ManageTeam),
     ("workspace.portal.generate",        C::ManageSecurity),
     ("workspace.portal.generate.failed", C::ManageSecurity),
+    ("workspace.action_control.set",        C::ManageSecurity),
+    ("workspace.action_control.set.failed", C::ManageSecurity),
     ("workspace.rename",            C::ManageTeam),
     ("workspace.rename.failed",     C::ManageTeam),
     ("workspace.delete",            C::ManageTeam),
@@ -515,7 +523,7 @@ mod tests {
         }
     }
 
-    const ALL: [Capability; 24] = [
+    const ALL: [Capability; 25] = [
         C::ReadTraces,
         C::ViewSpend,
         C::ViewSettings,
@@ -540,6 +548,7 @@ mod tests {
         C::GrantAdminScope,
         C::ManageMcp,
         C::ApproveToolCalls,
+        C::ManageConfig,
     ];
 
     #[test]
@@ -724,6 +733,19 @@ mod tests {
             web_action_capability("workspace.portal.generate.failed"),
             Some(C::ManageSecurity)
         );
+    }
+
+    #[test]
+    fn action_control_switch_requires_security_management() {
+        for a in [
+            "workspace.action_control.set",
+            "workspace.action_control.set.failed",
+        ] {
+            assert_eq!(web_action_capability(a), Some(C::ManageSecurity));
+        }
+        // Security management is the admin column: a developer or viewer cannot record it.
+        assert!(!principal(AuthMethod::JwtBearer, Some(Role::Member)).can(C::ManageSecurity));
+        assert!(principal(AuthMethod::JwtBearer, Some(Role::Owner)).can(C::ManageSecurity));
     }
 
     #[test]

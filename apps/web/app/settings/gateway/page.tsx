@@ -1,4 +1,5 @@
 import { ReadFailure } from "@/components/empty-states/ReadFailure";
+import { ConfigExportLazy } from "@/components/settings/ConfigExportLazy";
 import { FailoverManager } from "@/components/settings/FailoverManager";
 import { ModelAliasManager } from "@/components/settings/ModelAliasManager";
 import { GatewayError, gatewayGet } from "@/lib/gateway";
@@ -13,6 +14,7 @@ export default async function GatewaySettingsPage() {
 			<GatewaySettingsView
 				data={data}
 				aliasManager={<ModelAliasManager />}
+				configExport={<ConfigExportLazy />}
 				failoverManager={
 					<FailoverManager
 						operatorChain={data.failover.chain.map((h) => h.model)}

@@ -92,7 +92,7 @@ impl ControlsRow {
 /// The SELECT failed — the caller fails the whole resolve, so the cache keeps the
 /// last-known controls (never "no controls" because a read failed).
 pub async fn read_with(
-    client: &tokio_postgres::Client,
+    client: &(impl tokio_postgres::GenericClient + Sync),
     tenant: &Uuid,
 ) -> Result<Option<ControlsRow>> {
     let row = client
@@ -108,7 +108,7 @@ pub async fn read_with(
 /// Pool or SELECT failure.
 pub async fn get(pool: &Pool, tenant: &TenantId) -> Result<ControlsRow> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    Ok(read_with(&client, tenant.as_uuid())
+    Ok(read_with(&**client, tenant.as_uuid())
         .await?
         .unwrap_or_default())
 }
@@ -205,6 +205,22 @@ pub async fn apply(
 ) -> Result<ControlsRow> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = apply_in_tx(&tx, tenant, change, actor).await?;
+    tx.commit()
+        .await
+        .context("workspace_controls commit failed")?;
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn apply_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    change: &Change,
+    actor: &str,
+) -> Result<ControlsRow> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let t = tenant.as_uuid();
     tx.execute(
         "INSERT INTO workspace_controls (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING",
@@ -270,7 +286,7 @@ pub async fn apply(
             .context("SELECT workspace_controls after failed")?,
     );
     record_control_change(
-        &tx,
+        tx,
         &ControlChange {
             tenant: *t,
             actor,
@@ -282,8 +298,16 @@ pub async fn apply(
         },
     )
     .await?;
-    tx.commit()
-        .await
-        .context("workspace_controls commit failed")?;
     Ok(after)
+}
+
+/// Serialize configuration writers before row locks; callers retain the lock until commit.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn lock_config(tx: &tokio_postgres::Transaction<'_>, tenant: &TenantId) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('config:' || $1::uuid::text, 0))",
+        &[tenant.as_uuid()],
+    )
+    .await?;
+    Ok(())
 }

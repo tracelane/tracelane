@@ -13,5 +13,7 @@
 //! the bench needs library access without forcing `main.rs` to re-route
 //! every internal call through the library path.
 
+pub mod approval_notice;
+pub mod approver_step_up;
 pub mod circuit_breaker;
 pub mod rate_limiter;

@@ -35,7 +35,7 @@ pub struct StoredRouting {
 /// Propagates the statement error — the refresh then FAILS, so the cache keeps serving
 /// the last-known document (a routing change is never dropped because a read failed).
 pub async fn get_with(
-    client: &tokio_postgres::Client,
+    client: &(impl tokio_postgres::GenericClient + Sync),
     tenant: &uuid::Uuid,
 ) -> Result<Option<StoredRouting>> {
     let row = client
@@ -60,7 +60,7 @@ pub async fn get_with(
 /// Pool or statement error.
 pub async fn get(pool: &Pool, tenant: &TenantId) -> Result<Option<StoredRouting>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    get_with(&client, tenant.as_uuid()).await
+    get_with(&**client, tenant.as_uuid()).await
 }
 
 /// What [`put`] did.
@@ -122,6 +122,23 @@ pub async fn put(
 ) -> Result<PutOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = put_in_tx(&tx, tenant, doc, if_match, actor).await?;
+    if matches!(result, PutOutcome::Written { .. }) {
+        tx.commit().await?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn put_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    doc: &Value,
+    if_match: i32,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<PutOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     // Lock a row that exists even before the first routing document is written.
     tx.query_one(
         "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
@@ -169,7 +186,7 @@ pub async fn put(
     .await
     .context("UPSERT workspace_routing")?;
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         &actor,
         crate::db::control_audit::Change {
@@ -181,7 +198,6 @@ pub async fn put(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok(PutOutcome::Written { version })
 }
 

@@ -52,6 +52,14 @@ pub(super) fn breaker_outcome<T>(
 /// - anything else → `CredentialFault`. Unknown is never provider evidence.
 pub(crate) fn transport_outcome(err: &anyhow::Error) -> Option<crate::circuit_breaker::Outcome> {
     use crate::circuit_breaker::Outcome;
+    // GWY-80: a refusal taken here, before any byte left, is not an observation of any
+    // provider or credential: feed the breaker nothing.
+    if err
+        .chain()
+        .any(|e| e.is::<crate::sovereign::SovereignRefused>())
+    {
+        return None;
+    }
     if err
         .downcast_ref::<crate::providers::CredentialDerived>()
         .is_some()
@@ -809,10 +817,32 @@ pub(super) async fn dispatch_with_retry(
     // process global here.
     policy: crate::providers::failover::RetryPolicy,
     deadlines: crate::routing::deadlines::Budget,
+    // GWY-80: where this request may egress. A required argument, so every dispatch
+    // site — primary, routed fallthrough, cross-provider failover, and any added later —
+    // must state it. Judged against the SAME resolver `dispatch_to_provider` selects the
+    // adapter with, on the same `model` string, so the check and the dispatch cannot
+    // disagree about which provider is called.
+    egress: &crate::sovereign::Egress,
 ) -> (
     anyhow::Result<crate::providers::ProviderStream>,
     Vec<DispatchAttempt>,
 ) {
+    // Fail-CLOSED, before the first byte leaves: a confined request never reaches a
+    // provider outside the sovereign set, whatever chose it. No attempt is recorded —
+    // nothing was sent.
+    if !egress.permits(crate::providers::ProviderRegistry::provider_id_for_model(
+        model,
+    )) {
+        return (
+            Err(anyhow::Error::new(crate::sovereign::SovereignRefused(
+                format!(
+                    "a request carrying regulated data may not be dispatched to provider \
+                     `{provider}`"
+                ),
+            ))),
+            Vec::new(),
+        );
+    }
     let budget = std::time::Duration::from_millis(crate::providers::failover::FAILOVER_BUDGET_MS);
     retry_loop(policy, budget, provider, model, || {
         deadlines.clone().scope(dispatch_to_provider(
@@ -821,6 +851,7 @@ pub(super) async fn dispatch_with_retry(
             provider_key,
             model,
             tenant_id,
+            egress,
         ))
     })
     .await
@@ -1125,6 +1156,11 @@ pub(crate) async fn dispatch_to_provider(
     api_key: &str,
     model: &str,
     tenant_id: &tracelane_shared::TenantId,
+    // GWY-80: where this dispatch may egress. Required of EVERY caller: the chat path
+    // passes its classified egress (through `dispatch_with_retry`); a server-side caller
+    // whose text was never classified passes `Egress::unclassified`, which while a
+    // `sovereign:` block is installed refuses it outright.
+    egress: &crate::sovereign::Egress,
 ) -> anyhow::Result<crate::providers::ProviderStream> {
     use crate::providers::ProviderRegistry;
 
@@ -1133,6 +1169,14 @@ pub(crate) async fn dispatch_to_provider(
     let Some(provider_id) = ProviderRegistry::provider_id_for_model(model) else {
         anyhow::bail!("unroutable model '{model}': no provider configured");
     };
+    // Fail-CLOSED, before any byte leaves (GWY-80).
+    if !egress.permits(Some(provider_id)) {
+        return Err(anyhow::Error::new(crate::sovereign::SovereignRefused(
+            format!(
+                "this dispatch may not reach provider `{provider_id}` while sovereign routing is on"
+            ),
+        )));
+    }
     match provider_id {
         // The six native adapters — genuinely different wire formats.
         "anthropic" => registry.anthropic.chat(request, api_key, tenant_id).await,
@@ -2320,6 +2364,26 @@ mod breaker_trip_inputs {
         }
     }
 
+    /// GWY-80: a sovereign refusal is a local decision taken before any byte left. It must feed
+    /// the breaker NOTHING (it used to fall through to a `CredentialFault` for the credential
+    /// of the provider the request was refused from).
+    #[test]
+    fn a_sovereign_refusal_feeds_the_breaker_nothing() {
+        let refused: anyhow::Result<()> = Err(anyhow::Error::new(
+            crate::sovereign::SovereignRefused("no".to_owned()),
+        ));
+        assert_eq!(super::breaker_outcome(&refused), None);
+        use anyhow::Context as _;
+        let wrapped = refused.context("dispatch");
+        assert_eq!(super::breaker_outcome(&wrapped), None);
+        assert!(
+            format!("{:#}", wrapped.unwrap_err()).contains("sovereign_egress_refused"),
+            "the refusal text is unchanged"
+        );
+        // Control: an unrelated error still counts (here as a credential fault).
+        assert!(super::breaker_outcome(&Err::<(), _>(anyhow::anyhow!("boom"))).is_some());
+    }
+
     #[test]
     fn breaker_still_trips_on_a_real_upstream_fault() {
         for status in [500u16, 502, 503] {
@@ -2732,5 +2796,124 @@ fn kms_failure(error: crate::kms::KmsError) -> ProviderKey {
     match error {
         crate::kms::KmsError::Unavailable => ProviderKey::KmsUnavailable,
         crate::kms::KmsError::Denied => ProviderKey::KmsDenied,
+    }
+}
+
+/// `GWY-80`: the dispatch chokepoint on its own. A confined egress refuses a frontier
+/// dispatch before any byte leaves, whatever the caller of `dispatch_with_retry` chose —
+/// the defence that holds even if a handler path forgot to confine a request.
+#[cfg(all(test, debug_assertions))]
+mod gwy80_egress_chokepoint {
+    use crate::handler_harness::{LoopbackBypassGuard, chat_ok_body, dev_tenant};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn run(egress: &crate::sovereign::Egress) -> (bool, usize, usize) {
+        let _b = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+            .mount(&upstream)
+            .await;
+        let mut reg = crate::providers::ProviderRegistry::new().expect("registry");
+        reg.set_compat_base_url_for_test("ollama", upstream.uri())
+            .expect("ollama adapter");
+        let req: tracelane_shared::ChatRequest = serde_json::from_value(json!({
+            "model": "ollama/llama3",
+            "messages": [{"role": "user", "content": "card 4111 1111 1111 1111"}]
+        }))
+        .expect("request");
+        let (result, attempts) = super::dispatch_with_retry(
+            &reg,
+            &req,
+            "",
+            "ollama",
+            "ollama/llama3",
+            &dev_tenant(),
+            crate::providers::failover::RetryPolicy::BUILTIN,
+            crate::routing::deadlines::Budget::for_request(
+                None,
+                "ollama",
+                "ollama/llama3",
+                chrono::Utc::now(),
+            ),
+            egress,
+        )
+        .await;
+        let hits = upstream.received_requests().await.map_or(0, |r| r.len());
+        (result.is_ok(), attempts.len(), hits)
+    }
+
+    fn only(providers: &[&str]) -> crate::sovereign::Egress {
+        crate::sovereign::Egress::SovereignOnly(std::sync::Arc::new(
+            providers.iter().map(|p| (*p).to_owned()).collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_confined_request_is_not_dispatched_to_a_provider_outside_the_set() {
+        let (ok, attempts, hits) = run(&only(&["nvidia"])).await;
+        assert!(!ok);
+        assert_eq!(attempts, 0, "nothing was sent, so no attempt is recorded");
+        assert_eq!(hits, 0, "the upstream saw no request");
+    }
+
+    #[tokio::test]
+    async fn a_confined_request_is_dispatched_to_a_sovereign_provider() {
+        let (ok, _attempts, hits) = run(&only(&["ollama"])).await;
+        assert!(ok);
+        assert_eq!(hits, 1);
+    }
+
+    /// H2: a server-side caller (eval case, judge, Responses translation) goes through
+    /// `dispatch_to_provider` directly. With the block on, its unclassified egress is refused
+    /// there — even to a sovereign provider — and nothing is sent.
+    async fn direct(block: bool) -> (bool, usize) {
+        let _b = LoopbackBypassGuard::new();
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok_body()))
+            .mount(&upstream)
+            .await;
+        let mut reg = crate::providers::ProviderRegistry::new().expect("registry");
+        reg.set_compat_base_url_for_test("ollama", upstream.uri())
+            .expect("ollama adapter");
+        let req: tracelane_shared::ChatRequest = serde_json::from_value(json!({
+            "model": "ollama/llama3",
+            "messages": [{"role": "user", "content": "eval case"}]
+        }))
+        .expect("request");
+        let cfg = crate::sovereign::SovereignConfig::build("ollama", "ollama/llama3", None)
+            .expect("block");
+        let egress = crate::sovereign::Egress::unclassified(block.then_some(&cfg));
+        let result =
+            super::dispatch_to_provider(&reg, req, "", "ollama/llama3", &dev_tenant(), &egress)
+                .await;
+        let hits = upstream.received_requests().await.map_or(0, |r| r.len());
+        (result.is_ok(), hits)
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_server_side_dispatch_is_refused_while_the_block_is_on() {
+        let (ok, hits) = direct(true).await;
+        assert!(!ok);
+        assert_eq!(hits, 0, "the upstream saw no request");
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_server_side_dispatch_is_unchanged_without_the_block() {
+        let (ok, hits) = direct(false).await;
+        assert!(ok);
+        assert_eq!(hits, 1);
+    }
+
+    #[tokio::test]
+    async fn unconfined_traffic_is_dispatched_as_before() {
+        let (ok, _attempts, hits) = run(&crate::sovereign::Egress::Any).await;
+        assert!(ok);
+        assert_eq!(hits, 1);
     }
 }

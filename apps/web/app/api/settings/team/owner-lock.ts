@@ -11,6 +11,7 @@ import { NextResponse } from "next/server";
 export async function withOwnerMutation(
 	orgId: string | readonly string[],
 	mutate: () => Promise<NextResponse>,
+	failure?: { error: string; message: string },
 ): Promise<NextResponse> {
 	let pool: Pool | undefined;
 	try {
@@ -34,7 +35,7 @@ export async function withOwnerMutation(
 		// No database URL, credentials or external response bodies in the log.
 		console.error("[team/owners] serialized membership change failed");
 		return NextResponse.json(
-			{
+			failure ?? {
 				error: "membership_change_unavailable",
 				message:
 					"Could not confirm the membership change. Refresh the team before retrying.",

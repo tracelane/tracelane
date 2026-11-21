@@ -155,12 +155,15 @@ fn denied_is_denied() {
         approval_id,
         decider_digest,
         note_digest,
+        ..
     } = &e[4].body
     {
         e[4].body = ActionPayload::ApprovalDenied {
             approval_id: *approval_id,
             decider_digest: decider_digest.clone(),
             note_digest: note_digest.clone(),
+            channel: None,
+            link_digest: None,
         }
     }
     assert_eq!(semantics(&e, &a).unwrap().denied, vec![id(5)]);
@@ -172,6 +175,8 @@ fn denied_never_consumes() {
         approval_id: id(5),
         decider_digest: "b".repeat(64),
         note_digest: "c".repeat(64),
+        channel: None,
+        link_digest: None,
     };
     assert_eq!(
         semantics(&e, &a).unwrap_err().to_string(),
@@ -344,6 +349,8 @@ fn publisher_cannot_deny() {
         approval_id: id(5),
         decider_digest: "a".repeat(64),
         note_digest: "c".repeat(64),
+        channel: None,
+        link_digest: None,
     };
     assert_eq!(
         semantics(&events, &artifacts).unwrap_err().to_string(),
@@ -578,5 +585,207 @@ fn principal_refusal_vocabulary_requires_schema_v2() {
         assert!(semantics(&[event.clone()], &BTreeMap::new()).is_err());
         event.schema_version = 2;
         assert!(semantics(&[event], &BTreeMap::new()).is_ok());
+    }
+}
+
+#[test]
+fn workspace_paused_refusals_are_counted_and_other_reasons_are_not() {
+    let (events, artifacts) = fixture();
+    let refusal = |reason, n: u128| {
+        let mut e = events[0].clone();
+        e.body = ActionPayload::DeniedRuntime { reason };
+        e.event_id = Uuid::from_u128(0xfeed_0000 + n);
+        e
+    };
+    let mut all = events.clone();
+    all.push(refusal(ReasonCode::WorkspacePaused, 1));
+    all.push(refusal(ReasonCode::WorkspacePaused, 2));
+    all.push(refusal(ReasonCode::ToolDefinitionChanged, 3));
+    let counted = semantics(&all, &artifacts).unwrap();
+    assert_eq!(counted.refused_workspace_paused, 2);
+    assert_eq!(
+        semantics(&events, &artifacts)
+            .unwrap()
+            .refused_workspace_paused,
+        0
+    );
+}
+
+// ---- ACT-23 schema 3: approval decisions made in a chat channel ----
+/// Event 4 of the fixture is the grant; rebuild it as a Slack decision at schema 3.
+fn slack_decision(deny: bool, channel: Option<Channel>, schema: u32) -> Envelope {
+    let (mut e, _) = fixture();
+    let mut ev = e.remove(4);
+    let (approval_id, decider_digest, note_digest) = (id(5), "b".repeat(64), "c".repeat(64));
+    let link_digest = channel.map(|_| "d".repeat(64));
+    ev.schema_version = schema;
+    ev.body = if deny {
+        ActionPayload::ApprovalDenied {
+            approval_id,
+            decider_digest,
+            note_digest,
+            channel,
+            link_digest,
+        }
+    } else {
+        ActionPayload::ApprovalGranted {
+            approval_id,
+            decider_digest,
+            note_digest,
+            channel,
+            link_digest,
+        }
+    };
+    ev
+}
+fn with_event(ev: Envelope) -> anyhow::Result<Semantics> {
+    let (mut e, a) = fixture();
+    if matches!(ev.body, ActionPayload::ApprovalDenied { .. }) {
+        e.truncate(5); // a denied approval is never consumed or executed
+    }
+    e[4] = ev;
+    semantics(&e, &a)
+}
+#[test]
+fn web_decision_unchanged_schema1() {
+    // P16: the pre-ACT-23 bytes of a web grant. Captured before the change; must not move.
+    let (e, _) = fixture();
+    assert_eq!(
+        serde_json::to_string(&e[4]).unwrap(),
+        concat!(
+            r#"{"schema_version":1,"event_id":"00000000-0000-0000-0000-000000000018","#,
+            r#""action_id":"00000000-0000-0000-0000-000000000002","#,
+            r#""tenant_id":"00000000-0000-0000-0000-000000000001","agent_key_id":null,"#,
+            r#""occurred_at":"2026-10-30T12:00:00Z","#,
+            r#""request_digest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","#,
+            r#""body":{"event_type":"approval_granted","approval_id":"00000000-0000-0000-0000-000000000005","#,
+            r#""decider_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","#,
+            r#""note_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}"#
+        )
+    );
+    assert!(with_event(e[4].clone()).is_ok());
+}
+#[test]
+fn verifier_accepts_schema3_slack_decision() {
+    // P15
+    for deny in [false, true] {
+        let ev = slack_decision(deny, Some(Channel::Slack), 3);
+        let out = with_event(ev).unwrap();
+        assert_eq!(out.denied.len(), usize::from(deny));
+    }
+    assert!(with_event(slack_decision(false, Some(Channel::Teams), 3)).is_ok());
+}
+#[test]
+fn verifier_rejects_schema3_without_channel() {
+    // N43
+    for deny in [false, true] {
+        let err = with_event(slack_decision(deny, None, 3)).unwrap_err();
+        assert_eq!(err.to_string(), "invalid/duplicate action event");
+    }
+}
+#[test]
+fn verifier_rejects_schema3_channel_without_link_digest() {
+    // Every chat decision comes from a linked approver, so schema 3 must name the link.
+    for deny in [false, true] {
+        let mut ev = slack_decision(deny, Some(Channel::Slack), 3);
+        match &mut ev.body {
+            ActionPayload::ApprovalGranted { link_digest, .. }
+            | ActionPayload::ApprovalDenied { link_digest, .. } => *link_digest = None,
+            _ => unreachable!(),
+        }
+        let err = with_event(ev).unwrap_err();
+        assert_eq!(err.to_string(), "invalid/duplicate action event");
+    }
+}
+#[test]
+fn verifier_rejects_schema1_with_channel() {
+    // N44
+    for deny in [false, true] {
+        let err = with_event(slack_decision(deny, Some(Channel::Slack), 1)).unwrap_err();
+        assert_eq!(err.to_string(), "invalid/duplicate action event");
+    }
+}
+#[test]
+fn verifier_rejects_channel_at_schema2() {
+    let err = with_event(slack_decision(false, Some(Channel::Slack), 2)).unwrap_err();
+    assert_eq!(err.to_string(), "invalid/duplicate action event");
+}
+#[test]
+fn verifier_rejects_schema3_on_other_events() {
+    let (mut e, a) = fixture();
+    e[5].schema_version = 3; // approval_consumed carries no channel
+    assert_eq!(
+        semantics(&e, &a).unwrap_err().to_string(),
+        "invalid/duplicate action event"
+    );
+}
+#[test]
+fn verifier_rejects_link_digest_without_channel() {
+    let mut ev = slack_decision(false, None, 1);
+    if let ActionPayload::ApprovalGranted { link_digest, .. } = &mut ev.body {
+        *link_digest = Some("d".repeat(64));
+    }
+    assert_eq!(
+        with_event(ev).unwrap_err().to_string(),
+        "invalid link digest"
+    );
+}
+#[test]
+fn verifier_rejects_malformed_link_digest() {
+    for bad in ["", "D".repeat(64).as_str(), "d".repeat(63).as_str(), "xyz"] {
+        let mut ev = slack_decision(false, Some(Channel::Slack), 3);
+        if let ActionPayload::ApprovalGranted { link_digest, .. } = &mut ev.body {
+            *link_digest = Some(bad.to_string());
+        }
+        let err = with_event(ev).expect_err("accepted a malformed link_digest");
+        assert_eq!(err.to_string(), "invalid link digest", "{bad:?}");
+    }
+}
+#[test]
+fn schema3_attempt_rejected_needs_channel() {
+    let rejected = |channel, schema| {
+        let mut ev = slack_decision(false, channel, schema);
+        ev.body = ActionPayload::ApprovalAttemptRejected {
+            approval_id: id(5),
+            decider_digest: "b".repeat(64),
+            reason: ReasonCode::ApprovalDenied,
+            channel,
+            link_digest: channel.map(|_| "d".repeat(64)),
+        };
+        ev
+    };
+    let (mut e, a) = fixture();
+    e.insert(4, rejected(Some(Channel::Slack), 3));
+    e[4].event_id = id(77);
+    assert!(semantics(&e, &a).is_ok());
+    for (channel, schema) in [(None, 3), (Some(Channel::Slack), 1)] {
+        let (mut e, a) = fixture();
+        e.insert(4, rejected(channel, schema));
+        e[4].event_id = id(77);
+        assert!(semantics(&e, &a).is_err());
+    }
+}
+#[test]
+fn channel_wire_form_is_strict() {
+    let ev = slack_decision(false, Some(Channel::Slack), 3);
+    let text = serde_json::to_string(&ev).unwrap();
+    assert!(text.contains(r#""channel":"slack""#));
+    assert!(text.contains(&format!(r#""link_digest":"{}""#, "d".repeat(64))));
+    assert_eq!(
+        serde_json::from_str::<Envelope>(&text)
+            .unwrap()
+            .schema_version,
+        3
+    );
+    for bad in [
+        r#""channel":"email""#,
+        r#""channel":"Slack""#,
+        r#""channel":null,"x":1"#,
+    ] {
+        let tampered = text.replacen(r#""channel":"slack""#, bad, 1);
+        assert!(
+            serde_json::from_str::<Envelope>(&tampered).is_err(),
+            "{bad}"
+        );
     }
 }

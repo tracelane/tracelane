@@ -34,6 +34,8 @@ mod byok_rotate;
 mod checkpoint_timestamp;
 mod circuit_breaker;
 mod clickhouse_query;
+mod config_routes;
+mod config_sections;
 mod control_plane;
 mod control_routes;
 mod controls;
@@ -42,6 +44,7 @@ mod db;
 mod entitlement_cache;
 mod experiment_routes;
 mod files_batches;
+mod gateway_recording;
 mod gemini_native;
 mod guardrail;
 mod incident_routes;
@@ -51,14 +54,20 @@ mod multipart_scan;
 mod openai_responses;
 mod outcome_routes;
 mod passthrough;
+mod provider_failures;
 mod realtime;
 mod regression_routes;
+#[cfg(test)]
+mod ri08_wire_tests;
 // B-385 (2c): the in-process handler harness. Test-only by construction, and
 // `debug_assertions`-gated like `providers::smoke_tests` — the loopback SSRF
 // bypass it drives exists only in debug builds (`ssrf_guard.rs` says why a
 // bare `cfg(test)` would break the bench profile).
 #[cfg(all(test, debug_assertions))]
 mod handler_harness;
+// OG-61a: the configuration export against real Postgres (`#[ignore]`d without POSTGRES_TEST_URL).
+#[cfg(all(test, debug_assertions))]
+mod config_routes_pg_tests;
 // OG-34 / OG-36: the admin-plane gate on the existing control routes (uses the harness).
 #[cfg(all(test, debug_assertions))]
 mod og36_control_route_tests;
@@ -121,6 +130,7 @@ mod workspace_glance;
 use tracelane_shared::redact;
 mod generation_issues;
 mod server;
+mod sovereign;
 mod spans_stream;
 mod spend;
 mod spend_alerts;
@@ -230,7 +240,12 @@ fn init_tracing() {
 
 mod mcp_policy;
 
+mod approval_notice;
 mod approvals;
+mod approver_step_up;
+// ACT-23 PR 3: pure Slack interaction verifier; no route calls it until PR 4.
+#[allow(dead_code)]
+mod chat_approvals;
 mod mcp_store;
 
 mod mcp_proxy;

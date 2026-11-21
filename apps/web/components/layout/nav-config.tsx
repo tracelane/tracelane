@@ -381,6 +381,7 @@ const SETTINGS_ICONS: Partial<Record<string, () => React.JSX.Element>> = {
 	"/settings/audit": ShieldIcon,
 	"/settings/alerts": BellIcon,
 	"/settings/evals": ShieldCheckIcon,
+	"/settings/action-policies": ShieldCheckIcon,
 	"/settings/billing": CreditCardIcon,
 	"/settings/team": UsersIcon,
 	"/settings/workspace": BuildingIcon,

@@ -496,6 +496,7 @@ async fn pg_tenant_crossing() {
         [0; 32],
         None,
         1,
+        &[None],
         |seq, prev, _| {
             let mut rows = rows_for(
                 &b,

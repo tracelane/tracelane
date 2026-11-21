@@ -237,7 +237,7 @@ pub fn encode_span(span: &TracelaneSpan, include_content: bool) -> Span {
     // own name, rather than vanishing.
     if let Ok(Value::Object(map)) = serde_json::to_value(&span.attributes) {
         for (field, value) in &map {
-            if STRUCTURAL.contains(&field.as_str()) {
+            if STRUCTURAL.contains(&field.as_str()) || super::openinference_emit::owns(field) {
                 continue;
             }
             let key = export_key(field);
@@ -253,6 +253,17 @@ pub fn encode_span(span: &TracelaneSpan, include_content: bool) -> Span {
             }
         }
     }
+    // Only curated typed metadata gets this content-off path; arbitrary `extra`
+    // text stays filtered above. Owned aliases cannot override canonical fields.
+    let mut aliases = super::openinference_emit::metadata(&span.attributes);
+    if include_content {
+        aliases.extend(super::openinference_emit::content(&span.attributes));
+    }
+    attributes.extend(
+        aliases
+            .into_iter()
+            .filter_map(|(key, value)| to_any(&value).map(|value| kv(key, value))),
+    );
     // Stable order: a collector (and a test) sees the same bytes for the same span.
     attributes.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -583,6 +594,372 @@ mod tests {
         let mut out = map_otlp_to_tracelane_spans(req, Some(&s.tenant_id)).expect("decodes");
         assert_eq!(out.len(), 1);
         out.remove(0)
+    }
+
+    #[test]
+    fn openinference_export_uses_canonical_typed_attribute_names() {
+        let mut source = span();
+        source.attributes.output_value = Some("synthetic answer".into());
+        source.attributes.openinference_span_kind = Some("LLM".into());
+        let encoded = encode_span(&source, true);
+        for (key, expected) in [
+            ("input.value", "raw input"),
+            ("output.value", "synthetic answer"),
+            ("openinference.span.kind", "LLM"),
+        ] {
+            assert_eq!(
+                attr(&encoded, key).and_then(|v| v.value.as_ref()),
+                Some(&V::StringValue(expected.into())),
+                "canonical OpenInference key {key} must preserve the recorded value"
+            );
+        }
+        assert!(attr(&encoded, "gen_ai.input.messages").is_some());
+        assert_eq!(attr(&encoded, "input_value"), attr(&encoded, "input.value"));
+        assert_eq!(
+            attr(&encoded, "output_value"),
+            attr(&encoded, "output.value")
+        );
+    }
+
+    #[test]
+    fn openinference_export_derives_content_from_stored_gen_ai_fields() {
+        let mut source = span();
+        source.attributes.input_value = None;
+        source.attributes.output_value = None;
+        source.attributes.gen_ai_operation_name = Some("chat".into());
+        source.attributes.gen_ai_input_messages =
+            Some(serde_json::json!([{"role": "user", "content": "synthetic"}]));
+        source.attributes.gen_ai_output_messages =
+            Some(serde_json::json!([{"role": "assistant", "content": "answer"}]));
+        let encoded = encode_span(&source, true);
+        let input = attr(&encoded, "input.value").expect("derived at export");
+        assert!(format!("{input:?}").contains("synthetic"));
+        assert!(format!("{:?}", attr(&encoded, "output.value")).contains("answer"));
+        assert!(format!("{:?}", attr(&encoded, "input.mime_type")).contains("application/json"));
+    }
+
+    #[test]
+    fn openinference_export_derives_tool_content_from_tool_fields() {
+        let mut source = span();
+        source.attributes.input_value = None;
+        source.attributes.output_value = None;
+        source.attributes.gen_ai_operation_name = Some("execute_tool".into());
+        source.attributes.gen_ai_tool_call_arguments = Some(r#"{"q":"synthetic"}"#.into());
+        source.attributes.gen_ai_tool_call_result = Some("plain result".into());
+        let encoded = encode_span(&source, true);
+        assert!(format!("{:?}", attr(&encoded, "input.value")).contains("synthetic"));
+        assert!(format!("{:?}", attr(&encoded, "input.mime_type")).contains("application/json"));
+        assert!(format!("{:?}", attr(&encoded, "output.mime_type")).contains("text/plain"));
+    }
+
+    #[test]
+    fn openinference_export_content_off_keeps_kind_but_omits_both_content_names() {
+        let mut source = span();
+        source.attributes.output_value = Some("synthetic answer".into());
+        source.attributes.openinference_span_kind = Some("LLM".into());
+        source.attributes.gen_ai_input_messages =
+            Some(serde_json::json!([{"role": "user", "content": "synthetic"}]));
+        let encoded = encode_span(&source, false);
+        for key in [
+            "input.value",
+            "input_value",
+            "output.value",
+            "output_value",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+        ] {
+            assert!(attr(&encoded, key).is_none(), "content-off omitted {key}");
+        }
+        assert_eq!(
+            attr(&encoded, "openinference.span.kind").and_then(|v| v.value.as_ref()),
+            Some(&V::StringValue("LLM".into()))
+        );
+    }
+
+    fn oi_value(source: &TracelaneSpan, key: &str) -> Option<serde_json::Value> {
+        let encoded = encode_span(source, false);
+        attr(&encoded, key).and_then(super::super::decode::wire_json)
+    }
+
+    #[test]
+    fn openinference_recorded_example_golden() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/openinference-llm.json")).unwrap();
+        let mut source = span();
+        source.attributes.gen_ai_system = Some("openai".into());
+        source.attributes.gen_ai_provider_name = Some("openai".into());
+        source.attributes.gen_ai_request_model = Some("gpt-3.5-turbo-0613".into());
+        source.attributes.gen_ai_response_model = Some("gpt-3.5-turbo-0613".into());
+        source.attributes.gen_ai_usage_input_tokens = Some(229);
+        source.attributes.gen_ai_usage_output_tokens = Some(21);
+        for (key, expected) in golden["attributes"].as_object().unwrap() {
+            assert_eq!(oi_value(&source, key).as_ref(), Some(expected), "{key}");
+        }
+    }
+
+    #[test]
+    fn openinference_metadata_survives_content_off() {
+        let source = span();
+        assert_eq!(
+            oi_value(&source, "llm.provider"),
+            Some(serde_json::json!("anthropic"))
+        );
+        assert_eq!(
+            oi_value(&source, "openinference.span.kind"),
+            Some(serde_json::json!("LLM"))
+        );
+    }
+
+    #[test]
+    fn openinference_response_model_and_request_remain_distinct() {
+        let source = span();
+        assert_eq!(
+            oi_value(&source, "llm.model_name"),
+            Some(serde_json::json!("claude-sonnet-4-6-20260101"))
+        );
+        assert_eq!(
+            oi_value(&source, "llm.request.model_name"),
+            Some(serde_json::json!("claude-sonnet-4-6"))
+        );
+        assert_eq!(
+            oi_value(&source, "llm.response.model_name"),
+            Some(serde_json::json!("claude-sonnet-4-6-20260101"))
+        );
+        let decoded = roundtrip(&source, true);
+        assert_eq!(
+            decoded.attributes.gen_ai_request_model,
+            source.attributes.gen_ai_request_model
+        );
+        assert_eq!(
+            decoded.attributes.gen_ai_response_model,
+            source.attributes.gen_ai_response_model
+        );
+    }
+
+    #[test]
+    fn openinference_inclusive_token_counts() {
+        let source = span();
+        assert_eq!(
+            oi_value(&source, "llm.token_count.prompt"),
+            Some(serde_json::json!(12))
+        );
+        assert_eq!(
+            oi_value(&source, "llm.token_count.total"),
+            Some(serde_json::json!(46))
+        );
+    }
+
+    #[test]
+    fn openinference_exclusive_token_counts() {
+        let mut source = span();
+        source.attributes.tracelane_usage_input_includes_cache = Some(false);
+        source.attributes.gen_ai_usage_cache_read_input_tokens = Some(5);
+        source.attributes.gen_ai_usage_cache_creation_input_tokens = Some(7);
+        assert_eq!(
+            oi_value(&source, "llm.token_count.prompt"),
+            Some(serde_json::json!(24))
+        );
+        assert_eq!(
+            oi_value(&source, "llm.token_count.total"),
+            Some(serde_json::json!(58))
+        );
+        assert_eq!(source.attributes.gen_ai_usage_input_tokens, Some(12));
+    }
+
+    #[test]
+    fn openinference_zero_is_preserved() {
+        let mut source = span();
+        source.attributes.gen_ai_usage_input_tokens = Some(0);
+        source.attributes.gen_ai_usage_output_tokens = Some(0);
+        assert_eq!(
+            oi_value(&source, "llm.token_count.total"),
+            Some(serde_json::json!(0))
+        );
+    }
+
+    #[test]
+    fn openinference_known_kinds() {
+        for kind in ["tool", "agent", "LLM", "prompt"] {
+            let mut source = span();
+            source.attributes.openinference_span_kind = Some(kind.into());
+            assert_eq!(
+                oi_value(&source, "openinference.span.kind"),
+                Some(serde_json::json!(kind.to_ascii_uppercase()))
+            );
+        }
+    }
+
+    #[test]
+    fn openinference_embedding_has_no_llm_identity() {
+        let mut source = span();
+        source.attributes.gen_ai_operation_name = Some("embeddings".into());
+        assert_eq!(
+            oi_value(&source, "openinference.span.kind"),
+            Some(serde_json::json!("EMBEDDING"))
+        );
+        assert_eq!(
+            oi_value(&source, "embedding.model_name"),
+            Some(serde_json::json!("claude-sonnet-4-6"))
+        );
+        assert!(oi_value(&source, "llm.model_name").is_none());
+    }
+
+    #[test]
+    fn openinference_invocation_parameters_are_numeric() {
+        let source = span();
+        let params = oi_value(&source, "llm.invocation_parameters").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(params.as_str().unwrap()).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"temperature":0.5,"max_tokens":256,"seed":42})
+        );
+    }
+
+    #[test]
+    fn openinference_missing_usage_is_absent() {
+        let mut source = span();
+        source.attributes.gen_ai_usage_input_tokens = None;
+        source.attributes.gen_ai_usage_output_tokens = None;
+        assert!(oi_value(&source, "llm.token_count.prompt").is_none());
+        assert!(oi_value(&source, "llm.token_count.total").is_none());
+    }
+
+    #[test]
+    fn openinference_unknown_cache_omits_total() {
+        let mut source = span();
+        source.attributes.tracelane_usage_input_includes_cache = Some(false);
+        source.attributes.gen_ai_usage_cache_read_input_tokens = Some(5);
+        assert!(oi_value(&source, "llm.token_count.prompt").is_none());
+        assert!(oi_value(&source, "llm.token_count.total").is_none());
+        assert_eq!(
+            oi_value(&source, "llm.token_count.prompt_details.cache_read"),
+            Some(serde_json::json!(5))
+        );
+    }
+
+    #[test]
+    fn openinference_total_does_not_wrap() {
+        let mut source = span();
+        source.attributes.gen_ai_usage_input_tokens = Some(u32::MAX);
+        source.attributes.gen_ai_usage_output_tokens = Some(u32::MAX);
+        assert_eq!(
+            oi_value(&source, "llm.token_count.total"),
+            Some(serde_json::json!(8589934590_u64))
+        );
+    }
+
+    #[test]
+    fn openinference_unknown_kind_is_absent() {
+        let mut source = span();
+        source.attributes.gen_ai_operation_name = Some("unknown-operation".into());
+        source.attributes.gen_ai_agent_name = Some("synthetic-agent".into());
+        assert!(oi_value(&source, "openinference.span.kind").is_none());
+        assert!(oi_value(&source, "llm.model_name").is_none());
+    }
+
+    #[test]
+    fn openinference_untrusted_aliases_are_not_metadata() {
+        let mut source = span();
+        source.attributes.gen_ai_request_temperature = None;
+        source.attributes.gen_ai_request_max_tokens = None;
+        source.attributes.gen_ai_request_seed = None;
+        source.attributes.extra.insert(
+            "llm.invocation_parameters".into(),
+            serde_json::json!("synthetic private text"),
+        );
+        source.attributes.extra.insert(
+            "llm.provider".into(),
+            serde_json::json!("unreviewed extra text"),
+        );
+        assert!(oi_value(&source, "llm.invocation_parameters").is_none());
+        assert_eq!(
+            oi_value(&source, "llm.provider"),
+            Some(serde_json::json!("anthropic"))
+        );
+    }
+
+    #[test]
+    fn openinference_mime_requires_content() {
+        let mut source = span();
+        source.attributes.input_value = None;
+        source.attributes.output_value = None;
+        source.attributes.extra.insert(
+            "output.mime_type".into(),
+            serde_json::json!("application/json"),
+        );
+        assert!(oi_value(&source, "output.mime_type").is_none());
+    }
+
+    #[test]
+    fn openinference_content_export_invariant_sweep() {
+        // 4 input states × 4 output states × 2 destination choices = 32 named
+        // scenarios. Values are harmless synthetic fixtures, never traffic.
+        let states = [
+            ("absent", None),
+            ("empty", Some("")),
+            ("plain", Some("synthetic text")),
+            ("json", Some("[]")),
+        ];
+        let mut scenarios = 0;
+        for (input_name, input) in states {
+            for (output_name, output) in states {
+                for content in [false, true] {
+                    let case = format!("input={input_name}/output={output_name}/content={content}");
+                    let mut source = span();
+                    // Stored-value semantics only: no GenAI fields to derive from here
+                    // (derivation has its own tests).
+                    source.attributes.gen_ai_input_messages = None;
+                    source.attributes.gen_ai_output_messages = None;
+                    source.attributes.input_value = input.map(str::to_owned);
+                    source.attributes.output_value = output.map(str::to_owned);
+                    // Only supported, valid MIME accompanies JSON. Arbitrary
+                    // dotted extras cannot impersonate the typed capture result.
+                    for key in ["input.mime_type", "output.mime_type"] {
+                        source
+                            .attributes
+                            .extra
+                            .insert(key.into(), serde_json::json!("application/json"));
+                    }
+                    source.attributes.extra.insert(
+                        "input.value".into(),
+                        serde_json::json!("unclassified fixture text"),
+                    );
+                    source.attributes.extra.insert(
+                        "output.value".into(),
+                        serde_json::json!("unclassified fixture text"),
+                    );
+                    let encoded = encode_span(&source, content);
+                    for (key, legacy, mime, value) in [
+                        ("input.value", "input_value", "input.mime_type", input),
+                        ("output.value", "output_value", "output.mime_type", output),
+                    ] {
+                        let expected = value.filter(|_| content);
+                        let actual = attr(&encoded, key).and_then(super::super::decode::wire_json);
+                        assert_eq!(
+                            actual,
+                            expected.map(|v| serde_json::json!(v)),
+                            "{case}/{key}"
+                        );
+                        assert_eq!(
+                            attr(&encoded, legacy),
+                            attr(&encoded, key),
+                            "{case}/{legacy}"
+                        );
+                        assert_eq!(
+                            attr(&encoded, mime).is_some(),
+                            expected == Some("[]"),
+                            "{case}/{mime}"
+                        );
+                        assert!(
+                            encoded.attributes.iter().filter(|a| a.key == key).count() <= 1,
+                            "{case}/duplicate"
+                        );
+                    }
+                    scenarios += 1;
+                }
+            }
+        }
+        assert_eq!(scenarios, 32);
     }
 
     /// Spec §7 row 1: `decode(encode(span))` equals the span on every mapped field, ids

@@ -39,16 +39,11 @@ pub(crate) async fn load_tx(
     request_digest: &str,
     attestation: &str,
 ) -> Result<Option<ReceiptKey>> {
-    let row = tx
-        .query_opt(
-            "SELECT receipt_key_id,public_key FROM action_tool_receipt_keys WHERE tenant_id=$1 AND server_id=$2",
-            &[tenant.as_uuid(), &server],
-        )
-        .await?;
-    Ok(row.map(|r| ReceiptKey {
-        public: r.get(1),
+    let registered = registered_tx(tx, tenant, server).await?;
+    Ok(registered.map(|(key_id, public)| ReceiptKey {
+        public,
         expected: Expected {
-            receipt_key_id: r.get(0),
+            receipt_key_id: key_id,
             attestation_digest: sha(attestation.as_bytes()),
         },
         binding: Binding {
@@ -59,6 +54,61 @@ pub(crate) async fn load_tx(
             server_id: server,
         },
     }))
+}
+/// Latest canonical registration; the mutable table is only a compatibility projection.
+/// # Errors
+/// Fails CLOSED on read or validation errors. Only no matching row means no registration.
+async fn registered_tx(
+    tx: &Transaction<'_>,
+    tenant: &TenantId,
+    server: Uuid,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let row = tx.query_opt(
+        "SELECT payload FROM audit_log_rows WHERE tenant_id=$1 AND event_type='tool_receipt_key_registered' AND (payload::jsonb)->>'action_id'=$2 ORDER BY seq DESC LIMIT 1",
+        &[tenant.as_uuid(), &server.to_string()],
+    ).await?;
+    row.map(|r| registered_payload(r.get::<_, &str>(0), tenant, server))
+        .transpose()
+}
+/// Validate the selected row, never search backwards past an invalid newest registration.
+/// # Errors
+/// Fails CLOSED on malformed or inconsistent canonical registration evidence.
+fn registered_payload(payload: &str, tenant: &TenantId, server: Uuid) -> Result<(String, Vec<u8>)> {
+    let value = crate::strict_json::from_str(payload)
+        .map_err(|_| anyhow::anyhow!("invalid receipt key registration"))?;
+    ensure!(
+        value
+            .as_object()
+            .is_some_and(|o| o.contains_key("agent_key_id")),
+        "invalid receipt key registration"
+    );
+    let e: tracelane_audit_verifier::action::Envelope = serde_json::from_value(value)?;
+    let ActionPayload::ToolReceiptKeyRegistered {
+        server_id,
+        receipt_key_id,
+        public_key,
+    } = e.body
+    else {
+        anyhow::bail!("invalid receipt key registration");
+    };
+    ensure!(
+        e.schema_version == 1
+            && e.tenant_id == *tenant.as_uuid()
+            && e.agent_key_id.is_none()
+            && e.action_id == server
+            && server_id == server
+            && e.request_digest == receipt_key_id
+            && public_key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid receipt key registration"
+    );
+    let public = hex::decode(public_key)?;
+    ensure!(
+        receipt::valid_public_key(&public) && receipt::key_id(&public) == receipt_key_id,
+        "invalid receipt key registration"
+    );
+    Ok((receipt_key_id, public))
 }
 /// Decides whether a tool's success may be recorded, and with which countersignature.
 /// # Errors
@@ -100,12 +150,47 @@ fn parse(body: &[u8]) -> Result<[u8; 32], Refusal> {
 /// Fail-CLOSED: registering the gateway's key is refused.
 fn refuse_gateway_key(
     signer: Option<&execution::AttestationSigner>,
+    platform: Option<&[u8]>,
     public: &[u8; 32],
 ) -> Result<(), Refusal> {
-    match signer {
-        Some(s) if s.public_key() == public.as_slice() => Err(INVALID),
-        _ => Ok(()),
+    if signer.is_some_and(|s| s.public_key() == public.as_slice())
+        || platform.is_some_and(|p| p == public.as_slice())
+    {
+        Err(INVALID)
+    } else {
+        Ok(())
     }
+}
+/// The tenant's own ledger key is gateway-held (`audit_keys.rs`): registering it would let the
+/// gateway countersign "tool" receipts for that tenant (B-634). Read the published public half
+/// only; never mint a key here.
+/// # Errors
+/// Fail-CLOSED: a match is 400; a key row whose public half is not yet published cannot be
+/// compared, so it is 503 rather than an unchecked accept.
+async fn refuse_tenant_audit_key(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &Uuid,
+    public: &[u8; 32],
+) -> Result<(), Refusal> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(public);
+    let rows = tx
+        .query(
+            "SELECT COALESCE(public_key_b64, '') FROM tenant_audit_keys WHERE tenant_id=$1",
+            &[tenant],
+        )
+        .await
+        .map_err(unavailable)?;
+    for row in &rows {
+        let published: &str = row.get(0);
+        if published.is_empty() {
+            return Err(UNAVAILABLE);
+        }
+        if published == encoded {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
 }
 /// `PUT /v1/mcp-servers/{id}/receipt-key`: register or rotate the server's receipt key.
 /// # Errors
@@ -127,7 +212,11 @@ pub async fn register(
         return Err(INVALID);
     }
     let public = parse(body)?;
-    refuse_gateway_key(state.action_signer.as_deref(), &public)?;
+    refuse_gateway_key(
+        state.action_signer.as_deref(),
+        state.audit_chain.platform_public_key(),
+        &public,
+    )?;
     let server: Uuid = server.parse().map_err(|_| NOT_FOUND)?;
     let timeout = std::time::Duration::from_secs(limits.call_timeout_secs);
     let (out, rows) = tokio::time::timeout(
@@ -164,6 +253,7 @@ pub(crate) async fn commit(
     tx.query_one("SELECT id FROM tenants WHERE id=$1 FOR UPDATE", &[tenant])
         .await
         .map_err(unavailable)?;
+    refuse_tenant_audit_key(&tx, tenant, public).await?;
     let owned = tx
         .query_opt(
             "SELECT 1 FROM mcp_servers WHERE tenant_id=$1 AND id=$2 AND archived_at IS NULL FOR SHARE",
@@ -175,14 +265,10 @@ pub(crate) async fn commit(
         return Err(NOT_FOUND);
     }
     let key_id = receipt::key_id(public);
-    let prior = tx
-        .query_opt(
-            "SELECT receipt_key_id FROM action_tool_receipt_keys WHERE tenant_id=$1 AND server_id=$2",
-            &[tenant, &server],
-        )
+    let prior = registered_tx(&tx, &claims.tenant_id, server)
         .await
         .map_err(unavailable)?
-        .map(|r| json!({"receipt_key_id":r.get::<_, String>(0)}));
+        .map(|(key_id, _)| json!({"receipt_key_id":key_id}));
     tx.execute(
         "INSERT INTO action_tool_receipt_keys(tenant_id,server_id,receipt_key_id,public_key) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id,server_id) DO UPDATE SET receipt_key_id=EXCLUDED.receipt_key_id,public_key=EXCLUDED.public_key,registered_at=now()",
         &[tenant, &server, &key_id, &public.as_slice()],
@@ -234,6 +320,15 @@ pub(crate) async fn commit(
 pub(crate) mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+    /// Same selection contract for ordinary PG reads and pure local result doubles.
+    pub(crate) fn assert_selected_registration(selected: Option<&ReceiptKey>, public: &[u8]) {
+        let key = selected.expect("canonical registration must select a receipt key");
+        assert_eq!(
+            key.public, public,
+            "latest canonical registration must supply the key"
+        );
+        assert_eq!(key.expected.receipt_key_id, receipt::key_id(public));
+    }
     pub(crate) fn pair(seed: u8) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
     }
@@ -382,9 +477,9 @@ pub(crate) mod tests {
         // Key substitution: the gateway cannot countersign for the tool server.
         let signer = crate::action_control::execution_tests::signer();
         let own: [u8; 32] = signer.public_key().try_into().unwrap();
-        assert_eq!(refuse_gateway_key(Some(&signer), &own), Err(INVALID));
-        assert_eq!(refuse_gateway_key(Some(&signer), &[7; 32]), Ok(()));
-        assert_eq!(refuse_gateway_key(None, &own), Ok(()));
+        assert_eq!(refuse_gateway_key(Some(&signer), None, &own), Err(INVALID));
+        assert_eq!(refuse_gateway_key(Some(&signer), None, &[7; 32]), Ok(()));
+        assert_eq!(refuse_gateway_key(None, None, &own), Ok(()));
     }
     #[test]
     fn rejects_invalid_public_key() {
@@ -409,3 +504,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "receipt_key_validation_tests.rs"]
+mod validation_tests;

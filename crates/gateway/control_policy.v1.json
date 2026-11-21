@@ -24,5 +24,9 @@
     "channel_tests_per_minute": 6,
     "_incident_controls_what": "rev6 N1: the incident controls — pause, resume, blocks, revoke-all, single-key revoke, member removal (its POST /v1/audit/control-changes record) — draw on THIS per-(workspace, principal) bucket INSTEAD of the shared ones, so an owner mid-incident is never refused because the shared bucket was spent. Generous; it still bounds the undeletable audit rows these write.",
     "incident_controls_per_minute": 60
+  },
+  "config": {
+    "_what": "OG-61a (2026-11-19): the configuration export is capped at 1 MiB (a JSON document of one workspace's control settings; the largest sections are projects and the routing document, each bounded by its own route's limits). Past it the export is refused 413 config_too_large, never truncated.",
+    "max_document_bytes": 1048576
   }
 }

@@ -1,6 +1,6 @@
 "use client";
 import { Button } from "@tracelanedev/ui";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
 	Boundary,
 	RefusalNote,
@@ -273,7 +273,17 @@ function ModelRules() {
 		</Panel>
 	);
 }
+/** The approval a notification link points at (`?id=`), read once on the client. */
+function useFocusedApprovalId(): string | null {
+	const [id, setId] = useState<string | null>(null);
+	useEffect(() => {
+		setId(new URLSearchParams(window.location.search).get("id"));
+	}, []);
+	return id;
+}
 export function Approvals() {
+	const focusId = useFocusedApprovalId();
+	const scrolled = useRef(false);
 	const { allowed } = useCan("approve_tool_calls");
 	const { allowed: manage } = useCan("manage_mcp");
 	const [status, setStatus] = useState("pending");
@@ -312,11 +322,27 @@ export function Approvals() {
 					</select>
 				</Field>
 				<Boundary query={queue} resource="approval queue">
-					{(v) => <p>{v.pending} pending requests</p>}
+					{(v) => (
+						<p className="flex items-center gap-2">
+							{v.pending > 0 && (
+								<span
+									aria-hidden="true"
+									className="inline-block h-2 w-2 bg-accent-warm"
+								/>
+							)}
+							{v.pending} pending requests
+						</p>
+					)}
 				</Boundary>
 				<Boundary query={queue} resource="approval queue">
 					{(v) => (
 						<>
+							{focusId && !v.approvals.some((r) => r.id === focusId) && (
+								<output className="block">
+									The request in your link is not in this list. It may be
+									decided, expired or older: change the status filter above.
+								</output>
+							)}
 							{v.approvals.length === 0 ? (
 								<p>No {status} requests.</p>
 							) : (
@@ -324,7 +350,14 @@ export function Approvals() {
 									{v.approvals.map((row) => (
 										<li
 											key={row.id}
-											className="space-y-2 rounded border border-line p-4"
+											ref={(el) => {
+												if (el && row.id === focusId && !scrolled.current) {
+													scrolled.current = true;
+													el.scrollIntoView?.({ block: "center" });
+												}
+											}}
+											aria-current={row.id === focusId ? "true" : undefined}
+											className={`space-y-2 rounded border p-4 ${row.id === focusId ? "border-line-2 outline outline-2 outline-focus-ring" : "border-line"}`}
 										>
 											<h4 className="font-medium">
 												{row.subject} · {row.server_name ?? "Model call"}

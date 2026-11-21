@@ -505,6 +505,14 @@ static LEDGER_WRITER_HEALTH: OnceLock<Arc<LedgerWriterShared>> = OnceLock::new()
 /// when that times out, logs the rows still unlanded — each a seq the chain
 /// consumed whose row is now LOST — rather than assuming they were written.
 impl AuditChain {
+    /// Public half of the configured platform audit signer; never exposes private material.
+    pub(crate) fn platform_public_key(&self) -> Option<&[u8]> {
+        self.rekor_client
+            .signing
+            .as_ref()
+            .map(|s| s.key_pair.public_key().as_ref())
+    }
+
     /// Rows this chain's self-host ledger writer has accepted but ClickHouse has
     /// not acknowledged — `0` on the hosted path (no writer). Read by the shutdown
     /// drain after `drain_ledger_writer` times out, so the loss is a number.
@@ -1666,6 +1674,23 @@ impl AuditChain {
         let tenant_id = tenant_id.clone();
         let genesis = audit_format::genesis_prev_hash(&tenant_id);
         let count = items.len();
+        anyhow::ensure!(
+            event_ids.is_none_or(|ids| ids.len() == count),
+            "event ID count mismatch"
+        );
+        let recordings = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                crate::gateway_recording::Recording::parse(
+                    &tenant_id,
+                    event_ids.map(|ids| ids[index].as_str()),
+                    &item.event_type,
+                    &item.actor,
+                    &item.payload_json,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // ADR-078 (B): the closure is PURE — it chains the row hashes over the
         // seqs the lock just claimed and returns the rows; `append_atomic_batch`
@@ -1678,6 +1703,7 @@ impl AuditChain {
             genesis,
             event_ids,
             count,
+            &recordings,
             |first_seq, prev_hash, kept| {
                 let mut prev = prev_hash;
                 let mut rows = Vec::with_capacity(kept.len());
@@ -6343,3 +6369,7 @@ mod c1_fix_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "audit/receipt_key_store_tests.rs"]
+mod receipt_key_store_tests;

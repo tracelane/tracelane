@@ -283,3 +283,6 @@ async fn pg_registration_row_carries_no_agent_key() {
         format!("{LEDGER}'tool_receipt_key_registered' AND payload LIKE '%\"agent_key_id\":null%'");
     assert_eq!(count(&f, &sql).await, 1);
 }
+
+#[path = "receipt_integrity_tests.rs"]
+mod integrity_tests;

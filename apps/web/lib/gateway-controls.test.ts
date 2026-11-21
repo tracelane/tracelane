@@ -260,3 +260,42 @@ describe("guardrail hook routes", () => {
 		}
 	});
 });
+
+describe("describeRefusal — approver step-up (ACT-41)", () => {
+	it("words the window the gateway sent", () => {
+		const m = (secs: unknown) =>
+			describeRefusal(403, { error: "reauth_required", max_age_secs: secs })
+				.message;
+		expect(m(300)).toBe(
+			"Approving needs a sign-in from the last 5 minutes. Sign in again, then approve.",
+		);
+		expect(m(60)).toContain("from the last minute.");
+		expect(m(90)).toContain("from the last 90 seconds.");
+		for (const bad of [null, 0, -60, 1.5, "900", undefined]) {
+			expect(m(bad)).toBe(
+				"Approving needs a recent sign-in. Sign in again, then approve.",
+			);
+		}
+	});
+	it("words reauth_required as a sign-in request, not a role problem", () => {
+		const r = describeRefusal(403, {
+			error: "reauth_required",
+			max_age_secs: 900,
+		});
+		expect(r.kind).toBe("reauth_required");
+		expect(r.code).toBe("reauth_required");
+		expect(r.message).toBe(
+			"Approving needs a sign-in from the last 15 minutes. Sign in again, then approve.",
+		);
+		expect(r.message).not.toMatch(/role/i);
+	});
+	it("only a 403 carries it; other statuses keep their meaning", () => {
+		expect(describeRefusal(409, { error: "reauth_required" }).kind).toBe(
+			"conflict",
+		);
+		expect(describeRefusal(503, { error: "reauth_required" }).kind).toBe(
+			"unavailable",
+		);
+		expect(describeRefusal(403, { error: "forbidden" }).kind).toBe("forbidden");
+	});
+});

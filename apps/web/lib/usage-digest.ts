@@ -46,6 +46,8 @@ export interface UsageCounts {
 	activeWorkspaces7d: number;
 	/** Newest first, at most `max_listed_signups + 1` (the extra row only proves "more"). */
 	newPeople: string[];
+	/** ISO time of the newest sign-up before the window end, any age; null when there is none. */
+	lastSignupAt: string | null;
 }
 
 export type DigestResult = "sent" | "skipped" | "failed";
@@ -79,6 +81,7 @@ export function render(
 	const day = dayIso(end);
 	const lines = [
 		`People: ${c.peopleTotal} total · ${c.peopleNew24h} new in 24 h · ${c.peopleNew7d} new in 7 d`,
+		`Last sign-up: ${c.lastSignupAt ? `${c.lastSignupAt.slice(0, 10)} ${c.lastSignupAt.slice(11, 16)} UTC` : "none yet"}`,
 		`Logged in: ${c.logins24h} in 24 h · ${c.logins7d} in 7 d`,
 		`Workspaces: ${c.workspacesTotal} total · ${c.workspacesNew24h} new in 24 h · ${c.workspacesNew7d} new in 7 d`,
 		`Workspaces that used the gateway: ${c.activeWorkspaces24h} in 24 h · ${c.activeWorkspaces7d} in 7 d`,
@@ -137,6 +140,7 @@ export async function queryCounts(
 		  (SELECT count(*) FROM tenants WHERE created_at >= ${e}::timestamptz - interval '7 days' AND created_at < ${e}::timestamptz) AS workspaces_new_7d,
 		  (SELECT count(DISTINCT tenant_id) FROM api_keys WHERE last_used_at >= ${e}::timestamptz - interval '24 hours' AND last_used_at < ${e}::timestamptz) AS active_24h,
 		  (SELECT count(DISTINCT tenant_id) FROM api_keys WHERE last_used_at >= ${e}::timestamptz - interval '7 days' AND last_used_at < ${e}::timestamptz) AS active_7d,
+		  (SELECT max(first_seen_at) FROM signups WHERE first_seen_at < ${e}::timestamptz) AS last_signup_at,
 		  ARRAY(SELECT email FROM signups WHERE first_seen_at >= ${e}::timestamptz - interval '24 hours' AND first_seen_at < ${e}::timestamptz ORDER BY first_seen_at DESC, email LIMIT ${limit}) AS new_people`;
 	const r = rows[0] ?? {};
 	return {
@@ -151,6 +155,10 @@ export async function queryCounts(
 		activeWorkspaces24h: toNumber(r.active_24h),
 		activeWorkspaces7d: toNumber(r.active_7d),
 		newPeople: Array.isArray(r.new_people) ? r.new_people.map(String) : [],
+		lastSignupAt:
+			r.last_signup_at == null
+				? null
+				: new Date(r.last_signup_at as string | Date).toISOString(),
 	};
 }
 

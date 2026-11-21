@@ -124,9 +124,15 @@ async fn evidence(
 }
 /// The outbox payload for a waiting protected approval. Named fields only: the webhook channel
 /// forwards it whole, so no evidence, digest, policy id or preview may ever be added here.
-pub(crate) fn protected_approval_notice(g: &Grant) -> serde_json::Value {
-    json!({"type":"approval.requested","approval_id":g.id,"subject":g.subject,"subject_kind":"tool",
-        "protected":true,"expires_at":g.expires_at.to_rfc3339(),"queue_path":"/settings/gateway/approvals"})
+pub(crate) fn protected_approval_notice(g: &Grant, server_name: Option<&str>) -> serde_json::Value {
+    let mut p = json!({"type":"approval.requested","approval_id":g.id,"subject":g.subject,"subject_kind":"tool",
+        "protected":true,"expires_at":g.expires_at.to_rfc3339(),"queue_path":"/settings/gateway/approvals",
+        // The version of the active action policy, not an internal id (GWY-81).
+        "rule":format!("action policy v{}",g.policy_version)});
+    if let Some(s) = server_name {
+        p["server_name"] = json!(s);
+    }
+    p
 }
 /// Errors fail CLOSED; row and evidence share the caller's reservation transaction.
 ///
@@ -225,11 +231,18 @@ pub(crate) async fn request_tx(
         .approval_notice_window_secs;
     ensure!(window > 0, "approval_policy_invalid");
     let bucket = ac::db_now(tx).await?.timestamp().div_euclid(window);
+    let server_name = tx
+        .query_opt(
+            "SELECT name FROM mcp_servers WHERE tenant_id=$1 AND id=$2",
+            &[t, &g.server_id],
+        )
+        .await?
+        .map(|r| r.get::<_, String>(0));
     crate::db::spend_alerts::enqueue_with(
         tx,
         *t,
         &format!("approval-waiting:{bucket}"),
-        &protected_approval_notice(&g),
+        &protected_approval_notice(&g, server_name.as_deref()),
     )
     .await?;
     Ok((g, rows))
@@ -255,6 +268,8 @@ pub(crate) async fn reject_attempt_tx(
             approval_id: id,
             decider_digest: ac::sha(ac::canonical(&claims.sub)?.as_bytes()),
             reason: ReasonCode::Unauthorized,
+            channel: None,
+            link_digest: None,
         },
     )
     .await
@@ -379,18 +394,24 @@ pub(crate) async fn decide_echo_tx(
                 "approval_denied" => ReasonCode::ApprovalDenied,
                 _ => ReasonCode::ApprovalMismatch,
             },
+            channel: None,
+            link_digest: None,
         }
     } else if approve {
         ActionPayload::ApprovalGranted {
             approval_id: id,
             decider_digest,
             note_digest,
+            channel: None,
+            link_digest: None,
         }
     } else {
         ActionPayload::ApprovalDenied {
             approval_id: id,
             decider_digest,
             note_digest,
+            channel: None,
+            link_digest: None,
         }
     };
     let rows = evidence(tx, claims, resolved, &g, body).await?;
@@ -660,9 +681,20 @@ pub(crate) mod session_tests {
             "y":"WR0RHVEzislYb3g0sis_Vyzn3VirVWKCwgG4bi1Q0mc","use":"sig","alg":"ES256","kid":"synthetic-c1-4"})
     }
     pub(crate) fn signed_jwt(claims: &Claims, sid: Option<&str>) -> String {
+        signed_jwt_at(claims, sid, Some(Utc::now().timestamp()))
+    }
+    /// ACT-41: `signed_jwt` with a chosen `auth_time` claim (`None` omits it).
+    pub(crate) fn signed_jwt_at(
+        claims: &Claims,
+        sid: Option<&str>,
+        auth_time: Option<i64>,
+    ) -> String {
         let mut body = json!({"sub":claims.sub,"role":claims.role.map(|r| r.product_name()),
             "tenant_id":claims.tenant_id.as_uuid(), "iss":"synthetic-c1-4", "aud":"synthetic-c1-4",
             "exp":Utc::now().timestamp()+3600});
+        if let Some(at) = auth_time {
+            body["auth_time"] = json!(at);
+        }
         if let Some(sid) = sid {
             body["sid"] = json!(sid);
         }
@@ -727,7 +759,7 @@ mod notice_tests {
             "qualified_human_sub":null,"status":"pending","expires_at":"2026-11-09T14:05:33Z",
             "server_id":Uuid::nil(),"subject":"pay"}))
         .unwrap();
-        let n = protected_approval_notice(&g);
+        let n = protected_approval_notice(&g, Some("srv"));
         let mut keys: Vec<_> = n.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -737,10 +769,24 @@ mod notice_tests {
                 "expires_at",
                 "protected",
                 "queue_path",
+                "rule",
+                "server_name",
                 "subject",
                 "subject_kind",
                 "type"
             ]
         );
+    }
+    #[test]
+    fn notice_without_a_server_name_omits_the_key() {
+        let g: Grant = serde_json::from_value(serde_json::json!({"id":Uuid::nil(),"action_id":Uuid::nil(),"decision_id":Uuid::nil(),"request_digest":"d","args_fp":"f","policy_id":Uuid::nil(),
+            "policy_version":3,"policy_hash":"h","tool_ref":Uuid::nil(),"contract_version":1,
+            "proposer_key_id":Uuid::nil(),"requester_creator":null,"policy_publisher_sub":"p",
+            "qualified_human_sub":null,"status":"pending","expires_at":"2026-11-09T14:05:33Z",
+            "server_id":Uuid::nil(),"subject":"pay"}))
+        .unwrap();
+        let n = protected_approval_notice(&g, None);
+        assert!(n.get("server_name").is_none());
+        assert_eq!(n["rule"], "action policy v3");
     }
 }

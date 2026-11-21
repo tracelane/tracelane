@@ -28,9 +28,16 @@ pub fn etag(policy: Option<&Value>) -> String {
     format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
 }
 
-/// Called only during the entitlement snapshot refresh. Fail-CLOSED to the cache's
-/// last-known snapshot when any query fails.
-pub async fn load(client: &tokio_postgres::Client, tenant: &Uuid) -> Result<Policies> {
+/// The stored scoped policies only (workspace, key, project) — no hooks, no key/project
+/// membership, nothing sealed. [`load`] starts here, and the configuration export
+/// (`config_sections`) reads the SAME statement, so the two cannot disagree.
+///
+/// # Errors
+/// A statement failure, or a stored scope this gateway does not know. Fail-CLOSED.
+pub async fn load_scoped(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &Uuid,
+) -> Result<Policies> {
     let mut policies = Policies::default();
     for row in client
         .query(
@@ -56,6 +63,13 @@ pub async fn load(client: &tokio_postgres::Client, tenant: &Uuid) -> Result<Poli
             _ => anyhow::bail!("unknown stored guardrail scope"),
         }
     }
+    Ok(policies)
+}
+
+/// Called only during the entitlement snapshot refresh. Fail-CLOSED to the cache's
+/// last-known snapshot when any query fails.
+pub async fn load(client: &tokio_postgres::Client, tenant: &Uuid) -> Result<Policies> {
+    let mut policies = load_scoped(client, tenant).await?;
     // Resolve membership in the same tenant; a project ID alone is never authority.
     for row in client
         .query(
@@ -99,13 +113,32 @@ pub async fn write(
 ) -> Result<WriteOutcome> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+    let result = write_in_tx(&tx, tenant, scope, id, value, expected_etag, actor).await?;
+    if matches!(result, WriteOutcome::Updated) {
+        tx.commit().await?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn write_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    scope: &str,
+    id: Uuid,
+    value: &Value,
+    expected_etag: &str,
+    actor: &crate::db::control_audit::Actor,
+) -> Result<WriteOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     // Serialize same-tenant creates too (SELECT FOR UPDATE on a missing policy cannot).
     tx.query_one(
         "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
         &[tenant.as_uuid()],
     )
     .await?;
-    if !owns(&*tx, tenant.as_uuid(), scope, &id).await? {
+    if !owns(&**tx, tenant.as_uuid(), scope, &id).await? {
         return Ok(WriteOutcome::NotFound);
     }
     let before: Option<Value> = tx.query_opt("SELECT policy FROM guardrail_policies WHERE tenant_id = $1 AND scope = $2 AND scope_id = $3", &[tenant.as_uuid(), &scope, &id]).await?.map(|r| r.get(0));
@@ -122,7 +155,7 @@ pub async fn write(
         tx.execute("INSERT INTO guardrail_policies (tenant_id, scope, scope_id, policy, updated_by) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (tenant_id, scope, scope_id) DO UPDATE SET policy = EXCLUDED.policy, updated_by = EXCLUDED.updated_by, updated_at = clock_timestamp()", &[tenant.as_uuid(), &scope, &id, value, &actor.sub]).await?;
     }
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         actor,
         crate::db::control_audit::Change {
@@ -134,7 +167,6 @@ pub async fn write(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok(WriteOutcome::Updated)
 }
 

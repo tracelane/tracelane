@@ -47,6 +47,7 @@ const COUNTS: UsageCounts = {
 	activeWorkspaces24h: 2,
 	activeWorkspaces7d: 3,
 	newPeople: ["b@example.com", "a@example.com"],
+	lastSignupAt: "2026-11-15T18:07:00.000Z",
 };
 
 function setEnv(vars: Record<string, string | undefined>) {
@@ -370,6 +371,16 @@ describe("usage digest — the count query on real Postgres (PGlite)", () => {
 			"n2@example.com",
 		]);
 	});
+	it("reports the newest sign-up, even one older than the 7-day window", async () => {
+		await person(h(24 * 9), h(24 * 8));
+		await person(h(24 * 30), h(24 * 30));
+		const c = await queryCounts(run, END, 20);
+		expect(c.lastSignupAt).toBe(new Date(h(24 * 9)).toISOString());
+	});
+	it("reports no last sign-up on an empty database", async () => {
+		const c = await queryCounts(run, END, 20);
+		expect(c.lastSignupAt).toBeNull();
+	});
 });
 
 describe("usage digest — review fixes", () => {
@@ -431,5 +442,19 @@ describe("usage digest — review fixes", () => {
 			await sendEmail({ to: "o@x.com", subject: "s", html: "h", text: "t" }),
 		).toBe(false);
 		vi.unstubAllGlobals();
+	});
+});
+
+describe("usage digest — last sign-up line", () => {
+	it("prints the newest sign-up in UTC", () => {
+		const { text } = render(END, {
+			...COUNTS,
+			lastSignupAt: "2026-11-15T18:07:00.000Z",
+		});
+		expect(text).toContain("Last sign-up: 2026-11-15 18:07 UTC");
+	});
+	it("says none when nobody has signed up", () => {
+		const { text } = render(END, { ...COUNTS, lastSignupAt: null });
+		expect(text).toContain("Last sign-up: none yet");
 	});
 });

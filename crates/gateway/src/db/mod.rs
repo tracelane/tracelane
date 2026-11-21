@@ -509,10 +509,13 @@ pub async fn apply_migrations(pool: &DbPool) -> Result<()> {
         include_str!("../../../../apps/web/db/migrations/0096_siem_export_checks.sql"),
         include_str!("../../../../apps/web/db/migrations/0097_tenant_principal_issuers.sql"),
         include_str!("../../../../apps/web/db/migrations/0098_tenant_principal_constraints.sql"),
-        // ACT-17: `action_tool_receipt_keys` (read in the protected reservation) and the
-        // append-only trigger list for `tool_receipt_key_registered` rows.
+        // Receipt-key compatibility projection and protected canonical registrations;
+        // reservations read the canonical ledger through the dedicated lookup index.
         include_str!("../../../../apps/web/db/migrations/0099_act17_tool_receipt_keys.sql"),
         include_str!("../../../../apps/web/db/migrations/0100_act17_protect_receipt_key_rows.sql"),
+        include_str!("../../../../apps/web/db/migrations/0101_gateway_recording_identity.sql"),
+        include_str!("../../../../apps/web/db/migrations/0102_receipt_key_lookup.sql"),
+        include_str!("../../../../apps/web/db/migrations/0103_act41_approver_auth.sql"),
     ];
     for migration in MIGRATIONS {
         // Disposable test databases use transaction-safe index builds. Production

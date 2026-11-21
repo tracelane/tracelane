@@ -80,7 +80,7 @@ pub fn validate(
 /// # Errors
 /// Propagates the statement error (the entitlement refresh treats it as "operator default").
 pub async fn get_with(
-    client: &tokio_postgres::Client,
+    client: &(impl tokio_postgres::GenericClient + Sync),
     tenant: &uuid::Uuid,
 ) -> Result<Option<WorkspaceFailover>> {
     let row = client
@@ -102,7 +102,7 @@ pub async fn get_with(
 /// Propagates pool/statement errors.
 pub async fn get(pool: &Pool, tenant_id: &TenantId) -> Result<WorkspaceFailover> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
-    Ok(get_with(&client, tenant_id.as_uuid())
+    Ok(get_with(&**client, tenant_id.as_uuid())
         .await?
         .unwrap_or_default())
 }
@@ -118,10 +118,24 @@ pub async fn put(
     settings: &WorkspaceFailover,
     actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<()> {
-    let actor_cow = actor.as_actor();
-    let updated_by = actor_cow.sub.as_str();
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    put_in_tx(&tx, tenant_id, settings, actor).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn put_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    settings: &WorkspaceFailover,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<()> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
+    let actor_cow = actor.as_actor();
+    let updated_by = actor_cow.sub.as_str();
     let before = tx
         .query_opt(
             "SELECT enabled, models FROM workspace_failover WHERE tenant_id = $1 FOR UPDATE",
@@ -150,7 +164,7 @@ pub async fn put(
     .await
     .map_err(|e| anyhow!("workspace_failover upsert: {e}"))?;
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant_id,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -165,7 +179,6 @@ pub async fn put(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 

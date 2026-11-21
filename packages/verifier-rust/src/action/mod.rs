@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 mod canonical;
+mod head;
 pub mod receipt;
 pub mod replay;
 pub use canonical::canonical_json;
@@ -71,6 +72,15 @@ impl Principal {
         if exclude { !intersects } else { intersects }
     }
 }
+/// The chat channel an approval decision was made in (ACT-23). Absent on web decisions.
+/// A decision that carries one is schema 3; one that does not stays schema 1, so every
+/// existing row and hash is untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Slack,
+    Teams,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionPayload {
@@ -100,16 +110,28 @@ pub enum ActionPayload {
         approval_id: Uuid,
         decider_digest: String,
         note_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<Channel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_digest: Option<String>,
     },
     ApprovalDenied {
         approval_id: Uuid,
         decider_digest: String,
         note_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<Channel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_digest: Option<String>,
     },
     ApprovalAttemptRejected {
         approval_id: Uuid,
         decider_digest: String,
         reason: ReasonCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<Channel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_digest: Option<String>,
     },
     ApprovalConsumed {
         approval_id: Uuid,
@@ -225,6 +247,8 @@ pub struct Semantics {
     pub countersigned: u64,
     /// Successes on a tool server with no registered receipt key.
     pub uncountersigned: u64,
+    /// `denied_runtime` rows with reason `workspace_paused`: protected calls a paused workspace refused.
+    pub refused_workspace_paused: u64,
 }
 #[derive(Default)]
 struct State {
@@ -296,12 +320,48 @@ pub fn semantics(
             }
             _ => false,
         };
+        // ACT-23: a decision made in a chat channel is schema 3 and names the channel; a web
+        // decision stays schema 1 and names none. Neither may borrow the other's schema.
+        let chat = match &e.body {
+            ApprovalGranted {
+                channel,
+                link_digest,
+                ..
+            }
+            | ApprovalDenied {
+                channel,
+                link_digest,
+                ..
+            }
+            | ApprovalAttemptRejected {
+                channel,
+                link_digest,
+                ..
+            } => Some((channel.is_some(), link_digest.as_deref())),
+            _ => None,
+        };
         let schema_allowed = match (&e.body, e.schema_version) {
             (ActionProposed { .. }, 1 | 2) => true,
             (DeniedRuntime { .. }, 2) => new_reason,
-            (_, 1) => !new_reason,
+            // Every chat decision comes from a linked approver (an unlinked user writes no
+            // row, spec D5 and N13), so schema 3 carries the link digest as well as the channel.
+            (_, 3) => {
+                chat.is_some_and(|(has_channel, digest)| has_channel && digest.is_some())
+                    && !new_reason
+            }
+            (_, 1) => !new_reason && !chat.is_some_and(|(has_channel, _)| has_channel),
             _ => false,
         };
+        if let Some((has_channel, Some(digest))) = chat {
+            ensure!(
+                has_channel
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "invalid link digest"
+            );
+        }
         ensure!(
             schema_allowed && event_ids.insert(e.event_id),
             "invalid/duplicate action event"
@@ -383,6 +443,14 @@ pub fn semantics(
             continue;
         }
         if matches!(e.body, LegacyForwardAttempted { .. } | DeniedRuntime { .. }) {
+            if matches!(
+                e.body,
+                DeniedRuntime {
+                    reason: ReasonCode::WorkspacePaused
+                }
+            ) {
+                result.refused_workspace_paused += 1;
+            }
             continue;
         }
         if let ActionProposed {

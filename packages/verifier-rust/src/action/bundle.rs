@@ -10,18 +10,6 @@ struct Manifest {
     domain: String,
     files: BTreeMap<String, String>,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Head {
-    domain: String,
-    schema_version: u32,
-    tenant_id: Uuid,
-    seq: Option<String>,
-    head_hash: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    key_id: String,
-    previous_checkpoint_digest: Option<String>,
-}
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub tenant_id: Uuid,
@@ -33,6 +21,8 @@ pub struct Report {
     pub chain: bool,
     pub head: bool,
     pub actions: Semantics,
+    /// Default-path tool/model approvals replayed from the ledger.
+    pub approvals: crate::approval::Semantics,
     pub batch_signatures: u64,
     pub rekor_included: u64,
     pub timestamped: bool,
@@ -112,6 +102,15 @@ impl std::fmt::Display for Report {
             "; tool receipts: {} countersigned, {} uncountersigned",
             self.actions.countersigned, self.actions.uncountersigned
         )?;
+        // Only when present, so a ledger without approvals prints exactly as before.
+        let a = &self.approvals;
+        if a.requested > 0 {
+            write!(
+                f,
+                "; approvals: {} requested, {} approved, {} denied, {} consumed, {} expired, {} open, {} self-decided",
+                a.requested, a.approved, a.denied, a.consumed, a.expired, a.open, a.self_decided
+            )?;
+        }
         write!(f, "; timestamped: {}", self.timestamped)?;
         if let Some(reason) = self.timestamp_reason {
             write!(f, "; timestamp_reason: {reason}")?;
@@ -225,6 +224,24 @@ pub fn verify_with_tsa(
 ) -> std::result::Result<Report, Failure> {
     verify_with_options(raw, pinned, certs, None)
 }
+/// Verify the bundle normally, then require its verified tree checkpoint when requested.
+/// Legacy callers retain optional-tree behavior through the existing entry points.
+/// # Errors
+/// Fail-CLOSED: code 4 when the tree is required and no verified tree checkpoint exists, and
+/// every code of [`verify_with_options`] otherwise.
+pub fn verify_with_tree_requirement(
+    raw: &[u8],
+    pinned: Option<[u8; 32]>,
+    certs: &[Vec<u8>],
+    max_gap: Option<std::time::Duration>,
+    require_tree: bool,
+) -> std::result::Result<Report, Failure> {
+    let report = verify_with_options(raw, pinned, certs, max_gap)?;
+    if require_tree && (report.tree_size.is_none() || report.tree_root.is_none()) {
+        return Err(failure(4, "required tree checkpoint is absent"));
+    }
+    Ok(report)
+}
 /// As [`verify_with_tsa`], and reports every interval between consecutive signed checkpoints
 /// longer than `max_gap` as a gap. Errors fail CLOSED.
 pub fn verify_with_options(
@@ -282,11 +299,7 @@ pub fn verify_with_options(
         let statement = get(&files, "checkpoint.json")?;
         let text = std::str::from_utf8(statement)?;
         ensure!(canonical_json(text)? == text, "checkpoint not JCS");
-        let h: Head = serde_json::from_slice(statement)?;
-        ensure!(
-            h.domain == "tracelane.action-head.v1" && h.schema_version == 1,
-            "checkpoint domain/version"
-        );
+        let h = super::head::parse(text)?;
         let _ = &h.previous_checkpoint_digest;
         Ok((h, statement, get(&files, "checkpoint.sig")?))
     })()
@@ -313,11 +326,12 @@ pub fn verify_with_options(
         }
         None => false,
     };
-    let (events, rows, coverage, leaves) = (|| -> Result<_> {
+    let (events, approvals, rows, coverage, leaves) = (|| -> Result<_> {
         let ledger = get(&files, "ledger.ndjson")?;
         let mut prev = crate::genesis_v2(head.tenant_id.as_bytes());
         let mut seq = 0;
         let mut events = Vec::new();
+        let mut approvals = Vec::new();
         let mut leaves = Vec::new();
         for line in std::str::from_utf8(ledger)?.lines() {
             let value: serde_json::Value = serde_json::from_str(line)?;
@@ -373,6 +387,13 @@ pub fn verify_with_options(
                     ensure!(row.actor == key.to_string(), "actor/key mismatch");
                 }
                 events.push(e);
+            } else if crate::approval::is_record(&row.event_type) {
+                approvals.push(crate::approval::Record::from_row(
+                    head.tenant_id,
+                    &row.event_type,
+                    &row.actor,
+                    payload,
+                )?);
             }
             leaves.push(super::tree::leaf_hash(&prev));
             seq += 1;
@@ -397,7 +418,7 @@ pub fn verify_with_options(
         }
         let coverage =
             crate::verify_ledger_reader(std::io::Cursor::new(ledger), "action-bundle", &opts)?;
-        Ok((events, seq, coverage, leaves))
+        Ok((events, approvals, seq, coverage, leaves))
     })()
     .map_err(|e| failure(4, e))?;
     if !coverage.errors.is_empty() || !coverage.signatures_valid || coverage.strip_detected {
@@ -412,8 +433,16 @@ pub fn verify_with_options(
             format!("batch verification failed: {:?}", coverage.errors),
         ));
     }
+    if head.tree.is_some() && !files.contains_key(super::tree::MEMBER) {
+        return Err(failure(4, "signed tree head requires tree-checkpoint.note"));
+    }
     let tree = super::tree::check_member(&files, head.tenant_id, &pin, &leaves)
         .map_err(|(code, detail)| failure(code, detail))?;
+    if let Some((size, root)) = head.tree {
+        if size != rows || tree != Some(root) {
+            return Err(failure(4, "signed tree head does not match ledger prefix"));
+        }
+    }
     let artifacts = files
         .iter()
         .filter_map(|(name, bytes)| {
@@ -423,15 +452,23 @@ pub fn verify_with_options(
         })
         .collect();
     let actions = semantics(&events, &artifacts).map_err(semantic_failure)?;
+    let approvals = crate::approval::semantics(&approvals).map_err(semantic_failure)?;
     let gen_time = super::timestamp::verify_optional(
         files.get("checkpoint.tsr").map(Vec::as_slice),
         statement,
         certs,
     )
     .map_err(|e| failure(4, e))?;
-    let checkpoint_chain =
-        super::chain::verify(&files, head.tenant_id, pin, statement, certs, max_gap)
-            .map_err(|(code, e)| failure(code, e))?;
+    let checkpoint_chain = super::chain::verify(
+        &files,
+        head.tenant_id,
+        pin,
+        statement,
+        certs,
+        max_gap,
+        &leaves,
+    )
+    .map_err(|(code, e)| failure(code, e))?;
     Ok(Report {
         tenant_id: head.tenant_id,
         head_seq: head.seq,
@@ -441,6 +478,7 @@ pub fn verify_with_options(
         chain: true,
         head: true,
         actions,
+        approvals,
         batch_signatures: coverage.batch_signatures_verified,
         rekor_included: coverage.anchors_included,
         timestamped: gen_time.is_some(),
@@ -475,5 +513,7 @@ pub fn is_action(name: &str) -> bool {
             | "tool_receipt_key_registered"
     )
 }
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod tests;

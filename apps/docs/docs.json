@@ -57,7 +57,8 @@
               "integrations/crewai",
               "integrations/vercel-ai",
               "integrations/claude-code",
-              "integrations/codex"
+              "integrations/codex",
+              "integrations/approvals"
             ]
           },
           {
@@ -65,6 +66,7 @@
             "pages": [
               "architecture",
               "diagnostics",
+              "otel-attributes",
               "benchmarks",
               "predictive-guardrails",
               "guardrail-policy",

@@ -1,4 +1,5 @@
 //! Authenticated MCP control plane: every write and its audit row share a transaction.
+use crate::action_control::policy_store;
 use crate::{
     auth::Claims,
     control_plane::ControlActor,
@@ -17,7 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 #[derive(Debug)]
-struct Fault(u16, &'static str);
+pub(crate) struct Fault(u16, &'static str);
 type Result<T> = std::result::Result<T, Fault>;
 impl From<tokio_postgres::Error> for Fault {
     fn from(_: tokio_postgres::Error) -> Self {
@@ -59,6 +60,10 @@ fn fields(v: &Value, allowed: &[&str]) -> Result<()> {
         Err(invalid())
     }
 }
+
+/// `GET /v1/mcp-tool-rules` and the configuration export (`config_sections`) read this one
+/// statement, so the route and the export cannot disagree about what a rule is.
+pub(crate) const TOOL_RULES_SQL: &str = "SELECT to_jsonb(r)-'tenant_id' FROM mcp_tool_rules r WHERE tenant_id=$1 ORDER BY created_at,id";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -197,7 +202,7 @@ async fn control(
                 // A denied control gate must never run the granting decision path.
                 let recorded = tokio::time::timeout(
                     timeout,
-                    protected_decision(&state, &claims, &headers, id, None, "", None),
+                    protected_decision(&state, &claims, &headers, id, None, "", None, None),
                 )
                 .await;
                 // A resolved-OFF flag is the legacy path: keep the original refusal (no 503
@@ -320,6 +325,16 @@ fn respond(r: Result<Value>) -> Response {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if let Some(field) = code.strip_prefix("invalid_field:") {
                 (status, Json(json!({"error":"invalid_field","field":field}))).into_response()
+            } else if code == "reauth_required" {
+                // ACT-41: the dashboard words the window from this, never from its own copy.
+                let window = crate::mcp_policy::settings()
+                    .ok()
+                    .map(|s| s.approvals.approver_auth_max_age_secs);
+                (
+                    status,
+                    Json(json!({"error":code,"message":"reauth required","max_age_secs":window})),
+                )
+                    .into_response()
             } else {
                 crate::mcp_proxy::error(status, code)
             }
@@ -396,7 +411,7 @@ async fn read(
             )
         }
         "/v1/mcp-tool-rules" => {
-            let rows=client.query("SELECT to_jsonb(r)-'tenant_id' FROM mcp_tool_rules r WHERE tenant_id=$1 ORDER BY created_at,id",&[tenant]).await?;
+            let rows = client.query(TOOL_RULES_SQL, &[tenant]).await?;
             Ok(json!({"rules":rows.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>()}))
         }
         "/v1/approval-rules" => {
@@ -493,6 +508,144 @@ async fn record(
     .await?;
     Ok(())
 }
+/// ACT-41: how the approver authenticated, recorded with an approve decision.
+#[derive(Debug, Clone)]
+pub(crate) struct ApproverAuth {
+    /// The signed `auth_time`; `None` for a credential with no identity provider behind it.
+    pub(crate) at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Claims::auth_method_label` (`workos_session`, `self_host_master_key`, …).
+    pub(crate) method: &'static str,
+}
+
+/// ACT-41: may this approver approve now? (`specs/ACT-41-approver-step-up.md`)
+///
+/// # Errors
+/// Fail-CLOSED: a sign-in older than `approvals.approver_auth_max_age_secs`, a token without
+/// `auth_time`, or any credential that is not a verified session or the self-host operator is
+/// `403 reauth_required`; a token that cannot be re-verified (JWKS down) or an unreadable
+/// reference table is `503 approval_unavailable`. Never reads a request body.
+async fn approver_auth(
+    pool: &crate::db::DbPool,
+    claims: &Claims,
+    actor: &ControlActor,
+    headers: &HeaderMap,
+    approval: Uuid,
+) -> Result<ApproverAuth> {
+    use crate::approver_step_up::{Credential, Verdict, verdict};
+    let settings = crate::mcp_policy::settings().map_err(|_| Fault(503, "approval_unavailable"))?;
+    let credential = match claims.auth_method {
+        crate::auth::AuthMethod::SelfHostMasterKey => Credential::SelfHostOperator,
+        crate::auth::AuthMethod::JwtBearer => {
+            let header = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default();
+            match crate::auth::verified_auth_time(header).await {
+                Ok(crate::auth::SessionAuth::Session { auth_time }) => {
+                    Credential::WorkosSession { auth_time }
+                }
+                // No WorkOS configured: only the debug dev stub reaches here (release refuses
+                // a JWT without WorkOS before this point); `verdict` exempts it in debug only.
+                Ok(crate::auth::SessionAuth::NotASession) => Credential::DevStub,
+                Err(_) => return Err(Fault(503, "approval_unavailable")),
+            }
+        }
+        crate::auth::AuthMethod::ApiKey | crate::auth::AuthMethod::Mtls => Credential::Other,
+    };
+    let window = settings.approvals.approver_auth_max_age_secs;
+    let at = match verdict(
+        credential,
+        chrono::Utc::now().timestamp(),
+        window,
+        settings.principal.clock_skew_secs,
+        cfg!(debug_assertions),
+    ) {
+        Verdict::Fresh { auth_time } => chrono::DateTime::from_timestamp(auth_time, 0),
+        Verdict::Exempt => None,
+        Verdict::ReauthRequired => {
+            let reason = match credential {
+                Credential::WorkosSession { auth_time: None } => "auth_time_missing",
+                Credential::WorkosSession { .. } => "auth_time_outside_window",
+                Credential::DevStub => "no_identity_provider",
+                Credential::SelfHostOperator | Credential::Other => "credential_cannot_step_up",
+            };
+            return Err(refuse_step_up(pool, claims, actor, approval, reason, window).await);
+        }
+    };
+    if at.is_none() && matches!(credential, Credential::WorkosSession { .. }) {
+        // A Fresh claim chrono cannot represent: refuse rather than record no time.
+        return Err(
+            refuse_step_up(pool, claims, actor, approval, "auth_time_invalid", window).await,
+        );
+    }
+    Ok(ApproverAuth {
+        at,
+        method: actor.audit.auth_method,
+    })
+}
+
+/// ACT-41: a refused step-up leaves a trace — one rate-limited WARN and a control-audit row
+/// (`approval.reauth_required`) — then answers `403 reauth_required`.
+///
+/// # Errors
+/// None: returns the refusal. The audit row is fail-OPEN (a failed write is logged and the
+/// approve is still refused); the refusal itself never depends on it.
+async fn refuse_step_up(
+    pool: &crate::db::DbPool,
+    claims: &Claims,
+    actor: &ControlActor,
+    approval: Uuid,
+    reason: &'static str,
+    window: i64,
+) -> Fault {
+    if crate::control_plane::refusal_logged(claims) {
+        tracing::warn!(tenant_id = %claims.tenant_id, approval_id = %approval, reason, "approve refused: approver must sign in again");
+    }
+    let written = async {
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        record(
+            &tx,
+            actor,
+            "approval.reauth_required",
+            &approval.to_string(),
+            None,
+            Some(json!({"reason":reason,"max_age_secs":window})),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<(), Fault>(())
+    }
+    .await;
+    if written.is_err() {
+        tracing::warn!(tenant_id = %claims.tenant_id, approval_id = %approval, "approve refused: step-up audit row not written");
+    }
+    Fault(403, "reauth_required")
+}
+
+/// ACT-41: store the approver's authentication on the row this transaction just approved.
+///
+/// # Errors
+/// Fail-CLOSED: anything but exactly one approved row decided by this caller rolls the
+/// decision back (`503`), so no approval exists without its authentication record.
+async fn record_approver_auth(
+    tx: &deadpool_postgres::Transaction<'_>,
+    claims: &Claims,
+    approval: Uuid,
+    auth: &ApproverAuth,
+) -> Result<()> {
+    let n = tx
+        .execute(
+            "UPDATE approvals SET decided_auth_at=$4,decided_auth_method=$5 WHERE tenant_id=$1 AND id=$2 AND status='approved' AND decided_by=$3",
+            &[claims.tenant_id.as_uuid(), &approval, &claims.sub, &auth.at, &auth.method],
+        )
+        .await?;
+    if n != 1 {
+        return Err(Fault(503, "approval_unavailable"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Retain authenticated Claims and the header for verified session provenance.
 async fn write(
     state: &AppState,
@@ -527,6 +680,12 @@ async fn write(
         }
         let approval = id(p.get("id").ok_or_else(invalid)?)?;
         let timeout = std::time::Duration::from_secs(l.limits.call_timeout_secs);
+        // ACT-41: an approve needs a recent sign-in, decided before any decision SQL runs.
+        let auth = if path.ends_with("/approve") {
+            Some(approver_auth(pool, claims, actor, headers, approval).await?)
+        } else {
+            None
+        };
         if let Some(result) = tokio::time::timeout(
             timeout,
             protected_decision(
@@ -537,6 +696,7 @@ async fn write(
                 Some(path.ends_with("/approve")),
                 note,
                 echo,
+                auth.as_ref(),
             ),
         )
         .await
@@ -544,13 +704,50 @@ async fn write(
         {
             return Ok(result);
         }
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        let (result, wake, records) = control_write_in_tx(&tx, actor, path, p, v).await?;
+        if let Some(auth) = &auth {
+            record_approver_auth(&tx, claims, approval, auth).await?;
+        }
+        tx.commit().await?;
+        crate::approvals::ledger::forward(Some(&state.audit_chain), &actor.tenant_id, records);
+        if let Some(id) = wake {
+            crate::approvals::wake(id);
+        }
+        return Ok(result);
     }
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+    let (result, wake, records) = control_write_in_tx(&tx, actor, path, p, v).await?;
+    tx.commit().await?;
+    crate::approvals::ledger::forward(Some(&state.audit_chain), &actor.tenant_id, records);
+    if let Some(id) = wake {
+        crate::approvals::wake(id);
+    }
+    Ok(result)
+}
+
+/// The route's validated control write and audit in an externally owned transaction.
+#[tracing::instrument(skip_all, fields(tenant_id = %actor.tenant_id))]
+pub(crate) async fn control_write_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    actor: &ControlActor,
+    path: &str,
+    p: &HashMap<String, String>,
+    v: &mut Value,
+) -> Result<(
+    Value,
+    Option<Uuid>,
+    Vec<crate::db::audit_chain_state::AtomicBatchAppend>,
+)> {
+    let l = crate::mcp_policy::settings()?;
+    crate::db::controls::lock_config(tx, &actor.tenant_id).await?;
     let tenant = actor.tenant_id.as_uuid();
     tx.query_one("SELECT id FROM tenants WHERE id=$1 FOR UPDATE", &[tenant])
         .await?;
     let mut wake = None;
+    let mut records = Vec::new();
     let result = match path {
         "/v1/mcp-policy" => {
             let policy: crate::mcp_policy::Policy =
@@ -567,7 +764,7 @@ async fn write(
                 .map(|r| r.get(0));
             tx.execute("INSERT INTO mcp_policy(tenant_id,rules_mode,pins_mode,injection_mode,default_action,updated_by) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id) DO UPDATE SET rules_mode=$2,pins_mode=$3,injection_mode=$4,default_action=$5,updated_by=$6,updated_at=now()",&[tenant,&text(v,"rules_mode")?,&text(v,"pins_mode")?,&text(v,"injection_mode")?,&text(v,"default_action")?,&actor.audit.sub]).await?;
             record(
-                &tx,
+                tx,
                 actor,
                 "mcp_policy.update",
                 &tenant.to_string(),
@@ -643,7 +840,7 @@ async fn write(
                 tx.execute("INSERT INTO mcp_tool_rules(id,tenant_id,server_id,key_id,tool_glob,action,reason,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",&[&rule,tenant,&server,&key,&glob,&action,&reason,&actor.audit.sub]).await?;
             }
             record(
-                &tx,
+                tx,
                 actor,
                 if model {
                     "approval_rule.create"
@@ -675,7 +872,7 @@ async fn write(
                 .map(|r| r.get(0));
             tx.execute("INSERT INTO approval_settings(tenant_id,require_second_approver,default_ttl_secs,updated_by) VALUES($1,$2,$3,$4) ON CONFLICT(tenant_id) DO UPDATE SET require_second_approver=$2,default_ttl_secs=$3,updated_by=$4,updated_at=now()",&[tenant,&settings.require_second_approver,&settings.default_ttl_secs,&actor.audit.sub]).await?;
             record(
-                &tx,
+                tx,
                 actor,
                 "approval.settings.update",
                 &tenant.to_string(),
@@ -696,7 +893,7 @@ async fn write(
             tx.execute("UPDATE mcp_tool_defs SET status='observed',approved_by=NULL,approved_at=NULL WHERE tenant_id=$1 AND server_id=$2 AND tool_name=$3 AND status='approved'",&[tenant,&server,&name]).await?;
             tx.execute("UPDATE mcp_tool_defs SET status='approved',approved_by=$5,approved_at=now() WHERE tenant_id=$1 AND server_id=$2 AND tool_name=$3 AND def_hash=$4",&[tenant,&server,&name,&stored,&actor.audit.sub]).await?;
             record(
-                &tx,
+                tx,
                 actor,
                 "mcp_tool.approve",
                 name,
@@ -735,12 +932,30 @@ async fn write(
                 return Err(Fault(403, "self_approval_forbidden"));
             }
             let status = if approve { "approved" } else { "denied" };
+            // After the row lock, before the conditional UPDATE (whose clock is later): the
+            // record's time is strictly before the pending deadline the UPDATE checked.
+            let at = crate::approvals::ledger::now(tx).await?;
             let n=tx.execute("UPDATE approvals SET status=$3,decided_by=$4,decided_at=clock_timestamp(),decision_note=$5,grant_expires_at=CASE WHEN $3='approved' THEN clock_timestamp()+make_interval(secs=>$6::double precision) ELSE NULL END WHERE action_id IS NULL AND tenant_id=$1 AND id=$2 AND status='pending' AND expires_at>clock_timestamp()",&[tenant,&approval,&status,&actor.audit.sub,&note,&f64::from(l.approvals.grant_ttl_secs)]).await?;
             if n != 1 {
                 return Err(Fault(409, "approval_not_pending"));
             }
+            // Fail CLOSED: no decision commits without its signed-ledger record.
+            records.extend(
+                crate::approvals::ledger::record_tx(
+                    tx,
+                    &actor.tenant_id,
+                    approval,
+                    if approve {
+                        tracelane_audit_verifier::approval::Transition::Approved
+                    } else {
+                        tracelane_audit_verifier::approval::Transition::Denied
+                    },
+                    at,
+                )
+                .await?,
+            );
             record(
-                &tx,
+                tx,
                 actor,
                 if approve {
                     "approval.approve"
@@ -764,7 +979,7 @@ async fn write(
                 return Err(Fault(404, "tool_pin_not_found"));
             }
             record(
-                &tx,
+                tx,
                 actor,
                 "mcp_tool.unpin",
                 tool,
@@ -779,7 +994,7 @@ async fn write(
             let model = path.starts_with("/v1/approval-rules/");
             let row=tx.query_opt(if model{"DELETE FROM approval_rules WHERE tenant_id=$1 AND id=$2 RETURNING to_jsonb(approval_rules)-'tenant_id'"}else{"DELETE FROM mcp_tool_rules WHERE tenant_id=$1 AND id=$2 RETURNING to_jsonb(mcp_tool_rules)-'tenant_id'"},&[tenant,&rule]).await?.ok_or(Fault(404,"rule_not_found"))?;
             record(
-                &tx,
+                tx,
                 actor,
                 if model {
                     "approval_rule.delete"
@@ -795,12 +1010,9 @@ async fn write(
         }
         _ => return Err(Fault(404, "not_found")),
     };
-    tx.commit().await?;
-    if let Some(id) = wake {
-        crate::approvals::wake(id);
-    }
-    Ok(result)
+    Ok((result, wake, records))
 }
+
 async fn server_write(
     state: &AppState,
     actor: &ControlActor,
@@ -851,6 +1063,11 @@ async fn server_write(
     }
     if method == Method::DELETE {
         let tx = client.transaction().await?;
+        // B-640 (audit H1): archiving a protected server would free its upstream URL.
+        policy_store::lock_server_for_write_tx(&tx, &actor.tenant_id, target).await?;
+        if policy_store::server_currently_protected_tx(&tx, tenant, &target).await? {
+            return Err(Fault(409, "mcp_server_protected"));
+        }
         let n=tx.execute("UPDATE mcp_servers SET archived_at=now(),enabled=false,credential_ct=NULL,auth_mode='none',credential_last4=NULL WHERE tenant_id=$1 AND id=$2 AND archived_at IS NULL",&[tenant,&target]).await?;
         if n != 1 {
             return Err(Fault(404, "mcp_server_not_found"));
@@ -987,6 +1204,10 @@ async fn server_write(
         .check_revision(&actor.tenant_id, revision)
         .map_err(|_| Fault(409, "credential_configuration_changed"))?;
     let tx = client.transaction().await?;
+    // B-640: the activation advisory lock FIRST, before any row lock, in the same order as
+    // `activate_tx` and DELETE, so an edit and an activation cannot deadlock (third review, L1).
+    // A protected server keeps its upstream; duplicates are refused at call time.
+    policy_store::lock_server_for_write_tx(&tx, &actor.tenant_id, target).await?;
     tx.query_one("SELECT id FROM tenants WHERE id=$1 FOR UPDATE", &[tenant])
         .await?;
     if let Some(previous) = &previous {
@@ -1006,6 +1227,16 @@ async fn server_write(
         if count >= l.limits.max_servers_per_workspace as i64 {
             return Err(Fault(409, "mcp_server_limit"));
         }
+    }
+    if let Some(previous) = &previous
+        && previous
+            .get("url")
+            .and_then(Value::as_str)
+            .map(policy_store::upstream_identity)
+            != Some(policy_store::upstream_identity(url))
+        && policy_store::server_currently_protected_tx(&tx, tenant, &target).await?
+    {
+        return Err(Fault(409, "mcp_server_protected"));
     }
     tx.execute("INSERT INTO mcp_servers(id,tenant_id,slug,name,url,transport,auth_mode,credential_kind,credential_header,credential_ct,credential_last4,enabled) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO UPDATE SET slug=$3,name=$4,url=$5,transport=$6,auth_mode=$7,credential_kind=$8,credential_header=$9,credential_ct=$10,credential_last4=$11,enabled=$12,updated_at=now() WHERE mcp_servers.tenant_id=$2 AND mcp_servers.archived_at IS NULL",&[&target,tenant,&slug,&name,&url,&transport,&auth_mode,&kind,&header,&ct,&last4,&enabled]).await?;
     let public = json!({"id":target,"slug":slug,"name":name,"url":url,"transport":transport,"auth_mode":auth_mode,"credential_kind":kind,"credential_header":header,"credential_last4":last4,"enabled":enabled});
@@ -1083,7 +1314,9 @@ mod fix_tests;
 /// # Errors
 /// Fail-CLOSED: no control plane, an unresolved flag or an unverifiable session is a
 /// 503; a refused human is the decision's own 403. No pooled connection is held
-/// across the entitlement resolve or the session (JWKS) check.
+/// across the entitlement resolve or the session (JWKS) check. `auth` (ACT-41) is stored on
+/// a granted approve inside the decision transaction.
+#[allow(clippy::too_many_arguments)] // The six request facts, the descriptor echo, and ACT-41 auth.
 async fn protected_decision(
     state: &AppState,
     claims: &Claims,
@@ -1092,6 +1325,7 @@ async fn protected_decision(
     decision: Option<bool>,
     note: &str,
     echo: Option<&str>,
+    auth: Option<&ApproverAuth>,
 ) -> Result<Option<Value>> {
     // A digest we cannot honour (flag off, or not a protected row) is refused, never ignored.
     let unsupported = echo.map_or(Ok(None), |_| Err(Fault(400, "descriptor_unsupported")));
@@ -1163,6 +1397,12 @@ async fn protected_decision(
                 .await?,
         )
     };
+    if code.is_none()
+        && decision == Some(true)
+        && let Some(auth) = auth
+    {
+        record_approver_auth(&tx, claims, id, auth).await?;
+    }
     tx.commit().await?;
     crate::action_control::execution::after_commit(
         Some(&state.audit_chain),

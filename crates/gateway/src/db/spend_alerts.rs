@@ -56,6 +56,18 @@ pub enum CreateOutcome {
 /// Pool or SELECT failure.
 pub async fn list_channels(pool: &Pool, tenant: &TenantId) -> Result<Vec<Channel>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    list_channels_with(&**client, tenant).await
+}
+
+/// The same tenant-scoped read on a caller-held client or transaction.
+///
+/// # Errors
+/// Propagates query errors; the caller must not treat an unreadable store as empty.
+#[tracing::instrument(skip(client, tenant), fields(tenant_id = %tenant))]
+pub async fn list_channels_with(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &TenantId,
+) -> Result<Vec<Channel>> {
     let rows = client
         .query(
             "SELECT id, kind, name, target, created_at FROM spend_alert_channels \
@@ -90,6 +102,25 @@ pub async fn create_channel(
 ) -> Result<CreateOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = create_channel_in_tx(&tx, tenant, new, max, actor).await?;
+    if matches!(result, CreateOutcome::Created(_)) {
+        tx.commit()
+            .await
+            .context("spend_alert_channels commit failed")?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn create_channel_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    new: &NewChannel,
+    max: usize,
+    actor: &str,
+) -> Result<CreateOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let t = tenant.as_uuid();
     tx.execute(
         "SELECT pg_advisory_xact_lock(hashtext('spend_alert_channels:' || $1::uuid::text))",
@@ -132,7 +163,7 @@ pub async fn create_channel(
         created_at: row.get(0),
     };
     crate::db::controls::record_control_change(
-        &tx,
+        tx,
         &crate::db::controls::ControlChange {
             tenant: *t,
             actor,
@@ -149,9 +180,6 @@ pub async fn create_channel(
         },
     )
     .await?;
-    tx.commit()
-        .await
-        .context("spend_alert_channels commit failed")?;
     Ok(CreateOutcome::Created(channel))
 }
 
@@ -180,6 +208,24 @@ pub(crate) fn redacted_target(kind: &str, target: &str) -> String {
 pub async fn delete_channel(pool: &Pool, tenant: &TenantId, id: Uuid, actor: &str) -> Result<bool> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = delete_channel_in_tx(&tx, tenant, id, actor).await?;
+    if result {
+        tx.commit()
+            .await
+            .context("spend_alert_channels delete commit failed")?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn delete_channel_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    id: Uuid,
+    actor: &str,
+) -> Result<bool> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let Some(row) = tx
         .query_opt(
             "DELETE FROM spend_alert_channels WHERE tenant_id = $1 AND id = $2 \
@@ -193,7 +239,7 @@ pub async fn delete_channel(pool: &Pool, tenant: &TenantId, id: Uuid, actor: &st
     };
     let (kind, name, target): (String, String, String) = (row.get(0), row.get(1), row.get(2));
     crate::db::controls::record_control_change(
-        &tx,
+        tx,
         &crate::db::controls::ControlChange {
             tenant: *tenant.as_uuid(),
             actor,
@@ -208,9 +254,6 @@ pub async fn delete_channel(pool: &Pool, tenant: &TenantId, id: Uuid, actor: &st
         },
     )
     .await?;
-    tx.commit()
-        .await
-        .context("spend_alert_channels delete commit failed")?;
     Ok(true)
 }
 
@@ -286,7 +329,9 @@ pub struct Due {
 
 /// Claim up to `limit` due deliveries: their `next_attempt_at` moves `lease_secs` ahead
 /// (a crashed worker's claim comes back on its own), `FOR UPDATE SKIP LOCKED` so two
-/// claimers never take one row.
+/// claimers never take one row. Consider each tenant's first eligible row before its second.
+/// This bounds sharing within one batch, not starvation across batches with more tenants
+/// than slots. Locked rows are skipped; no delivery order or latency is promised.
 ///
 /// # Errors
 /// Pool or UPDATE failure.
@@ -294,10 +339,17 @@ pub async fn claim_due(pool: &Pool, limit: i64, lease_secs: i64) -> Result<Vec<D
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let rows = client
         .query(
-            "WITH due AS ( \
-               SELECT id FROM spend_alert_events \
-               WHERE status = 'pending' AND next_attempt_at <= now() \
-               ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED) \
+            "WITH ranked AS ( \
+               SELECT e.id, e.created_at, \
+                      row_number() OVER (PARTITION BY e.tenant_id ORDER BY e.created_at,e.id) AS tenant_turn \
+               FROM spend_alert_events e \
+               JOIN spend_alert_channels c ON c.id=e.channel_id AND c.tenant_id=e.tenant_id \
+               WHERE e.status='pending' AND e.next_attempt_at<=now()), \
+             due AS ( \
+               SELECT e.id FROM spend_alert_events e JOIN ranked r ON r.id=e.id \
+               WHERE e.status='pending' AND e.next_attempt_at<=now() \
+               ORDER BY r.tenant_turn,r.created_at,r.id \
+               LIMIT $1 FOR UPDATE OF e SKIP LOCKED) \
              UPDATE spend_alert_events e \
                SET next_attempt_at = now() + make_interval(secs => $2::double precision) \
              FROM due, spend_alert_channels c \

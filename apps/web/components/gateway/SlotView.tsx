@@ -37,6 +37,11 @@ const Approvals = dynamic(
 	{ ssr: false },
 );
 
+const ProtectedPolicies = dynamic(
+	() => import("./ProtectedPolicies").then((m) => m.ProtectedPolicies),
+	{ ssr: false },
+);
+
 export function SlotView({
 	slot,
 }: {
@@ -44,6 +49,7 @@ export function SlotView({
 }) {
 	if (slot.id === "mcp") return <McpControls />;
 	if (slot.id === "approvals") return <Approvals />;
+	if (slot.id === "protected-tools") return <ProtectedPolicies />;
 	if (slot.id === "data-controls") return <DataControls />;
 	if (slot.id === "cache") return <CacheSettings />;
 	if (slot.id === "otel") return <OtelExports />;

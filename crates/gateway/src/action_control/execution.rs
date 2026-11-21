@@ -701,12 +701,15 @@ pub(super) async fn reserve_tx(
     .await?;
     // The verifier refuses a start row whose receipt key is the attestation key, and the ledger
     // is append-only: a key registered before a signer rotation must not reach the ledger.
-    ensure!(
-        receipt_key
-            .as_ref()
-            .is_none_or(|k| k.expected.receipt_key_id != signer.key_id()),
-        "attestation_signer_unavailable"
-    );
+    if receipt_key
+        .as_ref()
+        .is_some_and(|k| k.expected.receipt_key_id == signer.key_id())
+    {
+        tracelane_shared::degradation::note(
+            tracelane_shared::degradation::Degradation::ReceiptKeyConflict,
+        );
+        anyhow::bail!("receipt_key_conflict");
+    }
     let started = append(
         tx,
         claims,

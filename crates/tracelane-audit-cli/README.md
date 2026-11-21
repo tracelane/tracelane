@@ -103,6 +103,13 @@ Source-built Rust CLI only; the npm and PyPI verifiers do not provide this comma
 tracelane-audit evidence-pack --file evidence.zip --pubkey tenant-public-key.txt --out pack/
 ```
 
+Add `--require-tree` to `verify` or `evidence-pack` when a verified signed tree
+checkpoint is required. The option applies to local action ZIPs only. A missing
+checkpoint fails with exit code 4 and writes no evidence pack; an invalid note
+still fails its signature, tenant, size or root checks. Without the option, older
+bundles retain the explicit `tree checkpoint: absent` report. This requirement
+does not establish that every action was recorded.
+
 The command runs the same offline action-ZIP verification as `verify`. If verification fails it exits with the same code and writes nothing. If it passes it writes three files into a new or empty directory: `controls.csv`, `oscal-component-definition.json` (OSCAL 1.1.2) and `summary.html`.
 
 The pack maps a fixed, reviewed list of control topics (`evidence/control-map.json`: EU AI Act Articles 12 and 19, OCC Bulletin 2026-54, the FINOS AI Governance Framework and the RBI FREE-AI report) to what one verified bundle carries. Each row is `partial` or `not covered`, names the bundle evidence and the source line of the check, and states its gap.

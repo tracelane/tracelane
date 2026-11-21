@@ -431,6 +431,7 @@ async fn fix_pass_flag_off_authorized_decision_skips_protected_probe() {
                     Uuid::nil(),
                     Some(decision),
                     "",
+                    None,
                     None
                 )
                 .await,

@@ -1,0 +1,104 @@
+{
+  "module": "crates/gateway/src/config_routes.rs",
+  "operations": {
+    "GET /v1/config/export": {
+      "summary": "Export the workspace's control configuration as one JSON document.",
+      "tags": [
+        "config"
+      ],
+      "parameters": [
+        {
+          "name": "sections",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated section names; omitted exports every section. An unknown or empty name is 400 unknown_section.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "responses": {
+        "200": {
+          "description": "The document. version is the blake3 of the canonical sections object and moves only when a section does.",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "schema": {
+                "type": "string",
+                "enum": [
+                  "tracelane.config/v1"
+                ]
+              },
+              "version": {
+                "type": "string"
+              },
+              "exported_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "sections": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "secret_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "excluded": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "what": {
+                      "type": "string"
+                    },
+                    "why": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "what",
+                    "why"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "schema",
+              "version",
+              "exported_at",
+              "sections",
+              "secret_refs",
+              "excluded"
+            ]
+          }
+        },
+        "400": {
+          "description": "unknown_section.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "413": {
+          "description": "config_too_large — the document is over the export limit; export fewer sections.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        },
+        "503": {
+          "description": "config_export_unavailable — a section could not be read; no partial document is returned.",
+          "schema": {
+            "$ref": "#/components/schemas/ControlError"
+          }
+        }
+      },
+      "x-error-codes": [
+        "unknown_section",
+        "config_too_large",
+        "config_export_unavailable"
+      ]
+    }
+  }
+}

@@ -2463,6 +2463,7 @@ async fn responses_admitted(
                         key.expose_secret(),
                         hop_model,
                         tenant_id,
+                        &crate::sovereign::Egress::unclassified(crate::server::config::sovereign()),
                     ))
                     .await
                     {

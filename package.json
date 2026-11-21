@@ -2,7 +2,7 @@
 	"name": "tracelane",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Agents act. People decide. Rules and human approval for AI agent actions.",
+	"description": "Agent actions, on a record anyone can check. Rules and human approval for AI agent actions.",
 	"scripts": {
 		"prepare": "git config core.hooksPath .githooks || true",
 		"dev": "pnpm --filter @tracelanedev/web dev",

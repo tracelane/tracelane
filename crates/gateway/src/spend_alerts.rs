@@ -167,35 +167,10 @@ impl Mail {
 }
 
 /// The plain-text line an email or Slack message carries. Only numbers and labels —
-/// never a prompt or a key.
-pub(crate) fn message_text(payload: &Value) -> String {
-    if payload.get("type").and_then(Value::as_str) == Some("approval.requested") {
-        let subject = payload
-            .get("subject")
-            .and_then(Value::as_str)
-            .unwrap_or("a protected call")
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        if payload.get("protected") == Some(&Value::Bool(true)) {
-            let expiry = payload
-                .get("expires_at")
-                .and_then(Value::as_str)
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| {
-                    format!(
-                        ", expires {} UTC",
-                        t.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M")
-                    )
-                })
-                .unwrap_or_default();
-            return format!(
-                "Tracelane: approvals are waiting (first: {subject}{expiry}). Review them in Settings → Gateway → Approvals."
-            );
-        }
-        return format!(
-            "Tracelane approval requested for {subject}. Review it in Settings → Gateway → Approvals."
-        );
+/// never a prompt or a key. Approval notices are built by [`crate::approval_notice`] (GWY-81).
+pub(crate) fn message_text(payload: &Value, base_url: &str) -> String {
+    if let Some(n) = crate::approval_notice::approval_notice(payload, base_url) {
+        return n.fallback_text();
     }
     let s = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
     let n = |k: &str| payload.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -274,7 +249,13 @@ pub(crate) async fn deliver_webhook(
 }
 
 /// Send an email through Resend (the BILL-01 path).
-async fn deliver_email(mail: &Mail, to: &str, text: &str) -> Result<(), DeliveryError> {
+async fn deliver_email(
+    mail: &Mail,
+    to: &str,
+    subject: &str,
+    text: &str,
+    html: Option<&str>,
+) -> Result<(), DeliveryError> {
     if mail.api_key.is_none() {
         tracelane_shared::degradation::note(
             tracelane_shared::degradation::Degradation::UsageWarningEmailUnconfigured,
@@ -286,14 +267,15 @@ async fn deliver_email(mail: &Mail, to: &str, text: &str) -> Result<(), Delivery
         .await
         .map_err(|e| DeliveryError::Rejected(e.to_string()))?;
     let http = crate::billing::email::http_client();
-    tracelane_shared::email::send_plain_text(
+    tracelane_shared::email::send_message(
         &http,
         url,
         mail.api_key.as_ref(),
         &mail.from,
         to,
-        "Tracelane: spend alert",
+        subject,
         text,
+        html,
     )
     .await
     .map_err(|e| match e {
@@ -323,27 +305,48 @@ pub(crate) async fn deliver(
     ch: &crate::db::spend_alerts::Sealed,
     event_id: uuid::Uuid,
     payload: &Value,
+    base_url: &str,
 ) -> Result<(), DeliveryError> {
-    let text = message_text(payload);
+    let text = message_text(payload, base_url);
+    let notice = crate::approval_notice::approval_notice(payload, base_url);
     match ch.kind.as_str() {
-        "email" => deliver_email(mail, &ch.target, &text).await,
+        "email" => match &notice {
+            Some(n) => {
+                deliver_email(
+                    mail,
+                    &ch.target,
+                    "Tracelane: approval needed",
+                    &n.plain(),
+                    Some(&n.html()),
+                )
+                .await
+            }
+            None => deliver_email(mail, &ch.target, "Tracelane: spend alert", &text, None).await,
+        },
         "slack" => {
             let url = open_secret(ch)?;
-            crate::alerts::deliver_alert(url.expose_secret(), &text)
-                .await
-                .map(|_| ())
-                .map_err(|e| match e {
-                    crate::alerts::DeliveryError::Rejected(m) => DeliveryError::Rejected(m),
-                    crate::alerts::DeliveryError::Unreachable(m) => DeliveryError::Unreachable(m),
-                    crate::alerts::DeliveryError::Status { http_status, .. } => {
-                        DeliveryError::Status(http_status)
-                    }
-                })
+            let sent = match &notice {
+                Some(n) => {
+                    crate::alerts::deliver_alert_blocks(
+                        url.expose_secret(),
+                        &text,
+                        n.slack_blocks(),
+                    )
+                    .await
+                }
+                None => crate::alerts::deliver_alert(url.expose_secret(), &text).await,
+            };
+            sent.map(|_| ()).map_err(|e| match e {
+                crate::alerts::DeliveryError::Rejected(m) => DeliveryError::Rejected(m),
+                crate::alerts::DeliveryError::Unreachable(m) => DeliveryError::Unreachable(m),
+                crate::alerts::DeliveryError::Status { http_status, .. } => {
+                    DeliveryError::Status(http_status)
+                }
+            })
         }
         "webhook" => {
             let secret = open_secret(ch)?;
-            let mut body = payload.clone();
-            body["event_id"] = Value::String(event_id.to_string());
+            let body = crate::approval_notice::webhook_body(payload, event_id, base_url);
             deliver_webhook(&ch.target, &secret, event_id, &body)
                 .await
                 .map(|_| ())
@@ -358,7 +361,7 @@ pub(crate) async fn deliver(
 
 /// Spawn the ONE worker: drain crossings into the outbox, deliver due rows. Started at
 /// boot when a Postgres control plane exists.
-pub(crate) fn spawn(pool: crate::db::DbPool, mail: Mail) {
+pub(crate) fn spawn(pool: crate::db::DbPool, mail: Mail, base_url: String) {
     let Some(mut rx) = queue().1.lock().ok().and_then(|mut g| g.take()) else {
         return;
     };
@@ -376,13 +379,18 @@ pub(crate) fn spawn(pool: crate::db::DbPool, mail: Mail) {
                         tracing::debug!(error = %format!("{e:#}"), "spend alert outbox insert failed");
                     }
                 }
-                _ = tick.tick() => deliver_due(&pool, &mail, cfg).await,
+                _ = tick.tick() => deliver_due(&pool, &mail, cfg, &base_url).await,
             }
         }
     });
 }
 
-async fn deliver_due(pool: &crate::db::DbPool, mail: &Mail, cfg: crate::controls::ControlsConfig) {
+async fn deliver_due(
+    pool: &crate::db::DbPool,
+    mail: &Mail,
+    cfg: crate::controls::ControlsConfig,
+    base_url: &str,
+) {
     let due = match crate::db::spend_alerts::claim_due(pool, 50, LEASE_SECS).await {
         Ok(d) => d,
         Err(e) => {
@@ -391,7 +399,7 @@ async fn deliver_due(pool: &crate::db::DbPool, mail: &Mail, cfg: crate::controls
         }
     };
     for d in due {
-        let result = deliver(mail, &d.channel, d.event_id, &d.payload).await;
+        let result = deliver(mail, &d.channel, d.event_id, &d.payload, base_url).await;
         let attempts = u32::try_from(d.attempts).unwrap_or(0) + 1;
         let give_up = result.is_err() && attempts >= cfg.alert_max_attempts;
         let retry = cfg
@@ -428,53 +436,30 @@ mod tests {
     use wiremock::matchers::{header_exists, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn protected_payload() -> Value {
-        serde_json::json!({"type":"approval.requested","approval_id":"a","subject":"pay","subject_kind":"tool","protected":true,"expires_at":"2026-11-09T14:05:33+00:00","queue_path":"/settings/gateway/approvals","args_preview":"SECRET-PREVIEW","amount":"1500000"})
+    const BASE: &str = "https://app.tracelane.dev";
+    // The approval message cases and the hostile-value sweep lives in `approval_notice.rs`, which is compiled
+    // into the library so it runs without linking the gateway binary. These two prove the
+    // wiring: `message_text` delegates for approvals and leaves spend alerts alone.
+    #[test]
+    fn approval_text_is_built_by_the_notice_module() {
+        let p = serde_json::json!({"type":"approval.requested","approval_id":"0b9a7f0e-5d55-4c3e-9a57-6a1f3e2c8d11","subject":"delete_repo","subject_kind":"tool","server_name":"github","rule":"delete_*","expires_at":"2026-11-09T14:05:33+00:00","args_preview":"private-password"});
+        let t = message_text(&p, BASE);
+        assert!(t.contains("`delete_repo`") && t.contains("`github`") && t.contains("`delete_*`"));
+        assert!(t.contains("/settings/gateway/approvals?id=0b9a7f0e"));
+        assert!(!t.contains("private-password"));
     }
     #[test]
-    fn protected_approval_text_names_tool() {
-        assert!(message_text(&protected_payload()).contains("first: pay,"));
-    }
-    #[test]
-    fn protected_approval_text_includes_expiry_utc() {
-        assert!(message_text(&protected_payload()).contains("expires 2026-11-09 14:05 UTC"));
-    }
-    #[test]
-    fn protected_approval_text_points_to_queue() {
-        assert!(
-            message_text(&protected_payload())
-                .ends_with("Review them in Settings → Gateway → Approvals.")
+    fn spend_alert_text_is_unchanged() {
+        let t = message_text(
+            &serde_json::json!({"scope":"project","subject_id":"p-1","threshold":"80%","window":"monthly","policy":"project","spent_usd":80.0,"budget_usd":100.0,"mode":"hard"}),
+            BASE,
         );
-    }
-    #[test]
-    fn approval_text_escapes_slack_control_characters() {
-        let mut p = protected_payload();
-        p["subject"] = serde_json::json!("<!channel> <https://x|y> a&b");
-        for protected in [true, false] {
-            p["protected"] = serde_json::json!(protected);
-            let t = message_text(&p);
-            assert!(
-                t.contains("&lt;!channel&gt; &lt;https://x|y&gt; a&amp;b"),
-                "{t}"
-            );
-            assert!(!t.contains("<!channel>") && !t.contains("<https"), "{t}");
-        }
-    }
-    #[test]
-    fn legacy_approval_text_unchanged() {
-        let p = serde_json::json!({"type":"approval.requested","approval_id":"a","subject":"pay","subject_kind":"tool","queue_path":"/settings/gateway/approvals"});
         assert_eq!(
-            message_text(&p),
-            "Tracelane approval requested for pay. Review it in Settings → Gateway → Approvals."
+            t,
+            "Tracelane spend alert — project p-1 reached 80% of its monthly project budget: $80.00 \
+             spent of $100.00 (hard mode)."
         );
-    }
-    #[test]
-    fn protected_approval_text_contains_no_arguments() {
-        let t = message_text(&protected_payload());
-        assert!(
-            !t.contains("SECRET-PREVIEW") && !t.contains("1500000"),
-            "{t}"
-        );
+        assert!(!t.contains("approval"));
     }
 
     fn secret() -> SecretString {
@@ -586,28 +571,5 @@ mod tests {
             deliver_webhook(&failing.uri(), &secret(), id, &body).await,
             Err(DeliveryError::Status(500))
         );
-    }
-
-    #[test]
-    fn og24_the_message_names_the_numbers_and_nothing_else() {
-        let t = message_text(&serde_json::json!({
-            "scope": "project", "subject_id": "p-1", "threshold": "80%", "window": "monthly",
-            "policy": "project", "spent_usd": 80.0, "budget_usd": 100.0, "mode": "hard"
-        }));
-        assert_eq!(
-            t,
-            "Tracelane spend alert — project p-1 reached 80% of its monthly project budget: $80.00 \
-             spent of $100.00 (hard mode)."
-        );
-    }
-    #[test]
-    fn mcp_approval_notification_contains_no_arguments() {
-        let text = message_text(
-            &serde_json::json!({"type":"approval.requested","subject":"delete_repo","args_preview":"private-password"}),
-        );
-        assert!(text.contains("approval"));
-        assert!(text.contains("delete_repo"));
-        assert!(!text.contains("private-password"));
-        assert!(!text.contains("budget"));
     }
 }

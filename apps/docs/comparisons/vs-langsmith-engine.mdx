@@ -1,6 +1,6 @@
 ---
 title: Tracelane for LangSmith users
-description: What Tracelane ships — rules and human approval for AI agent actions, full-fidelity capture, a tamper-evident ledger, BYOK at 0% markup, OTel GenAI semconv, and an Apache 2.0 self-host.
+description: What Tracelane ships — rules and human approval for AI agent actions, no default sampling, a tamper-evident ledger, BYOK at 0% markup, OTel GenAI semconv, and an Apache 2.0 self-host.
 classification: PUBLIC
 ---
 
@@ -14,8 +14,8 @@ For LangSmith's current capabilities, pricing and terms, read
 
 ## What Tracelane is
 
-Tracelane puts **rules and human approval in front of AI agent actions**, with full-fidelity capture of every model
-call, plus a tamper-evident ledger that a third party can verify offline, without
+Tracelane puts **rules and human approval in front of AI agent actions**, with no default sampling of model
+calls routed through the gateway (prompt and response text off unless a workspace owner turns it on), plus a tamper-evident ledger that a third party can verify offline, without
 access to our systems — and, for every batch anchored in the public Sigstore Rekor
 log, without trusting us either (anchoring is best-effort and not yet universal; see
 [the ledger page](/audit-ledger) for exactly what rests on what).
@@ -35,10 +35,10 @@ best-effort basis; universal per-run anchoring is on the roadmap.
 
 See [Audit Ledger](/audit-ledger) for the format and the verification procedure.
 
-### Full-fidelity capture, on a neutral wire format
+### No default sampling, on a neutral wire format
 
 Traces are emitted as OTel GenAI semantic conventions — an open standard, not a
-Tracelane-specific envelope. Capture defaults to full fidelity rather than sampled, so
+Tracelane-specific envelope. Capture is not sampled by default, so
 the recorder does not silently drop the trace you later need.
 
 ### Observe-first guardrails
@@ -80,7 +80,7 @@ plans start at $29/mo (Builder); self-hosting the open-source stack is free.
 <AccordionGroup>
 
 <Accordion title="Does Tracelane do failure clustering today?">
-No. Tracelane positions on full-fidelity capture and the tamper-evident record, not on
+No. Tracelane positions on unsampled capture and the tamper-evident record, not on
 post-failure clustering. If
 clustering is your primary need today, Tracelane is not yet the tool for that job.
 </Accordion>

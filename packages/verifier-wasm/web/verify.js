@@ -137,6 +137,20 @@ drop.addEventListener("drop", (e) => {
 // A file dropped outside the box must not navigate the tab away to it.
 for (const type of ["dragover", "drop"]) window.addEventListener(type, (e) => e.preventDefault());
 
+// Sample bundles exist only on a page that ships ./samples.js (embedded as base64, so loading a
+// sample is not a fetch) and a #sample-good button. The standalone page has neither.
+const samples = $("sample-good") ? await import("./samples.js") : null;
+function loadSample(name) {
+  state.certs = [];
+  state.certNames = [];
+  state.note = "";
+  state.zip = Uint8Array.from(atob(samples[name]), (c) => c.charCodeAt(0));
+  state.zipName = `${name}.zip (synthetic sample data)`;
+  $("key").value = samples.publicKey;
+  run();
+}
+if (samples) for (const name of ["good", "tampered"]) $(`sample-${name}`).addEventListener("click", () => loadSample(name));
+
 try {
   await init({ module_or_path: Uint8Array.from(atob(wasmBase64), (c) => c.charCodeAt(0)) });
   state.ready = true;

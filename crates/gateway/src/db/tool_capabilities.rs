@@ -48,7 +48,23 @@ pub async fn upsert(
 ) -> Result<()> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
-    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    upsert_in_tx(&tx, tenant_id, tool_name, caps, def_hash, actor).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn upsert_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    tool_name: &str,
+    caps: i16,
+    def_hash: Option<&str>,
+    actor: &Actor,
+) -> Result<()> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
+    let before = pin_state(tx, tenant_id, tool_name).await?;
     tx.execute(
         "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
              VALUES ($1, $2, $3, $4)
@@ -60,9 +76,9 @@ pub async fn upsert(
     )
     .await
     .map_err(|e| anyhow!("tool_capabilities upsert: {e}"))?;
-    let after = pin_state(&tx, tenant_id, tool_name).await?;
+    let after = pin_state(tx, tenant_id, tool_name).await?;
     audit(
-        &tx,
+        tx,
         tenant_id,
         actor,
         "guardrail.tool_pin.set",
@@ -71,7 +87,6 @@ pub async fn upsert(
         after,
     )
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -145,7 +160,22 @@ pub async fn upsert_definition_only(
 ) -> Result<()> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
-    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    upsert_definition_only_in_tx(&tx, tenant_id, tool_name, def_hash, actor).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn upsert_definition_only_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    tool_name: &str,
+    def_hash: &str,
+    actor: &Actor,
+) -> Result<()> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
+    let before = pin_state(tx, tenant_id, tool_name).await?;
     tx.execute(
         "INSERT INTO tool_capabilities (tenant_id, tool_name, caps, def_hash)
              VALUES ($1, $2, 0, $3)
@@ -156,9 +186,9 @@ pub async fn upsert_definition_only(
     )
     .await
     .map_err(|e| anyhow!("tool_capabilities upsert_definition_only: {e}"))?;
-    let after = pin_state(&tx, tenant_id, tool_name).await?;
+    let after = pin_state(tx, tenant_id, tool_name).await?;
     audit(
-        &tx,
+        tx,
         tenant_id,
         actor,
         "guardrail.tool_pin.set",
@@ -167,7 +197,6 @@ pub async fn upsert_definition_only(
         after,
     )
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -178,6 +207,18 @@ pub async fn upsert_definition_only(
 /// not be indistinguishable to the caller.
 pub async fn list(pool: &Pool, tenant_id: &TenantId) -> Result<Vec<ToolPin>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    list_with(&**client, tenant_id).await
+}
+
+/// The same tenant-scoped read on a caller-held client or transaction.
+///
+/// # Errors
+/// Propagates query errors; the caller must not treat an unreadable store as empty.
+#[tracing::instrument(skip(client, tenant_id), fields(tenant_id = %tenant_id))]
+pub async fn list_with(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant_id: &TenantId,
+) -> Result<Vec<ToolPin>> {
     let rows = client
         .query(
             "SELECT tool_name, caps, def_hash FROM tool_capabilities
@@ -208,7 +249,23 @@ pub async fn delete(
 ) -> Result<bool> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
-    let before = pin_state(&tx, tenant_id, tool_name).await?;
+    let result = delete_in_tx(&tx, tenant_id, tool_name, actor).await?;
+    if result {
+        tx.commit().await?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn delete_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    tool_name: &str,
+    actor: &Actor,
+) -> Result<bool> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
+    let before = pin_state(tx, tenant_id, tool_name).await?;
     if before.is_none() {
         return Ok(false);
     }
@@ -219,7 +276,7 @@ pub async fn delete(
     .await
     .map_err(|e| anyhow!("tool_capabilities delete: {e}"))?;
     audit(
-        &tx,
+        tx,
         tenant_id,
         actor,
         "guardrail.tool_pin.delete",
@@ -228,6 +285,5 @@ pub async fn delete(
         None,
     )
     .await?;
-    tx.commit().await?;
     Ok(true)
 }

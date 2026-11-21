@@ -7,6 +7,7 @@ documented here. Versioned in lockstep with the TypeScript and Python verifiers.
 ## [Unreleased]
 
 ### Added
+- **`actions.refused_workspace_paused` in the action report.** Counts `denied_runtime` rows with reason `workspace_paused`: distinct protected tool calls a paused workspace refused. Other refusal reasons are not counted. The field is new in the serialized report; it is 0 for a bundle with no such rows.
 - **Action evidence bundles (`action` module).** Offline verification of an action-control
   evidence ZIP against an externally supplied workspace public key: the hashed manifest, the
   chain from genesis, the signed covering head (which must equal the last row), and the

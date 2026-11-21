@@ -22,8 +22,7 @@ use crate::db::DbPool as Pool;
 pub const MAX_ALIAS_LEN: usize = 64;
 /// Longest target model string stored (the table CHECKs 1..=256).
 pub const MAX_TARGET_LEN: usize = 256;
-/// Upper bound on rows the entitlement refresh reads per workspace. A safety bound on a
-/// background read, above any cap `billing_policy` can set today — not the product cap.
+/// Preserve the legacy background-read floor when a write cap drops or is unavailable.
 const LIST_BOUND: i64 = 1000;
 
 /// Why a write was refused. Each maps to one `400` code the UI shows at the field.
@@ -134,11 +133,38 @@ pub async fn list_with(
     client: &tokio_postgres::Client,
     tenant: &uuid::Uuid,
 ) -> Result<BTreeMap<String, String>> {
+    // Missing/invalid cap still disables creation in the write path. Existing aliases
+    // remain readable under the legacy bound; a larger configured cap raises it.
+    let cap = read_cap_with(client)
+        .await?
+        .map(i64::from)
+        .unwrap_or_default();
+    read_aliases(client, tenant, Some(LIST_BOUND.max(cap))).await
+}
+
+/// All aliases for a canonical export, without the ordinary listing's row bound.
+/// The export applies its document byte limit instead of silently dropping rows.
+///
+/// # Errors
+/// Propagates query errors; no partial configuration is returned.
+#[tracing::instrument(skip(client, tenant), fields(tenant_id = %tenant))]
+pub async fn list_all_with(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &uuid::Uuid,
+) -> Result<BTreeMap<String, String>> {
+    read_aliases(client, tenant, None).await
+}
+
+async fn read_aliases(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &uuid::Uuid,
+    limit: Option<i64>,
+) -> Result<BTreeMap<String, String>> {
     let rows = client
         .query(
             "SELECT alias, target_model FROM model_aliases \
              WHERE tenant_id = $1 ORDER BY alias LIMIT $2",
-            &[tenant, &LIST_BOUND],
+            &[tenant, &limit],
         )
         .await
         .map_err(|e| anyhow!("model_aliases list: {e}"))?;
@@ -181,8 +207,25 @@ pub async fn put(
 ) -> Result<PutOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = put_in_tx(&tx, tenant_id, alias, target, actor, max, create_only).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn put_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    alias: &str,
+    target: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    max: u32,
+    create_only: bool,
+) -> Result<PutOutcome> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
     let outcome = put_in(
-        &tx,
+        tx,
         tenant_id,
         alias,
         target,
@@ -197,7 +240,7 @@ pub async fn put(
         PutOutcome::Exists | PutOutcome::CapReached => None,
     } {
         crate::db::control_audit::record(
-            &tx,
+            tx,
             tenant_id,
             &actor.as_actor(),
             crate::db::control_audit::Change {
@@ -210,7 +253,6 @@ pub async fn put(
         )
         .await?;
     }
-    tx.commit().await?;
     Ok(outcome)
 }
 
@@ -293,6 +335,22 @@ pub async fn delete(
 ) -> Result<bool> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = delete_in_tx(&tx, tenant_id, alias, actor).await?;
+    if result {
+        tx.commit().await?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+pub async fn delete_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant_id: &TenantId,
+    alias: &str,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<bool> {
+    crate::db::controls::lock_config(tx, tenant_id).await?;
     let removed: Option<String> = tx
         .query_opt(
             "DELETE FROM model_aliases WHERE tenant_id = $1 AND alias = $2 RETURNING target_model",
@@ -305,7 +363,7 @@ pub async fn delete(
         return Ok(false);
     };
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant_id,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -317,18 +375,23 @@ pub async fn delete(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok(true)
 }
 
-/// `billing_policy.model_aliases_max_per_workspace` — read on the WRITE path only
-/// (writes are rare; this is not the hot path). `Ok(None)` when the row is absent or
+/// `billing_policy.model_aliases_max_per_workspace` — shared by control writes and
+/// background alias refresh, never queried per inference request. `Ok(None)` when the row is absent or
 /// not a non-negative integer: the caller refuses new aliases rather than guessing a cap.
 ///
 /// # Errors
 /// Propagates pool/statement errors.
 pub async fn read_cap(pool: &Pool) -> Result<Option<u32>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    read_cap_with(&**client).await
+}
+
+async fn read_cap_with(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+) -> Result<Option<u32>> {
     let row = client
         .query_opt(
             "SELECT value::text FROM billing_policy WHERE key = 'model_aliases_max_per_workspace'",

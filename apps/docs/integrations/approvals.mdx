@@ -1,0 +1,106 @@
+---
+title: "Approvals for held tool calls"
+description: "Pause an agent while a person decides on a held MCP tool call, then retry the same call. LangGraph and OpenAI Agents SDK, Python and TypeScript."
+classification: PUBLIC
+---
+
+When a workspace policy requires a person to approve an MCP tool call, the gateway **detects and
+holds** it and sends the request to an approver. The agent gets a "held" answer instead of the
+tool result. These helpers wait for the person's decision and then retry the identical call.
+
+<Note>
+  Approval holds for MCP tool calls are in development and are not available on every workspace.
+  Approval decisions on the default path are written to the tenant's hash-chained ledger, whose batches are signed when a signing key is configured, and the open-source verifier replays them offline. Approvals opened before this shipped are not recorded. The signed approval record is still a **Preview**: we have not yet observed it with a real approval in production, and the helpers below do not read or verify it.
+</Note>
+
+The helpers only wait and retry. The gateway still decides: a retried call that has no
+approval is held again.
+
+## What the agent receives
+
+A held call comes back in one of two shapes. `is_held` / `isHeld` parses both and returns `None` /
+`null` for anything else, including a denied or expired answer.
+
+- A tool result with `isError: true` and the text `approval required "<id>"; retry the same call after approval`.
+- An HTTP 409 with `{"error": "approval_required", "approval_id": "<id>", "expires_at": "<time>"}`.
+
+## Wait for the decision
+
+`wait_for_decision` reads `GET /v1/approvals/{id}` with the same API key the agent uses. That key can read
+the status of the approvals it requested. The base URL must be `https` (plain `http` only for localhost),
+and a redirect from the gateway is treated as an error, so the key is never sent anywhere else. It returns one of `approved`, `denied`, `expired`
+or `timeout`. `timeout` means your deadline passed and the approval may still be pending.
+
+```python
+from tracelane.approvals import is_held, wait_for_decision
+
+held = is_held(result)
+if held:
+    decision = wait_for_decision(held, base_url="https://gateway.tracelane.dev", api_key=KEY, timeout=300)
+```
+
+The wait always ends: the default deadline is 300 seconds, polling starts at 2 seconds and backs off
+to 15. A wrong key or an unknown approval raises an error instead of waiting.
+
+## LangGraph (Python)
+
+Wrap the tool call inside a node. A held call raises a LangGraph `interrupt()` with a typed payload
+(`type`, `approval_id`, `expires_at`). LangGraph runs the node again from its first line when it resumes, so that first call is already the retry,
+and **the gateway decides**: an approved approval returns the tool result, a denied or expired one raises
+`ApprovalNotGranted`, and a still-pending one interrupts again. The resume value
+(`{"decision": "approved"}` once `wait_for_decision` returns) matters only while the approval is still
+pending; only `approved` triggers one more retry, anything else raises `ApprovalNotGranted`. Requires `langgraph`; nothing else is added to the SDK.
+
+```python
+from tracelane.approvals import langgraph_gate
+
+def refund_node(state):
+    return {"result": langgraph_gate(lambda: mcp.call_tool("refund", state["args"]))}
+```
+
+Keep side effects out of the node before the gated call, since it runs again on resume.
+
+Protected tools require an `Idempotency-Key`. The retry must carry the same key as the first call.
+
+## OpenAI Agents SDK
+
+Wrap the async function behind the tool. If the call is held, the wrapper waits, retries the
+identical call once after approval, and otherwise returns a short message telling the model the action was
+not performed and should not be retried.
+
+```python
+from agents import function_tool
+from tracelane.approvals import with_approval
+
+refund = function_tool(with_approval(refund_fn, base_url=GATEWAY, api_key=KEY))
+```
+
+```ts
+import { tool } from "@openai/agents";
+import { withApproval } from "@tracelanedev/sdk/approvals";
+
+const refund = tool({
+  name: "refund",
+  description: "Refund an order",
+  parameters,
+  execute: withApproval(refundExecute, { baseUrl: GATEWAY, apiKey: KEY }),
+});
+```
+
+## TypeScript
+
+`isHeld(body)` parses an already-read body. For a real `fetch` `Response` use `await isHeldResponse(res)`, which reads a clone. `waitForDecision(held, { baseUrl, apiKey, timeoutMs })` returns the same four decisions as the Python function.
+
+## Who can approve
+
+On the hosted service, approving needs a recent sign-in. If the approver signed in too long ago, the gateway refuses the decision and asks them to sign in again. The window is set by the gateway's policy table, not by the caller. A tenant API key cannot approve. On a single-tenant self-host, the operator's master key can approve and has no sign-in check.
+
+## Notifications
+
+When a call is held, the gateway can notify approvers by Slack or email. The message names the tool, the server, the rule and the expiry, and its button links to that exact held call in the approvals page, where the approver signs in. Tool arguments are not put in the message.
+
+## Limits
+
+- One retry after approval. A call that is still held after the retry is reported as not performed.
+- The helper never retries on a denied, expired or timed-out decision. The gateway decides: if a person approved the call before your agent resumes, the identical retry runs once.
+- The status read is rate limited per key. A `Retry-After` header is honoured, up to your deadline. Keep the default backoff when many agents wait at once.

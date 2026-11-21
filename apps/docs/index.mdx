@@ -1,40 +1,28 @@
 ---
-title: Tracelane — the tamper-evident runtime proxy for AI agents
-description: The tamper-evident runtime proxy for AI agents — full-fidelity traces, a tamper-evident audit ledger, and agent-tool attack detection. Apache 2.0, OTel-native.
+title: Tracelane — approval and proof for AI agents that act on money and customer data
+description: Tracelane holds risky agent tool calls for a person, binds the approval to that exact call, and keeps a signed record you check offline. Signed approval evidence is in preview. Apache 2.0, self-hostable.
 classification: PUBLIC
 ---
 
-**The tamper-evident runtime proxy for enterprise AI agents.**
+**Approval and proof for AI agents that act on money and customer data.**
 
-Tracelane is a Rust gateway and ClickHouse-backed observability tier that
-captures the LLM calls routed through it at full fidelity — no default sampling — with a tamper-evident audit
-ledger that makes each gateway call verifiable. Its sharpest edge is **MCP and agent-tool
-safety**: it surfaces tool-definition-drift, rug-pull substitution, and
-hallucinated tool-call arguments as first-class signals (drift and rug-pull compare
-against a definition you approved in one click from the tools Tracelane has
-observed on your own traffic) and records each with a
-tamper-evident signature.
+Your agents pay, refund and pull customer records. Tracelane holds risky tool calls for a person, binds the approval to that exact call so it is used once, and writes the decision to a signed record that you check offline with the open-source verifier.
 
-Heuristic checks for the lethal trifecta and prompt
-injection observe alongside, on every request and on every tier. A2A/A2UI drift,
-browser stuck-loops and argument drift are **roadmap**: those detectors gate on
-payload fields a `/v1/chat/completions` request does not carry, so they do not
-fire on LLM traffic today. Gateway-level enforcement is opt-in (observe-first by
-default), and an ML ensemble is on the roadmap.
+- **Hold.** A workspace policy can require a person to approve an MCP tool call. The gateway detects and holds it, and the agent gets a "held" answer. Approval holds are in development and not available on every workspace. See [Approvals](/integrations/approvals).
+- **Bind.** The approval is tied to the request it was raised for and is used once, then it expires.
+- **Prove.** Approval decisions on the default path are written to the tenant's hash-chained ledger, signed per batch, and `tlane verify` replays them offline. The signed approval record is a **Preview**. Read [the audit ledger](/audit-ledger) for what is and is not chained.
 
-You point traffic at us, get low-overhead gateway routing, full-fidelity
-trace capture, tamper-evident audit logs, and merge-gate evals. Premium
-positioning, Apache 2.0, no SaaS-blocked license games.
+Underneath is a Rust gateway with BYOK routing and OTel capture, backed by ClickHouse. It also records gateway calls and guardrail verdicts in the same tamper-evident ledger. Heuristic checks for the lethal trifecta and prompt injection observe alongside, on every request and on every tier. Tool-definition drift and rug-pull checks compare against a definition you approved from the tools Tracelane has observed on your own traffic. A2A/A2UI drift, browser stuck-loops and argument drift are **roadmap**: those detectors gate on payload fields a `/v1/chat/completions` request does not carry, so they do not fire on LLM traffic today. Gateway-level enforcement is opt-in (observe-first by default), and an ML ensemble is on the roadmap.
 
 <CardGroup cols={2}>
   <Card title="60-second quickstart" icon="rocket" href="/quickstart">
     Drop two env vars in, get your first trace.
   </Card>
+  <Card title="Approvals" icon="user-check" href="/integrations/approvals">
+    Hold a tool call, wait for a person, retry the same call.
+  </Card>
   <Card title="Architecture" icon="layer-group" href="/architecture">
     Five components, one monorepo, OTel under the hood.
-  </Card>
-  <Card title="Agent-tool safety" icon="shield-check" href="/predictive-guardrails">
-    MCP tool-definition-drift + schema validation at the gateway. Each rail backed by a green eval.
   </Card>
   <Card title="205 providers" icon="plug" href="/providers">
     BYOK across Anthropic, OpenAI, Google, Bedrock, Azure, Cohere + any OpenAI-compatible endpoint.
@@ -48,7 +36,7 @@ positioning, Apache 2.0, no SaaS-blocked license games.
     Not GPL-3.0 viral. Not ELv2 SaaS-blocked. Run it however you want.
   </Card>
   <Card title="Caught at the gateway, not after" icon="bolt">
-    Tool-definition-drift is flagged or halted inline at the gateway, not
+    Tool-definition-drift is flagged inline at the gateway, not
     reconstructed from an incident write-up.
   </Card>
   <Card title="Every claim carries an eval" icon="clipboard-check">

@@ -148,6 +148,24 @@ pub struct Config {
     pub web_base_url: String,
 }
 
+/// `TRACELANE_WEB_URL`, default `https://app.tracelane.dev` — the one place the web app's base
+/// URL is read (share links, approval notification deep links).
+pub(crate) fn web_base_url_from_env() -> String {
+    match std::env::var("TRACELANE_WEB_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => "https://app.tracelane.dev".to_string(),
+    }
+}
+
+/// The base for approval-notification deep links: `TRACELANE_WEB_URL` ONLY. Unset yields an
+/// empty base, which `approval_notice` turns into "no link" (settings-path text): a self-host
+/// must not send its approvers to the hosted app's domain.
+pub(crate) fn approval_link_base_from_env() -> String {
+    std::env::var("TRACELANE_WEB_URL")
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default()
+}
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
@@ -178,9 +196,13 @@ impl Config {
             bench_mock_upstream: std::env::var("TRACELANE_BENCH_MOCK_UPSTREAM")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            web_base_url: match std::env::var("TRACELANE_WEB_URL") {
-                Ok(v) if !v.trim().is_empty() => v,
-                _ => "https://app.tracelane.dev".to_string(),
+            web_base_url: {
+                if std::env::var("TRACELANE_WEB_URL").map_or(true, |v| v.trim().is_empty()) {
+                    tracing::warn!(
+                        "TRACELANE_WEB_URL is unset: share links default to https://app.tracelane.dev and approval notifications carry no deep link; self-hosted deployments should set it"
+                    );
+                }
+                web_base_url_from_env()
             },
         })
     }
@@ -282,6 +304,10 @@ pub struct AppState {
     /// lifetime (`config::install_from_env`); a test passes `None` or a leaked
     /// block instead of installing a file.
     pub failover: Option<&'static self::config::FailoverConfig>,
+    /// GWY-80: the `sovereign:` block of `tracelane.yaml`, read ONCE at boot, the same
+    /// way as `failover`. `None` ⇒ no request is classified or confined. A test passes a
+    /// leaked block instead of installing a file, so it never leaks into other tests.
+    pub sovereign: Option<&'static crate::sovereign::SovereignConfig>,
     /// B-386 (b), EXPAND step: the control-plane pool as a field. `None` with no
     /// `POSTGRES_URL` (dev / OSS self-host). `db::global_pool()` still answers
     /// the same pool for the readers not yet converted; the static is deleted
@@ -299,6 +325,26 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // one process lifetime. Absent file ⇒ no aliases, no behaviour change;
     // present-but-invalid ⇒ this `?` refuses to boot (see `config::install_from_env`).
     self::config::install_from_env().context("tracelane.yaml")?;
+    // GWY-80: a `sovereign:` block must name a model that resolves (through the SAME
+    // canonical map the chat handler uses, aliases included) to a sovereign provider,
+    // and every sovereign provider must be re-pointed at the operator's own host.
+    // Refuse to boot otherwise (fail-CLOSED): a block that cannot confine anything
+    // would refuse every regulated request at run time while looking configured.
+    if let Some(sv) = self::config::sovereign() {
+        sv.check_boot(
+            crate::providers::ProviderRegistry::provider_id_for_model,
+            |k| std::env::var(k).ok(),
+        )
+        .context("tracelane.yaml `sovereign:`")?;
+        tracing::info!(
+            providers = %sv.providers().collect::<Vec<_>>().join(","),
+            model = sv.model(),
+            "sovereign routing ON: model dispatches of regulated chat requests are confined \
+             to these providers; other model wires and server-side dispatches (evals, \
+             experiments, judges) are refused. Guardrail vendor hooks and MCP need the \
+             control plane, which this mode refuses; PROMPT_GUARD_URL must be loopback"
+        );
+    }
 
     let providers = Arc::new(ProviderRegistry::new().context("build provider registry")?);
 
@@ -443,6 +489,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             "POSTGRES_URL not set — running without DB. api_key validation falls back to dev stub."
         );
     }
+
+    // GWY-80 (defence in depth): `check_boot` refused the block alongside every control-plane
+    // signal, so a pool here means the two checks disagree. Refuse rather than run one
+    // operator block over a multi-tenant control plane.
+    anyhow::ensure!(
+        self::config::sovereign().is_none() || pg.is_none(),
+        "a `sovereign:` block cannot run with a Postgres control plane"
+    );
 
     // Audit chain — built AFTER the Postgres pool so it can persist + warm the
     // per-tenant hash-chain state and sign anchors with per-tenant keys (ADR-042
@@ -1095,6 +1149,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         rejection_metrics,
         hotpath: crate::hotpath::Config::from_env(),
         failover: self::config::failover(),
+        sovereign: self::config::sovereign(),
         pg,
         paused_evidence,
     };
@@ -1592,6 +1647,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // OG-35 / OG-36: the admin-access policy and the control-change trail. Same
         // Postgres gate — both live in the control plane.
         app = app.merge(crate::control_plane::router(pg.clone()));
+        // OG-61a: the workspace's configuration export (Postgres control plane only).
+        app = app.merge(crate::config_routes::router(pg.clone()));
         tracing::info!(
             "Admin plane mounted at /v1/security/admin-access (GET/PUT) and /v1/audit/control-changes (GET/POST)"
         );
@@ -1641,7 +1698,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .merge(crate::guardrail::policy_api::router(state.clone()));
         app = app.merge(crate::guardrail::hooks_api::router(state.clone()));
         // OG-24: the ONE spend-alert worker (outbox + delivery), off the request path.
-        crate::spend_alerts::spawn(pool.clone(), crate::spend_alerts::Mail::from_env());
+        crate::spend_alerts::spawn(
+            pool.clone(),
+            crate::spend_alerts::Mail::from_env(),
+            approval_link_base_from_env(),
+        );
         tracing::info!("workspace controls mounted at /v1/controls/*");
 
         // OBS-18 annotations. Postgres-backed (mutable, low-volume, read one
@@ -1870,6 +1931,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         preauth,
         crate::preauth_limiter::layer,
     ));
+    // GWY-80: with a `sovereign:` block installed, every model wire the block does not
+    // classify answers 403 before it can send text to a provider. Without one, a single
+    // atomic load per request.
+    let app = crate::sovereign::with_wire_gate(app, state.sovereign);
     let app = with_admission(app, admission)
         .route("/health", get(health_handler))
         // B-389: per-route request counters + head-of-response histogram, and the
@@ -3402,6 +3467,37 @@ mod tests {
             server_src.contains(&squeeze(&needle)),
             "the write route moved or changed method — re-check the merge"
         );
+    }
+
+    /// GWY-80: a layer wraps only the routes merged BEFORE it. The sovereign wire gate is the
+    /// only control for ~15 wires, so it must be mounted after the last route merge in `run()`.
+    /// Needles are assembled at runtime so this assertion cannot satisfy itself.
+    #[test]
+    fn sovereign_wire_gate_follows_the_last_route_merge() {
+        let src = include_str!("server.rs");
+        let start = src
+            .find(&format!("{}{}", "pub async fn run(", "config: Config)"))
+            .expect("run() moved");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end of run()")];
+        let gate = body
+            .find(&format!("{}{}", "sovereign::with_", "wire_gate("))
+            .expect("the wire gate is no longer mounted in run()");
+        // Nothing that adds a route may follow the gate: a layer wraps only the routes added
+        // before it. The one exception is `/health`, which is deliberately mounted outside the
+        // admission layer (so an overloaded node still answers) and is in the gate's allow-list.
+        let after = &body[gate..];
+        // (needle halves are joined at runtime so this test cannot match its own text)
+        for (head, tail) in [(".mer", "ge("), (".nes", "t("), (".rou", "te(")] {
+            let needle = format!("{head}{tail}");
+            for (at, _) in after.match_indices(&needle) {
+                let rest = &after[at + needle.len()..];
+                assert!(
+                    head == ".rou" && rest.trim_start().starts_with("\"/health\""),
+                    "a route is added after the sovereign wire gate and would bypass it: {}",
+                    &after[at..(at + 60).min(after.len())]
+                );
+            }
+        }
     }
 
     /// B-230. Six routes authenticated a caller and then returned tenant data — or

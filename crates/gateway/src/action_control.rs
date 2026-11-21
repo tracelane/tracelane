@@ -229,6 +229,21 @@ pub(crate) fn require_enabled(
     ensure!(enabled(resolved), "action control disabled");
     Ok(())
 }
+fn actor_for(key: Option<Uuid>, method: Option<crate::auth::AuthMethod>) -> String {
+    key.map_or_else(
+        || {
+            match method {
+                Some(crate::auth::AuthMethod::JwtBearer) => "human",
+                Some(crate::auth::AuthMethod::SelfHostMasterKey) => "self_host_master_key",
+                Some(crate::auth::AuthMethod::ApiKey) => "api_key",
+                Some(crate::auth::AuthMethod::Mtls) => "mtls",
+                None => "system",
+            }
+            .to_owned()
+        },
+        |k| k.to_string(),
+    )
+}
 fn rows_for(
     t: &TenantId,
     key: Option<Uuid>,
@@ -247,19 +262,7 @@ fn rows_for(
             "action evidence too large"
         );
         let seq = first + offset as u64;
-        let actor = key.map_or_else(
-            || {
-                match method {
-                    Some(crate::auth::AuthMethod::JwtBearer) => "human",
-                    Some(crate::auth::AuthMethod::SelfHostMasterKey) => "self_host_master_key",
-                    Some(crate::auth::AuthMethod::ApiKey) => "api_key",
-                    Some(crate::auth::AuthMethod::Mtls) => "mtls",
-                    None => "system",
-                }
-                .to_owned()
-            },
-            |k| k.to_string(),
-        );
+        let actor = actor_for(key, method);
         let hash =
             crate::audit_format::row_hash_v2(&prev, t, seq, e.event_type(), &actor, &payload);
         rows.push(crate::db::ledger::AuditLogRow {
@@ -345,12 +348,27 @@ async fn append_for_actor_tx(
         .iter()
         .map(|e| format!("action:{}:{}", tenant, e.event_id))
         .collect();
+    let recordings = events
+        .iter()
+        .map(|e| {
+            // Protected writes use the same reserved-envelope contract as the consumer.
+            // Current protected payloads have no recording member; producers remain off.
+            crate::gateway_recording::Recording::parse(
+                tenant,
+                Some(&e.event_id.to_string()),
+                e.event_type(),
+                &actor_for(key, method),
+                &e.canonical(tenant, key)?,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     crate::db::audit_chain_state::append_atomic_batch_tx(
         tx,
         tenant,
         crate::audit_format::genesis_prev_hash(tenant),
         Some(&ids),
         events.len(),
+        &recordings,
         |seq, prev, kept| rows_for(tenant, key, method, events, seq, prev, kept),
     )
     .await

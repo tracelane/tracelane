@@ -913,11 +913,27 @@ async fn security_second_approver_rejects_key_creator_and_non_session_deciders()
         sub: "independent-owner".into(),
         ..creator
     };
+    let method = independent.auth_method_label();
     assert_eq!(
         fixture.decision(&independent, approval, "approve").await.0,
         StatusCode::OK
     );
     assert_eq!(fixture.audit_count(approval, "approval.approve").await, 1);
+    // ACT-41: the legacy approve stores how the approver authenticated in the same
+    // transaction. This route harness has no WorkOS (debug dev stub), so no sign-in time.
+    let row = fixture
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT decided_auth_method, decided_auth_at IS NULL FROM approvals WHERE tenant_id=$1 AND id=$2",
+            &[fixture.tenant.as_uuid(), &approval],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0).as_deref(), Some(method));
+    assert!(row.get::<_, bool>(1));
     let _claims = crate::auth::test_claims::Guard::set(caller);
     let allowed = response_json(
         fixture
@@ -1375,6 +1391,7 @@ async fn mcp_approval_notification_is_durable_deduplicated_and_delivered() {
         &event.channel,
         event.event_id,
         &event.payload,
+        "https://app.tracelane.dev",
     )
     .await
     .unwrap();
@@ -1387,9 +1404,64 @@ async fn mcp_approval_notification_is_durable_deduplicated_and_delivered() {
         chrono::Utc::now().timestamp(),
         300
     ));
+    let delivered = calls[0].body_json::<Value>().unwrap();
+    assert_eq!(delivered["approval_id"], id.to_string());
+    // GWY-81: the delivered body carries the deep link and the in-transaction labels.
     assert_eq!(
-        calls[0].body_json::<Value>().unwrap()["approval_id"],
-        id.to_string()
+        delivered["url"],
+        format!("https://app.tracelane.dev/settings/gateway/approvals?id={id}")
+    );
+    let server_name: String = fixture
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT s.name FROM approvals a JOIN mcp_servers s ON s.tenant_id=a.tenant_id AND s.id=a.server_id WHERE a.tenant_id=$1 AND a.id=$2",
+            &[fixture.tenant.as_uuid(), &id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(delivered["server_name"], server_name);
+    assert!(delivered.get("args_preview").is_none());
+    // The non-protected notice carries the row's real expiry (GWY-81 review M2).
+    let row_expiry: chrono::DateTime<chrono::Utc> = fixture
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT expires_at FROM approvals WHERE tenant_id=$1 AND id=$2",
+            &[fixture.tenant.as_uuid(), &id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let got =
+        chrono::DateTime::parse_from_rfc3339(delivered["expires_at"].as_str().unwrap()).unwrap();
+    assert_eq!(got, row_expiry);
+    let mut keys: Vec<&str> = delivered
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "rule") // present only when a rule matched
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "approval_id",
+            "event_id",
+            "expires_at",
+            "queue_path",
+            "server_name",
+            "subject",
+            "subject_kind",
+            "type",
+            "url"
+        ]
     );
     crate::db::spend_alerts::record_outcome(&fixture.pool, event.event_id, Ok(()), 0, false)
         .await
@@ -2027,4 +2099,350 @@ async fn mcp_flush_drops_a_batch_postgres_rejects_instead_of_retrying_forever() 
         crate::mcp_inspection::flush(&fixture.pool).await.unwrap(),
         1
     );
+}
+
+// ---- ACT-40: default-path approvals in the signed, hash-chained ledger ----
+impl Fixture {
+    /// Plant (Some) or clear (None) a fault that refuses new approval ledger rows only.
+    async fn ledger_failure(&self, on: bool) {
+        let client = self.pool.get().await.unwrap();
+        client
+            .batch_execute(
+                "ALTER TABLE audit_log_rows DROP CONSTRAINT IF EXISTS act40_reject_approval_row",
+            )
+            .await
+            .unwrap();
+        if on {
+            client.batch_execute("ALTER TABLE audit_log_rows ADD CONSTRAINT act40_reject_approval_row CHECK(event_type NOT LIKE 'tool_approval.%') NOT VALID").await.unwrap();
+        }
+    }
+    /// (event_type, actor, payload) of this tenant's approval rows, in ledger order.
+    async fn approval_rows(&self) -> Vec<(String, String, String)> {
+        self.pool.get().await.unwrap().query("SELECT event_type,actor,payload FROM audit_log_rows WHERE tenant_id=$1 AND event_type LIKE 'tool_approval.%' ORDER BY seq", &[self.tenant.as_uuid()]).await.unwrap()
+            .iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect()
+    }
+    /// Recompute this tenant's whole chain from genesis (no gap, no fork, every row hash).
+    async fn chain_holds(&self) -> bool {
+        let rows = self.pool.get().await.unwrap().query("SELECT seq,event_type,actor,payload,prev_hash,row_hash FROM audit_log_rows WHERE tenant_id=$1 ORDER BY seq", &[self.tenant.as_uuid()]).await.unwrap();
+        let mut prev = crate::audit_format::genesis_prev_hash(&self.tenant);
+        for (i, r) in rows.iter().enumerate() {
+            let seq: i64 = r.get(0);
+            let (et, actor, payload): (String, String, String) = (r.get(1), r.get(2), r.get(3));
+            if seq != i as i64 || r.get::<_, String>(4) != hex::encode(prev) {
+                return false;
+            }
+            prev = crate::audit_format::row_hash_v2(
+                &prev,
+                &self.tenant,
+                seq as u64,
+                &et,
+                &actor,
+                &payload,
+            );
+            if r.get::<_, String>(5) != hex::encode(prev) {
+                return false;
+            }
+        }
+        true
+    }
+    fn replay(
+        &self,
+        rows: &[(String, String, String)],
+    ) -> anyhow::Result<tracelane_audit_verifier::approval::Semantics> {
+        let records = rows
+            .iter()
+            .map(|(et, actor, payload)| {
+                tracelane_audit_verifier::approval::Record::from_row(
+                    *self.tenant.as_uuid(),
+                    et,
+                    actor,
+                    payload,
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        tracelane_audit_verifier::approval::semantics(&records)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_lifecycle_is_chained_signed_shape_and_replays() {
+    let _loopback = LoopbackBypassGuard::new();
+    let fixture = Fixture::new("none").await;
+    let caller = principal(&fixture.tenant);
+    // A distinct human decides; the requester's own decisions are covered by the deny test.
+    let approver = Claims {
+        sub: format!("security-approver:{}", fixture.tenant),
+        ..principal(&fixture.tenant)
+    };
+    let approval = fixture.create_pending_for(&caller).await;
+    assert_eq!(
+        fixture.decision(&approver, approval, "approve").await.0,
+        StatusCode::OK
+    );
+    let _claims = crate::auth::test_claims::Guard::set(caller.clone());
+    let allowed = response_json(
+        fixture
+            .call(
+                "delete_current",
+                "session-a",
+                "Bearer account-a",
+                Some(approval),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(allowed.1["result"]["content"][0]["text"], "executed");
+    let rows = fixture.approval_rows().await;
+    let kinds: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "tool_approval.requested",
+            "tool_approval.approved",
+            "tool_approval.consumed"
+        ]
+    );
+    // Actors come from validated claims: the requester, then the session decider.
+    let actors: Vec<_> = rows.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(
+        actors,
+        [
+            caller.sub.as_str(),
+            approver.sub.as_str(),
+            caller.sub.as_str()
+        ]
+    );
+    for (_, _, payload) in &rows {
+        // Keyed fingerprint only: no arguments, preview or upstream credential.
+        for leak in ["arguments", "args_preview", "account-a", "params"] {
+            assert!(!payload.contains(leak), "{leak} in {payload}");
+        }
+        assert!(payload.contains(&approval.to_string()));
+    }
+    let s = fixture.replay(&rows).unwrap();
+    assert_eq!(
+        (s.requested, s.approved, s.consumed, s.open, s.self_decided),
+        (1, 1, 1, 0, 0)
+    );
+    assert!(fixture.chain_holds().await);
+    // A second consume attempt is refused and adds no ledger row.
+    let again = response_json(
+        fixture
+            .call(
+                "delete_current",
+                "session-a",
+                "Bearer account-a",
+                Some(approval),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(again.1["result"]["isError"], true);
+    assert_eq!(fixture.approval_rows().await.len(), 3);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_ledger_fault_blocks_request_decision_and_consume() {
+    let _loopback = LoopbackBypassGuard::new();
+    let fixture = Fixture::new("none").await;
+    let caller = principal(&fixture.tenant);
+    // Request: with the ledger refusing, no pending approval may exist.
+    fixture.ledger_failure(true).await;
+    {
+        let _claims = crate::auth::test_claims::Guard::set(caller.clone());
+        let refused = response_json(
+            fixture
+                .call("delete_current", "session-a", "Bearer account-a", None)
+                .await,
+        )
+        .await;
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
+    }
+    let count: i64 = fixture
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM approvals WHERE tenant_id=$1",
+            &[fixture.tenant.as_uuid()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0, "a request with no ledger record must roll back");
+    assert_eq!(fixture.destructive_calls().await, 0);
+    fixture.ledger_failure(false).await;
+    let approval = fixture.create_pending_for(&caller).await;
+    // Decision: refused, state unchanged.
+    fixture.ledger_failure(true).await;
+    assert!(
+        fixture
+            .decision(&caller, approval, "approve")
+            .await
+            .0
+            .is_server_error()
+    );
+    assert_eq!(fixture.status(approval).await, "pending");
+    assert_eq!(fixture.audit_count(approval, "approval.approve").await, 0);
+    fixture.ledger_failure(false).await;
+    assert_eq!(
+        fixture.decision(&caller, approval, "approve").await.0,
+        StatusCode::OK
+    );
+    // Consume: refused, grant stays approved, the tool never runs.
+    fixture.ledger_failure(true).await;
+    let _claims = crate::auth::test_claims::Guard::set(caller.clone());
+    let refused = response_json(
+        fixture
+            .call(
+                "delete_current",
+                "session-a",
+                "Bearer account-a",
+                Some(approval),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
+    assert_eq!(fixture.status(approval).await, "approved");
+    assert_eq!(fixture.destructive_calls().await, 0);
+    fixture.ledger_failure(false).await;
+    assert!(fixture.chain_holds().await);
+    assert_eq!(
+        fixture.replay(&fixture.approval_rows().await).unwrap().open,
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_sweep_expiry_records_and_retries_after_fault() {
+    let _loopback = LoopbackBypassGuard::new();
+    let fixture = Fixture::new("none").await;
+    let caller = principal(&fixture.tenant);
+    // A real one-second TTL, so the recorded deadline is the one that lapses.
+    fixture.pool.get().await.unwrap().execute("INSERT INTO approval_settings(tenant_id,require_second_approver,default_ttl_secs,updated_by) VALUES($1,false,1,'act40-test')", &[fixture.tenant.as_uuid()]).await.unwrap();
+    let approval = fixture.create_pending_for(&caller).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let lapsed: bool = fixture
+                .pool
+                .get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT now()>expires_at FROM approvals WHERE tenant_id=$1 AND id=$2",
+                    &[fixture.tenant.as_uuid(), &approval],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if lapsed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("one-second TTL lapses");
+    fixture.ledger_failure(true).await;
+    assert!(crate::approvals::expire(&fixture.pool, None).await.is_err());
+    assert_eq!(
+        fixture.status(approval).await,
+        "pending",
+        "sweep rolls back, retries next tick"
+    );
+    fixture.ledger_failure(false).await;
+    assert_eq!(
+        crate::approvals::expire(&fixture.pool, None).await.unwrap(),
+        1
+    );
+    assert_eq!(fixture.status(approval).await, "expired");
+    let rows = fixture.approval_rows().await;
+    assert_eq!(rows.last().unwrap().0, "tool_approval.expired");
+    assert_eq!(
+        rows.last().unwrap().1,
+        tracelane_audit_verifier::approval::EXPIRY_ACTOR
+    );
+    let s = fixture.replay(&rows).unwrap();
+    assert_eq!((s.requested, s.expired, s.open), (1, 1, 0));
+    assert!(fixture.chain_holds().await);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_deny_is_recorded_with_decider_and_blocks_execution() {
+    let _loopback = LoopbackBypassGuard::new();
+    let fixture = Fixture::new("none").await;
+    let caller = principal(&fixture.tenant);
+    let approval = fixture.create_pending_for(&caller).await;
+    assert_eq!(
+        fixture.decision(&caller, approval, "deny").await.0,
+        StatusCode::OK
+    );
+    let rows = fixture.approval_rows().await;
+    assert_eq!(rows.last().unwrap().0, "tool_approval.denied");
+    assert!(
+        rows.last()
+            .unwrap()
+            .2
+            .contains(&format!("\"decided_by\":\"{}\"", caller.sub))
+    );
+    let s = fixture.replay(&rows).unwrap();
+    assert_eq!((s.denied, s.self_decided, s.open), (1, 1, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_approvals_opened_off_ledger_stay_off_ledger_and_replay_passes() {
+    let _loopback = LoopbackBypassGuard::new();
+    let fixture = Fixture::new("none").await;
+    let caller = principal(&fixture.tenant);
+    // Two approvals opened before ACT-40 shipped: rows with no `requested` ledger record.
+    let legacy = |pending_secs: i64| {
+        let pool = fixture.pool.clone();
+        let tenant = *fixture.tenant.as_uuid();
+        let sub = caller.sub.clone();
+        async move {
+            let id = Uuid::new_v4();
+            pool.get().await.unwrap().execute("INSERT INTO approvals(id,tenant_id,subject_kind,subject,requester_sub,args_fp,args_bytes,expires_at,trace_id) VALUES($1,$2,'tool','delete_current',$3,$4,0,clock_timestamp()+make_interval(secs=>$5::double precision),$1)", &[&id, &tenant, &sub, &id.simple().to_string().repeat(2), &(pending_secs as f64)]).await.unwrap();
+            id
+        }
+    };
+    let decided = legacy(3600).await;
+    let lapsed = legacy(-1).await;
+    let before =
+        crate::approvals::ledger::LEGACY_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        fixture.decision(&caller, decided, "approve").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(fixture.status(decided).await, "approved");
+    assert_eq!(
+        crate::approvals::expire(&fixture.pool, None).await.unwrap(),
+        1
+    );
+    assert_eq!(fixture.status(lapsed).await, "expired");
+    assert!(
+        fixture.approval_rows().await.is_empty(),
+        "no orphan transition rows"
+    );
+    assert!(
+        crate::approvals::ledger::LEGACY_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+            >= before + 2
+    );
+    // A ledgered approval in the same tenant still records its full lifecycle.
+    let approval = fixture.create_pending_for(&caller).await;
+    assert_eq!(
+        fixture.decision(&caller, approval, "approve").await.0,
+        StatusCode::OK
+    );
+    let rows = fixture.approval_rows().await;
+    assert_eq!(rows.len(), 2);
+    let s = fixture.replay(&rows).unwrap();
+    assert_eq!((s.requested, s.approved, s.open), (1, 1, 1));
+    assert!(fixture.chain_holds().await);
 }

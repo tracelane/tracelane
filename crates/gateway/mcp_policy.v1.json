@@ -93,6 +93,11 @@
     "paused_refusal_queue_bytes": 33554432,
     "paused_refusal_timeout_ms": 2000,
     "register_as_of_min_age_secs": 150,
-    "register_read_timeout_secs": 10
+    "register_read_timeout_secs": 10,
+    "approver_auth_max_age_secs": 900
+  },
+  "chat": {
+    "replay_window_secs": 300,
+    "max_interaction_bytes": 32768
   }
 }

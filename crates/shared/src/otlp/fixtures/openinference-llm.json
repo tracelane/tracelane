@@ -1,0 +1,13 @@
+{
+  "source": "https://github.com/Arize-ai/openinference/blob/9c181be6bf4cd16571a6c340f3713a9e42a6f45d/spec/spans/llm.md#chat-completions",
+  "recorded": "2026-11-19",
+  "scope": "Metadata projection of first Chat Completions example; content omitted from this fixture",
+  "attributes": {
+    "openinference.span.kind": "LLM",
+    "llm.system": "openai",
+    "llm.model_name": "gpt-3.5-turbo-0613",
+    "llm.token_count.prompt": 229,
+    "llm.token_count.completion": 21,
+    "llm.token_count.total": 250
+  }
+}

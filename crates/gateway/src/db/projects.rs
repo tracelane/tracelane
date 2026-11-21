@@ -110,6 +110,18 @@ fn is_name_taken(e: &tokio_postgres::Error) -> bool {
 #[tracing::instrument(skip(pool, tenant), fields(tenant_id = %tenant))]
 pub async fn list(pool: &Pool, tenant: &TenantId) -> Result<Vec<Project>> {
     let client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
+    list_with(&**client, tenant).await
+}
+
+/// The same tenant-scoped read on a caller-held client or transaction.
+///
+/// # Errors
+/// Propagates query errors; the caller must not treat an unreadable store as empty.
+#[tracing::instrument(skip(client, tenant), fields(tenant_id = %tenant))]
+pub async fn list_with(
+    client: &(impl tokio_postgres::GenericClient + Sync),
+    tenant: &TenantId,
+) -> Result<Vec<Project>> {
     let rows = client
         .query(
             &format!(
@@ -175,6 +187,23 @@ pub async fn create(
 ) -> Result<CreateOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = create_in_tx(&tx, tenant, new, max_projects, actor).await?;
+    if matches!(result, CreateOutcome::Created(_)) {
+        tx.commit().await.context("project create commit failed")?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn create_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    new: &NewProject,
+    max_projects: usize,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<CreateOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     tx.query_opt(
         "SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE",
         &[tenant.as_uuid()],
@@ -192,6 +221,10 @@ pub async fn create(
     if usize::try_from(live).unwrap_or(usize::MAX) >= max_projects {
         return Ok(CreateOutcome::LimitReached { max: max_projects });
     }
+    // A unique violation aborts the whole transaction. The savepoint confines it to this
+    // statement, so a shared (import) transaction that reports `NameTaken` and commits does
+    // not silently roll back everything else it wrote.
+    tx.batch_execute("SAVEPOINT project_write").await?;
     let row = match tx
         .query_one(
             &format!(
@@ -202,8 +235,15 @@ pub async fn create(
         )
         .await
     {
-        Ok(r) => r,
-        Err(e) if is_name_taken(&e) => return Ok(CreateOutcome::NameTaken),
+        Ok(r) => {
+            tx.batch_execute("RELEASE SAVEPOINT project_write").await?;
+            r
+        }
+        Err(e) if is_name_taken(&e) => {
+            tx.batch_execute("ROLLBACK TO SAVEPOINT project_write")
+                .await?;
+            return Ok(CreateOutcome::NameTaken);
+        }
         Err(e) => return Err(anyhow::Error::new(e).context("INSERT INTO projects failed")),
     };
     let project = from_row(&row);
@@ -213,7 +253,7 @@ pub async fn create(
         "policy": project.policy,
     });
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -226,7 +266,6 @@ pub async fn create(
     )
     .await
     .context("admin_audit_log project.create insert failed")?;
-    tx.commit().await.context("project create commit failed")?;
     Ok(CreateOutcome::Created(project))
 }
 
@@ -246,9 +285,28 @@ pub async fn update(
     patch: &ProjectPatch,
     actor: &(impl crate::db::control_audit::AsActor + ?Sized),
 ) -> Result<PatchOutcome> {
-    use serde_json::json;
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let mut invalidations = Vec::new();
+    let result = update_in_tx(&tx, tenant, id, patch, actor, &mut invalidations).await?;
+    if matches!(&result, PatchOutcome::Updated { changed, .. } if !changed.is_empty()) {
+        crate::db::api_keys::commit_and_invalidate(tx, invalidations).await?;
+    }
+    Ok(result)
+}
+
+/// Write and audit inside the caller's transaction; collect cache effects for fenced commit.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn update_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    id: Uuid,
+    patch: &ProjectPatch,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+    invalidations: &mut Vec<[u8; 32]>,
+) -> Result<PatchOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
+    use serde_json::json;
     let Some(row) = tx
         .query_opt(
             &format!(
@@ -315,6 +373,7 @@ pub async fn update(
         });
     }
     let new_policy: Option<serde_json::Value> = policy.cloned().flatten();
+    tx.batch_execute("SAVEPOINT project_write").await?;
     let row = match tx
         .query_one(
             &format!(
@@ -338,13 +397,20 @@ pub async fn update(
         )
         .await
     {
-        Ok(r) => r,
-        Err(e) if is_name_taken(&e) => return Ok(PatchOutcome::NameTaken),
+        Ok(r) => {
+            tx.batch_execute("RELEASE SAVEPOINT project_write").await?;
+            r
+        }
+        Err(e) if is_name_taken(&e) => {
+            tx.batch_execute("ROLLBACK TO SAVEPOINT project_write")
+                .await?;
+            return Ok(PatchOutcome::NameTaken);
+        }
         Err(e) => return Err(anyhow::Error::new(e).context("UPDATE projects failed")),
     };
     let project = from_row(&row);
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -373,7 +439,7 @@ pub async fn update(
     } else {
         Vec::new()
     };
-    crate::db::api_keys::commit_and_invalidate(tx, digests).await?;
+    invalidations.extend(digests);
     Ok(PatchOutcome::Updated {
         project: Box::new(project),
         changed,
@@ -394,6 +460,22 @@ pub async fn archive(
 ) -> Result<ArchiveOutcome> {
     let mut client = pool.get().await.map_err(|e| anyhow!("pool: {e}"))?;
     let tx = client.transaction().await?;
+    let result = archive_in_tx(&tx, tenant, id, actor).await?;
+    if matches!(result, ArchiveOutcome::Archived) {
+        tx.commit().await.context("project archive commit failed")?;
+    }
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn archive_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    id: Uuid,
+    actor: &(impl crate::db::control_audit::AsActor + ?Sized),
+) -> Result<ArchiveOutcome> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let Some(row) = tx
         .query_opt(
             "SELECT name FROM projects \
@@ -427,7 +509,7 @@ pub async fn archive(
     .await
     .context("UPDATE projects archive failed")?;
     crate::db::control_audit::record(
-        &tx,
+        tx,
         tenant,
         &actor.as_actor(),
         crate::db::control_audit::Change {
@@ -440,6 +522,5 @@ pub async fn archive(
     )
     .await
     .context("admin_audit_log project.archive insert failed")?;
-    tx.commit().await.context("project archive commit failed")?;
     Ok(ArchiveOutcome::Archived)
 }

@@ -15,6 +15,10 @@ and Tracelane follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+**Tool receipt signing keys — In development, not yet available.** Protected tool calls use
+the latest key registration in the audit trail. Registration refuses gateway signing keys, and
+a conflict after gateway key rotation has a distinct refusal and diagnostic counter.
+
 **A clearer homepage.** tracelane.dev now leads with one message — rules and human approval for
 AI agent actions — and shows the real product: the approval queue, tool rules, a trace, the change
 history, the pause control, guardrail verdicts and spend by key, captured from the app over demo data.
@@ -43,6 +47,11 @@ SDK's own `registerTelemetry()` API. Tracelane now ships an integration for it t
 a span per operation, per step, per model call and **per tool call**.
 
 ### Fixed
+
+**Spend-alert batch scheduling.** Eligible alerts are selected in workspace rounds: each
+workspace's first alert is considered before its second. Workspaces can still wait across
+multiple batches; this change does not guarantee delivery times or rotation across batches.
+
 
 **Framework instrumentation in the Python SDK (`tracelane` 0.3.0).**
 `instrument_langchain()`, `instrument_llamaindex()` and `instrument_crewai()` raised
@@ -207,6 +216,24 @@ here is Apache 2.0; there is no separate enterprise tree.
   response does not distinguish a missing prompt from one belonging to another workspace,
   so prompt names are not discoverable.
 
+
+## [0.5.0] - 2026-11-21
+
+### Added
+
+**Wait for a person's decision on a held tool call (`tracelane` and `@tracelanedev/sdk` 0.5.0).**
+When a workspace policy holds an MCP tool call for approval, `is_held` / `isHeld` recognise the
+held answer, `wait_for_decision` / `waitForDecision` poll the approval until a person decides,
+and the agent then retries the same call. Helpers are included for LangGraph interrupts and the
+OpenAI Agents SDK. The helpers only wait and retry: the gateway still decides, and a retried
+call with no approval is held again. Approval holds are in development and not available on
+every workspace.
+
+**Approval decisions recorded in the tenant's ledger (Preview).** On the default approval path,
+requests, decisions, use and expiry are written to the tenant's hash-chained ledger, whose
+batches are signed when a signing key is configured. The open-source verifier
+(`tracelane-audit-verifier` and `@tracelanedev/audit-verifier` 0.5.0) replays these records
+offline. Approvals opened before this release are not recorded.
 
 ## [0.2.3] - 2026-08-01
 

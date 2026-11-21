@@ -177,6 +177,12 @@ fn csv_has_one_row_per_control_and_per_limit() {
     );
     assert_eq!(csv.matches("\r\n").count(), 1 + controls + limits);
     assert!(csv.starts_with("\"framework\",\"framework_title\",\"control_id\",\"status\""));
+    assert!(
+        csv.lines()
+            .next()
+            .unwrap()
+            .ends_with(",\"gap\",\"records_in_bundle\"")
+    );
     assert!(csv.contains("\"Art. 12(2)(a)\",\"partial\""), "{csv}");
     assert!(csv.contains("\"pack\",\"Limits of this pack\",\"limit-2\",\"not covered\""));
 }
@@ -222,7 +228,9 @@ fn every_output_lists_every_gap() {
         let inner = json_text(text);
         assert!(oscal.contains(&inner[1..inner.len() - 1]), "oscal: {text}");
     }
-    assert!(html.contains("No per-record inclusion proof"));
+    assert!(
+        html.contains("A single row's hash can be checked alone against the signed tree root when")
+    );
     assert!(html.contains("No signed scope attestation"));
 }
 #[test]
@@ -342,4 +350,231 @@ fn non_empty_out_dir_is_refused_and_left_untouched() {
     assert!(stderr.contains("new or empty directory"), "{stderr}");
     assert_eq!(run.read("summary.html"), "stale");
     assert!(!run.out.join("controls.csv").exists());
+}
+
+// Ordinary synthetic policy fixtures, never a downloaded or production bundle.
+fn tree_policy_fixture(state: &str) -> (Files, [u8; 32]) {
+    use tracelane_audit_verifier::action::tree;
+    let (mut files, pin) = bundle_files();
+    if state != "absent" {
+        let seed = if state == "wrong signer" { 8 } else { 7 };
+        let key = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+        let public: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let tenant = if state == "wrong tenant" { 2 } else { 1 };
+        let origin = tree::origin(uuid::Uuid::from_u128(tenant));
+        let mut leaves = tree::ledger_leaves(&files["ledger.ndjson"]).unwrap();
+        if state == "wrong size" {
+            leaves.pop();
+        }
+        let body = tree::checkpoint_body(&origin, leaves.len() as u64, &tree::root(&leaves));
+        let note = if state == "malformed" {
+            "synthetic malformed note".to_owned()
+        } else {
+            tree::signed_note(&body, &origin, &public, key.sign(body.as_bytes()).as_ref())
+        };
+        files.insert(tree::MEMBER.into(), note.into_bytes());
+    }
+    (files, pin)
+}
+
+fn run_tree_policy(command: &str, required: bool, state: &str, pin_state: &str) -> Run {
+    let (files, pin) = tree_policy_fixture(state);
+    let dir = tempfile::tempdir().unwrap();
+    let (zip, out) = (dir.path().join("synthetic.zip"), dir.path().join("pack"));
+    std::fs::write(&zip, seal(files).unwrap()).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tracelane-audit"));
+    cmd.arg(command).arg("--file").arg(zip);
+    if command == "evidence-pack" {
+        cmd.arg("--out").arg(&out);
+    }
+    if required {
+        cmd.arg("--require-tree");
+    }
+    if pin_state != "missing" {
+        let path = dir.path().join("pin.pub");
+        let pin = if pin_state == "wrong" { [8; 32] } else { pin };
+        std::fs::write(&path, hex::encode(pin)).unwrap();
+        cmd.arg("--pubkey").arg(path);
+    }
+    Run {
+        out,
+        output: cmd.output().unwrap(),
+        _dir: dir,
+    }
+}
+
+#[test]
+fn require_tree_verify_refuses_synthetic_absence() {
+    run_tree_policy("verify", true, "absent", "right")
+        .refused(4, "required tree checkpoint is absent");
+}
+
+#[test]
+fn require_tree_pack_refuses_synthetic_absence_without_output() {
+    run_tree_policy("evidence-pack", true, "absent", "right")
+        .refused(4, "required tree checkpoint is absent");
+}
+
+#[test]
+fn require_tree_policy_invariant_sweep() {
+    let mut scenarios = 0;
+    for command in ["verify", "evidence-pack"] {
+        for required in [false, true] {
+            for state in [
+                "absent",
+                "valid",
+                "wrong signer",
+                "wrong tenant",
+                "wrong size",
+                "malformed",
+            ] {
+                for pin in ["right", "wrong", "missing"] {
+                    scenarios += 1;
+                    let run = run_tree_policy(command, required, state, pin);
+                    let accepted =
+                        pin == "right" && (state == "valid" || (state == "absent" && !required));
+                    assert_eq!(
+                        run.output.status.success(),
+                        accepted,
+                        "command={command}, required={required}, state={state}, pin={pin}: {}",
+                        String::from_utf8_lossy(&run.output.stderr)
+                    );
+                    if accepted {
+                        let stdout = String::from_utf8_lossy(&run.output.stdout);
+                        assert!(stdout.contains(if state == "absent" {
+                            "tree checkpoint: absent"
+                        } else {
+                            "tree checkpoint: size 3 root"
+                        }));
+                    } else {
+                        assert!(!run.out.exists(), "no pack on refusal");
+                        assert!(
+                            matches!(run.output.status.code(), Some(4 | 5)),
+                            "verification refusal, not parser failure"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(scenarios, 72);
+}
+
+#[test]
+fn require_tree_rejects_online_mode_without_fetching() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tracelane-audit"))
+        .args(["verify", "--require-tree"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require --file"));
+}
+
+#[test]
+fn require_tree_rejects_non_zip_input() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(input.path(), "{}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tracelane-audit"))
+        .args(["verify", "--require-tree", "--file"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require an action ZIP"));
+}
+
+#[test]
+fn require_tree_refusal_preserves_existing_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let (files, pin) = tree_policy_fixture("absent");
+    let zip = dir.path().join("fixture.zip");
+    let key = dir.path().join("pin.pub");
+    let out = dir.path().join("existing");
+    std::fs::write(&zip, seal(files).unwrap()).unwrap();
+    std::fs::write(&key, hex::encode(pin)).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("sentinel.txt"), "existing synthetic output").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tracelane-audit"))
+        .args(["evidence-pack", "--require-tree", "--file"])
+        .arg(zip)
+        .arg("--pubkey")
+        .arg(key)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        std::fs::read_to_string(out.join("sentinel.txt")).unwrap(),
+        "existing synthetic output"
+    );
+    assert_eq!(std::fs::read_dir(out).unwrap().count(), 1);
+}
+
+#[test]
+fn require_tree_json_report_retains_verified_tree_measurements() {
+    let dir = tempfile::tempdir().unwrap();
+    let (files, pin) = tree_policy_fixture("valid");
+    let zip = dir.path().join("fixture.zip");
+    let key = dir.path().join("pin.pub");
+    std::fs::write(&zip, seal(files).unwrap()).unwrap();
+    std::fs::write(&key, hex::encode(pin)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tracelane-audit"))
+        .args(["verify", "--require-tree", "--format", "json", "--file"])
+        .arg(zip)
+        .arg("--pubkey")
+        .arg(key)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tree_size"], 3);
+    assert_eq!(report["tree_root"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn fixture_bundle_counts_its_rows_and_zero_elsewhere() {
+    let run = good();
+    let (csv, html) = (run.read("controls.csv"), run.read("summary.html"));
+    let cell = |framework: &str, control: &str| -> String {
+        let line = csv
+            .split("\r\n")
+            .find(|l| {
+                l.starts_with(&format!("\"{framework}\","))
+                    && l.contains(&format!("\"{control}\","))
+            })
+            .unwrap();
+        line.rsplit(',')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned()
+    };
+    assert_eq!(cell("eu-ai-act", "Art. 12(1)"), "3");
+    assert_eq!(cell("occ-2026-54", "2.14"), "3");
+    assert_eq!(
+        cell("occ-2026-54", "2.10"),
+        "0",
+        "no paused refusals in the fixture"
+    );
+    assert!(html.contains("3 records in this bundle"));
+    assert!(html.contains("0 in this bundle"));
+}
+#[test]
+fn records_column_is_digits_or_empty_and_oscal_prop_matches() {
+    let run = good();
+    let csv = run.read("controls.csv");
+    for line in csv.split("\r\n").skip(1).filter(|l| !l.is_empty()) {
+        let last = line.rsplit(',').next().unwrap().trim_matches('"');
+        assert!(
+            last.chars().all(|c| c.is_ascii_digit()),
+            "formula-safe cell: {last}"
+        );
+    }
+    let oscal = run.oscal();
+    assert_eq!(schema_errors(&oscal), None);
+    let text = oscal.to_string();
+    assert!(text.contains(
+        r#"{"name":"records-in-bundle","ns":"https://tracelane.dev/ns/oscal","value":"3"}"#
+    ));
 }

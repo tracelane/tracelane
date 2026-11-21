@@ -2,6 +2,23 @@
 use super::*;
 use std::sync::Arc;
 
+// ACT-40 added the ledger candidates to these results; these reproductions assert state only.
+async fn find_or_create(
+    pool: &DbPool,
+    claims: &Claims,
+    request: &Request<'_>,
+    preview: Option<String>,
+) -> Result<Approval> {
+    super::find_or_create(pool, claims, request, preview)
+        .await
+        .map(|(a, _)| a)
+}
+async fn consume(pool: &DbPool, claims: &Claims, id: Uuid) -> Result<Option<String>> {
+    super::consume(pool, claims, id)
+        .await
+        .map(|o| o.map(|(by, _)| by))
+}
+
 async fn fixture() -> (DbPool, Claims) {
     crate::tool_fingerprint::init_from_existing_pepper(&"07".repeat(32)).unwrap();
     let pool = crate::entitlement_cache::b409_fixture::fresh_migrated_pool().await;
@@ -483,4 +500,89 @@ async fn approval_pending_capacity_refuses_without_row_or_notification_and_is_te
         .unwrap()
         .get(0);
     assert_eq!(count, 1);
+}
+
+// ---- ACT-40 ----
+async fn approval_ledger_rows(pool: &DbPool, claims: &Claims) -> Vec<(String, String, String)> {
+    pool.get().await.unwrap().query("SELECT event_type,actor,payload FROM audit_log_rows WHERE tenant_id=$1 AND event_type LIKE 'tool_approval.%' ORDER BY seq", &[claims.tenant_id.as_uuid()]).await.unwrap()
+        .iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect()
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_legacy_grant_consumes_off_ledger_and_ledgered_one_replays() {
+    let (pool, claims) = fixture().await;
+    // A grant approved before ACT-40 shipped: same fingerprint the gate computes, no ledger row.
+    let body = json!({"legacy":true});
+    let req = request("model", &body);
+    let fp = fingerprint(&claims, &req).unwrap();
+    let legacy = Uuid::new_v4();
+    pool.get().await.unwrap().execute("INSERT INTO approvals(id,tenant_id,subject_kind,subject,requester_sub,args_fp,args_bytes,expires_at,trace_id,status,decided_by,grant_expires_at) VALUES($1,$2,'model','protected-operation',$3,$4,0,clock_timestamp()+interval '1 hour',$1,'approved','independent-human',clock_timestamp()+interval '1 hour')", &[&legacy, claims.tenant_id.as_uuid(), &claims.sub, &fp]).await.unwrap();
+    let (by, rows) = super::consume(&pool, &claims, legacy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by, "independent-human");
+    assert!(rows.is_none(), "no orphan consume row");
+    assert!(approval_ledger_rows(&pool, &claims).await.is_empty());
+    // A ledgered approval alongside it: requested is recorded; its consume is recorded too.
+    let fresh = json!({"legacy":false});
+    let (a, recorded) = super::find_or_create(&pool, &claims, &request("model", &fresh), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    // The test-only `approve` helper decides off-ledger, exactly like a pre-ACT-40 decision.
+    approve(&pool, &claims, a.id).await;
+    let (_, consumed) = super::consume(&pool, &claims, a.id).await.unwrap().unwrap();
+    assert!(
+        consumed.is_none(),
+        "consume after an off-ledger decision stays off-ledger"
+    );
+    let rows = approval_ledger_rows(&pool, &claims).await;
+    let records = rows
+        .iter()
+        .map(|(e, a, p)| {
+            tracelane_audit_verifier::approval::Record::from_row(
+                *claims.tenant_id.as_uuid(),
+                e,
+                a,
+                p,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let s = tracelane_audit_verifier::approval::semantics(&records).unwrap();
+    assert_eq!((s.requested, s.consumed, s.open), (1, 0, 1));
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres"]
+async fn act40_unrecordable_subject_fails_closed_through_the_gate_path() {
+    let (pool, claims) = fixture().await;
+    let body = json!({"x":1});
+    let long = "t".repeat(513);
+    for subject in [long.as_str(), "tool\u{7}name"] {
+        let req = Request {
+            subject,
+            ..request("model", &body)
+        };
+        assert!(
+            super::find_or_create(&pool, &claims, &req, None)
+                .await
+                .is_err()
+        );
+    }
+    let n: i64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM approvals WHERE tenant_id=$1",
+            &[claims.tenant_id.as_uuid()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0, "no approval may exist without its ledger record");
+    assert!(approval_ledger_rows(&pool, &claims).await.is_empty());
 }

@@ -448,3 +448,24 @@ fn current_semconv_structured_content_is_gated_by_the_right_half() {
         r#"{"secret":"argument"}"#
     );
 }
+
+#[test]
+fn openinference_explicit_request_model_wins_over_response_fallback_in_either_order() {
+    let generic = kv("llm.model_name", json!("served-model"));
+    let request = kv("llm.request.model_name", json!("requested-model"));
+    let response = kv("llm.response.model_name", json!("served-model"));
+    for attrs in [
+        vec![generic.clone(), request.clone(), response.clone()],
+        vec![response, request, generic],
+    ] {
+        let decoded = build_attributes(&attrs);
+        assert_eq!(
+            decoded.gen_ai_request_model.as_deref(),
+            Some("requested-model")
+        );
+        assert_eq!(
+            decoded.gen_ai_response_model.as_deref(),
+            Some("served-model")
+        );
+    }
+}

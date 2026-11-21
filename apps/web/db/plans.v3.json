@@ -292,8 +292,8 @@
       "f_customer_kms": true,
       "f_cache_control": true,
       "cache_ttl_hours": 720,
-      "f_otel_export": false,
-      "max_exports": 0,
+      "f_otel_export": true,
+      "max_exports": 3,
       "overage_allowed": true,
       "rate_limit_rpm": 60000,
       "cold_gb_included": 4800
@@ -317,8 +317,8 @@
       "f_customer_kms": true,
       "f_cache_control": true,
       "cache_ttl_hours": 2160,
-      "f_otel_export": false,
-      "max_exports": 0,
+      "f_otel_export": true,
+      "max_exports": 10,
       "overage_allowed": true,
       "rate_limit_rpm": null,
       "cold_gb_included": null

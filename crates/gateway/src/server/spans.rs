@@ -39,6 +39,36 @@ pub(crate) fn spawn_span_publish(state: &AppState, mut span: TracelaneSpan) {
     crate::otlp_emit::spawn_publish(Arc::clone(nats_client), span, "chat");
 }
 
+/// Upper bound of the generated OpenInference metadata aliases (a dozen short keys); the
+/// worst case is measured by `openinference_alias_headroom_covers_measured_worst_case_metadata`.
+const ALIAS_HEADROOM_BYTES: usize = 4096;
+/// Room for the `tracelane_span_bytes` stamp itself in the final wire check.
+const STAMP_BYTES: usize = 64;
+
+/// The billable logical size of a span: its attributes WITHOUT generated OpenInference
+/// aliases or the stamp, plus name, status message and a fixed envelope. Alias keys are
+/// moved out and back, never cloned, so the hot path copies no captured content.
+pub(crate) fn metered_span_bytes(span: &mut TracelaneSpan) -> usize {
+    let aliases: Vec<(String, serde_json::Value)> = span
+        .attributes
+        .extra
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() == "tracelane_span_bytes"
+                || tracelane_shared::otlp::openinference_emit::is_generated_metadata(k)
+        })
+        .map(|(k, _)| k.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|k| span.attributes.extra.remove(&k).map(|v| (k, v)))
+        .collect();
+    let attrs_len = serde_json::to_vec(&span.attributes)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    span.attributes.extra.extend(aliases);
+    attrs_len + span.name.len() + span.status.message.as_deref().unwrap_or("").len() + 96
+}
+
 /// BILL-01 / ADR-076 meter 1 (`ingest_bytes`) — the LOGICAL size of the span
 /// record as published: `serde_json::to_vec(&attributes).len() + name.len() +
 /// status_message.len() + 96` (the 96 covers the fixed columns — two 36-char
@@ -56,15 +86,24 @@ pub(crate) fn stamp_and_meter_span_bytes(
     span: &mut TracelaneSpan,
     sink: Option<Arc<crate::billing::MeterSink>>,
 ) {
-    let attrs_len = serde_json::to_vec(&span.attributes)
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let size =
-        attrs_len + span.name.len() + span.status.message.as_deref().unwrap_or("").len() + 96;
-    span.attributes.extra.insert(
-        "tracelane_span_bytes".to_string(),
-        serde_json::Value::Number(size.into()),
-    );
+    span.attributes.extra.remove("tracelane_span_bytes");
+    // The meter is what the customer SENT: measured before any OpenInference alias is
+    // added, so a protocol alias is never billed (BILL-01 meter 1).
+    let size = metered_span_bytes(span);
+    tracelane_shared::otlp::openinference_emit::enrich(&mut span.attributes);
+    // Metadata aliases are small and bounded; a full-envelope serialization is paid only
+    // when the span is already near the wire cap, and then the aliases give way.
+    let limit = tracelane_shared::otlp::limits::DEFAULT_MAX_SPAN_BYTES;
+    if size.saturating_add(ALIAS_HEADROOM_BYTES) >= limit
+        && serde_json::to_vec(span).map_or(true, |bytes| {
+            bytes.len().saturating_add(STAMP_BYTES) >= limit
+        })
+    {
+        tracelane_shared::otlp::openinference_emit::remove_metadata_aliases(&mut span.attributes);
+    }
+    span.attributes
+        .extra
+        .insert("tracelane_span_bytes".into(), serde_json::json!(size));
     if let Some(sink) = sink {
         let tenant = span.tenant_id.clone();
         tokio::spawn(async move {
@@ -712,6 +751,9 @@ pub(crate) struct RouteMeta {
     pub(crate) bucket: Option<u32>,
     pub(crate) sticky_source: Option<&'static str>,
     pub(crate) non_sticky: bool,
+    /// GWY-80: the data class and where it was confined (`tracelane_routing_*`).
+    /// `None` when no `sovereign:` block is installed.
+    pub(crate) sovereign: Option<crate::sovereign::Meta>,
 }
 
 impl RouteMeta {
@@ -768,6 +810,9 @@ impl RouteMeta {
         }
         if self.non_sticky {
             put("tracelane_route_non_sticky", serde_json::json!(true));
+        }
+        if let Some(m) = &self.sovereign {
+            m.apply(attrs);
         }
     }
 }
@@ -2158,6 +2203,126 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
         }
+    }
+
+    #[test]
+    fn openinference_metadata_alone_preserves_near_limit_legacy_span() {
+        let limit = tracelane_shared::otlp::limits::DEFAULT_MAX_SPAN_BYTES;
+        let mut span = span_with(&CallerIdentity::default(), None);
+        span.attributes
+            .extra
+            .insert("tracelane_span_bytes".into(), serde_json::json!(1_000_000));
+        span.attributes
+            .extra
+            .insert("fixture_padding".into(), serde_json::json!(""));
+        let overhead = serde_json::to_vec(&span).unwrap().len();
+        span.attributes.extra.insert(
+            "fixture_padding".into(),
+            serde_json::json!("x".repeat(limit - overhead - 1)),
+        );
+        assert!(
+            serde_json::to_vec(&span).unwrap().len() < limit,
+            "legacy precondition"
+        );
+        span.attributes.extra.remove("tracelane_span_bytes");
+        stamp_and_meter_span_bytes(&mut span, None);
+        assert!(
+            serde_json::to_vec(&span).unwrap().len() < limit,
+            "metadata must also fit"
+        );
+        assert!(span.attributes.openinference_span_kind.is_none());
+        assert!(
+            !span
+                .attributes
+                .extra
+                .contains_key("openinference.span.kind")
+        );
+        let stamped = serde_json::to_value(&span).unwrap();
+        tracelane_shared::otlp::openinference_emit::enrich(&mut span.attributes);
+        assert_eq!(serde_json::to_value(&span).unwrap(), stamped);
+    }
+
+    #[test]
+    fn openinference_aliases_exist_before_byte_stamp_and_fixture_missing_control_is_rejected() {
+        let mut span = span_with(&CallerIdentity::default(), None);
+        // The customer-sent shape, before any alias exists: what the meter must bill.
+        let unaliased = serde_json::to_vec(&span.attributes).unwrap().len()
+            + span.name.len()
+            + span.status.message.as_deref().unwrap_or("").len()
+            + 96;
+        fn require_alias(span: &TracelaneSpan) {
+            assert_eq!(
+                span.attributes.extra.get("openinference.span.kind"),
+                Some(&serde_json::json!("LLM"))
+            );
+        }
+        // Ordinary fixture control: an un-enriched span does not satisfy the contract.
+        assert!(std::panic::catch_unwind(|| require_alias(&span)).is_err());
+        stamp_and_meter_span_bytes(&mut span, None);
+        require_alias(&span);
+        let stamped = serde_json::to_value(&span.attributes).unwrap();
+        let stamped_len = serde_json::to_vec(&span.attributes).unwrap().len();
+        // This is the same second enrichment performed at final publication.
+        tracelane_shared::otlp::openinference_emit::enrich(&mut span.attributes);
+        assert_eq!(serde_json::to_value(&span.attributes).unwrap(), stamped);
+        assert_eq!(
+            serde_json::to_vec(&span.attributes).unwrap().len(),
+            stamped_len
+        );
+        let recorded_bytes = span
+            .attributes
+            .extra
+            .remove("tracelane_span_bytes")
+            .unwrap();
+        assert_eq!(
+            recorded_bytes,
+            serde_json::json!(unaliased),
+            "OpenInference aliases are never billed: the meter is the pre-alias size"
+        );
+    }
+
+    #[test]
+    fn openinference_alias_headroom_covers_measured_worst_case_metadata() {
+        // Every metadata alias at its widest: 256-char model/provider names, u32::MAX counts.
+        let mut span = span_with(&CallerIdentity::default(), None);
+        let long = "m".repeat(256);
+        let a = &mut span.attributes;
+        a.gen_ai_request_model = Some(long.clone());
+        a.gen_ai_response_model = Some(long.clone());
+        a.gen_ai_provider_name = Some(long.clone());
+        a.gen_ai_system = Some(long.clone());
+        a.gen_ai_usage_input_tokens = Some(u32::MAX);
+        a.gen_ai_usage_output_tokens = Some(u32::MAX);
+        a.gen_ai_usage_cache_read_input_tokens = Some(u32::MAX);
+        a.gen_ai_usage_cache_creation_input_tokens = Some(u32::MAX);
+        a.gen_ai_usage_reasoning_output_tokens = Some(u32::MAX);
+        a.gen_ai_request_temperature = Some(1.0);
+        a.gen_ai_request_top_p = Some(1.0);
+        a.gen_ai_request_max_tokens = Some(u32::MAX);
+        a.gen_ai_request_seed = Some(u64::MAX);
+        let before = serde_json::to_vec(&span.attributes).unwrap().len();
+        tracelane_shared::otlp::openinference_emit::enrich(&mut span.attributes);
+        let added = serde_json::to_vec(&span.attributes).unwrap().len() - before;
+        // Measured 2026-11-20: under 2 KiB with these widths; the headroom is twice that.
+        assert!(added < 2048, "aliases added {added} bytes");
+        assert!(added + STAMP_BYTES < ALIAS_HEADROOM_BYTES);
+    }
+
+    #[test]
+    fn openinference_capture_stores_no_second_content_copy() {
+        use tracelane_shared::model::MessageContent;
+        let req = gwy53_req(vec![gwy53_msg(MessageContent::Text("synthetic".into()))]);
+        let mut span = span_with(&CallerIdentity::default(), None);
+        CapturedInput::build(gwy53_on(4096), &req)
+            .unwrap()
+            .apply(&mut span.attributes);
+        CapturedOutput::build(gwy53_on(4096), "synthetic out", &[])
+            .unwrap()
+            .apply(&mut span.attributes);
+        stamp_and_meter_span_bytes(&mut span, None);
+        assert!(span.attributes.input_value.is_none() && span.attributes.output_value.is_none());
+        assert!(!span.attributes.extra.contains_key("input.mime_type"));
+        assert!(span.attributes.gen_ai_input_messages.is_some());
     }
 
     // Security review 2026-09-28 (H-1 / H-2): the stored copy is redacted on EVERY plan,

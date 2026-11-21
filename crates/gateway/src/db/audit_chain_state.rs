@@ -217,6 +217,7 @@ pub async fn append_atomic_batch<F>(
     genesis_prev_hash: [u8; 32],
     dedup: Option<&[String]>,
     count: usize,
+    recordings: &[Option<crate::gateway_recording::Recording>],
     build_rows: F,
 ) -> Result<Option<AtomicBatchAppend>>
 where
@@ -230,8 +231,16 @@ where
         .transaction()
         .await
         .context("begin audit append tx")?;
-    let outcome =
-        append_atomic_batch_tx(&tx, tenant_id, genesis_prev_hash, dedup, count, build_rows).await?;
+    let outcome = append_atomic_batch_tx(
+        &tx,
+        tenant_id,
+        genesis_prev_hash,
+        dedup,
+        count,
+        recordings,
+        build_rows,
+    )
+    .await?;
     if outcome.is_some() {
         tx.commit().await.context("commit audit append tx")?;
     } else {
@@ -254,6 +263,7 @@ pub async fn append_atomic_batch_tx<F>(
     genesis_prev_hash: [u8; 32],
     dedup: Option<&[String]>,
     count: usize,
+    recordings: &[Option<crate::gateway_recording::Recording>],
     build_rows: F,
 ) -> Result<Option<AtomicBatchAppend>>
 where
@@ -265,51 +275,17 @@ where
     if let Some(ids) = dedup {
         anyhow::ensure!(ids.len() == count, "event ID count mismatch");
     }
-    // ADR-069 idempotency: on the async consumer path, dedup on `event_id` INSIDE
-    // the tx so a JetStream redelivery consumes no seq and writes no row (the
-    //  dup-seq class). ONE statement for the whole batch; `RETURNING` names
-    // the ids that were actually new. The synchronous path passes `None` and
-    // skips this block entirely, so its behavior is byte-unchanged.
-    let kept: Vec<usize> = match dedup {
-        Some(ids) => {
-            // A batch may carry the same id twice (two redeliveries queued
-            // together); the first occurrence wins, later ones are duplicates.
-            let mut first_index = std::collections::HashMap::with_capacity(ids.len());
-            for (i, id) in ids.iter().enumerate() {
-                first_index.entry(id.as_str()).or_insert(i);
-            }
-            let unique: Vec<&str> = {
-                let mut seen = std::collections::HashSet::with_capacity(ids.len());
-                ids.iter()
-                    .map(String::as_str)
-                    .filter(|id| seen.insert(*id))
-                    .collect()
-            };
-            let rows = tx
-                .query(
-                    "INSERT INTO audit_appended (event_id) \
-                     SELECT unnest($1::text[]) ON CONFLICT DO NOTHING RETURNING event_id",
-                    &[&unique],
-                )
-                .await
-                .context("audit_appended dedup insert")?;
-            let mut kept: Vec<usize> = rows
-                .iter()
-                .map(|r| {
-                    let id: String = r.get(0);
-                    first_index[id.as_str()]
-                })
-                .collect();
-            kept.sort_unstable();
-            if kept.is_empty() {
-                return Ok(None);
-            }
-            kept
-        }
-        None => (0..count).collect(),
-    };
-    let n = kept.len();
-
+    anyhow::ensure!(
+        recordings.len() == count,
+        "recording identity count mismatch"
+    );
+    anyhow::ensure!(
+        dedup.is_some() || recordings.iter().all(Option::is_none),
+        "recording requires stable dedup identity"
+    );
+    // Namespace reservations and canonical appends use one lock order. Lock the tenant
+    // before reserving recording sequences; two differently ordered batches cannot
+    // deadlock by taking different emitter sequence rows before the head lock.
     // (1) Ensure the chain-state row exists so FOR UPDATE locks a real row even
     //     for a tenant's first-ever append. The genesis sentinel makes the first
     //     assigned seq = 0; it is advanced in this same tx (never commits
@@ -347,6 +323,53 @@ where
     }
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(last_row_hash_bytes);
+    // ADR-069 idempotency: on the async consumer path, dedup on `event_id` INSIDE
+    // the tx so a JetStream redelivery consumes no seq and writes no row (the
+    //  dup-seq class). ONE statement for the whole batch; `RETURNING` names
+    // the ids that were actually new. The synchronous path passes `None` and
+    // skips this block entirely, so its behavior is byte-unchanged.
+    let kept: Vec<usize> = match dedup {
+        Some(ids) => {
+            // A batch may carry the same id twice (two redeliveries queued
+            // together); the first occurrence wins, later ones are duplicates.
+            let mut first_index = std::collections::HashMap::with_capacity(ids.len());
+            for (i, id) in ids.iter().enumerate() {
+                first_index.entry(id.as_str()).or_insert(i);
+            }
+            let mut unique: Vec<&str> = {
+                let mut seen = std::collections::HashSet::with_capacity(ids.len());
+                ids.iter()
+                    .map(String::as_str)
+                    .filter(|id| seen.insert(*id))
+                    .collect()
+            };
+            unique.sort_unstable();
+            let rows = tx
+                .query(
+                    "INSERT INTO audit_appended (event_id) \
+                     SELECT unnest($1::text[]) ORDER BY 1 ON CONFLICT DO NOTHING RETURNING event_id",
+                    &[&unique],
+                )
+                .await
+                .context("audit_appended dedup insert")?;
+            let mut kept: Vec<usize> = rows
+                .iter()
+                .map(|r| {
+                    let id: String = r.get(0);
+                    first_index[id.as_str()]
+                })
+                .collect();
+            kept.sort_unstable();
+            crate::gateway_recording::reserve_tx(tx, tenant_id, ids, recordings, &kept).await?;
+            if kept.is_empty() {
+                return Ok(None);
+            }
+            kept
+        }
+        None => (0..count).collect(),
+    };
+    let n = kept.len();
+
     // `last_seq + 1`: -1 -> 0 (genesis), N -> N+1. A negative other than -1
     // (corrupt) makes this negative -> try_into fails -> fail closed.
     let first_seq: u64 = last_seq
@@ -396,6 +419,7 @@ where
         inserted == n as u64,
         "canonical audit_log_rows write inserted {inserted} of {n} rows — refusing to advance the head"
     );
+    crate::gateway_recording::project_tx(tx, tenant_id, dedup, recordings, &kept, &rows).await?;
     let last_seq_new = first_seq
         .checked_add(n as u64 - 1)
         .context("audit sequence exhausted")?;

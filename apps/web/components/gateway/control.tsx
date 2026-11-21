@@ -15,6 +15,7 @@ import {
 	type CapabilitySlug,
 	roleCan,
 } from "@/lib/role-capabilities.generated";
+import { reauthHref } from "@/lib/step-up";
 import {
 	type UseQueryResult,
 	useMutation,
@@ -63,6 +64,15 @@ export class ControlError extends Error {
 
 type Verb = "GET" | "PUT" | "POST" | "PATCH" | "DELETE";
 
+/**
+ * A body sent byte-for-byte. For a document the gateway parses strictly (duplicate keys,
+ * big integers): re-serialising a parsed copy would hand it a different document than the
+ * one the user chose (ACT-12b security review, M1).
+ */
+export class RawJson {
+	constructor(readonly text: string) {}
+}
+
 /** One call to `url` (our own `/api/*`). A non-2xx throws a `ControlError` carrying the wording. */
 export async function requestJson<T>(
 	verb: Verb,
@@ -78,7 +88,7 @@ export async function requestJson<T>(
 				? {}
 				: {
 						headers: { "content-type": "application/json", ...headers },
-						body: JSON.stringify(body),
+						body: body instanceof RawJson ? body.text : JSON.stringify(body),
 					}),
 		});
 	} catch (err) {
@@ -222,6 +232,19 @@ export function RefusalNote({
 				<span className="ml-1 font-mono text-xs text-ink-3">
 					{error.refusal.code}
 				</span>
+			) : null}
+			{error.refusal.kind === "reauth_required" ? (
+				<>
+					{" "}
+					<a
+						className="underline"
+						href={reauthHref(
+							`${window.location.pathname}${window.location.search}`,
+						)}
+					>
+						Sign in again
+					</a>
+				</>
 			) : null}
 			{error.refusal.kind === "paused" ? (
 				<>

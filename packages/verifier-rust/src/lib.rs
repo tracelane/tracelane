@@ -67,6 +67,7 @@
 //! Python and TypeScript verifiers mirror this exactly.
 
 pub mod action;
+pub mod approval;
 
 use std::collections::BTreeMap;
 use std::fs::File;

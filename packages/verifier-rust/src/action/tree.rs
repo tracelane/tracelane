@@ -43,6 +43,45 @@ pub fn root(leaves: &[Hash]) -> Hash {
         }
     }
 }
+/// Incrementally derives monotonically requested roots; each supplied leaf is consumed once.
+/// Only O(log N) subtree hashes are retained in addition to the caller's leaf buffer.
+#[derive(Default)]
+pub(super) struct PrefixRoots {
+    count: usize,
+    nodes: Vec<Option<Hash>>,
+}
+impl PrefixRoots {
+    /// Errors fail CLOSED for a regressing prefix or one outside the verified ledger.
+    pub(super) fn at(&mut self, leaves: &[Hash], size: u64) -> Result<Hash> {
+        let end = usize::try_from(size)?;
+        ensure!(
+            end >= self.count && end <= leaves.len(),
+            "signed tree prefix outside verified ledger"
+        );
+        for leaf in &leaves[self.count..end] {
+            let mut carry = *leaf;
+            let mut level = 0;
+            loop {
+                if level == self.nodes.len() {
+                    self.nodes.push(None);
+                }
+                if let Some(left) = self.nodes[level].take() {
+                    carry = node(&left, &carry);
+                    level += 1;
+                } else {
+                    self.nodes[level] = Some(carry);
+                    break;
+                }
+            }
+        }
+        self.count = end;
+        let mut root = None;
+        for left in self.nodes.iter().flatten() {
+            root = Some(root.map_or(*left, |right| node(left, &right)));
+        }
+        Ok(root.unwrap_or_else(|| crate::sha256(b"")))
+    }
+}
 /// RFC 6962 §2.1.1 audit path for `leaves[index]`.
 ///
 /// # Errors

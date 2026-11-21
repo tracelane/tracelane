@@ -805,5 +805,7 @@ fn browser_fixtures_are_current() {
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "stale fixture {name}");
     }
 }
+#[path = "signed_head_tests.rs"]
+mod signed_head_tests;
 #[path = "tree_tests.rs"]
 mod tree_tests;

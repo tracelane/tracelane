@@ -298,7 +298,7 @@ impl PromptGuardClient {
     ///
     /// Target: <30 ms p50, <50 ms p95.  If the sidecar exceeds the 30 ms
     /// timeout the call is cancelled and `Ok(0.0)` is returned immediately.
-    #[instrument(skip(self), fields(text_len = text.len()))]
+    #[instrument(skip(self, text), fields(text_len = text.len()))]
     pub async fn score(&self, text: &str) -> anyhow::Result<f32> {
         // SSRF gate (memoised): never issue a request to a URL the guard
         // rejects. Terminal fail-open — see `url_allowed`.
@@ -347,7 +347,7 @@ impl PromptGuardClient {
     /// - `text`: raw text extracted from the request (before
     ///   `<UNTRUSTED_USER_DATA>` sentinel wrapping by the redaction layer).
     /// - `threshold`: decision boundary; the PR6 default is `0.5`.
-    #[instrument(skip(self), fields(text_len = text.len(), threshold))]
+    #[instrument(skip(self, text), fields(text_len = text.len(), threshold))]
     pub async fn is_injection(&self, text: &str, threshold: f32) -> anyhow::Result<bool> {
         let s = self.score(text).await?;
         Ok(s >= threshold)

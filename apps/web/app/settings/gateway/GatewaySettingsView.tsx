@@ -46,6 +46,7 @@ export function GatewaySettingsView({
 	data,
 	aliasManager,
 	failoverManager,
+	configExport,
 }: {
 	data: GatewaySettings;
 	/** GWY-27: the workspace's own, editable aliases (a client island, so the page
@@ -53,6 +54,8 @@ export function GatewaySettingsView({
 	aliasManager?: ReactNode;
 	/** GWY-52: the workspace's own, editable failover (a client island). */
 	failoverManager?: ReactNode;
+	/** The workspace's configuration download (a lazily loaded client island). */
+	configExport?: ReactNode;
 }) {
 	return (
 		<div className="space-y-6">
@@ -65,6 +68,16 @@ export function GatewaySettingsView({
 					set by your plan or the operator.
 				</p>
 			</div>
+			{configExport ? (
+				<section className="space-y-2">
+					<h3 className="t-h3">Configuration</h3>
+					<p className="text-sm text-ink-2">
+						Download this workspace&apos;s gateway controls as a JSON file.
+						Secrets such as alert targets are never included.
+					</p>
+					{configExport}
+				</section>
+			) : null}
 			<section className="space-y-2">
 				<h3 className="t-h3">Response cache</h3>
 				<p>

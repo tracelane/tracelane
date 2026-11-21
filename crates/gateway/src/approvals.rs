@@ -1,8 +1,10 @@
 //! Durable single-use approvals. Every transition is conditional and audited atomically.
+pub(crate) mod ledger;
 pub(crate) mod protected;
 use crate::{
     admission::ControlDenial,
     auth::Claims,
+    db::audit_chain_state::AtomicBatchAppend,
     db::{
         DbPool,
         control_audit::{self, Actor, Change},
@@ -13,6 +15,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::OnceLock, time::Duration};
+use tracelane_audit_verifier::approval::Transition;
 use tracelane_shared::TenantId;
 use uuid::Uuid;
 
@@ -84,6 +87,63 @@ async fn audit(
     .await?;
     Ok(())
 }
+/// The outbox payload for a held call (GWY-81). Named fields only: the webhook channel forwards
+/// it whole, so no argument, preview, amount, key or policy hash may ever be added here.
+/// `server_name` and `rule` are workspace configuration (names and globs its admins wrote);
+/// `expires_at` is the inserted row's own expiry (RETURNING), never recomputed.
+fn approval_notice(
+    id: Uuid,
+    request: &Request<'_>,
+    server_name: Option<&str>,
+    rule: Option<&str>,
+    expires_at: DateTime<Utc>,
+) -> Value {
+    let mut p = json!({"type":"approval.requested","approval_id":id,"subject":request.subject,"subject_kind":request.kind,"expires_at":expires_at.to_rfc3339(),"queue_path":"/settings/gateway/approvals"});
+    if let Some(s) = server_name {
+        p["server_name"] = json!(s);
+    }
+    if let Some(r) = rule {
+        p["rule"] = json!(r);
+    }
+    p
+}
+/// Display labels for the notification, read in the request's own transaction: the server's
+/// name and the matched rule's glob (`mcp_tool_rules.tool_glob` or `approval_rules.model_glob`).
+///
+/// # Errors
+/// Fail-CLOSED: a failed read propagates and rolls back the whole request transaction (the
+/// approval row, its audit and the outbox row). A missing server or rule row is not an error;
+/// it yields `None` and the message drops that line.
+async fn notice_labels(
+    tx: &tokio_postgres::Transaction<'_>,
+    tenant: &Uuid,
+    request: &Request<'_>,
+) -> Result<(Option<String>, Option<String>)> {
+    let server = match request.server {
+        Some(s) => tx
+            .query_opt(
+                "SELECT name FROM mcp_servers WHERE tenant_id=$1 AND id=$2",
+                &[tenant, &s],
+            )
+            .await?
+            .map(|r| r.get::<_, String>(0)),
+        None => None,
+    };
+    let rule = match request.rule {
+        Some(r) => {
+            let sql = if request.kind == "tool" {
+                "SELECT tool_glob FROM mcp_tool_rules WHERE tenant_id=$1 AND id=$2"
+            } else {
+                "SELECT model_glob FROM approval_rules WHERE tenant_id=$1 AND id=$2"
+            };
+            tx.query_opt(sql, &[tenant, &r])
+                .await?
+                .map(|r| r.get::<_, String>(0))
+        }
+        None => None,
+    };
+    Ok((server, rule))
+}
 #[derive(Debug, thiserror::Error)]
 #[error("approval capacity")]
 struct Capacity;
@@ -93,7 +153,7 @@ async fn find_or_create(
     claims: &Claims,
     request: &Request<'_>,
     preview: Option<String>,
-) -> Result<Approval> {
+) -> Result<(Approval, Vec<AtomicBatchAppend>)> {
     let fp = fingerprint(claims, request)?;
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
@@ -107,12 +167,24 @@ async fn find_or_create(
         "UPDATE approvals SET status='expired' WHERE action_id IS NULL AND tenant_id=$1 AND requester_sub=$2 AND args_fp=$3 AND ((status='pending' AND expires_at<=clock_timestamp()) OR (status='approved' AND grant_expires_at<=clock_timestamp())) RETURNING id",
         &[claims.tenant_id.as_uuid(), &claims.sub, &fp],
     ).await?;
+    let mut records = Vec::new();
+    let at = if expired.is_empty() {
+        None
+    } else {
+        Some(ledger::now(&tx).await?)
+    };
     for row in expired {
+        let id: Uuid = row.get(0);
+        if let Some(at) = at {
+            records.extend(
+                ledger::record_tx(&tx, &claims.tenant_id, id, Transition::Expired, at).await?,
+            );
+        }
         audit(
             &tx,
             &claims.tenant_id,
             &Actor::system(&claims.sub),
-            row.get(0),
+            id,
             "approval.expire",
             None,
             "expired",
@@ -125,7 +197,7 @@ async fn find_or_create(
     ).await? {
         let result = approval_row(&row);
         tx.commit().await?;
-        return Ok(result);
+        return Ok((result, records));
     }
     let count: i64 = tx.query_one("SELECT count(*) FROM approvals WHERE tenant_id=$1 AND status='pending' AND expires_at>clock_timestamp()", &[claims.tenant_id.as_uuid()]).await?.get(0);
     if count
@@ -149,9 +221,22 @@ async fn find_or_create(
         Some(claims.sub.clone())
     };
     let bytes = i64::try_from(request.body.to_string().len())?;
-    let inserted=tx.query_opt("INSERT INTO approvals (tenant_id,subject_kind,server_id,subject,key_id,requester_sub,requester_creator,args_fp,args_bytes,rule_id,expires_at,trace_id,args_preview) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+make_interval(secs=>$11::double precision),$12,$13) ON CONFLICT(tenant_id,requester_sub,args_fp) WHERE status IN ('pending','approved') DO NOTHING RETURNING id",&[claims.tenant_id.as_uuid(),&request.kind,&request.server,&request.subject,&key,&claims.sub,&creator,&fp,&bytes,&request.rule,&f64::from(request.ttl_secs),&request.trace_id,&preview]).await?;
+    // Read before the INSERT: the row's `expires_at` (clock + TTL) is strictly later.
+    let requested_at = ledger::now(&tx).await?;
+    let inserted=tx.query_opt("INSERT INTO approvals (tenant_id,subject_kind,server_id,subject,key_id,requester_sub,requester_creator,args_fp,args_bytes,rule_id,expires_at,trace_id,args_preview) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,clock_timestamp()+make_interval(secs=>$11::double precision),$12,$13) ON CONFLICT(tenant_id,requester_sub,args_fp) WHERE status IN ('pending','approved') DO NOTHING RETURNING id,expires_at",&[claims.tenant_id.as_uuid(),&request.kind,&request.server,&request.subject,&key,&claims.sub,&creator,&fp,&bytes,&request.rule,&f64::from(request.ttl_secs),&request.trace_id,&preview]).await?;
     if let Some(row) = inserted {
         let id: Uuid = row.get(0);
+        let expires_at: DateTime<Utc> = row.get(1);
+        records.extend(
+            ledger::record_tx(
+                &tx,
+                &claims.tenant_id,
+                id,
+                Transition::Requested,
+                requested_at,
+            )
+            .await?,
+        );
         audit(
             &tx,
             &claims.tenant_id,
@@ -162,12 +247,25 @@ async fn find_or_create(
             "pending",
         )
         .await?;
-        crate::db::spend_alerts::enqueue_with(&*tx,*claims.tenant_id.as_uuid(),&format!("approval:{id}"),&json!({"type":"approval.requested","approval_id":id,"subject":request.subject,"subject_kind":request.kind,"queue_path":"/settings/gateway/approvals"})).await?;
+        let (server_name, rule) = notice_labels(&tx, claims.tenant_id.as_uuid(), request).await?;
+        crate::db::spend_alerts::enqueue_with(
+            &*tx,
+            *claims.tenant_id.as_uuid(),
+            &format!("approval:{id}"),
+            &approval_notice(
+                id,
+                request,
+                server_name.as_deref(),
+                rule.as_deref(),
+                expires_at,
+            ),
+        )
+        .await?;
     }
     let row=tx.query_one("SELECT id,status,expires_at,decided_by FROM approvals WHERE action_id IS NULL AND tenant_id=$1 AND requester_sub=$2 AND args_fp=$3 AND status IN ('pending','approved')",&[claims.tenant_id.as_uuid(),&claims.sub,&fp]).await?;
     let result = approval_row(&row);
     tx.commit().await?;
-    Ok(result)
+    Ok((result, records))
 }
 fn approval_row(row: &tokio_postgres::Row) -> Approval {
     Approval {
@@ -179,15 +277,23 @@ fn approval_row(row: &tokio_postgres::Row) -> Approval {
 }
 
 /// Conditional UPDATE is the grant. A concurrent request losing it cannot execute.
-async fn consume(pool: &DbPool, claims: &Claims, id: Uuid) -> Result<Option<String>> {
+async fn consume(
+    pool: &DbPool,
+    claims: &Claims,
+    id: Uuid,
+) -> Result<Option<(String, Option<AtomicBatchAppend>)>> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     // PostgreSQL can evaluate an UPDATE predicate before waiting for its row lock.
     // Acquire that lock first so wall-clock grant expiry is checked after the wait.
     tx.query_opt("SELECT id FROM approvals WHERE action_id IS NULL AND tenant_id=$1 AND id=$2 AND requester_sub=$3 FOR UPDATE",
         &[claims.tenant_id.as_uuid(), &id, &claims.sub]).await?;
+    // After the lock, before the conditional UPDATE: the UPDATE's own clock is later, so a
+    // consume that passes `grant_expires_at>clock_timestamp()` is recorded strictly before it.
+    let at = ledger::now(&tx).await?;
     let row=tx.query_opt("UPDATE approvals SET status='consumed', consumed_at=clock_timestamp() WHERE action_id IS NULL AND tenant_id=$1 AND id=$2 AND requester_sub=$3 AND status='approved' AND consumed_at IS NULL AND grant_expires_at>clock_timestamp() RETURNING decided_by",&[claims.tenant_id.as_uuid(),&id,&claims.sub]).await?;
     let Some(row) = row else { return Ok(None) };
+    let rows = ledger::record_tx(&tx, &claims.tenant_id, id, Transition::Consumed, at).await?;
     audit(
         &tx,
         &claims.tenant_id,
@@ -202,7 +308,7 @@ async fn consume(pool: &DbPool, claims: &Claims, id: Uuid) -> Result<Option<Stri
         .get::<_, Option<String>>(0)
         .ok_or_else(|| anyhow::anyhow!("approval has no approver"))?;
     tx.commit().await?;
-    Ok(Some(by))
+    Ok(Some((by, rows)))
 }
 #[derive(Default)]
 struct Holds {
@@ -322,7 +428,7 @@ pub async fn gate(
         ).await.map_err(|_| unavailable())?.ok_or_else(|| denial("approval_mismatch"))?;
         approval_row(&row)
     } else {
-        find_or_create(pool, claims, &request, preview)
+        let (row, rows) = find_or_create(pool, claims, &request, preview)
             .await
             .map_err(|e| {
                 if e.is::<Capacity>() {
@@ -335,7 +441,9 @@ pub async fn gate(
                 } else {
                     unavailable()
                 }
-            })?
+            })?;
+        ledger::forward(Some(&state.audit_chain), &claims.tenant_id, rows);
+        row
     };
     if request.kind == "tool" && row.status == "pending" && row.expires_at > Utc::now() {
         let mut slot = hold(*claims.tenant_id.as_uuid(), row.id)?;
@@ -375,10 +483,16 @@ pub async fn gate(
                 crate::admission::Refusal::Control(d) => d,
                 _ => unavailable(),
             })?;
-        return consume(pool, claims, row.id)
+        let (by, rows) = consume(pool, claims, row.id)
             .await
             .map_err(|_| unavailable())?
-            .ok_or_else(|| denial("approval_consumed"));
+            .ok_or_else(|| denial("approval_consumed"))?;
+        ledger::forward(
+            Some(&state.audit_chain),
+            &claims.tenant_id,
+            rows.into_iter().collect(),
+        );
+        return Ok(by);
     }
     let code = match row.status.as_str() {
         "pending" if row.expires_at > Utc::now() => "approval_required",
@@ -405,6 +519,13 @@ pub async fn expire(
     let tx = client.transaction().await?;
     let rows=tx.query("SELECT tenant_id,id,status,action_id FROM approvals WHERE (status='pending' AND expires_at<=now()) OR (status='approved' AND CASE WHEN action_id IS NULL THEN grant_expires_at ELSE expires_at END<=now()) ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED",&[&limit]).await?;
     let mut copies = Vec::new();
+    let mut records = Vec::new();
+    // At or after the transaction's now(), which every row here already lapsed by.
+    let at = if rows.is_empty() {
+        None
+    } else {
+        Some(ledger::now(&tx).await?)
+    };
     for r in &rows {
         let tenant = TenantId::from_jwt_claim(r.get(0));
         let id: Uuid = r.get(1);
@@ -420,6 +541,12 @@ pub async fn expire(
                 "UPDATE approvals SET status='expired' WHERE tenant_id=$1 AND id=$2 AND status IN ('pending','approved')",
                 &[tenant.as_uuid(), &id],
             ).await?;
+            if let Some(at) = at
+                && let Some(rows) =
+                    ledger::record_tx(&tx, &tenant, id, Transition::Expired, at).await?
+            {
+                records.push((tenant.clone(), rows));
+            }
         }
         audit(
             &tx,
@@ -434,6 +561,9 @@ pub async fn expire(
     }
     tx.commit().await?;
     let timeout = Duration::from_secs(crate::mcp_policy::settings()?.limits.call_timeout_secs);
+    for (tenant, rows) in records {
+        ledger::forward(chain, &tenant, vec![rows]);
+    }
     for (tenant, batch) in copies {
         crate::action_control::execution::after_commit_for_tenant(
             chain,

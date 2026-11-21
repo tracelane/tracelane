@@ -569,3 +569,139 @@ fn principal_digest_binds_intent() {
         .unwrap()
     );
 }
+/// The documents the dashboard's policy templates generate (`apps/web/lib/policy-templates.ts`;
+/// its vitest keeps this fixture equal to the generator's output). Parsed and evaluated by the
+/// REAL parser and evaluator, not a mirror of them.
+const TEMPLATE_DOCS: &str = include_str!("../../tests/fixtures/template_documents.json");
+type Decision = Result<(Action, String), String>;
+fn template_decision(doc: &Value, args: &Value) -> Result<(Action, String)> {
+    let c = parse_contract(&doc["contract"].to_string())?;
+    let p = parse_policy(&doc["policy"].to_string(), &c)?;
+    let f = fields(&c, args)?;
+    Ok(evaluate(
+        Some(&p),
+        Uuid::nil(),
+        &f,
+        Action::Allow,
+        Mode::Observe,
+    ))
+}
+#[test]
+fn template_documents_parse_and_decide() {
+    use Action::{Allow, Deny, RequireApproval};
+    let docs: Value = serde_json::from_str(TEMPLATE_DOCS).unwrap();
+    for name in ["payments_cents", "payments_whole_dollars", "customer_data"] {
+        let d = &docs[name];
+        let c = parse_contract(&d["contract"].to_string()).unwrap();
+        parse_policy(&d["policy"].to_string(), &c).unwrap();
+    }
+    let pay = |amount: Value, currency: Value, beneficiary: Value| json!({"amount":amount,"currency":currency,"beneficiary":beneficiary});
+    let ok = |a: Action, r: &str| Ok((a, r.to_owned()));
+    let err = |e: &str| Err(e.to_owned());
+    let cases: Vec<(&str, Value, Decision)> = vec![
+        (
+            "payments_cents",
+            pay(json!(100_000), json!("USD"), json!("acme-ltd")),
+            ok(Allow, "allow-small-approved"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(500_000), json!("USD"), json!("acme-ltd")),
+            ok(Allow, "allow-small-approved"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(500_001), json!("USD"), json!("globex")),
+            ok(RequireApproval, "hold-large-approved"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(100), json!("USD"), json!("mallory")),
+            ok(Deny, "deny-unknown-beneficiary"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(9_999_999), json!("USD"), json!("mallory")),
+            ok(Deny, "deny-unknown-beneficiary"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(100), json!("EUR"), json!("acme-ltd")),
+            err("currency_invalid"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(-5), json!("USD"), json!("acme-ltd")),
+            err("amount_negative"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(12.5), json!("USD"), json!("acme-ltd")),
+            err("amount_not_integer"),
+        ),
+        (
+            "payments_cents",
+            pay(json!("100"), json!("USD"), json!("acme-ltd")),
+            err("amount_not_integer"),
+        ),
+        (
+            "payments_cents",
+            json!({"amount":100,"currency":"USD"}),
+            err("field_missing"),
+        ),
+        (
+            "payments_cents",
+            pay(json!(100), json!("USD"), json!(5)),
+            err("contract_invalid"),
+        ),
+        (
+            "payments_whole_dollars",
+            pay(json!(5000), json!("USD"), json!("acme-ltd")),
+            ok(Allow, "allow-small-approved"),
+        ),
+        (
+            "payments_whole_dollars",
+            pay(json!(5001), json!("USD"), json!("acme-ltd")),
+            ok(RequireApproval, "hold-large-approved"),
+        ),
+        (
+            "payments_whole_dollars",
+            pay(json!(1), json!("USD"), json!("mallory")),
+            ok(Deny, "deny-unknown-beneficiary"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":10,"destination":"s3://approved-bucket"}),
+            ok(Allow, "allow-small-approved"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":1001,"destination":"s3://approved-bucket"}),
+            ok(RequireApproval, "hold-large-approved"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":1001,"destination":"s3://evil"}),
+            ok(Deny, "deny-unapproved-destination"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":1,"destination":"s3://evil"}),
+            ok(Deny, "deny-unapproved-destination"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":-1,"destination":"s3://approved-bucket"}),
+            err("amount_negative"),
+        ),
+        (
+            "customer_data",
+            json!({"record_count":1}),
+            err("field_missing"),
+        ),
+    ];
+    for (name, args, want) in cases {
+        let got = template_decision(&docs[name], &args).map_err(|e| e.to_string());
+        assert_eq!(got, want, "{name} {args}");
+    }
+}

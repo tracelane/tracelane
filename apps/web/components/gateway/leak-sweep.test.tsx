@@ -28,6 +28,7 @@ const responses: Record<string, unknown> = {
 		},
 	},
 	approvals: { approvals: [], pending: 0, next_cursor: null },
+	"protected-tools": { policies: [] },
 	"data-controls": {
 		retention: {
 			days: null,
@@ -130,6 +131,8 @@ async function checkTab(slot: (typeof GATEWAY_SLOTS)[number]) {
 		await screen.findByRole("button", { name: "Save tool policy" });
 	else if (slot.id === "approvals")
 		await screen.findByText("No pending requests.");
+	else if (slot.id === "protected-tools")
+		await screen.findByText(/No protected-tool policies are active/);
 	else if (slot.id === "guardrail-integrations")
 		await screen.findByRole("button", { name: "Add integration" });
 	else

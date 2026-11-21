@@ -8,6 +8,30 @@ Four tables — gateway, observability, evals, trust — built the same way as o
 [gateway-overhead benchmark](/benchmarks): every number and every claim is sourced, and a
 `—` is not a loss, it's a "we didn't find it," which is not the same thing.
 
+## Approval and proof for agent actions
+
+If you are choosing a way to hold risky agent tool calls for a person, this is the comparison that matters. It was read from each vendor's own page on **2026-11-21**. "Not documented" means we did not find it on the page cited, not that the vendor lacks it.
+
+| Capability | Tracelane | DigitalOcean Action Gateway | Permit.io MCP Gateway | TrueFoundry MCP tool approval | Microsoft Agent Governance Toolkit |
+|---|---|---|---|---|---|
+| A person approves a held call | Yes | Yes <sup>[A1]</sup> | Yes <sup>[A2]</sup> | Yes <sup>[A3]</sup> | Approval workflows with quorum logic are listed; how they work is not documented <sup>[A4]</sup> |
+| Approval bound to the exact call | Yes, to the request it was raised for | Yes, "bound to the team, endpoint scope, tool version, and arguments" <sup>[A1]</sup> | The held call itself runs on approval <sup>[A2]</sup> | No, scoped to requester, server and tool <sup>[A3]</sup> | Not documented |
+| Used once | Yes | Yes, "consumed once" <sup>[A1]</sup> | The held call itself runs on approval <sup>[A2]</sup> | Only with the Once option <sup>[A3]</sup> | Not documented |
+| Notification that links to the held call | Slack and email | Not documented <sup>[A1]</sup> | Email or Slack webhook <sup>[A2]</sup> | Email, Slack, PagerDuty, MS Teams or webhook, with a link <sup>[A3]</sup> | Not documented |
+| Recent sign-in required to approve | Yes, on the hosted service (the self-host operator key is exempt) | Not documented | Yes, for people approving their own agent's writes <sup>[A2]</sup> | Not documented | Not documented |
+| Signed record that a third party verifies offline | Preview. Written to a signed ledger and replayed by an open-source verifier; not yet observed with a real approval in production | Not documented <sup>[A1]</sup> | Not documented. A decision history is documented <sup>[A2]</sup> | Not documented <sup>[A3]</sup> | Not documented <sup>[A4]</sup> |
+
+Exact-call, single-use binding exists at DigitalOcean today. Our difference is the record: a signed approval record that a third party checks offline with open-source code, which we label a preview until it has been observed with a real approval in production. Cells for a competitor are read from one page each and may be out of date. If one is wrong, [open an issue](https://github.com/tracelane/tracelane/issues) and we will fix it.
+
+**Sources (fetched 2026-11-21)**
+
+- **[A1]** DigitalOcean, [How to Configure Server-Side Approval](https://docs.digitalocean.com/products/managed-agents/action-gateway/how-to/configure-server-side-approval/)
+- **[A2]** Permit.io, [Permit MCP Gateway: human in the loop](https://docs.permit.io/permit-mcp-gateway/human-in-the-loop)
+- **[A3]** TrueFoundry, [MCP tool approval](https://www.truefoundry.com/docs/ai-gateway/mcp/mcp-tool-approval)
+- **[A4]** Microsoft, [Introducing the Agent Governance Toolkit](https://opensource.microsoft.com/blog/2026/04/02/introducing-the-agent-governance-toolkit/)
+
+The tables below compare gateways and observability tools.
+
 ## Method
 
 - **Every competitor cell that asserts a capability links to a numbered source**, fetched
@@ -52,7 +76,7 @@ See also: [Tracelane vs LiteLLM](/comparisons/vs-litellm) ·
 | Capability | Tracelane | LiteLLM | Portkey | Bifrost | Helicone | Langfuse | LangSmith | Braintrust | Arize Phoenix |
 |---|---|---|---|---|---|---|---|---|---|
 | OTel-native ingest (OTLP) | Yes — the OTLP decode path preserves `parent_span_id` by design <sup>[T8]</sup> | Partial — emits OTel spans for guardrail violations <sup>[1]</sup>; native ingest not confirmed | Partial — OTel emission, not primary ingest <sup>[8]</sup> | Partial — Prometheus + distributed tracing <sup>[3]</sup> | Not documented <sup>[4]</sup> | Yes — OTel-native, primary wire format <sup>[14]</sup> | Partial — proprietary format primary <sup>[5]</sup> | Partial — proprietary format primary <sup>[15]</sup> | Yes — native OTel <sup>[16]</sup> |
-| Full-fidelity capture (no default sampling) | Yes — no default sampling; capture on in the published benchmark <sup>[T2]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — all LLM and non-LLM calls <sup>[14]</sup> | Yes — "full visibility" <sup>[5]</sup> | Not documented | Not documented |
+| No default sampling (prompt and response text off unless a workspace owner turns it on) | Yes — no default sampling; capture on in the published benchmark <sup>[T2]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — all LLM and non-LLM calls <sup>[14]</sup> | Yes — "full visibility" <sup>[5]</sup> | Not documented | Not documented |
 | Trace tree + tool spans | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — traces include tool calls <sup>[14]</sup> | Yes — step-by-step agent view <sup>[5]</sup> | Yes — tracing with spans <sup>[15]</sup> | Yes — every step incl. tool calls <sup>[16]</sup> |
 | Sessions / threads | Yes — `/sessions`, keyed on `gen_ai.conversation.id` <sup>[T10]</sup> | Not documented | Not documented | Not documented | Yes — sessions listed <sup>[4]</sup> | Yes — multi-turn sessions <sup>[14]</sup> | Yes <sup>[5]</sup> | Yes — "Loop thread" <sup>[15]</sup> | Not documented |
 | Multi-agent swimlanes / agent graph | Yes <sup>[T9]</sup> | Not documented | Not documented | Not documented | Not documented | Yes — agent graphs <sup>[14]</sup> | Yes — agent step view <sup>[5]</sup> | Not documented | Not documented |

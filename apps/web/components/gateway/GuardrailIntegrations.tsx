@@ -827,7 +827,7 @@ export function GuardrailIntegrations() {
 						<Panel
 							id="guardrail-integrations"
 							title="Guardrail integrations"
-							description="Add a guardrail you already use, with your own account and key, or your own HTTPS endpoint. Tracelane sends request text to it, and response text when After the response is on, and follows its answer."
+							note="Add a guardrail you already use, with your own account and key, or your own HTTPS endpoint. Tracelane sends request text to it, and response text when After the response is on, and follows its answer."
 						>
 							<p className="text-sm text-ink-3">
 								{hooks.length} of {LIMITS.max_hooks} connected
@@ -863,7 +863,7 @@ export function GuardrailIntegrations() {
 						<Panel
 							id="guardrail-integrations-add"
 							title="Add an integration"
-							description={
+							note={
 								full
 									? `This workspace has reached its limit of ${LIMITS.max_hooks} integrations.`
 									: undefined

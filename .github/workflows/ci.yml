@@ -202,7 +202,7 @@ jobs:
             # The browser verifier compiles packages/verifier-rust to WASM: rebuild and test it
             # whenever either changes, so the page can never lag the CLI's verdict.
             case "$f" in
-              packages/verifier-rust/*|packages/verifier-wasm/*|scripts/proofs/verifier-wasm-browser.mjs) wasm=true;;
+              packages/verifier-rust/*|packages/verifier-wasm/*|apps/site/public/verify/*|scripts/proofs/verifier-wasm-browser.mjs) wasm=true;;
             esac
             # L2 live eval gate — only the gateway/ingest/span/CH/eval surface
             # needs the (expensive) ephemeral real stack. Docs/frontend PRs stay
@@ -228,10 +228,41 @@ jobs:
   # Browser verifier (AUD-33): build packages/verifier-wasm from source (web/pkg is NOT checked
   # in, so the page cannot drift from the verifier), then its wrapper tests, clippy for both
   # targets, and the Playwright proof (PASS/FAIL cases + zero network requests after load).
+  # On a push to main `changes` is skipped on purpose (see the comment on it), and that would skip
+  # verifier-wasm too. scripts/deploy/site-gate.sh needs a successful verifier-wasm check-run on the
+  # merge commit before it publishes a change to apps/site/public/verify/, so this tiny job (one API
+  # call, no checkout) computes ONLY the wasm flag on a push. Every other job keeps its push behaviour.
+  wasm-push:
+    if: github.event_name == 'push'
+    name: Detect browser-verifier changes (push)
+    runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
+    outputs:
+      wasm: ${{ steps.f.outputs.wasm }}
+    steps:
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          # Anything we cannot evaluate runs the job: a needless build is cheap, a missing check blocks a deploy.
+          if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then echo "wasm=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          files=$(gh api --paginate "repos/${REPO}/compare/${BEFORE}...${SHA}" --jq '.files[].filename' 2>/dev/null) || { echo "wasm=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          wasm=false
+          while IFS= read -r f; do
+            case "$f" in
+              packages/verifier-rust/*|packages/verifier-wasm/*|apps/site/public/verify/*|scripts/proofs/verifier-wasm-browser.mjs|rust-toolchain.toml) wasm=true;;
+            esac
+          done <<< "$files"
+          echo "wasm=$wasm" >> "$GITHUB_OUTPUT"
+
   verifier-wasm:
     name: Browser verifier (WASM build · tests · zero-network proof)
-    needs: changes
-    if: needs.changes.outputs.wasm == 'true'
+    needs: [changes, wasm-push]
+    # always-style: `changes` (PRs) or `wasm-push` (pushes) is skipped by design, which would skip this job.
+    if: ${{ !cancelled() && (needs.changes.outputs.wasm == 'true' || needs.wasm-push.outputs.wasm == 'true') }}
     runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -254,8 +285,13 @@ jobs:
           want=$(sed -n 's/^wasm-bindgen = "=\{0,1\}\([0-9.]*\)".*/\1/p' packages/verifier-wasm/Cargo.toml)
           have=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')
           [ "$have" = "$want" ] || cargo install --locked wasm-bindgen-cli --version "$want"
-      - name: Build (regenerates web/pkg from source)
-        run: bash packages/verifier-wasm/build.sh
+      # Rebuilds from source (regenerating web/pkg) and FAILS if the copy committed under
+      # apps/site/public/verify/ differs. Merges publish the site, so this is what stops a swapped
+      # binary reaching tracelane.dev; scripts/deploy/site-gate.sh requires this job's success.
+      - name: Hosted-copy listing check (symlinks, strays)
+        run: bash packages/verifier-wasm/tests/test-check-site-listing.sh
+      - name: Build from source and check the hosted copy matches
+        run: bash packages/verifier-wasm/publish-site.sh --check
       - name: Wrapper tests + clippy (native and wasm32)
         working-directory: packages/verifier-wasm
         run: |

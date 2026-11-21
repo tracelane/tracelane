@@ -110,7 +110,7 @@ export const metadata: Metadata = {
 		template: "%s — Tracelane",
 	},
 	description:
-		"Agents act. People decide. Rules and human approval for AI agent actions, full-fidelity traces, inline heuristic guardrails, and a tamper-evident audit ledger you can verify offline.",
+		"Agent actions, on a record anyone can check. Rules and human approval for AI agent actions, full-fidelity traces, inline heuristic guardrails, and a tamper-evident audit ledger you can verify offline.",
 	// Brand assets (public/brand) — the ADR-074 geometric T monogram, monochrome.
 	// The Chisel bracket-recorder mark it replaced is dead; do not resurrect it.
 	// One polarity only (dark mark on light), pinned PERMANENTLY by founder decision:

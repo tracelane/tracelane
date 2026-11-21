@@ -1,7 +1,7 @@
 <!-- tracelane:classification: PUBLIC -->
 # Tracelane
 
-**The tamper-evident runtime proxy for enterprise AI agents.**
+**Approval and proof for AI agents that act on money and customer data.**
 
 [![CI](https://github.com/tracelane/tracelane/actions/workflows/ci.yml/badge.svg)](https://github.com/tracelane/tracelane/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -14,11 +14,18 @@
 
 ## What it does
 
-Tracelane sits between your AI agents and your LLM providers. You get:
+Your agents pay, refund and pull customer records. Tracelane sits between them and the tools and models they call:
 
-- **BYOK proxy** — point agents at `https://gateway.tracelane.dev`, pass your own API key. 0% markup.
-- **Full-fidelity traces** — LLM calls, tool invocations, agent steps and retries captured as OTel spans using the GenAI semantic conventions, at full fidelity for everything routed through the gateway. There is no sampling you have to turn off: every gateway call is recorded as a span. Prompt and completion **text** is a separate, safe-by-default boundary — off unless a workspace owner turns it on. The one bound we do apply is a per-trace ceiling (10,000 spans / 64 MiB, env-tunable) so a runaway agent cannot exhaust your storage — it clips that trace, never your other traces.
-- **Tamper-evident audit ledger** — recorded gateway audit events are hash-chained per tenant. Batches are signed; public transparency-log anchoring is best-effort when configured, and an unanchored batch is reported as such. `tlane verify` re-checks the chain **offline**, from the export alone, with no call back to us.
+- **Holds risky tool calls for a person.** A workspace policy can require approval for an MCP tool call. The gateway detects and holds it (approval holds are in development and not available on every workspace), the agent gets a "held" answer, and a signed-in person approves or denies. On the hosted service, only signed-in admins approve, never an API key, and approving needs a recent sign-in.
+- **Binds the approval to that exact call, used once.** An approval is tied to the request it was raised for and is used once, then it expires. A call without a matching approval is held, or refused if it names an approval that does not match.
+- **A signed record, checked offline.** Approval decisions on the default path are written to the tenant's hash-chained ledger, signed per batch, and `tlane verify` replays them offline with the open-source verifier, with no call back to us. The signed approval record is a **Preview**: it is deployed, but we have not yet observed it with a real approval in production.
+- **Notifications that link to the held call.** Slack and email notices name the tool, server, rule and expiry and link to that exact call. Tool arguments stay out of the message.
+
+Supporting capabilities:
+
+- **BYOK gateway** — point agents at `https://gateway.tracelane.dev`, pass your own API key. 0% markup.
+- **OTel capture** — LLM calls, tool invocations, agent steps and retries are recorded as OTel spans using the GenAI semantic conventions for calls routed through the gateway or sent by the SDK. Prompt and completion **text** is a separate, safe-by-default boundary: off unless a workspace owner turns it on. A per-trace ceiling (10,000 spans / 64 MiB, env-tunable) keeps a runaway agent from exhausting your storage; it clips that trace, never your other traces.
+- **Tamper-evident audit ledger** — recorded gateway audit events are hash-chained per tenant. Batches are signed; public transparency-log anchoring is best-effort when configured, and an unanchored batch is reported as such. Spans sent by SDK or OpenTelemetry are captured but not chained.
 - **Inline heuristic guardrails** — cost, schema, and prompt-injection rails run in-request at the gateway (ML ensemble on the roadmap). Every rail verdict is written to the audit ledger. Most rails record and flag; the prompt-injection rail (R8) refuses a request carrying an injection in a tool result with a `403`. The separate predictive layer is **observe-first**: it records verdicts and enforces nothing unless an operator opts in.
 - **Cross-language ledger conformance** — the audit verifier is implemented three times, in Rust, Python and TypeScript, and all three are held to **one shared corpus of 8 conformance vectors** that includes deliberately-forged and boundary-numeric cases. **10 Rust + 14 Python + 19 TypeScript** conformance tests run in CI, plus a round-trip job asserting the three implementations agree. That is the suite behind "a third party can verify offline" — you can run it in this clone.
   Note the honest scope: `evals/` here carries the 20 conformance evals; some internal suites target private ADRs and infrastructure and are not part of this repo, so the `test` script says so rather than pretending to pass.
@@ -66,7 +73,7 @@ per-rail status.
 the vendor's own page as of 2026-09-07 (not necessarily absent).
 
 **Not yet:** SOC 2 report, configurable data residency, HIPAA/BAA, documented SAML SSO,
-contractual SLA, documented Slack/PagerDuty alert integrations. Stated as limits, not
+contractual SLA, PagerDuty alert integration. Stated as limits, not
 discovered as gaps — see the [full matrix](https://docs.tracelane.dev/comparisons) for
 what each competitor has instead.
 
@@ -182,7 +189,7 @@ Agent / SDK
 │  Rust Ingest Workers                │
 │  - High-throughput batch writes     │
 │  - ClickHouse batch writes          │
-│  - Full-fidelity capture (default)  │
+│  - No default sampling              │
 └────────────────┬────────────────────┘
                  │
      ┌───────────┴───────────┐

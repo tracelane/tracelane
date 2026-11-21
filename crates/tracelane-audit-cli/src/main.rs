@@ -135,6 +135,9 @@ struct EvidencePackArgs {
     /// Independently pinned Ed25519 public-key FILE (base64 or hex). Required.
     #[arg(long, value_name = "PATH")]
     pubkey: Option<PathBuf>,
+    /// Require a verified signed tree checkpoint; refuse a bundle that has none.
+    #[arg(long)]
+    require_tree: bool,
     /// Independently obtained TSA leaf certificate, DER or PEM. Repeatable.
     #[arg(long, value_name = "PATH")]
     tsa_cert: Vec<PathBuf>,
@@ -187,6 +190,10 @@ struct VerifyArgs {
     /// Independently obtained TSA leaf certificate, DER or PEM. Repeat for rotation.
     #[arg(long, value_name = "PATH")]
     tsa_cert: Vec<PathBuf>,
+
+    /// Require a verified signed tree checkpoint in an offline action ZIP.
+    #[arg(long)]
+    require_tree: bool,
 
     /// Report every interval longer than this many seconds between consecutive signed
     /// checkpoints of an action ZIP as a gap. Set it to your heartbeat cadence plus slack.
@@ -482,8 +489,15 @@ fn verify_consistency(args: &ConsistencyArgs) -> Result<String, TreeFailure> {
 fn run_evidence_pack(args: &EvidencePackArgs) -> ExitCode {
     let report = match std::fs::File::open(&args.file)
         .map_err(|e| (2, format!("tracelane-audit: error: {e}")))
-        .and_then(|file| verify_action_zip(file, args.pubkey.as_deref(), &args.tsa_cert, None))
-    {
+        .and_then(|file| {
+            verify_action_zip(
+                file,
+                args.pubkey.as_deref(),
+                &args.tsa_cert,
+                None,
+                args.require_tree,
+            )
+        }) {
         Ok(report) => report,
         Err((code, message)) => {
             eprintln!("{message}");
@@ -507,11 +521,14 @@ fn run_evidence_pack(args: &EvidencePackArgs) -> ExitCode {
 }
 
 fn run_action_bundle(args: &VerifyArgs) -> Option<ExitCode> {
-    if (args.pubkey.is_some() || !args.tsa_cert.is_empty() || args.max_gap.is_some())
+    if (args.pubkey.is_some()
+        || !args.tsa_cert.is_empty()
+        || args.max_gap.is_some()
+        || args.require_tree)
         && args.file.is_none()
     {
         eprintln!(
-            "--pubkey, --tsa-cert and --max-gap require --file; action bundles verify offline"
+            "--pubkey, --tsa-cert, --max-gap and --require-tree require --file; action bundles verify offline"
         );
         return Some(ExitCode::from(2));
     }
@@ -531,8 +548,12 @@ fn run_action_bundle(args: &VerifyArgs) -> Option<ExitCode> {
         || prefix == b"PK\x07\x08"
         || path.extension().is_some_and(|e| e == "zip");
     if !is_zip {
-        if args.pubkey.is_some() || !args.tsa_cert.is_empty() || args.max_gap.is_some() {
-            eprintln!("--pubkey, --tsa-cert and --max-gap require an action ZIP");
+        if args.pubkey.is_some()
+            || !args.tsa_cert.is_empty()
+            || args.max_gap.is_some()
+            || args.require_tree
+        {
+            eprintln!("--pubkey, --tsa-cert, --max-gap and --require-tree require an action ZIP");
             return Some(ExitCode::from(4));
         }
         // Replay the sniffed bytes into the unchanged legacy verifier.
@@ -554,7 +575,13 @@ fn run_action_bundle(args: &VerifyArgs) -> Option<ExitCode> {
     }
     let reader = Cursor::new(prefix).chain(file);
     Some(
-        match verify_action_zip(reader, args.pubkey.as_deref(), &args.tsa_cert, args.max_gap) {
+        match verify_action_zip(
+            reader,
+            args.pubkey.as_deref(),
+            &args.tsa_cert,
+            args.max_gap,
+            args.require_tree,
+        ) {
             Ok(report) => {
                 match args.format {
                     OutputFormat::Json => match serde_json::to_string_pretty(&report) {
@@ -585,6 +612,7 @@ fn verify_action_zip(
     pubkey: Option<&Path>,
     tsa_cert: &[PathBuf],
     max_gap_secs: Option<u64>,
+    require_tree: bool,
 ) -> std::result::Result<tracelane_audit_verifier::action::bundle::Report, (u8, String)> {
     let raw = read_bundle(reader).map_err(|e| (4, format!("FAIL (4): {e}")))?;
     let pin = pubkey
@@ -609,11 +637,12 @@ fn verify_action_zip(
             "TRUST FAIL: --tsa-cert is not a PEM or DER X.509 certificate".into(),
         ));
     }
-    tracelane_audit_verifier::action::bundle::verify_with_options(
+    tracelane_audit_verifier::action::bundle::verify_with_tree_requirement(
         &raw,
         pin,
         &tsa_pins,
         max_gap_secs.map(std::time::Duration::from_secs),
+        require_tree,
     )
     .map_err(|e| (e.code, format!("FAIL ({}): {}", e.code, e.detail)))
 }
@@ -942,6 +971,7 @@ mod tests {
             pubkey: None,
             tsa_cert: Vec::new(),
             max_gap: None,
+            require_tree: false,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -1059,6 +1089,7 @@ mod tests {
             pubkey: None,
             tsa_cert: Vec::new(),
             max_gap: None,
+            require_tree: false,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -1118,6 +1149,7 @@ mod tests {
             pubkey: None,
             tsa_cert: Vec::new(),
             max_gap: None,
+            require_tree: false,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,
@@ -1148,6 +1180,7 @@ mod tests {
             pubkey: None,
             tsa_cert: Vec::new(),
             max_gap: None,
+            require_tree: false,
             tenant_pubkey: None,
             platform_pubkey: None,
             workspace_key_since_seq: None,

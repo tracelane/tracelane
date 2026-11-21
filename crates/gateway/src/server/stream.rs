@@ -308,8 +308,6 @@ impl StreamFinalizer {
                 serde_json::Value::Bool(true),
             );
         }
-        // BILL-01 meter 1: stamp + meter the FINAL span shape.
-        super::spans::stamp_and_meter_span_bytes(&mut span, self.meters.clone());
         if cancelled {
             // The truth the recorder exists to keep: the client went away
             // before the provider finished. Token counts are whatever was
@@ -320,6 +318,8 @@ impl StreamFinalizer {
             );
             STREAMS_FINALIZED_ON_DROP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // BILL-01 meter 1: stamp + meter the FINAL span shape.
+        super::spans::stamp_and_meter_span_bytes(&mut span, self.meters.clone());
         // Test seam (B-385 2c): the finished stream's span is observable to a
         // test whether or not NATS is wired.
         #[cfg(test)]
@@ -1432,6 +1432,38 @@ pub(crate) mod tests {
             ) - before_no_nats
                 >= 1,
             "the span branch must have run (it lands on the no-NATS counter here)"
+        );
+    }
+
+    #[tokio::test]
+    async fn openinference_cancelled_stream_stamps_the_final_recorded_shape() {
+        use futures::StreamExt as _;
+        let _serial = DROP_COUNTER_TEST_LOCK.lock().await;
+        let tenant = uuid::Uuid::new_v4();
+        let mut ctx = test_ctx("claude-sonnet-4-6", None, tenant.as_u128(), 81);
+        ctx.capture = super::super::config::ContentCapture {
+            input: false,
+            output: true,
+            max_field_bytes: 4096,
+        };
+        let mut stream = Box::pin(provider_stream_to_sse(
+            mock_stream(vec![chunk("synthetic output"), chunk("unread")]),
+            ctx,
+        ));
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        let spans = crate::otlp_emit::test_sink::for_tenant(
+            &tracelane_shared::TenantId::from_jwt_claim(tenant),
+        );
+        assert_eq!(spans.len(), 1);
+        let mut span = spans[0].clone();
+        assert_eq!(span.attributes.extra["tracelane.stream.cancelled"], true);
+        let recorded = span.attributes.extra["tracelane_span_bytes"].clone();
+        let expected = super::super::spans::metered_span_bytes(&mut span);
+        assert_eq!(
+            recorded,
+            serde_json::json!(expected),
+            "meter includes cancellation metadata, excludes aliases"
         );
     }
 

@@ -31,6 +31,18 @@ const BANNED_WORDS: [&str; 6] = [
     "conformant",
     "trustless",
 ];
+/// The verifier-report counts a control may name in `evidenced_by`, in display order.
+/// Each is a number `Report` already carries; the map cannot name anything else.
+pub const COUNT_KEYS: [&str; 8] = [
+    "rows",
+    "unknown-outcomes",
+    "denied-approvals",
+    "decisions-replayed",
+    "decisions-not-replayable",
+    "countersigned-executions",
+    "uncountersigned-executions",
+    "workspace-paused-refusals",
+];
 pub const FILES: [&str; 3] = [
     "controls.csv",
     "oscal-component-definition.json",
@@ -74,6 +86,9 @@ struct Control {
     anchor_text: Option<String>,
     status: Status,
     gap: String,
+    /// Report counts summed into `records_in_bundle`. Never changes `status`.
+    #[serde(default)]
+    evidenced_by: Option<Vec<String>>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +149,7 @@ fn token(c: &Control) -> String {
 ///
 /// # Errors
 /// Fails CLOSED: a `covered` status, a partial row without a code anchor, a gap-less
-/// row, an unknown field/status/framework, a duplicate, a formula cell
+/// row, an unknown field/status/framework/`evidenced_by` key, a duplicate, a formula cell
 /// or a banned claim word refuses the whole map.
 pub fn parse_map(raw: &str) -> Result<ControlMap> {
     let value: Value = serde_json::from_str(raw).context("control map is not JSON")?;
@@ -183,6 +198,20 @@ pub fn parse_map(raw: &str) -> Result<ControlMap> {
             }
             _ => bail!("{id}: a partial row must cite a code anchor"),
         }
+        if let Some(keys) = &c.evidenced_by {
+            ensure!(
+                c.status != Status::NotCovered && !keys.is_empty(),
+                "{id}: evidenced_by needs a partial row and at least one key"
+            );
+            let mut once = BTreeSet::new();
+            for k in keys {
+                ensure!(
+                    COUNT_KEYS.contains(&k.as_str()),
+                    "{id}: unknown evidenced_by key {k}"
+                );
+                ensure!(once.insert(k), "{id}: duplicate evidenced_by key {k}");
+            }
+        }
     }
     Ok(map)
 }
@@ -206,12 +235,44 @@ fn uuid(name: &str) -> String {
     Uuid::from_bytes(b).to_string()
 }
 
-/// The verifier report numbers the pack restates: (token, label, value).
+/// The verifier counts a control may sum: (key, label, value), in `COUNT_KEYS` order.
+fn counts(r: &Report) -> Vec<(&'static str, &'static str, u64)> {
+    let len = |n: usize| n as u64;
+    let a = &r.actions;
+    let rows = [
+        ("Ledger rows verified", r.rows),
+        ("Executions with an unknown outcome", len(a.unknown.len())),
+        ("Approvals denied", len(a.denied.len())),
+        ("Policy decisions replayed", a.replayed),
+        (
+            "Decisions not replayable (opaque field)",
+            len(a.not_replayable.len()),
+        ),
+        (
+            "Executions with a verified tool countersignature",
+            a.countersigned,
+        ),
+        (
+            "Executions on a tool server with no receipt key",
+            a.uncountersigned,
+        ),
+        (
+            "Distinct protected calls refused while the workspace was paused",
+            a.refused_workspace_paused,
+        ),
+    ];
+    COUNT_KEYS
+        .iter()
+        .zip(rows)
+        .map(|(key, (label, n))| (*key, label, n))
+        .collect()
+}
+
+/// The verifier report values the pack restates: (token, label, value).
 fn facts(r: &Report) -> Vec<(&'static str, &'static str, String)> {
     let none = || "none".to_owned();
-    vec![
+    let mut out = vec![
         ("tenant-id", "Tenant", r.tenant_id.to_string()),
-        ("rows", "Ledger rows verified", r.rows.to_string()),
         (
             "head-seq",
             "Signed head sequence",
@@ -228,26 +289,6 @@ fn facts(r: &Report) -> Vec<(&'static str, &'static str, String)> {
             r.created_at.to_rfc3339(),
         ),
         (
-            "unknown-outcomes",
-            "Executions with an unknown outcome",
-            r.actions.unknown.len().to_string(),
-        ),
-        (
-            "denied-approvals",
-            "Approvals denied",
-            r.actions.denied.len().to_string(),
-        ),
-        (
-            "decisions-replayed",
-            "Policy decisions replayed",
-            r.actions.replayed.to_string(),
-        ),
-        (
-            "decisions-not-replayable",
-            "Decisions not replayable (opaque field)",
-            r.actions.not_replayable.len().to_string(),
-        ),
-        (
             "batch-signatures",
             "Batch signatures verified",
             r.batch_signatures.to_string(),
@@ -258,6 +299,14 @@ fn facts(r: &Report) -> Vec<(&'static str, &'static str, String)> {
             r.rekor_included.to_string(),
         ),
         (
+            "tree-checkpoint-leaves",
+            "Leaves in the signed tree checkpoint",
+            r.tree_size.map_or_else(
+                || "none (the bundle carries no tree checkpoint)".to_owned(),
+                |n| n.to_string(),
+            ),
+        ),
+        (
             "timestamp-verified",
             "Timestamp verified against a supplied authority certificate",
             match (r.gen_time, r.timestamp_reason) {
@@ -266,7 +315,28 @@ fn facts(r: &Report) -> Vec<(&'static str, &'static str, String)> {
                 (None, None) => "no (the bundle carries no timestamp)".to_owned(),
             },
         ),
-    ]
+    ];
+    out.extend(counts(r).into_iter().map(|(k, l, n)| (k, l, n.to_string())));
+    out
+}
+
+/// Records one control's `evidenced_by` keys match in this bundle, with the
+/// labels that were summed. `None` = the row names no key, so nothing is counted.
+fn records_in_bundle(c: &Control, counts: &[(&str, &str, u64)]) -> Option<(u64, String)> {
+    let keys = c.evidenced_by.as_ref()?;
+    let hit: Vec<_> = counts
+        .iter()
+        .filter(|(k, ..)| keys.iter().any(|x| x == k))
+        .collect();
+    let labels: Vec<&str> = hit.iter().map(|(_, l, _)| *l).collect();
+    Some((hit.iter().map(|(.., n)| n).sum(), labels.join("; ")))
+}
+fn records_phrase(n: u64) -> String {
+    match n {
+        0 => "0 in this bundle".to_owned(),
+        1 => "1 record in this bundle".to_owned(),
+        n => format!("{n} records in this bundle"),
+    }
 }
 
 fn csv_cell(s: &str) -> String {
@@ -292,6 +362,7 @@ fn prop(name: &str, value: &str) -> Value {
 /// Fails CLOSED if the OSCAL document cannot be serialized.
 pub fn render(map: &ControlMap, report: &Report) -> Result<Pack> {
     let facts = facts(report);
+    let counts = counts(report);
     let title = "Tracelane examiner evidence pack (mapping only)";
     let scope = format!(
         "{}/{}/{}",
@@ -309,6 +380,7 @@ pub fn render(map: &ControlMap, report: &Report) -> Result<Pack> {
         "evidence",
         "code_anchor",
         "gap",
+        "records_in_bundle",
     ]);
     let mut html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title>\
@@ -338,7 +410,7 @@ h1{{font-size:18px}}h2{{font-size:14px;margin-top:24px}}code{{font-size:12px}}</
     for f in &map.frameworks {
         html.push_str(&format!(
             "<h2>{}</h2><p>Source: {}. {} {}</p><table><tr><th>Control</th><th>Status</th>\
-<th>Requirement (paraphrase)</th><th>Evidence in the bundle</th><th>Code anchor</th><th>Gap</th></tr>",
+<th>Requirement (paraphrase)</th><th>Evidence in the bundle</th><th>Records</th><th>Code anchor</th><th>Gap</th></tr>",
             esc(&f.title),
             esc(&f.source),
             esc(&f.identifier_check),
@@ -347,6 +419,15 @@ h1{{font-size:18px}}h2{{font-size:14px;margin-top:24px}}code{{font-size:12px}}</
         let mut requirements = Vec::new();
         for c in map.controls.iter().filter(|c| c.framework == f.id) {
             let (status, anchor) = (c.status.label(), c.anchor.as_deref().unwrap_or(""));
+            let found = records_in_bundle(c, &counts);
+            let seen = found
+                .as_ref()
+                .map(|(n, _)| n.to_string())
+                .unwrap_or_default();
+            let shown = found.as_ref().map_or_else(
+                || "not counted".to_owned(),
+                |(n, labels)| format!("{} ({labels})", records_phrase(*n)),
+            );
             csv.push_str(&csv_row(&[
                 &f.id,
                 &f.title,
@@ -356,13 +437,15 @@ h1{{font-size:18px}}h2{{font-size:14px;margin-top:24px}}code{{font-size:12px}}</
                 &c.evidence,
                 anchor,
                 &c.gap,
+                &seen,
             ]));
             html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
                 esc(&c.control_id),
                 status,
                 esc(&c.requirement),
                 esc(&c.evidence),
+                esc(&shown),
                 esc(anchor),
                 esc(&c.gap)
             ));
@@ -373,6 +456,9 @@ h1{{font-size:18px}}h2{{font-size:14px;margin-top:24px}}code{{font-size:12px}}</
             ];
             if let Some(anchor) = &c.anchor {
                 props.push(prop("code-anchor", anchor));
+            }
+            if let Some((n, _)) = found {
+                props.push(prop("records-in-bundle", &n.to_string()));
             }
             requirements.push(json!({
                 "uuid": uuid(&format!("{scope}/{}", token(c))),
@@ -400,6 +486,7 @@ h1{{font-size:18px}}h2{{font-size:14px;margin-top:24px}}code{{font-size:12px}}</
             NOT_COVERED,
             "",
             limit,
+            "",
         ]));
     }
     html.push_str("</body></html>\n");

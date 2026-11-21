@@ -494,6 +494,11 @@ struct WorkOsClaims {
     /// (`control_plane::sso`). Read only by [`verified_session`].
     #[serde(default)]
     sid: Option<String>,
+    /// ACT-41: seconds since the epoch of the user's last ACTIVE sign-in (WorkOS advances it
+    /// only on an active authentication, never on a refresh). Read only by
+    /// [`verified_auth_time`]; a non-integer value fails the decode (closed).
+    #[serde(default)]
+    auth_time: Option<i64>,
 }
 
 /// B-391 (c): the credential could not be CHECKED — as distinct from checked
@@ -841,6 +846,44 @@ pub(crate) fn jwt_exp(authorization: &str) -> Option<u64> {
 /// Fail-CLOSED: a malformed or unverifiable token is `Err`, and the caller
 /// (SSO-required) refuses rather than treating it as "no session".
 pub async fn verified_session(authorization: &str) -> Result<Option<(String, Option<String>)>> {
+    let Some(claims) = verified_workos_claims(authorization).await? else {
+        return Ok(None);
+    };
+    let org = claims.org_id.filter(|o| !o.is_empty());
+    Ok(claims.sid.filter(|s| !s.is_empty()).map(|sid| (sid, org)))
+}
+
+/// ACT-41: what a re-verified bearer JWT says about when its user last ACTIVELY signed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuth {
+    /// Not a WorkOS JWT: an API key, the self-host master key, or the debug dev stub.
+    NotASession,
+    /// A verified WorkOS access token; `auth_time` is its signed claim, absent on a token
+    /// that does not carry one.
+    Session { auth_time: Option<i64> },
+}
+
+/// ACT-41: the signed `auth_time` of a bearer JWT, re-verified exactly as
+/// [`verified_session`] does. WorkOS advances `auth_time` only on an active sign-in, never
+/// on a refresh (workos.com/docs/authkit/reauthentication), unlike `iat`.
+///
+/// # Errors
+/// Fail-CLOSED: a malformed or unverifiable token is `Err`; the approve path refuses.
+pub async fn verified_auth_time(authorization: &str) -> Result<SessionAuth> {
+    Ok(match verified_workos_claims(authorization).await? {
+        None => SessionAuth::NotASession,
+        Some(c) => SessionAuth::Session {
+            auth_time: c.auth_time,
+        },
+    })
+}
+
+/// The one re-verification both session readers share. `Ok(None)` for a credential that is
+/// not a WorkOS JWT.
+///
+/// # Errors
+/// Fail-CLOSED: as [`verified_session`].
+async fn verified_workos_claims(authorization: &str) -> Result<Option<WorkOsClaims>> {
     let token = authorization
         .strip_prefix("Bearer ")
         .context("Authorization header must use Bearer scheme")?;
@@ -862,9 +905,7 @@ pub async fn verified_session(authorization: &str) -> Result<Option<(String, Opt
     let decoding_key = jwks_cache
         .lookup(&kid)
         .ok_or_else(|| anyhow::anyhow!("no JWKS entry for kid={kid}"))?;
-    let claims = decode_and_validate(token, decoding_key, header.alg)?;
-    let org = claims.org_id.filter(|o| !o.is_empty());
-    Ok(claims.sid.filter(|s| !s.is_empty()).map(|sid| (sid, org)))
+    decode_and_validate(token, decoding_key, header.alg).map(Some)
 }
 
 /// Resolve a `TenantId` from validated WorkOS claims.
@@ -1440,7 +1481,28 @@ mod tests {
             org_id: org_id.map(str::to_string),
             role: None,
             sid: None,
+            auth_time: None,
         }
+    }
+
+    /// ACT-41: the signed `auth_time` claim survives the decode; absent stays absent; a
+    /// non-integer refuses the whole token rather than reading as "no claim".
+    #[test]
+    fn act41_auth_time_claim_decodes() {
+        let with: WorkOsClaims = serde_json::from_value(
+            serde_json::json!({"sub":"u","exp":1,"auth_time":1_790_000_000_i64}),
+        )
+        .unwrap();
+        assert_eq!(with.auth_time, Some(1_790_000_000));
+        let without: WorkOsClaims =
+            serde_json::from_value(serde_json::json!({"sub":"u","exp":1})).unwrap();
+        assert_eq!(without.auth_time, None);
+        assert!(
+            serde_json::from_value::<WorkOsClaims>(
+                serde_json::json!({"sub":"u","exp":1,"auth_time":"1790000000"})
+            )
+            .is_err()
+        );
     }
 
     fn claims_with_role(role: Option<Role>) -> Claims {

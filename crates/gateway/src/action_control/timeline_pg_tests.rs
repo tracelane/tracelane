@@ -502,6 +502,8 @@ fn action_state_maps_every_terminal_event() {
                 approval_id: a,
                 decider_digest: d(),
                 note_digest: d(),
+                channel: None,
+                link_digest: None,
             },
             "approved",
         ),
@@ -511,6 +513,8 @@ fn action_state_maps_every_terminal_event() {
                 approval_id: a,
                 decider_digest: d(),
                 note_digest: d(),
+                channel: None,
+                link_digest: None,
             },
             "denied",
         ),
@@ -551,11 +555,15 @@ fn action_state_maps_every_terminal_event() {
         approval_id: a,
         decider_digest: d(),
         note_digest: d(),
+        channel: None,
+        link_digest: None,
     };
     let rejected = ApprovalAttemptRejected {
         approval_id: a,
         decider_digest: d(),
         reason: ReasonCode::Unauthorized,
+        channel: None,
+        link_digest: None,
     };
     assert_eq!(
         timeline::action_state([&granted, &rejected].into_iter()),

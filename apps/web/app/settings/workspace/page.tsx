@@ -8,6 +8,7 @@
  * from the session server-side.
  */
 
+import { ActionControlSetting } from "@/components/settings/ActionControlSetting";
 import { ContentCapture } from "@/components/settings/ContentCapture";
 import { WorkspaceManager } from "@/components/settings/WorkspaceManager";
 import { db } from "@/db";
@@ -90,6 +91,7 @@ export default async function WorkspacePage() {
 			</div>
 
 			<ContentCapture />
+			<ActionControlSetting />
 			<Card>
 				<dl className="px-4">
 					{org?.name && <InfoRow label="Organization" value={org.name} />}

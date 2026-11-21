@@ -1387,6 +1387,7 @@ export const auditLogRows = pgTable(
 	},
 	(t) => [primaryKey({ columns: [t.tenantId, t.seq] }),
         index("audit_protected_event_id").on(t.tenantId, sql`((${t.payload}::jsonb)->>'event_id')`).where(sql`${t.eventType} IN ('decision_made','denied_runtime')`),
+        index("audit_receipt_key_lookup").on(t.tenantId, sql`((${t.payload}::jsonb)->>'action_id')`, t.seq.desc()).where(sql`${t.eventType} = 'tool_receipt_key_registered'`),
         index("audit_policy_activations").on(t.tenantId, t.seq).where(sql`${t.eventType} = 'policy_activated'`),
         index("audit_action_id").on(t.tenantId, sql`((${t.payload}::jsonb)->>'action_id')`, t.seq).where(sql`${t.eventType} IN ('action_proposed','decision_made','approval_requested','approval_granted','approval_denied','approval_attempt_rejected','approval_consumed','approval_expired','approval_invalidated','legacy_forward_attempted','execution_started','execution_succeeded','execution_failed','execution_unknown','denied_runtime','policy_activated')`),
         index("audit_action_heads").on(t.tenantId, t.seq.desc()).where(sql`${t.eventType} IN ('action_proposed','denied_runtime')`),
@@ -2554,6 +2555,9 @@ export const approvals = pgTable(
 		decidedBy: text("decided_by"),
 		decidedAt: timestamp("decided_at", { withTimezone: true }),
 		decisionNote: text("decision_note"),
+		// ACT-41: the approver's signed sign-in time and credential class (0103).
+		decidedAuthAt: timestamp("decided_auth_at", { withTimezone: true }),
+		decidedAuthMethod: text("decided_auth_method"),
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.notNull()
 			.defaultNow(),
@@ -2674,6 +2678,32 @@ export const auditHeadCheckpoints = pgTable(
 		primaryKey({ columns: [t.tenantId, t.checkpointId] }),
 		index("audit_head_checkpoints_order").on(t.tenantId, t.checkpointOrder),
 	],
+);
+
+// Observed recording identities, not proof of gap-free coverage. Retained with audit rows.
+export const gatewayRecordingEvents = pgTable("gateway_recording_events", {
+	dedupId: text("dedup_id").primaryKey(),
+	tenantId: uuid("tenant_id").notNull(),
+	eventId: text("event_id").notNull(),
+	instanceId: text("instance_id").notNull(),
+	bootEpoch: uuid("boot_epoch").notNull(),
+	emitterSeq: bigint("emitter_seq", { mode: "bigint" }).notNull(),
+	eventDigest: text("event_digest").notNull(),
+	ledgerSeq: bigint("ledger_seq", { mode: "bigint" }),
+}, (t) => [
+	uniqueIndex("gateway_recording_sequence").on(t.tenantId, t.instanceId, t.bootEpoch, t.emitterSeq),
+	uniqueIndex("gateway_recording_ledger").on(t.tenantId, t.ledgerSeq),
+],
+);
+
+export const gatewayEmitterHeads = pgTable("gateway_emitter_heads", {
+	tenantId: uuid("tenant_id").notNull(),
+	instanceId: text("instance_id").notNull(),
+	bootEpoch: uuid("boot_epoch").notNull(),
+	highestEmitterSeq: bigint("highest_emitter_seq", { mode: "bigint" }).notNull(),
+	lastLedgerSeq: bigint("last_ledger_seq", { mode: "bigint" }).notNull(),
+	recordedEvents: bigint("recorded_events", { mode: "bigint" }).notNull(),
+}, (t) => [primaryKey({ columns: [t.tenantId, t.instanceId, t.bootEpoch] })],
 );
 
 export const actionToolContracts = pgTable("action_tool_contracts", {

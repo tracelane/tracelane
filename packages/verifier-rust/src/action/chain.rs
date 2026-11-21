@@ -16,18 +16,7 @@ struct Line {
     /// Hex Ed25519 signature over the statement bytes.
     signature: String,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Statement {
-    domain: String,
-    schema_version: u32,
-    tenant_id: Uuid,
-    seq: Option<String>,
-    head_hash: Option<String>,
-    created_at: DateTime<Utc>,
-    key_id: String,
-    previous_checkpoint_digest: Option<String>,
-}
+use super::head::Head as Statement;
 /// An interval between two consecutive signed checkpoints longer than the requested maximum.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Gap {
@@ -74,8 +63,9 @@ pub(super) fn verify(
     head: &[u8],
     certs: &[Vec<u8>],
     max_gap: Option<chrono::Duration>,
+    leaves: &[super::tree::Hash],
 ) -> std::result::Result<Option<ChainReport>, (u8, anyhow::Error)> {
-    let Some(raw) = files.get("checkpoints.ndjson") else {
+    let Some(_) = files.get("checkpoints.ndjson") else {
         // Stripping the (unsigned-manifest) member must not turn a requested gap check into a pass.
         if max_gap.is_some() {
             return Err((
@@ -87,19 +77,24 @@ pub(super) fn verify(
         }
         return Ok(None);
     };
-    check(files, raw, tenant, pin, head, certs, max_gap)
+    check(files, tenant, pin, head, certs, max_gap, leaves)
         .map(Some)
         .map_err(|e| (if e.is::<Untrusted>() { 5 } else { 4 }, e))
 }
 fn check(
     files: &Files,
-    raw: &[u8],
     tenant: Uuid,
     pin: [u8; 32],
     head: &[u8],
     certs: &[Vec<u8>],
     max_gap: Option<chrono::Duration>,
+    leaves: &[super::tree::Hash],
 ) -> Result<ChainReport> {
+    let raw = files
+        .get("checkpoints.ndjson")
+        .context("checkpoint chain missing")?;
+    let mut frontier = super::tree::PrefixRoots::default();
+    let mut tree_schema_seen = false;
     let key_id = hex::encode(crate::sha256(&pin));
     let key = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, pin);
     let mut report = ChainReport::default();
@@ -113,16 +108,31 @@ fn check(
             canonical_json(&text)? == text,
             "checkpoint statement not JCS"
         );
-        let s: Statement = serde_json::from_str(&text)?;
-        ensure!(
-            s.domain == "tracelane.action-head.v1"
-                && s.schema_version == 1
-                && s.tenant_id == tenant,
-            "checkpoint domain/version/tenant"
-        );
+        let s = super::head::parse(&text)?;
+        ensure!(s.tenant_id == tenant, "checkpoint domain/version/tenant");
         let signature = hex::decode(&l.signature)?;
         if s.key_id != key_id || key.verify(text.as_bytes(), &signature).is_err() {
             return Err(Untrusted.into());
+        }
+        ensure!(
+            !tree_schema_seen || s.tree.is_some(),
+            "checkpoint tree schema regressed"
+        );
+        if let Some((size, root)) = s.tree {
+            ensure!(
+                frontier.at(leaves, size)? == root,
+                "signed tree head does not match ledger prefix"
+            );
+            if size > 0 {
+                let row_hash =
+                    hex::decode(s.head_hash.as_deref().context("checkpoint hash required")?)?;
+                let index = usize::try_from(size - 1)?;
+                ensure!(
+                    leaves.get(index) == Some(&super::tree::leaf_hash(&row_hash)),
+                    "signed checkpoint hash does not match ledger row"
+                );
+            }
+            tree_schema_seen = true;
         }
         let digest = hex::encode(crate::sha256(text.as_bytes()));
         match &prev {

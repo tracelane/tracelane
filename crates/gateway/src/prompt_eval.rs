@@ -1954,6 +1954,7 @@ impl PromptEvalEngine {
             key.expose_secret(),
             model,
             tenant_id,
+            &crate::sovereign::Egress::unclassified(crate::server::config::sovereign()),
         )
         .await;
         // BILL-01 meter 6 (eval_runs): ONE unit per JUDGE call that reached a

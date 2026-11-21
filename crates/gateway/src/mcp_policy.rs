@@ -146,7 +146,18 @@ pub struct Settings {
     pub allow_passthrough_auth: bool,
     pub policy: PolicyLimits,
     pub approvals: ApprovalLimits,
+    pub chat: ChatLimits,
     pub spans: SpanLimits,
+}
+/// ACT-23: caps on a signed chat interaction (`specs/ACT-23-approve-from-slack-and-teams.md` §5).
+/// Security parameters, not workspace settings.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatLimits {
+    /// A signed request whose timestamp is further than this from our clock (either way) is
+    /// refused. 300 = the 5 minutes in Slack's published verification example; capped at 600.
+    pub replay_window_secs: i64,
+    /// Larger bodies are refused before any HMAC is computed. Our message is under 4 KB; capped at 65536.
+    pub max_interaction_bytes: usize,
 }
 /// Reviewed ACT-16 caps; invalid seed data fails CLOSED in settings().
 #[derive(Debug, Deserialize, Serialize)]
@@ -230,6 +241,10 @@ pub struct ApprovalLimits {
     pub register_as_of_min_age_secs: i64,
     /// ACT-15b: `statement_timeout` for the register's read-only transaction.
     pub register_read_timeout_secs: u64,
+    /// ACT-41: an approve needs the approver's signed `auth_time` within this many seconds.
+    /// A security parameter, not a workspace setting (`specs/ACT-41-approver-step-up.md` §1);
+    /// 900 = 15 min (unverified industry practice). The refusal body carries it to the dashboard.
+    pub approver_auth_max_age_secs: i64,
     pub capacity_retry_secs: u32,
     pub paused_refusal_attempts_per_key_epoch: usize,
     pub paused_refusal_queue_capacity: usize,
@@ -263,6 +278,9 @@ fn parse_settings(raw: &str) -> Result<Settings, String> {
         || p.max_claim_chars > p.max_token_bytes
         || p.max_token_bytes > settings.limits.max_request_bytes
         || p.max_jwks_bytes > settings.limits.max_response_bytes
+        || settings.approvals.approver_auth_max_age_secs <= 0
+        || !(1..=600).contains(&settings.chat.replay_window_secs)
+        || !(1..=65536).contains(&settings.chat.max_interaction_bytes)
     {
         return Err("invalid principal limits".into());
     }
@@ -354,6 +372,8 @@ pub async fn enforce(
         .map_err(|e| {
             if e.to_string() == "invalid_protected_request" {
                 refusal(400, "invalid_protected_request")
+            } else if e.to_string() == "mcp_tool_protected_elsewhere" {
+                refusal(403, "mcp_tool_protected_elsewhere")
             } else {
                 refusal(503, "protected_execution_unavailable")
             }
@@ -712,5 +732,48 @@ fn principal_clock_skew_settings_bounds() {
         let mut value = original.clone();
         value["principal"]["clock_skew_secs"] = serde_json::json!(skew);
         assert_eq!(parse_settings(&value.to_string()).is_ok(), accepted);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn act41_approver_auth_window_bounds() {
+    let original: serde_json::Value =
+        serde_json::from_str(include_str!("../mcp_policy.v1.json")).unwrap();
+    assert_eq!(original["approvals"]["approver_auth_max_age_secs"], 900);
+    for (window, accepted) in [(-1, false), (0, false), (1, true), (900, true)] {
+        let mut value = original.clone();
+        value["approvals"]["approver_auth_max_age_secs"] = serde_json::json!(window);
+        assert_eq!(
+            parse_settings(&value.to_string()).is_ok(),
+            accepted,
+            "{window}"
+        );
+    }
+    let mut value = original;
+    value["approvals"]
+        .as_object_mut()
+        .unwrap()
+        .remove("approver_auth_max_age_secs");
+    assert!(
+        parse_settings(&value.to_string()).is_err(),
+        "missing window accepted"
+    );
+}
+#[cfg(test)]
+#[test]
+#[rustfmt::skip]
+fn chat_limits_are_bounded() {
+    let value: serde_json::Value =
+        serde_json::from_str(include_str!("../mcp_policy.v1.json")).unwrap();
+    for (key, value_in, accepted) in [("replay_window_secs", 0, false), ("replay_window_secs", 1, true), ("replay_window_secs", 600, true), ("replay_window_secs", 601, false),
+        ("max_interaction_bytes", 0, false), ("max_interaction_bytes", 65536, true), ("max_interaction_bytes", 65537, false)] {
+        let mut candidate = value.clone();
+        candidate["chat"][key] = serde_json::json!(value_in);
+        assert_eq!(
+            parse_settings(&candidate.to_string()).is_ok(),
+            accepted,
+            "chat.{key} = {value_in}"
+        );
     }
 }

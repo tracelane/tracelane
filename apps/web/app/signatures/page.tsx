@@ -1,5 +1,6 @@
 import { PageHeader } from "@tracelanedev/ui";
 import { StatusBadge } from "@tracelanedev/ui";
+import { summarizeSignatures } from "./summary";
 /**
  * Failure Signatures page (§4) — the AFT-1 taxonomy running live.
  *
@@ -27,10 +28,11 @@ import { StatusBadge } from "@tracelanedev/ui";
  *     per-signature occurrences + traces are the row-level columns.
  *   - "matched" counts ONLY live-detector signatures; roadmap entries are shown
  *     in a separate section and excluded from the headline count.
- *   - EXACTLY TWO summary metrics. The `StatGrid` carries a "Detection volume"
- *     eyebrow because that is what the pair IS — a third tile would have to be a
- *     prevention claim, a network count, or a number nobody computes, and all
- *     three are banned above.
+ *   - Answer first (founder 2026-11-19): ONE answer card states the distinct live
+ *     patterns matched, their total occurrences and the DISTINCT traces affected
+ *     (`summary.ts`). The two stat tiles it replaced carried the same numbers. A
+ *     third figure would have to be a prevention claim, a network count, or a
+ *     number nobody computes, and all three are banned above.
  *
  * ── PRESENTATION (P1, 2026-08-22) ───────────────────────────────────────────
  * Both tables are the SHARED `Table` system (`@tracelanedev/ui`), so the header
@@ -57,8 +59,6 @@ import { WindowNotice } from "@/components/metrics/WindowNotice";
 import { LIVE_SIGNATURE_IDS, aftFor } from "@/lib/aft-taxonomy";
 import { fetchSignaturesFor } from "@/lib/metrics/fetch";
 import { fmtCount } from "@/lib/metrics/format";
-import { hintOf } from "@/lib/metrics/hint";
-import { METRICS } from "@/lib/metrics/registry";
 import {
 	type TimeRange,
 	parseTimeRange,
@@ -69,8 +69,6 @@ import {
 	Card,
 	EmptyState,
 	Skeleton,
-	StatCard,
-	StatGrid,
 	TBody,
 	TD,
 	TH,
@@ -97,7 +95,7 @@ function HeadRow() {
 			    column named for a screen reader without printing a visible header. */}
 			<TH className="w-10 px-2" aria-label="Expand" />
 			<TH>Signature</TH>
-			<TH>AFT-1</TH>
+			<TH>Pattern ID</TH>
 			<TH>Severity</TH>
 			<TH numeric>Occurrences</TH>
 			<TH numeric>Traces</TH>
@@ -112,8 +110,8 @@ function RoadmapHeadRow() {
 	return (
 		<TR>
 			<TH>Signature</TH>
-			<TH>AFT-1</TH>
-			<TH>Planned detection · V1.1</TH>
+			<TH>Pattern ID</TH>
+			<TH>Planned detection</TH>
 			<TH numeric>Occurrences</TH>
 			<TH numeric>Traces</TH>
 		</TR>
@@ -192,14 +190,10 @@ const SKELETON_ROW_KEYS = ["sk-a", "sk-b", "sk-c", "sk-d", "sk-e"] as const;
 function SignaturesSkeleton() {
 	return (
 		<div className="space-y-6">
-			<StatGrid cols={2} title="Detection volume" className="sm:max-w-xl">
-				{(["mc-a", "mc-b"] as const).map((k) => (
-					<Card key={k} className="p-5">
-						<Skeleton className="mb-3 h-3 w-28" />
-						<Skeleton className="h-7 w-16" />
-					</Card>
-				))}
-			</StatGrid>
+			<Card className="p-5">
+				<Skeleton className="mb-3 h-5 w-72" />
+				<Skeleton className="h-3 w-96 max-w-full" />
+			</Card>
 			<Card quiet className="overflow-hidden">
 				<Table>
 					<THead>
@@ -279,53 +273,40 @@ async function SignaturesData({ range }: { range: TimeRange }) {
 
 	return (
 		<div className="space-y-6">
-			{/* 2 stat tiles — detection volume, never a prevention claim. Traces
-			    affected is the gateway's DISTINCT count (never a sum). NO "From
-			    network" tile — there is no cross-tenant read surface to source it
-			    from, and none is promised.
-
-			    `title` and the wider `max-w-xl` are the two P1 changes, and both are
-			    layout: the eyebrow NAMES the pair instead of leaving two tiles
-			    floating under the page title, and at `max-w-md` each tile was ~180px
-			    of content, which wrapped "Signatures matched · 30d" onto two lines
-			    beside its icon and its hint affordance. The labels, values, hints and
-			    icons are unchanged. */}
-			<StatGrid cols={2} title="Detection volume" className="sm:max-w-xl">
-				<StatCard
-					icon="failure-signatures"
-					label={METRICS.signatures_matched.label}
-					value={fmtCount(matched)}
-					sub={range.label}
-					hint={hintOf(METRICS.signatures_matched)}
-				/>
-				<StatCard
-					icon="traffic"
-					label={METRICS.traces_affected.label}
-					value={tracesAffected === null ? "—" : fmtCount(tracesAffected)}
-					sub={
-						tracesAffected === null
-							? "not reported by this gateway"
-							: range.label
-					}
-					hint={hintOf(METRICS.traces_affected)}
-				/>
-			</StatGrid>
+			{/* Answer first (founder 2026-11-19): one sentence answers "did my agents hit a
+			    known failure pattern?" with its scope. Both counts (matches and distinct
+			    traces affected) live in that sentence, so the two large volume tiles are
+			    gone: one card instead of two big numbers, and no zeros on a quiet day. */}
+			{(() => {
+				const a = summarizeSignatures(
+					matched,
+					live.reduce((t, x) => t + x.your_hits, 0),
+					tracesAffected,
+					range.label,
+				);
+				return (
+					<section
+						data-signatures-answer={a.tone}
+						className="border border-line bg-surface p-5"
+					>
+						<h2 className="text-lg font-semibold tracking-tight">
+							{a.headline}
+						</h2>
+						<p className="mt-2 max-w-2xl text-sm text-ink-2">{a.detail}</p>
+						{matched === 0 && (
+							<Link
+								href="/traces"
+								className="mt-4 inline-block text-sm font-medium text-action-ink hover:underline"
+							>
+								Browse recent traces →
+							</Link>
+						)}
+					</section>
+				);
+			})()}
 
 			{/* LIVE TABLE — only signatures with a shipped reference detector. */}
-			{matched === 0 ? (
-				<EmptyState
-					title={`No known failure patterns matched — ${range.label}`}
-					description="When a request matches a known AFT-1 failure pattern (e.g. a tool-schema violation), it shows up here with your occurrence count, affected traces, and its AFT-1 id."
-					action={
-						<Link
-							href="/traces"
-							className="text-sm font-medium text-action-ink hover:underline"
-						>
-							Browse recent traces →
-						</Link>
-					}
-				/>
-			) : (
+			{matched > 0 && (
 				<Card quiet className="overflow-hidden">
 					<Table>
 						<THead>
@@ -357,10 +338,10 @@ async function SignaturesData({ range }: { range: TimeRange }) {
 			{roadmapHits.length > 0 && (
 				<section className="space-y-4 border-t border-line pt-8">
 					<div>
-						<h2 className="t-eyebrow">Roadmap — V1.1 · detectors ship next</h2>
+						<h2 className="t-eyebrow">Not detected live yet</h2>
 						<p className="mt-1.5 max-w-2xl text-sm text-ink-2">
-							These are valid AFT-1 taxonomy entries whose reference detector
-							ships in V1.1 — not detected live yet.
+							These patterns are defined, but their detectors are not live yet,
+							so these counts do not come from live detection of your traffic.
 						</p>
 					</div>
 					<Card quiet className="overflow-hidden">
@@ -413,9 +394,8 @@ export default async function SignaturesPage({
 				<div>
 					<PageHeader title={<>Failure Signatures</>} />
 					<p className="mt-2 max-w-2xl text-sm text-ink-2">
-						Live-detected failures matched against the AFT-1 taxonomy —
-						canonical id, your per-tenant counts, and affected traces.{" "}
-						{range.label}.
+						Known agent failure patterns found in your recorded calls, how often
+						each happened, and the traces it touched.
 					</p>
 				</div>
 				<RangeControl defaultPreset="30d" />

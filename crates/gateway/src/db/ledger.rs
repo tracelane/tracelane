@@ -212,9 +212,19 @@ pub async fn insert_rows_tx(tx: &Transaction<'_>, rows: &[AuditLogRow]) -> Resul
 
 /// Same insert, on a pooled client outside any transaction — the reconcile's "adopt
 /// these rows from the ClickHouse copy" path. Conflicts are intentionally ignored.
+/// Recording recovery is unsupported until identity/dedup and projection restoration
+/// can commit with the original ledger positions. Refuse the entire batch explicitly.
 pub async fn insert_rows(pool: &Pool, rows: &[AuditLogRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
+    }
+    for row in rows {
+        if let Ok(serde_json::Value::Object(payload)) = serde_json::from_str(&row.payload) {
+            anyhow::ensure!(
+                !payload.contains_key("gateway_recording"),
+                "recording recovery requires atomic identity and projection restoration; adoption refused"
+            );
+        }
     }
     let mut client = pool.get().await.context("acquire pg client")?;
     let tx = client

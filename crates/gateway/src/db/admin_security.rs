@@ -79,6 +79,21 @@ pub async fn put(
 ) -> Result<(AdminAccess, AdminAccess)> {
     let mut client = pool.get().await.context("pool checkout")?;
     let tx = client.transaction().await?;
+    let result = put_in_tx(&tx, tenant, allowlist, sso_required, actor).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// The same audited write in the caller's transaction; errors roll back with that caller.
+#[tracing::instrument(skip_all, fields(tenant_id = %tenant))]
+pub async fn put_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    tenant: &TenantId,
+    allowlist: &[String],
+    sso_required: bool,
+    actor: &Actor,
+) -> Result<(AdminAccess, AdminAccess)> {
+    crate::db::controls::lock_config(tx, tenant).await?;
     let before = tx
         .query_opt(
             "SELECT admin_ip_allowlist, sso_required, updated_at, updated_by
@@ -115,7 +130,7 @@ pub async fn put(
         updated_by: Some(r.get(3)),
     };
     control_audit::record(
-        &tx,
+        tx,
         tenant,
         actor,
         Change {
@@ -127,6 +142,5 @@ pub async fn put(
         },
     )
     .await?;
-    tx.commit().await?;
     Ok((before, after))
 }

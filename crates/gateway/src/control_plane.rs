@@ -55,6 +55,15 @@ pub struct ControlPolicy {
     pub admin_access: AdminAccessPolicy,
     pub control_audit: ControlAuditPolicy,
     pub rate_limit: ControlRatePolicy,
+    pub config: ConfigPolicy,
+}
+
+/// OG-61a: bounds on the configuration document (`GET /v1/config/export`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConfigPolicy {
+    /// The largest document the export will return; past it the route answers
+    /// `413 config_too_large` rather than a truncated document.
+    pub max_document_bytes: usize,
 }
 
 /// rev5 M7 / rev6 N1: per-minute caps on the admin plane. `control_routes_per_minute`,
@@ -117,6 +126,9 @@ impl ControlPolicy {
                 web_control_changes_per_minute: 30,
                 channel_tests_per_minute: 6,
                 incident_controls_per_minute: 60,
+            },
+            config: ConfigPolicy {
+                max_document_bytes: 1_048_576,
             },
         }
     }
@@ -181,7 +193,7 @@ impl ControlRefusal {
         (self.status, self.body)
     }
 
-    fn role_forbidden(cap: Capability) -> Self {
+    pub(crate) fn role_forbidden(cap: Capability) -> Self {
         Self::new(
             StatusCode::FORBIDDEN,
             &json!({

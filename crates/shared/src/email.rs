@@ -69,15 +69,36 @@ pub async fn send_plain_text(
     subject: &str,
     text: &str,
 ) -> Result<(), EmailError> {
+    send_message(http, url, api_key, from, to, subject, text, None).await
+}
+
+/// [`send_plain_text`] with an optional `html` part. The CALLER escapes the html.
+///
+/// # Errors
+/// Same as [`send_plain_text`].
+#[allow(clippy::too_many_arguments)] // flat mail fields, same shape as send_plain_text plus html
+pub async fn send_message(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: Option<&SecretString>,
+    from: &str,
+    to: &str,
+    subject: &str,
+    text: &str,
+    html: Option<&str>,
+) -> Result<(), EmailError> {
     let Some(key) = api_key else {
         return Err(EmailError::Unconfigured);
     };
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "from": from,
         "to": [to],
         "subject": subject,
         "text": text,
     });
+    if let Some(h) = html {
+        body["html"] = serde_json::Value::String(h.to_owned());
+    }
     let resp = http
         .post(url)
         .bearer_auth(key.expose_secret())

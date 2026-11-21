@@ -375,35 +375,105 @@ async fn shard_worker(
         }
         for group in group_by_tenant(batch) {
             let wires: Vec<AuditEventWire> = group.iter().map(|q| q.wire.clone()).collect();
-            match audit_chain.append_batch_from_wire(&wires).await {
-                Ok(()) => {
-                    // Appended (or idempotently skipped) AND committed — ack now.
-                    // A failed ack leaves the message for redelivery; the replay
-                    // is a no-op via `audit_appended` (0020), so it is safe.
-                    for q in group {
+            let outcomes = settle(&audit_chain, shard, &wires).await;
+            for (q, outcome) in group.into_iter().zip(outcomes) {
+                match outcome {
+                    // Appended (or idempotently skipped) AND committed. A failed ack leaves
+                    // the message for redelivery; the replay is a no-op via `audit_appended`.
+                    Outcome::Ack => {
                         if let Err(e) = q.msg.ack().await {
                             tracing::warn!(error = %e, shard, "audit ack failed after commit; will redeliver (idempotent)");
                         }
                     }
-                }
-                Err(e) => {
-                    // PG/CH outage — do NOT ack; JetStream redelivers after
-                    // ack_wait. ONE counter, not one line per event: how long
-                    // this has been open is the fact that matters.
-                    let n = tracelane_shared::degradation::note(
-                        tracelane_shared::degradation::Degradation::AuditAppendFailed,
-                    );
-                    tracing::error!(
-                        error = %e,
-                        shard,
-                        events = group.len(),
-                        failures_total = n,
-                        "audit batch append failed — leaving unacked for redelivery"
-                    );
+                    Outcome::Term => {
+                        if let Err(e) = q.msg.ack_with(async_nats::jetstream::AckKind::Term).await {
+                            // It redelivers and is refused (and counted) again.
+                            tracing::warn!(error = %e, shard, "audit Term ack failed; will redeliver");
+                        }
+                    }
+                    // No Nak: the natural `ack_wait` backoff avoids a hot retry spin.
+                    Outcome::Redeliver => {}
                 }
             }
         }
     }
+}
+
+/// What to do with one queued message after its tenant group was appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Ack,
+    /// Its own content can never append: terminate, so it stops redelivering.
+    Term,
+    Redeliver,
+}
+
+/// Append one tenant's group as one transaction. On a PERMANENT refusal (RI-08: a message
+/// whose own content can never append) retry each message alone, so the valid ones land and
+/// only the offender is terminated; redelivering the whole group would stall the tenant's
+/// ledger forever. Any other failure (PG/CH outage) leaves the whole group for redelivery.
+/// # Errors
+/// None returned. Fail-CLOSED for a refused event (it never enters the ledger, and is
+/// counted); fail-OPEN for the consumer (the tenant's other events keep flowing).
+pub(crate) async fn settle(
+    audit_chain: &AuditChain,
+    shard: usize,
+    wires: &[AuditEventWire],
+) -> Vec<Outcome> {
+    match audit_chain.append_batch_from_wire(wires).await {
+        Ok(()) => vec![Outcome::Ack; wires.len()],
+        Err(e) if crate::gateway_recording::is_permanent(&e) => {
+            tracing::warn!(error = %e, shard, events = wires.len(), "audit batch refused permanently; retrying one by one");
+            let mut out = Vec::with_capacity(wires.len());
+            for wire in wires {
+                out.push(
+                    match audit_chain
+                        .append_batch_from_wire(std::slice::from_ref(wire))
+                        .await
+                    {
+                        Ok(()) => Outcome::Ack,
+                        Err(e) if crate::gateway_recording::is_permanent(&e) => {
+                            let n = tracelane_shared::degradation::note(
+                                tracelane_shared::degradation::Degradation::AuditMessageTerminated,
+                            );
+                            tracing::error!(
+                                error = %e,
+                                shard,
+                                tenant_id = %wire.tenant_id,
+                                event_id = %wire.event_id,
+                                terminated_total = n,
+                                "audit message can never append; terminating"
+                            );
+                            Outcome::Term
+                        }
+                        Err(e) => {
+                            note_append_failed(&e, shard, 1);
+                            Outcome::Redeliver
+                        }
+                    },
+                );
+            }
+            out
+        }
+        Err(e) => {
+            note_append_failed(&e, shard, wires.len());
+            vec![Outcome::Redeliver; wires.len()]
+        }
+    }
+}
+
+/// PG/CH outage: ONE counter, not one line per event; how long it stays open is what matters.
+fn note_append_failed(e: &anyhow::Error, shard: usize, events: usize) {
+    let n = tracelane_shared::degradation::note(
+        tracelane_shared::degradation::Degradation::AuditAppendFailed,
+    );
+    tracing::error!(
+        error = %e,
+        shard,
+        events,
+        failures_total = n,
+        "audit batch append failed; leaving unacked for redelivery"
+    );
 }
 
 /// Split one drained batch into per-tenant groups, each in arrival order, the

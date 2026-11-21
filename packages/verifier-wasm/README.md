@@ -5,7 +5,7 @@ A static page that verifies a Tracelane **action evidence ZIP** in the browser. 
 Rust reference verifier ([`../verifier-rust`](../verifier-rust/), `action::bundle::verify_with_tsa`)
 compiled to WebAssembly. No check is reimplemented in JavaScript.
 
-Status: source only. The page is not hosted anywhere; serve `web/` yourself.
+Status: hosted at `https://tracelane.dev/verify/` once the site deploy that carries `apps/site/public/verify/` has run; check that URL before relying on it, it may not be live yet. You can always serve `web/` yourself.
 
 ## What it does
 
@@ -20,7 +20,7 @@ It prints `PASS` with every field of the verifier's report, or `FAIL (code N)` w
 verifier's reason. Codes match the `tracelane-audit` exit codes: 4 format or proof, 5 trust
 input (public key or TSA certificate), 6 action semantics.
 
-The files are read locally. The page makes no network requests after it loads: the WebAssembly
+The files are read locally. The page makes no network requests after it loads, and its policy blocks fetch, XHR and WebSocket connections: the WebAssembly
 binary is embedded in a script file rather than fetched, so the page's content security policy
 can set `connect-src 'none'`. The browser then refuses any fetch, XHR or subresource request the
 page might attempt. (A content security policy does not govern top-level navigation.)
@@ -57,6 +57,17 @@ wrapper tests and the browser proof against that fresh build. The release `.wasm
 1.1 MB (about 1.46 MB once base64-embedded). If you host the page, also send
 `frame-ancestors 'none'` as an HTTP header; a meta-tag policy cannot set it. This crate is its own Cargo workspace,
 so it is built from its own directory, not with `cargo build --workspace` at the repository root.
+
+## Hosted copy
+
+`apps/site/public/verify/` holds a committed copy of the generated files (the site build has no Rust
+toolchain), with `MANIFEST.sha256` recording each file's sha256 and the `.wasm`'s size and sha256.
+`./publish-site.sh` rebuilds and rewrites it; `./publish-site.sh --check` rebuilds and fails on any
+difference (same rustc and wasm-bindgen-cli versions required; `build.sh` builds from a fixed directory
+with paths remapped so the bytes do not depend on where the repository is checked out). The CI
+`verifier-wasm` job runs `--check` on every change to the verifier, the package or the hosted copy, and
+`scripts/deploy/site-gate.sh` refuses to publish a `/verify/` change unless that job passed. `apps/site/tests/verify-page.test.ts`
+checks the committed files against the manifest. The hosted page is `apps/site/src/pages/verify.astro`.
 
 ## Serve
 
